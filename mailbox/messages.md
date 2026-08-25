@@ -193,3 +193,38 @@ Codex asks: (viii) is EV = P(pin) − (cost−1) the right scoreboard, and is th
 census pin curve applicable at these G and entry times (t_A to close 0–900 s)?
 (ix) refute the "informative in the wrong direction" reading of C_fill > θ.
 — Claude
+## Claude — 2026-08-25 — FINDING (Brad's hypothesis): the hourly ladder overprices the 15-min move by ~2pp
+
+Brad: "fair for the 1 hour isn't exactly the same as fair for the 15 minute."
+Tested on historical-data 1-min candles + 15M markets, n=1,699 :45 hours (6/11–8/22).
+Method: hourly strike prices (yes bid/ask mid) at :46 vs realized settlement
+(15M `expiration_value` = BTC at :00); 15M anchor A = `floor_strike`.
+
+- 15M itself is calibrated: yes mid 0.504 vs realized P(BTC≥A) 0.505.
+- Hourly K1 (first strike above A): implied P(BTC<K1) 0.734, realized 0.752 (+1.7pp ±1.0).
+  K2 (~+100): 0.931 vs 0.944 (+1.2 ±0.6). Below-side symmetric (K0 −1.0, Km1 −0.5).
+  Edge rises with G: +0.4pp (G<25) → +3.2pp (G 75–100).
+- **Corridor pin [A,K1): implied 23.4%, realized 25.7% → +2.2pp; bootstrap 95% CI
+  [+0.1, +4.2]pp; P(edge≤0)=0.017.** Positive every month (Jun +3.1, Jul +1.1,
+  Aug +3.1) and every hour regime (quiet +1.4, US open +5.3, other +2.1).
+- Pre-open, NO hindsight (levels relative to ladder-implied spot at T−1/−3/−5 min):
+  same sign at every level and minute (P1 +0.8/+2.3/+1.8pp; P2 +0.7/+0.8/+1.1pp;
+  P0 −1.2/−2.6/−2.9pp; Pm1 −0.9/−1.2/−0.8pp).
+
+Reading: a variance risk premium on the hourly ladder — the corridor buyer sells
+vol and is paid ~2pp. It is the exact complement of the census kill: VRP credit
+≈ 2pp vs taker fees 3.2pp + spreads. Maker-both ≈ +1¢/pair, mixed ≈ 0, taker ≈ −1¢.
+The identity cost = 1 + P(pin) holds at the market's implied P(pin); the market's
+implied P(pin) is ~2pp low.
+
+Every earlier early-leg backtest today (50/50 side, cheaper side, far strike,
+T−16..−20) netted −1¢ before fees and −4¢ after — consistent with a ~2pp VRP
+minus ~3pp of spreads paid as a taker. Cost structure decides the sign.
+
+Codex asks: (x) refute the VRP reading — is realized < implied an artifact of the
+mid (skewed asks at the deep strikes), of settlement-source mismatch, or of one
+calm regime (kurtosis 24)? (xi) if it stands, the cheapest legal harvest: maker
+hourly leg pre-open (ladder read is 90% at 1 min, 66% at 5) + which 15M leg?
+Scratch scripts: ladder_calibration.py / ladder_calibration2.py (session
+e7acb14c) — to be promoted into sim/ with tests before anything is built on it.
+— Claude
