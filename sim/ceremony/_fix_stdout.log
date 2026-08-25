@@ -1,0 +1,19 @@
+﻿The fix pass is complete. Here's the summary.
+
+## Amendment A3 implemented ΓÇö FIX-COMPLETE
+
+I implemented A3.1ΓÇôA3.11 exactly as frozen in `rung1_commission.md ┬º11`, verified against the two adversarial reviews' receipts, and wrote `sim/ceremony/rung1_fix_report.md`.
+
+**The critical fix (A1/A3.1):** the frozen run crashed with `KeyError: 'floor_strike'` on the strike-less "up/down (Target price: TBD)" 15M product. Now those records are skipped in the anchor tape and route their grid hour to `EXCL_NO_ANCHOR`. Confirmed on all three reviewer-A repro days ΓÇö no crash; `EXCL_NO_ANCHOR` fires at exactly `2026-06-15 23:00` and `2026-06-23 04:00`.
+
+**The other ten clauses:** ╧â╠é window ratification (A3.2, no code change); WORST never gates inclusion + receipt count (A3.3); `EXCL_SIGMA_HEAD`/`EXCL_SIGMA_GAP` split (A3.4); `EXCL_EV_MISSING` + Decimal-compare integrity (A3.5); line-based freeze marker fixing the B1 deadlock (A3.6); loader-side frozen assertion on sealed access (A3.7); degenerate-quintile hard fail (A3.8); censusΓåögate sha binding in preflight (A3.9); aggregates-only unseal result (A3.10); dilution admission in the gate report (A3.11).
+
+**Verification:**
+- **55/55 tests pass** (42 prior + 13 new A3 tests).
+- **Engine unchanged:** reviewer A's 06-25ΓÇô27 window reconciles to their exact table (`OK=65`); smoke `OK=111`, with the old `EXCL_SIGMA_TAPE=3` correctly split into HEAD=1 + GAP=2.
+- Read-only scan confirmed **0 of 228,886** TRAIN 1H markets lack `floor_strike`, and all strike markets carry `result`/`expiration_value` keys ΓÇö no other run-stopper lurking.
+- **No sealed byte read**; the full 52-day frozen run was left for the bridge (`census.main` still refuses >7 days without `--authorize-full-run`).
+
+**Judgment calls confessed** (┬º2 of the report), the notable ones: A3.3 required making WORST columns `Optional` end-to-end in gate_fit/unseal (else a blank WORST reintroduces an A1-class crash); I edited `falsifier.md`'s STATUS line to be a clean structured marker for A3.6 (kept it a DRAFT); A3.4's HEAD/GAP is keyed on the corpus's earliest anchor rather than a hardcoded date; A3.10 also reduced sealed date lists to counts.
+
+Handoff for bridge verification is in ┬º5 of the fix report.

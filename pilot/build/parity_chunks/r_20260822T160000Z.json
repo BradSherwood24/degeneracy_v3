@@ -1,0 +1,38 @@
+{
+  "bin_counts": {
+    "no_signal_both": 1
+  },
+  "n_neutrality_failures": 0,
+  "n_windows": 1,
+  "neutrality_failures": [],
+  "passed": true,
+  "windows": [
+    {
+      "bin": "no_signal_both",
+      "close_time": "2026-08-22T16:00:00Z",
+      "detail": {},
+      "live": {
+        "C": null,
+        "ev": null,
+        "fired": false,
+        "high_limit": null,
+        "low_limit": null,
+        "source": null,
+        "t_minus_s": null
+      },
+      "neutrality_ok": true,
+      "sim": {
+        "C": null,
+        "ev": null,
+        "fired": false,
+        "high_leg_price": null,
+        "low_leg_price": null,
+        "payoff": null,
+        "pin": null,
+        "source": null,
+        "t_minus_s": null
+      },
+      "source_match": null
+    }
+  ]
+}

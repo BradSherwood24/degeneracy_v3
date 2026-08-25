@@ -1,0 +1,318 @@
+"""pilot_ledger.py — the append-only per-window pilot ledger + a tiny query CLI.
+
+Each window process appends ONE JSON object (one line) to ``pilot/ledger/pilot_ledger.jsonl`` at
+close (run_window step g). The paired-replay report and the promotion-gate check read ONLY this
+artifact (PLAN "Coding standards" 9). Money is kept as Decimal-safe strings on disk; the query layer
+re-parses to Decimal so no float wobble enters the loss/slippage totals.
+
+The promotion gates P1/P2 (falsifier) are COMPUTED PROPERTIES of the ledger, never stored booleans —
+so a re-run of the query re-derives them from the raw per-window counters and the falsifier text
+governs. The gate thresholds live here as named constants mirrored from the frozen falsifier; the
+falsifier remains the authority (a freeze that re-pins a number must be mirrored here).
+
+House law: this module places no orders, opens no socket, reads no sealed file. It is pure data +
+file append/read + a CLI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_LEDGER_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ledger"
+)
+DEFAULT_LEDGER_PATH = os.path.join(DEFAULT_LEDGER_DIR, "pilot_ledger.jsonl")
+
+# --- promotion-gate thresholds (mirrored from pilot/ceremony/falsifier.md P1/P2) ---
+P1_MIN_FIRED = 10
+P1_MIN_FILL_RATE = Decimal("0.60")
+P1_MAX_MEAN_ABS_SLIP = Decimal("0.01")  # <= 1c per side
+P1_MIN_DAYS = 1
+P2_MIN_FIRED = 10          # FURTHER fired signals at the 2-pair rung
+P2_MIN_SUB1 = 5            # incl. >= 5 sub-$1 entries at the 2-pair rung
+
+
+def _dec(v: Any) -> Decimal:
+    if v is None or v == "":
+        return Decimal(0)
+    try:
+        return Decimal(str(v))
+    except Exception:  # noqa: BLE001
+        return Decimal(0)
+
+
+# ---------------------------------------------------------------------------
+# Append / load
+# ---------------------------------------------------------------------------
+def append_entry(entry: dict[str, Any], path: str = DEFAULT_LEDGER_PATH) -> None:
+    """Append one window summary object as a single JSON line (Decimals rendered as strings)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=True, default=_json_default))
+        f.write("\n")
+
+
+def _json_default(obj: object) -> str:
+    if isinstance(obj, Decimal):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def load_entries(path: str = DEFAULT_LEDGER_PATH) -> list[dict[str, Any]]:
+    """Read all ledger entries in append order. Missing file -> []."""
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        nonempty = [ln.strip() for ln in f if ln.strip()]
+    out: list[dict[str, Any]] = []
+    for i, line in enumerate(nonempty):
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            # A crash mid-append (single writer, append-only) can leave a truncated FINAL line.
+            # Tolerate ONLY the trailing line so one bad write cannot break every subsequent read
+            # (operator CLI) or silently zero out the S4/A4 day-lock seed. Mid-file corruption is
+            # not expected and is surfaced loudly.
+            if i == len(nonempty) - 1:
+                logger.warning("pilot_ledger: skipping truncated trailing line in %s", path)
+                break
+            raise
+    return out
+
+
+def entries_for_day(entries: list[dict[str, Any]], day: str) -> list[dict[str, Any]]:
+    """Entries whose close_time UTC date == ``day`` (YYYY-MM-DD). Robust to 'Z'/'+00:00' spellings."""
+    return [e for e in entries if str(e.get("close_time", ""))[:10] == day]
+
+
+def s4_running_loss(entries: list[dict[str, Any]]) -> Decimal:
+    """Total realized P&L across all entries (negative = net loss). Sums ``realized_delta``."""
+    return sum((_dec(e.get("realized_delta")) for e in entries), Decimal(0))
+
+
+# ---------------------------------------------------------------------------
+# Promotion-gate counters (computed, never stored)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PromotionCounters:
+    fired_count: int
+    filled_count: int
+    fill_rate: Decimal | None          # None when fired_count == 0
+    imbalance_count: int               # unresolved imbalances (S2-eligible)
+    sub1_violations: int               # S1 arithmetic violations
+    mean_abs_slippage: Decimal | None  # per-side mean |slippage| across all filled legs
+    sub1_entries: int
+    calendar_days: int
+    windows: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "fired_count": self.fired_count,
+            "filled_count": self.filled_count,
+            "fill_rate": None if self.fill_rate is None else str(self.fill_rate),
+            "imbalance_count": self.imbalance_count,
+            "sub1_violations": self.sub1_violations,
+            "mean_abs_slippage": None if self.mean_abs_slippage is None else str(self.mean_abs_slippage),
+            "sub1_entries": self.sub1_entries,
+            "calendar_days": self.calendar_days,
+            "windows": self.windows,
+        }
+
+
+def compute_counters(entries: list[dict[str, Any]]) -> PromotionCounters:
+    """Fold the raw per-window fields into the promotion counters. A 'fired' window is one whose
+    ``fires`` > 0 (a live FIRE — WouldFire/shakedown windows do not count toward the gates)."""
+    fired = 0
+    filled = 0
+    imbalance = 0
+    s1 = 0
+    sub1 = 0
+    slips: list[Decimal] = []
+    days: set[str] = set()
+    for e in entries:
+        fires = int(e.get("fires", 0) or 0)
+        if fires <= 0:
+            continue
+        fired += fires
+        if e.get("filled"):
+            filled += 1
+        if e.get("imbalance_unresolved"):
+            imbalance += 1
+        if e.get("s1_violation"):
+            s1 += 1
+        if e.get("sub1_entry"):
+            sub1 += 1
+        for s in e.get("slippage_abs_per_side", []) or []:
+            slips.append(_dec(s))
+        ct = str(e.get("close_time", ""))
+        if ct:
+            days.add(ct[:10])
+    fill_rate = (Decimal(filled) / Decimal(fired)) if fired > 0 else None
+    mean_slip = (sum(slips, Decimal(0)) / Decimal(len(slips))) if slips else None
+    return PromotionCounters(
+        fired_count=fired,
+        filled_count=filled,
+        fill_rate=fill_rate,
+        imbalance_count=imbalance,
+        sub1_violations=s1,
+        mean_abs_slippage=mean_slip,
+        sub1_entries=sub1,
+        calendar_days=len(days),
+        windows=len(entries),
+    )
+
+
+def _rung_entries(entries: list[dict[str, Any]], pairs: int) -> list[dict[str, Any]]:
+    return [e for e in entries if int(e.get("pairs", 0) or 0) == pairs]
+
+
+@dataclass(frozen=True)
+class GateResult:
+    passed: bool
+    reasons: tuple[str, ...]
+    counters: PromotionCounters
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"passed": self.passed, "reasons": list(self.reasons), "counters": self.counters.as_dict()}
+
+
+def p1_gate(entries: list[dict[str, Any]]) -> GateResult:
+    """P1 (1 pair -> 2 pairs), falsifier: >= 10 fired AND fill rate >= 60% AND zero unresolved
+    imbalances AND zero S1 violations AND mean |slippage| <= 1c per side AND >= 1 calendar day at
+    1 pair. Computed over the 1-pair rung entries."""
+    c = compute_counters(_rung_entries(entries, 1))
+    reasons: list[str] = []
+    if c.fired_count < P1_MIN_FIRED:
+        reasons.append(f"fired {c.fired_count} < {P1_MIN_FIRED}")
+    if c.fill_rate is None or c.fill_rate < P1_MIN_FILL_RATE:
+        reasons.append(f"fill_rate {c.fill_rate} < {P1_MIN_FILL_RATE}")
+    if c.imbalance_count > 0:
+        reasons.append(f"unresolved imbalances {c.imbalance_count} > 0")
+    if c.sub1_violations > 0:
+        reasons.append(f"S1 violations {c.sub1_violations} > 0")
+    if c.mean_abs_slippage is None or c.mean_abs_slippage > P1_MAX_MEAN_ABS_SLIP:
+        reasons.append(f"mean |slippage| {c.mean_abs_slippage} > {P1_MAX_MEAN_ABS_SLIP}")
+    if c.calendar_days < P1_MIN_DAYS:
+        reasons.append(f"calendar days {c.calendar_days} < {P1_MIN_DAYS}")
+    return GateResult(passed=not reasons, reasons=tuple(reasons), counters=c)
+
+
+def p2_gate(entries: list[dict[str, Any]]) -> GateResult:
+    """P2 (2 pairs -> readiness report), falsifier: >= 10 FURTHER fired at 2 pairs incl. >= 5 sub-$1
+    AND P1 conditions still holding AND second-pair book-walk measured. Computed over the 2-pair rung
+    entries; P1 holding is checked against the 1-pair rung."""
+    c = compute_counters(_rung_entries(entries, 2))
+    reasons: list[str] = []
+    if c.fired_count < P2_MIN_FIRED:
+        reasons.append(f"2-pair fired {c.fired_count} < {P2_MIN_FIRED}")
+    if c.sub1_entries < P2_MIN_SUB1:
+        reasons.append(f"2-pair sub-$1 entries {c.sub1_entries} < {P2_MIN_SUB1}")
+    if c.imbalance_count > 0:
+        reasons.append(f"2-pair unresolved imbalances {c.imbalance_count} > 0")
+    if c.sub1_violations > 0:
+        reasons.append(f"2-pair S1 violations {c.sub1_violations} > 0")
+    if c.fill_rate is None or c.fill_rate < P1_MIN_FILL_RATE:
+        reasons.append(f"2-pair fill_rate {c.fill_rate} < {P1_MIN_FILL_RATE}")
+    if c.mean_abs_slippage is not None and c.mean_abs_slippage > P1_MAX_MEAN_ABS_SLIP:
+        reasons.append(f"2-pair mean |slippage| {c.mean_abs_slippage} > {P1_MAX_MEAN_ABS_SLIP}")
+    # second-pair book-walk must be measured on >= 1 two-pair window (reported by run_window)
+    walk_measured = any(e.get("second_pair_book_walk") is not None for e in _rung_entries(entries, 2))
+    if not walk_measured:
+        reasons.append("second-pair book-walk not measured on any 2-pair window")
+    # P1 must still hold
+    p1 = p1_gate(entries)
+    if not p1.passed:
+        reasons.append("P1 conditions no longer hold: " + "; ".join(p1.reasons))
+    return GateResult(passed=not reasons, reasons=tuple(reasons), counters=c)
+
+
+# ---------------------------------------------------------------------------
+# Query CLI
+# ---------------------------------------------------------------------------
+def _cmd_day(entries: list[dict[str, Any]], args: argparse.Namespace) -> int:
+    rows = entries_for_day(entries, args.day)
+    for e in rows:
+        print(json.dumps(
+            {
+                "close_time": e.get("close_time"),
+                "mode": e.get("mode"),
+                "pairs": e.get("pairs"),
+                "stand_down": e.get("stand_down"),
+                "would_fires": e.get("would_fires"),
+                "fires": e.get("fires"),
+                "filled": e.get("filled"),
+                "realized_delta": e.get("realized_delta"),
+                "alarms": e.get("alarms"),
+                "stops": e.get("stops"),
+            },
+            sort_keys=True,
+        ))
+    print(f"# {len(rows)} window(s) on {args.day}")
+    return 0
+
+
+def _cmd_loss(entries: list[dict[str, Any]], args: argparse.Namespace) -> int:
+    if args.day:
+        entries = entries_for_day(entries, args.day)
+    total = s4_running_loss(entries)
+    print(json.dumps({"realized_total": str(total), "windows": len(entries)}, sort_keys=True))
+    return 0
+
+
+def _cmd_gate(entries: list[dict[str, Any]], args: argparse.Namespace) -> int:
+    result = p1_gate(entries) if args.which == "P1" else p2_gate(entries)
+    print(json.dumps({args.which: result.as_dict()}, indent=2, sort_keys=True))
+    return 0 if result.passed else 1
+
+
+def _cmd_summary(entries: list[dict[str, Any]], args: argparse.Namespace) -> int:
+    print(json.dumps(
+        {
+            "windows": len(entries),
+            "realized_total": str(s4_running_loss(entries)),
+            "P1": p1_gate(entries).as_dict(),
+            "P2": p2_gate(entries).as_dict(),
+        },
+        indent=2, sort_keys=True,
+    ))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    # --ledger is a PARENT option so it is accepted before OR after the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
+
+    ap = argparse.ArgumentParser(description="Query the pilot ledger (read-only).", parents=[common])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_day = sub.add_parser("day", parents=[common], help="entries for a UTC day (YYYY-MM-DD)")
+    p_day.add_argument("day")
+    p_day.set_defaults(func=_cmd_day)
+
+    p_loss = sub.add_parser("loss", parents=[common], help="S4 running realized loss total")
+    p_loss.add_argument("--day", default=None)
+    p_loss.set_defaults(func=_cmd_loss)
+
+    p_gate = sub.add_parser("gate", parents=[common], help="P1/P2 promotion-gate check")
+    p_gate.add_argument("which", choices=["P1", "P2"])
+    p_gate.set_defaults(func=_cmd_gate)
+
+    p_sum = sub.add_parser("summary", parents=[common], help="windows + realized total + both gates")
+    p_sum.set_defaults(func=_cmd_summary)
+
+    args = ap.parse_args(argv)
+    entries = load_entries(args.ledger)
+    return args.func(entries, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

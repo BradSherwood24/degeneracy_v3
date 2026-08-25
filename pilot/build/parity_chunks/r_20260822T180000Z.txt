@@ -1,0 +1,10 @@
+# PARITY REPORT (five-bin)
+windows: 1
+passed (F15 neutrality): False
+neutrality failures: 1
+
+bin counts:
+  live-only (bin 2): 1
+
+NEUTRALITY FAILURES (a live/sim fire/no-fire flip — F15):
+  2026-08-22T18:00:00Z: bin 2 — live fired, sim did not — signal-engine divergence / book-vs-prints C (documented delta flipping a fire decision is an F15 FAILURE)

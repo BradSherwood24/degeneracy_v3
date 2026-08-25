@@ -1,0 +1,16 @@
+﻿Build complete. Final summary:
+
+**RUNG 1 BUILD ΓÇö 10-line summary**
+
+1. Entered to a partial prior build; audited `loader.py`/`census.py` (they reconcile the review's verified hour to the cent) and **adopted** them with minimal behaviour-preserving edits.
+2. Built the missing modules: `gate_fit.py`, `unseal_runner.py`, and `sim/tests/` (9 test files).
+3. **42/42 pytest pass** ΓÇö fee goldens as literals, pin truth table incl. exact-boundary in both orientations, complement identity, seal + unseal refusals, dedupe byte-identity, day-boundary, ╧â╠é 9-anchor/cross-day, G<$0.01, NaN hard-fail.
+4. Smoke census (2026-07-14ΓÇª18) = **120 rows = 24h ├ù 5d**, fully receipted: OK=111, SIGMA_TAPE=3, NO_15M=3, NO_1H=1, NO_PAIR=2; 23 pins / 88 escapes; all 20 input shas recorded.
+5. **Hand-reconciled 2026-07-15 08:00** independently ΓåÆ C_base=0.7239, C_worst=0.8564, PIN ΓÇö matches the design review exactly.
+6. Found & fixed a real quirk: 2026-07-16 has a 15M tape gap (06:45ΓåÆ09:15); the old enumeration dropped 3 hours silently ΓÇö now gridded + receipted (confession C7).
+7. The seal holds: `acknowledge_sealed_read=True` exists in exactly one place (`unseal_runner`), gated behind a fail-closed preflight + explicit-go flag; **no sealed byte was read by any means.**
+8. Did **not** create the frozen `census_train.csv`/`gate.json` ΓÇö those are the bridge's one run; smoke outputs are namespaced (`*_smoke`).
+9. Full CONFESSIONS section (C0ΓÇôC16) in `sim/ceremony/rung1_build_report.md`; the load-bearing ones for the reviewer are **C1** (╧â╠é window includes A(T); NOT rank-invariant) and **C7** (grid enumeration change).
+10. Pure stdlib (numpy present but unused; nothing installed).
+
+**BUILD-COMPLETE** ΓÇö deliverable at `sim/ceremony/rung1_build_report.md`; ready for adversarial review.

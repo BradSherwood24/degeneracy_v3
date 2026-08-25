@@ -1,0 +1,9 @@
+# PARITY REPORT (five-bin)
+windows: 1
+passed (F15 neutrality): True
+neutrality failures: 0
+
+bin counts:
+  both-fired (pending fills): 1
+
+No fire/no-fire flips: every window agrees live vs sim (F15 neutrality holds).

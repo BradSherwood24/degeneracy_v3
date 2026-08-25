@@ -1,0 +1,42 @@
+{
+  "bin_counts": {
+    "2": 1
+  },
+  "n_neutrality_failures": 1,
+  "n_windows": 1,
+  "neutrality_failures": [
+    "2026-08-22T18:00:00Z"
+  ],
+  "passed": false,
+  "windows": [
+    {
+      "bin": 2,
+      "close_time": "2026-08-22T18:00:00Z",
+      "detail": {
+        "cause": "live fired, sim did not \u2014 signal-engine divergence / book-vs-prints C (documented delta flipping a fire decision is an F15 FAILURE)"
+      },
+      "live": {
+        "C": "0.9999",
+        "ev": null,
+        "fired": true,
+        "high_limit": "0.1600",
+        "low_limit": "0.8200",
+        "source": "sub$1-flip",
+        "t_minus_s": 651.7890000343323
+      },
+      "neutrality_ok": false,
+      "sim": {
+        "C": null,
+        "ev": null,
+        "fired": false,
+        "high_leg_price": null,
+        "low_leg_price": null,
+        "payoff": null,
+        "pin": null,
+        "source": null,
+        "t_minus_s": null
+      },
+      "source_match": null
+    }
+  ]
+}

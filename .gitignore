@@ -1,0 +1,26 @@
+# --- data that must never leave this machine ---
+# sealed evaluation derivatives (house law: train-only forever, row-level sealed)
+sim/out/
+
+# --- bulk data (way over GitHub limits; regenerable via tools/fetch_history.py) ---
+historical-data/
+pilot/journals/
+pilot/logs/
+
+# --- runtime state (machine-local, not source) ---
+pilot/ledger/
+pilot/ops/mode.txt
+
+# --- scratch / caches ---
+_reviewA_tmp/
+_reviewB_tmp/
+.pytest_cache/
+__pycache__/
+*.pyc
+.claude/
+
+# --- secrets, belt-and-suspenders (none live in this tree; the proxy owns the key) ---
+*.pem
+.env
+.env.*
+*.key

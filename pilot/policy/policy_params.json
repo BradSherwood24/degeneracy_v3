@@ -1,0 +1,21 @@
+{
+  "roster_name": "pilot-frozen-v1",
+  "description": "The live-pilot roster: sub-$1 flip in ALL quintiles, Q1-strangle ONLY in q0, NO flip-EV anywhere. This differs from the sealed-read policy. Values are the sim law mapped to a live book.",
+  "sub_dollar_C_max": "1.00",
+  "q1_strangle_ev_min": "0.05",
+  "freshness_max_leg_age_s": 1.0,
+  "staleness_s": 60,
+  "quintile_routing": {
+    "q0": ["Q1-strangle", "sub$1-flip"],
+    "q1": ["sub$1-flip"],
+    "q2": ["sub$1-flip"],
+    "q3": ["sub$1-flip"],
+    "q4": ["sub$1-flip"]
+  },
+  "imbalance": {
+    "pair_cost_ceiling_sub1": "1.0320",
+    "max_retries_per_side": 5,
+    "no_rebalance_after_s_to_settle": 3,
+    "no_orders_after_s_to_settle": 1
+  }
+}

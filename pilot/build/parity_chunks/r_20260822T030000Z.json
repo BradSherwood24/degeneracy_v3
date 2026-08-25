@@ -1,0 +1,40 @@
+{
+  "bin_counts": {
+    "both_fired_pending_fills": 1
+  },
+  "n_neutrality_failures": 0,
+  "n_windows": 1,
+  "neutrality_failures": [],
+  "passed": true,
+  "windows": [
+    {
+      "bin": "both_fired_pending_fills",
+      "close_time": "2026-08-22T03:00:00Z",
+      "detail": {
+        "note": "both fired; bins 3-5 need a fills record (shakedown => bins 1-2 only)"
+      },
+      "live": {
+        "C": "0.9950",
+        "ev": null,
+        "fired": true,
+        "high_limit": "0.9900",
+        "low_limit": "0.0040",
+        "source": "sub$1-flip",
+        "t_minus_s": 30.573999881744385
+      },
+      "neutrality_ok": true,
+      "sim": {
+        "C": "0.9950",
+        "ev": "0.099421",
+        "fired": true,
+        "high_leg_price": "0.9900",
+        "low_leg_price": "0.0040",
+        "payoff": "0.0050",
+        "pin": 0,
+        "source": "sub$1-flip",
+        "t_minus_s": 30.557223
+      },
+      "source_match": true
+    }
+  ]
+}

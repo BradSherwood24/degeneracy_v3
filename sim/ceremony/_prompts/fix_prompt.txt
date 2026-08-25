@@ -1,0 +1,24 @@
+You are the FIX BUILDER for degeneracy_v3's Rung 1 sim, on Opus 4.8. Ceremony position: build -> adversarial review (done: two reviews, findings adjudicated) -> YOUR FIX PASS -> bridge verification -> one frozen run. You implement EXACTLY Amendment A3 — nothing more, nothing less; every judgment call is a written confession.
+
+READ, in order: sim/ceremony/rung1_commission.md (SECTIONS 10 and 11 — Amendments A2 and A3; A3 is your work order), sim/ceremony/rung1_adversarial_review_A.md and rung1_adversarial_review_B.md (the findings A3 adjudicates — they contain exact line numbers, reproduction receipts, and demonstrated failures), sim/ceremony/rung1_build_report.md (the original build's confessions). Then the code: sim/loader.py, sim/census.py, sim/gate_fit.py, sim/unseal_runner.py, sim/tests/*.
+
+IMPLEMENT A3.1 through A3.11 exactly as written. Key points the reviews pin down for you:
+- A3.1: skip floor_strike-less records in the anchor-tape build (census.py ~line 229) AND route grid hours whose only 15M market lacks floor_strike to EXCL_NO_ANCHOR (pairing path ~line 278). Reviewer A's crash repro: python census.py --dates 2026-06-15 (also 2026-06-23, 2026-07-22).
+- A3.3: inclusion decided on BASE only (census.py ~line 391: drop the cw-is-None condition; C_worst may be blank in the CSV, receipt-flagged count of such rows).
+- A3.4: split EXCL_SIGMA_TAPE into EXCL_SIGMA_HEAD (only 2026-06-11) and EXCL_SIGMA_GAP (everything else), including in receipts.
+- A3.5: empty expiration_value -> EXCL_EV_MISSING with receipt; present-but-unequal compared as Decimal -> hard fail; recompute check only when present.
+- A3.6: freeze check = parse lines, look for a line that strip()s to exactly "STATUS: FROZEN" (frozen) or a STATUS line containing "NOT FROZEN" (draft); no whole-file substring logic. New test: copy the REAL sim/ceremony/falsifier.md to a temp location, perform the natural freeze (change only the STATUS line), assert preflight passes on the copy. DO NOT modify the real falsifier.md.
+- A3.7: loader asserts falsifier is FROZEN (A3.6 semantics) whenever acknowledge_sealed_read=True, before any sealed open.
+- A3.8: strictly-increasing quintile edge assertion + degeneracy hard fail with receipt.
+- A3.9: preflight hashes census_train.csv, requires == gate.json["census_csv_sha256"].
+- A3.10: unseal_result exclusions as per-reason counts only.
+- A3.11: gate_report flags dilution admission (top gated bucket individual LB <= 0 while pooled prefix clears).
+- Also fix reviewer B's B10 (docstring overstatement in unseal_runner) and remove or clearly mark the dead census._is_top_of_hour (B12/C15) — your choice, confess it.
+
+TESTS: extend the suite to cover every A3 item (crash days become fixture cases: synthesize a strike-less 15M record in the synthetic corpus; empty expiration_value case; freeze-the-real-file-copy test; degenerate-edges test; sha-binding test). ALL existing 42 tests must still pass unless a test itself encoded the defective behavior (confess any test you change and why).
+
+VERIFY: (1) full pytest green; (2) python census.py --dates 2026-06-15 and --dates 2026-06-23 and --dates 2026-07-22 now complete with EXCL_NO_ANCHOR receipts where Reviewer A's scan predicts; (3) rerun the 5-day smoke (2026-07-14..18) and DIFF against sim/out/census_smoke.csv — expected: identical rows except any legitimately affected by A3.3/A3.4 relabeling; list every changed row in your report; (4) rerun Reviewer A's replication days (2026-06-25..27) via census.py and confirm the OK-row values are UNCHANGED from their review's table (the fixes must not move any correct number).
+
+HARD RULES: never open any file dated 2026-08-02..2026-08-18 (SEALED; harness-denied too); do not modify sim/ceremony/ files except writing your report; do not run the full train census (>7 days is refused anyway — do not touch that guard except as A3 requires); do not touch _reviewA_tmp/ or _reviewB_tmp/ (evidence). Receipts, not assurances.
+
+DELIVERABLE: write sim/ceremony/rung1_fix_report.md — per-A3-item implementation notes, test results (pytest tail), the three crash-day receipts, the smoke diff, the 06-25..27 no-change confirmation, and a CONFESSIONS section. Final stdout: 10-line summary ending FIX-COMPLETE or FIX-BLOCKED.
