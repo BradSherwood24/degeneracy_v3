@@ -104,3 +104,47 @@ Branches: repairs land on `repairs/instruments` (Tier 1) and
 `repairs/ejection-seat` (Tier 2) — disclosed here as they open. Brad merges.
 — Claude
 
+## Claude — 2026-08-25 — REPLAYER BUILT + MAKER-FLIP BACKTEST v1 (branch sim/replay @ 28e55dc)
+
+Built by the Opus 4.8 crew on Brad's go; 19 tests pass; results under
+`sim/out/replay/maker_flip_20260825T175025Z.*` (gitignored, on-box).
+
+### Replayer (`sim/replay/`)
+Engine-time (ts_ms) L2 folding of both legs, integer arithmetic (dust kill at
+<0.005 contracts), BookMirror top-of-book agreement tested on synthetic + a
+20k-frame real excerpt. SELFCHECK: 81/81 processed windows reconcile 100.00% —
+2,327,701 trade prints each matched a same-ms negative delta on the hit side.
+11 windows skipped (no legs: stand-down/shakedown). Sanity anchor reproduced:
+05:00Z 8/24 hourly yes-bid 0.54 = 1 contract at ts …727209, 0 at …727217 —
+gone 6–8ms after the fire frame. Runtime 479s / 91 windows / 8 workers.
+
+### Maker-flip v1 (rest 1¢ under each ask while taker-model C ≤ θ; first maker
+fill → chase the other leg at its ask Δ later; one pair per window)
+Funnel at θ=1.00, STRICT trade-through, Δ=0.15s, maker fee 25%:
+- 81 active windows → **26 ever had C ≤ 1.00** (rest time p50 0s; p90 22s)
+- → **7 first fills** (5 TRAIN / 2 HOLDOUT) → **6 pairs < $1.00**
+  (TRAIN 4/5, HOLDOUT 2/2). Costs: 0.9815, 0.9887, 0.9669, 0.9900, 1.0072
+  (TRAIN); 0.9716, 0.9717 (HOLDOUT). Chase gap p50 0¢, p90 2–3¢.
+- LENIENT (queue) adds 3 fills incl. the 05:00Z 8/24 blow-out (qA 0.48 →
+  chase 1.0716, gap 11¢): HOLDOUT P(<1)=0.75. Truth is between STRICT and LENIENT.
+- **Both-maker completions: 0 in every cell.** Every pair is maker + chase.
+- Δ from 0.10→1.0s moves mean cost ~0.3–0.5¢. Maker-fee 25% vs 0%: ~0.2–0.4¢.
+  Neither is the lever; **fill scarcity is** (~7–12% of windows bank a pair).
+- Tighter θ (0.99/0.98/0.97): 0–2 fills each, all < $1 when they occur
+  (medians 0.983 / 0.957 / 0.949) — too few to grade.
+
+### Read
+Conditional on a strict through-fill, the pair clears sub-$1 at 6/7 with 1–3¢
+locked plus the pin lottery — a different animal from the taker path
+(1/11 live, +0.07¢). Unconditionally it is a ~1-in-10-windows event at
+1 contract. n=7 certifies nothing; it says the geometry is right and the
+question is volume. Levers to test next, in order: (a) 71 days of historical
+trade prints as a STRICT fill oracle (through-trades need no book) to get
+n into the hundreds; (b) rest-depth sweep (0/1/2¢ under ask) and rest-only-
+in-last-N-s; (c) size >1 with ask-size gating on the chase. Caveats in
+`sim/replay/README.md` (instant replace/cancel, no impact, counterfactual Δ).
+
+Codex asks: (vi) attack the STRICT rule — is "print strictly through our
+price" too generous when the through-print is a single sweep that would have
+exhausted our level anyway? (vii) the historical-prints oracle protocol
+before it runs. — Claude
