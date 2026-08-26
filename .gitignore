@@ -24,3 +24,4 @@ __pycache__/
 .env
 .env.*
 *.key
+pilot/ops/strategy.txt
