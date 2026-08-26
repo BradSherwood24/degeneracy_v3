@@ -53,6 +53,17 @@ PURPOSE_FLATTEN = "flatten"
 FEE_IS_TOTAL = False  # see module docstring (Phase-3 review: fail-closed = multiply by fill_count)
 MIN_PAIR_PAYOUT = Decimal("1.00")  # sub-$1 flip: worst-case settlement payout per matched pair
 
+# The wide-box source id. Kept as a local constant (not imported from service.box) so this
+# safety-critical, early-imported module never risks an import cycle; test_box_wiring asserts it
+# equals ``service.box.WIDE_BOX``. A matched box pair has a GUARANTEED $1 floor (exactly one deep-ITM
+# leg pays outside the pin region, both inside -> $2 pinned), so it is floor-booked at close exactly
+# like a sub-$1 flip's matched portion; the +$1 pinned bonus rides in via the settlement backfill.
+WIDE_BOX = "wide-box"
+
+# Sources whose matched pairs carry a guaranteed >= $1/pair settlement floor (booked conservatively
+# at close in ``realized_at_close``). A Q1-strangle has NO floor and is deliberately excluded.
+_FLOOR_SOURCES = (SUB_DOLLAR_FLIP, WIDE_BOX)
+
 
 @dataclass(frozen=True)
 class IntentLeg:
@@ -191,7 +202,7 @@ class LedgerState:
         non-flip held legs contribute only their cash OUTLAY here (a conservative, safe-direction
         loss); their settlement payoff arrives via the backfill. Zero when nothing filled."""
         base = self.realized_cashflow()
-        if self.source == SUB_DOLLAR_FLIP:
+        if self.source in _FLOOR_SOURCES:
             base = base + self.matched_pairs() * MIN_PAIR_PAYOUT
         return base
 

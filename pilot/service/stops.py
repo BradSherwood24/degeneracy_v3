@@ -46,8 +46,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from service.ledger import (
+    PURPOSE_ENTRY,
     PURPOSE_FLATTEN,
     SUB_DOLLAR_FLIP,
+    WIDE_BOX,
     Intent,
     IntentLeg,
     LedgerState,
@@ -207,6 +209,45 @@ def check_s1(state: LedgerState) -> str | None:
         return (
             f"sub-$1 flip pair matched={state.matched_pairs()} realized_min={realized} < 0 "
             f"(net cash out {state.pair_net_cash_out()} with ACTUAL fees; floor violated)"
+        )
+    return None
+
+
+def check_s1_box(state: LedgerState, pair_cost_max: Decimal) -> str | None:
+    """S1 for the WIDE BOX (units + booked-cost tripwire). The corridor ``check_s1`` (whose
+    ``realized_min < 0`` test would trip on EVERY normal box pair, since a box costs ~$1.85 for a $1
+    floor) is scoped to sub-$1 flip and returns None here; the box uses THIS check instead. Trips iff:
+
+      * any FILLED leg's average fill price exceeds its OWN entry limit (a units tripwire — an IOC
+        buy can never fill above its limit, so this can only mean a units/side-space corruption like
+        the 2026-08-23 NO-in-YES-space bug), OR
+      * the pair's BOOKED COST (both legs, fees in) exceeds ``pair_cost_max`` (the roster ceiling
+        $1.99) — such a box is a guaranteed loss against the $2 pinned ceiling.
+
+    Returns a reason string on violation, else None. Scoped to the box source (fail-closed None for
+    any other source)."""
+    if state.source != WIDE_BOX:
+        return None
+    entry = next((i for i in state.intents if i.purpose == PURPOSE_ENTRY), None)
+    limits = {(lg.ticker, lg.side): lg.limit_price for lg in (entry.legs if entry else ())}
+    cost = Decimal(0)
+    for which in ("high", "low"):
+        pos = state.position(which)
+        if pos is None:
+            continue
+        cost += pos.bought_cost
+        if pos.avg_buy_price is not None:
+            lim = limits.get((pos.ticker, pos.side))
+            if lim is not None and pos.avg_buy_price > lim:
+                return (
+                    f"box units tripwire: {pos.ticker} ({pos.side}) avg fill {pos.avg_buy_price} "
+                    f"> own limit {lim} (an IOC buy cannot fill above its limit — units/side-space "
+                    f"corruption suspected)"
+                )
+    if cost > pair_cost_max:
+        return (
+            f"box pair booked cost {cost} (both legs, fees in) > pair_cost_max {pair_cost_max} "
+            f"(guaranteed loss against the $2 pinned ceiling)"
         )
     return None
 

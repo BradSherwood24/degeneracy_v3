@@ -416,6 +416,7 @@ def test_default_load_self_verifies():
     assert p.entry_start_s == 600 and p.entry_end_s == 60
     assert p.freshness_max_leg_age_s == 1.0
     assert p.no_orders_after_s_to_settle == 1 and p.contracts == 1
+    assert p.pair_cost_max == Decimal("1.99")
 
 
 def test_canonical_sha_key_order_invariant():

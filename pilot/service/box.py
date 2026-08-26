@@ -376,7 +376,9 @@ DEFAULT_BOX_POLICY_PATH = os.path.join(_POLICY_DIR, "box_params.json")
 
 # Canonical sha of the frozen box roster shipped in policy/box_params.json. A plain
 # load_box_policy() self-verifies the shipped file against this and refuses any drift.
-FROZEN_BOX_POLICY_SHA256 = "a91bc569b8f38df31a5fe050cc07c2fd6f2642988c24f51ea870d11d80eed9f0"
+# Re-pinned in phase box-2 when ``pair_cost_max`` (the S1_box booked-cost ceiling) was added to
+# the roster; the box roster is not yet ceremonially frozen (a box falsifier comes later).
+FROZEN_BOX_POLICY_SHA256 = "480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3"
 
 
 class BoxPolicyShaMismatch(Exception):
@@ -399,6 +401,9 @@ class BoxParams:
     freshness_max_leg_age_s: float
     no_orders_after_s_to_settle: int
     contracts: int
+    # S1_box booked-cost ceiling (both legs, fees in). A filled box pair whose cost exceeds this is a
+    # guaranteed loss against the $2 pinned ceiling -> S1_box trips (halts the day). Pinned in the roster.
+    pair_cost_max: Decimal
     sha256: str
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
@@ -441,6 +446,7 @@ def load_box_policy(
         freshness_max_leg_age_s=float(raw["freshness_max_leg_age_s"]),
         no_orders_after_s_to_settle=int(raw["no_orders_after_s_to_settle"]),
         contracts=int(raw["contracts"]),
+        pair_cost_max=Decimal(str(raw["pair_cost_max"])),
         sha256=sha,
         raw=raw,
     )

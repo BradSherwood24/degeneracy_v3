@@ -103,6 +103,35 @@ def s4_running_loss(entries: list[dict[str, Any]]) -> Decimal:
 
 
 # ---------------------------------------------------------------------------
+# A5 — the box one-legged-entry alarm counter (rolling last N box fires).
+# ---------------------------------------------------------------------------
+BOX_SOURCE = "wide-box"
+A5_ONE_LEGGED_RATE_MAX = Decimal("0.10")  # alarm when one-legged/fires exceeds this over the window
+
+
+def box_fire_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The window rows that were a live box FIRE (``fires`` > 0 AND ``fired_source`` == box), in
+    append order. Backfill rows (``fires`` == 0) and non-box rows are excluded."""
+    return [
+        e
+        for e in entries
+        if int(e.get("fires", 0) or 0) > 0 and e.get("fired_source") == BOX_SOURCE
+    ]
+
+
+def box_one_legged_rate(
+    entries: list[dict[str, Any]], n: int = 20
+) -> tuple[Decimal | None, int, int]:
+    """(rate, one_legged, fires) over the LAST ``n`` box fires. ``rate`` is one_legged/fires, or None
+    when there are no box fires yet. A row is one-legged iff ``box_one_legged`` is truthy."""
+    fires = box_fire_entries(entries)[-n:]
+    if not fires:
+        return None, 0, 0
+    one_legged = sum(1 for e in fires if e.get("box_one_legged"))
+    return (Decimal(one_legged) / Decimal(len(fires))), one_legged, len(fires)
+
+
+# ---------------------------------------------------------------------------
 # Settlement backfill (BUG-2 repair, part c)
 #
 # A window that ends holding a naked/overhang leg books only that leg's cash OUTLAY at close (the
@@ -135,8 +164,17 @@ def build_backfill_entry(
     window_entry: dict[str, Any], results: dict[str, str], payoff: Decimal, now: float
 ) -> dict[str, Any]:
     """A ledger line recording a settlement backfill. ``fires``/``filled`` are zeroed so the promotion
-    counters ignore it; only ``realized_delta`` (the payoff) feeds ``s4_running_loss`` and the day
-    total. ``close_time`` mirrors the settled window so it lands on the right UTC day."""
+    counters ignore it; only ``realized_delta`` feeds ``s4_running_loss`` and the day total.
+    ``close_time`` mirrors the settled window so it lands on the right UTC day.
+
+    ``realized_delta`` is the settlement ``payoff`` NET of any floor already booked at close
+    (``floor_booked`` on the window entry). For a sub-$1 flip / corridor row ``floor_booked`` is
+    absent (== 0), so the backfill is the raw payoff, exactly as before. For a wide-box both-filled
+    row the $1 floor was booked at close and BOTH legs are recorded unsettled, so the payoff ($1 not
+    pinned / $2 pinned) is netted by the $1 floor -> +$0 (not pinned) or +$1 (pinned), which is the
+    'backfill +1 if pinned' the box wants."""
+    floor = _dec(window_entry.get("floor_booked"))
+    realized = payoff - floor
     return {
         "close_time": window_entry.get("close_time"),
         "mode": "backfill",
@@ -144,7 +182,9 @@ def build_backfill_entry(
         "pairs": window_entry.get("pairs"),
         "fires": 0,
         "filled": False,
-        "realized_delta": str(payoff),
+        "realized_delta": str(realized),
+        "settlement_payoff": str(payoff),
+        "floor_netted": str(floor),
         "realized_unsettled": False,
         "settled_legs": window_entry.get("unsettled_legs"),
         "settlement_results": results,
