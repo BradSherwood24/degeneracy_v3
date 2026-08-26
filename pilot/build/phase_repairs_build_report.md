@@ -6,7 +6,7 @@ sourced from the account balance. Ground truth throughout is the real journals i
 `pilot/journals/2026082[34]*.jsonl` (the raw Kalshi order responses) and Kalshi's own realized
 numbers. House law observed: no network calls, no sealed reads, no key/PEM/.env access, `python` only.
 
-Test suite on this branch: **411 passed** (`cd pilot; python -m pytest -q`). Baseline before the work
+Test suite on this branch: **415 passed** (+ 2 pre-existing test_quintile errors that need the untracked historical-data/ corpus, absent from the review worktree; they pass in the main checkout) (`cd pilot; python -m pytest -q`). Baseline before the work
 was 406 passed + 1 pre-existing failure (see CONFESSIONS #1). The 4 sim/tests failures are outside the
 pilot suite and were not touched.
 
@@ -143,7 +143,7 @@ balance delta == P&L):
 
 ---
 
-## Tests added (all green; 411 total on this branch)
+## Tests added (all green; 415 passing on this branch)
 
 - `tests/test_orders_envelope.py`: `normalize_fill_to_side` (NO flip / YES pass-through / idempotent /
   None), `parse_single_response(side=...)`.
@@ -208,3 +208,54 @@ already-normalized positions.
 6. **`FEE_IS_TOTAL` unchanged.** It stays `False` (fail-closed multiply-by-fill_count). At the pilot's
    n=1 size every fill has `fill_count == 1`, so it did not affect any armed-span number; the
    difference only appears at 2 pairs.
+
+---
+
+## Review round 1 (Opus 4.8, b18105b) — FIX-THEN-SHIP findings + fixes
+
+Reviewer confirmed BUG-1 units and BUG-2 booking by rebuilding all 11 armed-span windows from the raw
+journals (exact match to the table above). Five follow-ups, all addressed on this branch:
+
+**F2 (balance units) — FIXED.** The real `/portfolio/balance` payload (fetched read-only 2026-08-26,
+$52.97) carries BOTH `balance` (int cents, `5297`) and `balance_dollars` (str, `"52.9718"`, sub-cent).
+`stops.parse_balance` now parses `balance_dollars` as the PRIMARY Decimal (sub-cent precision) AND
+`balance` as int cents, and requires `|dollars − cents/100| < 0.01` else fails closed. The guessy
+`available_balance`/`available`/`portfolio_value` int() fallbacks are gone — no field that might be
+dollars is ever `int()`-ed, and an unexpected shape fails closed (no arm). The whole S4 pipeline is now
+Decimal dollars: the day-guard baseline is stored as `balance_start_dollars`, and `balance_loss_dollars`
+/ `s4_balance_breached` take Decimals. `run_window` journals `portfolio_value` (0 = flat) at each wake,
+and emits `balance_parse_mismatch` on a units disagreement. Tests: the exact real payload fixture
+(52.9718 ok), dollars-only (fail closed), cents-only (fail closed), mismatch (fail closed), non-dict.
+
+**F1 (flatten fills unbooked) — FIXED.** `StopController` gained a `flatten_sink(intent, exec_result)`
+callback; `trip()` calls it for every stop-authorized flatten it dispatches. `run_window` wires
+`_fold_flatten_response`, which `record_intent`+`record_response`s the flatten into the in-process
+ledger. A flatten that FILLS is now booked as a round-trip (the reduce-only sell reduces net), so the
+leg drops out of `unsettled_legs` (no phantom backfill payoff) and out of the naked cash-outlay
+booking. Test: naked leg → stop → flatten fills → `unsettled_legs` empty, `realized_at_close` = the
+round-trip (−0.0255), not the naked outlay. (The armed-span table is unchanged: those flattens hit
+A_FLATTEN_NO_BID and never filled, which is exactly the naked-to-settlement case.)
+
+**F3 (corrupt guard self-heals) — FIXED.** `ensure_balance_start` now refuses to write over a corrupt
+guard (returns `(None, False)`), and `run_window` skips the balance snapshot/compare entirely when the
+step-(b) read reported corrupt, journaling `stops_guard_corrupt`. A corrupt guard therefore keeps
+refusing to arm every wake that UTC day until a human repairs the file — it is never silently reset,
+so latches/baseline are not erased. Tests: `ensure_balance_start` leaves a corrupt file byte-identical
+and returns `(None, False)`; a run_window prepare over a corrupt guard does not rewrite it.
+
+**F6 (backfill CLI) — FIXED.** `_cmd_backfill` wraps result parsing + `settlement_payoff` in a
+try/except and prints a one-line `{"error":"invalid_results",...}` (rc=1) instead of a raw traceback
+on a missing/invalid result. Test: backfill with no `--result` for the held leg → clean rc=1.
+
+**F4 / F5 — documented limitations (by review direction).**
+- **F4 (baseline = first clean wake).** The S4 balance baseline is snapshotted at the first wake of the
+  UTC day that reads a clean balance with no open positions. If the very first wakes of a day all have
+  open positions (balance not clean), the baseline is deferred to the first clean wake; intra-day P&L
+  before that wake is not captured by the balance leash (the per-window realized ledger still records
+  it). Acceptable: the wake is normally a flat point, and a missed baseline fails toward *later*
+  arming, not looser risk.
+- **F5 (both-win $2 sub-$1 pairs understated).** `realized_at_close` books the sub-$1 flip floor at
+  exactly $1/pair (`MIN_PAIR_PAYOUT`). A complementary flip pays exactly $1, but a pair where BOTH legs
+  happen to settle in-the-money would pay $2 — the floor booking understates that by $1/pair. This is
+  the conservative (safe) direction and did not occur in the armed span; a precise both-win credit
+  would need the settlement backfill to also credit matched sub-$1 pairs, deferred.

@@ -233,26 +233,38 @@ from service.stops import (  # noqa: E402
     day_guard_path,
     ensure_balance_start,
     latched_stop_kind,
-    parse_balance_cents,
+    parse_balance,
     read_day_guard,
     record_latched_stop,
     s4_balance_breached,
     _write_day_guard,
 )
 
+# The REAL proxy /portfolio/balance payload (fetched read-only 2026-08-26; balance $52.97).
+REAL_BALANCE_PAYLOAD = {
+    "balance": 5297,
+    "balance_breakdown": [{"balance": "52.9718", "exchange_index": 0},
+                          {"balance": "0.0000", "exchange_index": 1},
+                          {"balance": "0.0000", "exchange_index": 2},
+                          {"balance": "0.0000", "exchange_index": 3}],
+    "balance_dollars": "52.9718",
+    "portfolio_value": 0,
+    "updated_ts": 1787774216,
+}
+
 
 def test_day_guard_missing_is_empty_not_corrupt(tmp_path):
     g = read_day_guard(day_guard_path(str(tmp_path), "2026-08-24"), "2026-08-24")
     assert g.exists is False and g.corrupt is False
-    assert g.latched == () and g.balance_start_cents is None
+    assert g.latched == () and g.balance_start_dollars is None
 
 
 def test_day_guard_roundtrip_and_latched_kind(tmp_path):
     p = day_guard_path(str(tmp_path), "2026-08-24")
-    _write_day_guard(p, DayGuard("2026-08-24", balance_start_cents=1000,
+    _write_day_guard(p, DayGuard("2026-08-24", balance_start_dollars="52.9718",
                                  latched=({"kind": "S2", "reason": "x", "window": CT, "ts": 1.0},)))
     g = read_day_guard(p, "2026-08-24")
-    assert g.balance_start_cents == 1000
+    assert g.balance_start() == Decimal("52.9718")   # sub-cent precision preserved
     assert latched_stop_kind(g) == "S2"
 
 
@@ -280,39 +292,68 @@ def test_record_latched_stop_appends_and_survives_corrupt(tmp_path):
 
 def test_ensure_balance_start_first_wake_then_reuse_and_new_day(tmp_path):
     p24 = day_guard_path(str(tmp_path), "2026-08-24")
-    start, first = ensure_balance_start(p24, "2026-08-24", 1000000, 1.0)
-    assert start == 1000000 and first is True
+    start, first = ensure_balance_start(p24, "2026-08-24", Decimal("52.9718"), 1.0)
+    assert start == Decimal("52.9718") and first is True
     # same day, later wake: baseline is reused (a lower balance-now does NOT move it)
-    start2, first2 = ensure_balance_start(p24, "2026-08-24", 990000, 2.0)
-    assert start2 == 1000000 and first2 is False
+    start2, first2 = ensure_balance_start(p24, "2026-08-24", Decimal("49.97"), 2.0)
+    assert start2 == Decimal("52.9718") and first2 is False
     # a NEW UTC day is a fresh file -> fresh snapshot
     p25 = day_guard_path(str(tmp_path), "2026-08-25")
-    start3, first3 = ensure_balance_start(p25, "2026-08-25", 990000, 3.0)
-    assert start3 == 990000 and first3 is True
+    start3, first3 = ensure_balance_start(p25, "2026-08-25", Decimal("49.97"), 3.0)
+    assert start3 == Decimal("49.97") and first3 is True
+
+
+def test_ensure_balance_start_never_self_heals_a_corrupt_guard(tmp_path):
+    # F3 review: a corrupt guard must NOT be overwritten by ensure_balance_start (would erase the
+    # day's latches/baseline and let arming resume). It returns (None, False) and writes nothing, so
+    # a second wake still reads the same corrupt file and keeps refusing.
+    p = day_guard_path(str(tmp_path), "2026-08-24")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("{corrupt")
+    before = open(p).read()
+    start, first = ensure_balance_start(p, "2026-08-24", Decimal("52.97"), 1.0)
+    assert start is None and first is False
+    assert open(p).read() == before                      # not overwritten
+    assert read_day_guard(p, "2026-08-24").corrupt is True  # still corrupt on the next wake
 
 
 # ===========================================================================
-# BUG-3: S4 balance parsing + breach (cents integers -> Decimal dollars)
+# BUG-3 / F2 (review): S4 balance parsing (dollars primary + cents cross-check) + breach.
 # ===========================================================================
-def test_parse_balance_cents_shapes_and_failclosed():
-    assert parse_balance_cents({"balance": 100000}) == 100000
-    assert parse_balance_cents({"available_balance": 5025}) == 5025
-    assert parse_balance_cents({"nope": 1}) is None
-    assert parse_balance_cents("garbage") is None
-    assert parse_balance_cents({"balance": "not-int"}) is None
+def test_parse_balance_real_payload():
+    br = parse_balance(REAL_BALANCE_PAYLOAD)
+    assert br.ok is True
+    assert br.dollars == Decimal("52.9718")   # sub-cent precision from balance_dollars
+    assert br.cents == 5297
+    assert br.portfolio_value == 0
 
 
-def test_balance_loss_dollars_cents_to_decimal():
-    # start 1000000c, now 999700c -> loss $3.00 (exact Decimal, no float wobble)
-    assert balance_loss_dollars(1000000, 999700) == Decimal("3.00")
-    assert balance_loss_dollars(1000000, 1000500) == Decimal("-5.00")  # a gain
+def test_parse_balance_failclosed_shapes():
+    # dollars-only (no cents) -> fail closed
+    assert parse_balance({"balance_dollars": "52.97"}).ok is False
+    assert parse_balance({"balance_dollars": "52.97"}).status == "missing_balance_cents"
+    # cents-only (no dollars) -> fail closed (never int() a maybe-dollars field / never guess)
+    assert parse_balance({"balance": 5297}).ok is False
+    assert parse_balance({"balance": 5297}).status == "missing_balance_dollars"
+    # mismatch: cents says $10.00, dollars says $52.97 -> fail closed
+    mm = parse_balance({"balance": 1000, "balance_dollars": "52.97"})
+    assert mm.ok is False and mm.status == "mismatch"
+    # not a dict / unparseable dollars
+    assert parse_balance("garbage").ok is False
+    assert parse_balance({"balance": 5297, "balance_dollars": "NaNish"}).ok is False
+
+
+def test_balance_loss_dollars_decimal():
+    assert balance_loss_dollars(Decimal("52.9718"), Decimal("49.9718")) == Decimal("3.0000")
+    assert balance_loss_dollars(Decimal("100.00"), Decimal("105.00")) == Decimal("-5.00")  # gain
 
 
 def test_s4_balance_breached_at_over_and_under_cap():
     cap = Decimal("3.00")
-    assert s4_balance_breached(1000000, 999700, cap) == (True, Decimal("3.00"))   # at cap
-    assert s4_balance_breached(1000000, 999699, cap)[0] is True                    # over cap
-    assert s4_balance_breached(1000000, 999800, cap) == (False, Decimal("2.00"))  # under cap
+    assert s4_balance_breached(Decimal("100.00"), Decimal("97.00"), cap) == (True, Decimal("3.00"))
+    assert s4_balance_breached(Decimal("100.00"), Decimal("96.99"), cap)[0] is True
+    assert s4_balance_breached(Decimal("100.00"), Decimal("98.00"), cap) == (False, Decimal("2.00"))
 
 
 # ===========================================================================
@@ -353,3 +394,56 @@ def test_controller_alarm_does_not_latch_the_day(tmp_path):
     c.raise_alarm("A1", "slippage")
     # no day-halting stop was tripped -> no guard file / no latch
     assert latched_stop_kind(read_day_guard(p, "2026-08-24")) is None
+
+
+# ===========================================================================
+# F1 (review): a stop-authorized flatten that FILLS is folded into the ledger as a round-trip,
+# NOT left as a phantom unsettled leg / over-booked close.
+# ===========================================================================
+class _FillingExec:
+    def __init__(self):
+        self.armed = True
+
+    def set_armed(self, v):
+        self.armed = v
+
+    def execute(self, intent, stop_authorized=False):
+        # the reduce-only NO sell fills at the bid; response already side-normalized to NO-space.
+        leg = intent.legs[0]
+        r = OrderResponse(leg.client_order_id, "o", Decimal(1), Decimal(0), Decimal("0.9500"),
+                          Decimal("0.0034"), 1, raw_reported_price=Decimal("0.0500"))
+        return type("R", (), {"responses": (r,)})()
+
+
+def test_stop_flatten_fill_folds_into_ledger_as_roundtrip(tmp_path):
+    from service.journal import Journal
+    from service.stops import StopController
+    st = record_intent(new_ledger(CT, SUB_DOLLAR_FLIP, HI, LO), _flip_entry("0.9700", "0.0250"))
+    st = record_response(st, _resp("h", 1, "0.9700", "0.0021"))  # naked NO (low missed)
+    assert st.unsettled_legs() == ((HI, "no", 1),)               # pending BEFORE the flatten
+    holder = {"ls": st}
+
+    def sink(intent, res):
+        holder["ls"] = record_intent(holder["ls"], intent)
+        for r in res.responses:
+            holder["ls"] = record_response(holder["ls"], r)
+
+    c = StopController(_FillingExec(), Journal(), flatten_sink=sink, clock=lambda: 1.0)
+    c.trip("S2", "imbalance", ledger_state=holder["ls"], bids={HI: Decimal("0.9500")})
+    ls2 = holder["ls"]
+    assert ls2.unsettled_legs() == ()                # flatten filled -> nothing pending
+    assert ls2.realized_at_close() == Decimal("-0.0255")  # booked round-trip, not the naked outlay
+
+
+# ===========================================================================
+# F6 (review): backfill CLI returns a clean error (not a raw traceback) on a missing/invalid result.
+# ===========================================================================
+def test_backfill_clean_error_on_missing_result(tmp_path):
+    from service.pilot_ledger import append_entry, main
+    lp = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    append_entry({"close_time": CT, "mode": "armed", "pairs": 1, "fires": 1,
+                  "realized_delta": "-0.4975", "realized_unsettled": True,
+                  "unsettled_legs": [{"ticker": LO, "side": "yes", "count": 1}]}, lp)
+    # no --result given for the held leg -> clean rc=1, no traceback
+    rc = main(["--ledger", lp, "backfill", "--window", CT])
+    assert rc == 1

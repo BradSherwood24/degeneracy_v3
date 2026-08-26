@@ -129,15 +129,31 @@ def _outcome(**kw):
 _FIXED_NOW = float(close_epoch("2026-08-21T21:00:05Z"))
 
 
+def _balance_payload(dollars):
+    """A realistic proxy /portfolio/balance payload (both cents + dollars, agreeing)."""
+    cents = int((Decimal(str(dollars)) * 100).to_integral_value())
+    return {"balance": cents, "balance_dollars": str(dollars), "portfolio_value": 0}
+
+
 def _svc(tmp_path, cli_mode, *, wake=None, outcome=None, health=GOOD_HEALTH,
          positions_body=None, falsifier_path=None, window_driver=None, pairs=1,
-         anchor_fetcher=None, clock=None, poll_sleep=None, balance=1000000):
+         anchor_fetcher=None, clock=None, poll_sleep=None, balance="10000",
+         balance_payload=None):
     if positions_body is None:
         positions_body = {"market_positions": []}
     # S4 is balance-based (Brad 2026-08-26): armed/dry need a clean balance read at wake. Default a
-    # healthy balance ($10,000 in cents); a fresh tmp_path guard snapshots it as the day baseline
-    # (first wake -> no loss). Pass balance=None to exercise the fail-closed path.
-    balance_get = None if balance is None else (lambda: {"balance": balance})
+    # healthy balance ($10,000, dollars string); a fresh tmp_path guard snapshots it as the day
+    # baseline (first wake -> no loss). Pass balance=None to exercise the fail-closed path, or
+    # balance_payload=<dict> for a raw (e.g. mismatched) payload.
+    def _raise():
+        raise RuntimeError("balance transport failure")
+
+    if balance_payload is not None:
+        balance_get = (lambda: balance_payload)
+    elif balance is None:
+        balance_get = _raise  # simulate a transport failure -> _fetch_balance_payload returns None
+    else:
+        balance_get = (lambda: _balance_payload(balance))
     w = wake if wake is not None else _wake()
     if anchor_fetcher is None:
         # PHASE B: default to a fetcher returning the strike-bearing co-settling 15M leg markets, so
@@ -494,9 +510,9 @@ def test_armed_refused_by_s4_balance_loss(tmp_path):
     # cap ($3.00) -> refuse to arm (degrade to dry).
     from service.stops import DayGuard, _write_day_guard, day_guard_path
     gp = day_guard_path(str(tmp_path), "2026-08-21")
-    _write_day_guard(gp, DayGuard(utc_day="2026-08-21", balance_start_cents=1000000, latched=()))
+    _write_day_guard(gp, DayGuard(utc_day="2026-08-21", balance_start_dollars="10000", latched=()))
     svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path),
-               balance=1000000 - 300)  # $3.00 loss, exactly the cap
+               balance="9997")  # $3.00 loss, exactly the cap
     plan = svc.prepare()
     assert plan.armed is False and plan.degraded is True
     assert "S4 balance day-lock" in plan.degrade_reason
@@ -508,7 +524,7 @@ def test_armed_refused_by_latched_stop_in_day_guard(tmp_path):
     from service.stops import DayGuard, _write_day_guard, day_guard_path
     gp = day_guard_path(str(tmp_path), "2026-08-21")
     _write_day_guard(gp, DayGuard(
-        utc_day="2026-08-21", balance_start_cents=1000000,
+        utc_day="2026-08-21", balance_start_dollars="10000",
         latched=({"kind": "S2", "reason": "imbalance unrestorable", "window": "2026-08-21T20:00:00Z",
                   "ts": 1.0},)))
     svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path))
@@ -541,15 +557,43 @@ def test_armed_refused_when_balance_read_fails(tmp_path):
 def test_first_wake_snapshots_balance_start_and_arms(tmp_path):
     # BUG-3 (S4 balance): the FIRST wake of the day snapshots balance_start into the guard file and,
     # with no loss, arms. The s4_balance_check record carries first_wake + ledger_vs_balance_delta.
+    from decimal import Decimal
     from service.stops import day_guard_path, read_day_guard
-    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path), balance=1000000)
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path), balance="10000")
     plan = svc.prepare()
     assert plan.armed is True
     g = read_day_guard(day_guard_path(str(tmp_path), CLOSE[:10]), CLOSE[:10])
-    assert g.balance_start_cents == 1000000
+    assert g.balance_start() == Decimal("10000")
     checks = [r["obj"] for r in svc.journal.records() if r["kind"] == "s4_balance_check"]
     assert checks and checks[0]["first_wake"] is True
-    assert "ledger_vs_balance_delta" in checks[0]
+    assert "ledger_vs_balance_delta" in checks[0] and "portfolio_value" in checks[0]
+
+
+def test_armed_refused_on_balance_parse_mismatch(tmp_path):
+    # F2 (review): cents and dollars disagree -> fail closed with a balance_parse_mismatch record.
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path),
+               balance_payload={"balance": 1000, "balance_dollars": "52.97", "portfolio_value": 0})
+    plan = svc.prepare()
+    assert plan.armed is False and plan.degraded is True
+    kinds = [r["kind"] for r in svc.journal.records()]
+    assert "balance_parse_mismatch" in kinds
+
+
+def test_corrupt_guard_is_not_self_healed(tmp_path):
+    # F3 (review): a corrupt guard is refused AND never overwritten (no balance snapshot), so it
+    # keeps refusing every wake until repaired by hand.
+    from service.stops import day_guard_path
+    gp = day_guard_path(str(tmp_path), CLOSE[:10])
+    os.makedirs(os.path.dirname(gp), exist_ok=True)
+    with open(gp, "w", encoding="utf-8") as f:
+        f.write("{corrupt guard")
+    before = open(gp).read()
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path))
+    plan = svc.prepare()
+    assert plan.armed is False
+    assert open(gp).read() == before  # NOT self-healed
+    kinds = [r["kind"] for r in svc.journal.records()]
+    assert "stops_guard_corrupt" in kinds
 
 
 def test_open_positions_at_wake_skip_balance_compare(tmp_path):
