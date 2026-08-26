@@ -1,10 +1,11 @@
 # BOX FALSIFIER — late-window wide box, single pair, taker
 
-STATUS: DRAFT
+STATUS: FROZEN
 
-(The freeze line above becomes exactly `STATUS: FROZEN` on Brad's verbatim go. The box
-arming gate — S5 — checks THIS file, not the corridor's falsifier. From the freeze line down,
-nothing changes except appended verdicts in Registration.)
+Frozen 2026-08-26 23:1xZ on Brad's explicit go (verbatim, this session): "Lock it in. Lets send'r
+live. And 1 contract pair you mean, right?" — confirmed: 1 contract per leg. The box arming gate
+— S5 — checks THIS file, not the corridor's falsifier. From this line down, nothing in this
+document may change except appended verdicts in Registration.
 
 Rulings this document encodes (Brad, 2026-08-26, verbatim):
 - "Lets make this into a strategy. Try just single pairs takers, keep it simple and see how it
@@ -97,3 +98,10 @@ None inside this document. 1 contract until R4 or Brad's word.
 ## Registration
 
 The freeze line, Brad's verbatim go, and every verdict get appended here and nowhere else.
+
+- 2026-08-26 23:1xZ — FROZEN. Brad (verbatim): "Lock it in. Lets send'r live. And 1 contract pair
+  you mean, right?" Preceded the same day by: "Yea, lets get crawling here before gettin fancy
+  with it" (no stop-loss rule; per-leg <$0.10 stop tested Δ +0.04¢ ± 0.05, not adopted).
+  Shakedown: 2 windows (22:00Z would-fire pinned +17.8¢ paper; 23:00Z would-fire missed −83.1¢
+  paper), 189 tickers each, zero errors, zero orders. Main @ 275ae55, 544 tests green. Roster sha
+  480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3.
