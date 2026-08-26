@@ -94,13 +94,18 @@ def test_s1_scoped_to_sub_dollar_only():
     assert check_s1(st) is None
 
 
-# --- S4 daily loss ---
+# --- S4 daily loss (in-process realized backstop; cap default is now $3.00) ---
 def test_s4_trips_at_daily_cap():
     st = StopState()
-    st, tripped = on_realized(st, Decimal("-3.00"), CFG)
+    st, tripped = on_realized(st, Decimal("-2.00"), CFG)  # cap is -3.00
     assert not tripped and not st.is_stopped
-    st, tripped = on_realized(st, Decimal("-2.50"), CFG)  # cumulative -5.50 <= -5.00
+    st, tripped = on_realized(st, Decimal("-1.50"), CFG)  # cumulative -3.50 <= -3.00
     assert tripped and st.has(S4_DAILY_LOSS)
+
+
+def test_stopconfig_default_cap_is_three_dollars():
+    # Brad's ruling 2026-08-26: default S4 cap $3.00 (the box falsifier will pin it).
+    assert StopConfig().daily_loss_cap_dollars == Decimal("3.00")
 
 
 # --- position policy (PENDING-BRAD F8 defaults) ---
@@ -135,12 +140,17 @@ def test_position_policy_hold_when_flatten_disabled():
 
 
 # --- S5 arming ---
-def test_falsifier_currently_draft_refuses_arming():
-    # the real ceremony falsifier is STATUS: DRAFT -> must refuse
-    assert falsifier_is_frozen(_FALSIFIER) is False
+def test_draft_falsifier_refuses_arming(tmp_path):
+    # A falsifier whose STATUS line is not exactly 'STATUS: FROZEN' must refuse to arm. Uses a temp
+    # draft file so the assertion is decoupled from the live ceremony file's current status (the real
+    # pilot/ceremony/falsifier.md is now FROZEN — see test_live_falsifier_status below).
+    draft = os.path.join(tmp_path, "falsifier_draft.md")
+    with open(draft, "w", encoding="utf-8") as f:
+        f.write("# X\nSTATUS: DRAFT\n")
+    assert falsifier_is_frozen(draft) is False
     health = {"orders_enabled": True, "caps": {"max_contracts_per_order": 2,
               "ticker_prefixes": ["KXBTCD"], "daily_order_budget": 100}}
-    decision = arming_check(_FALSIFIER, health, policy_verified=True)
+    decision = arming_check(draft, health, policy_verified=True)
     assert not decision.armed
     assert any("FROZEN" in r for r in decision.reasons)
 

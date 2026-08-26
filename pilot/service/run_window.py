@@ -352,6 +352,7 @@ class WindowService:
         sigma_feed: Any = None,
         health_get: Callable[[], Any] | None = None,
         positions_reader: Callable[[], Any] | None = None,
+        balance_get: Callable[[], Any] | None = None,
         ev_curve: Any = None,
         window_driver: WindowDriver | None = None,
         post_fn: Any = None,
@@ -375,6 +376,7 @@ class WindowService:
         self._sigma_feed = sigma_feed
         self._health_get = health_get
         self._positions_reader = positions_reader
+        self._balance_get = balance_get
         self._ev_curve_obj = ev_curve
         self._window_driver = window_driver or self._default_window_driver
         self._post_fn = post_fn
@@ -391,6 +393,11 @@ class WindowService:
         self._connect_not_before: float | None = None  # WS-dial gate (15M open_time); set in execute()
         self._finalized = False
         self._day_totals: tuple[Decimal, int] = (Decimal(0), 0)  # (realized_today, guard_trips_today)
+        # BUG-3 repair: day-scoped guard file (stop latching + S4 balance baseline) at ops/.
+        self._utc_day = str(close_time)[:10]
+        self._ops_dir = os.path.dirname(os.path.abspath(mode_txt_path))
+        self._day_guard_path = os.path.join(self._ops_dir, f"stops_{self._utc_day}.json")
+        self._day_guard: Any = None
 
     # --- lazy collaborators ---
     def _wake(self) -> Any:
@@ -439,6 +446,18 @@ class WindowService:
             return r.json()
         except Exception as e:  # noqa: BLE001
             logger.warning("[RUN] health fetch failed: %s", e)
+            return None
+
+    def _fetch_balance_payload(self) -> Any:
+        """Fetch the raw /portfolio/balance payload via the proxy (read-only). Injectable for tests.
+        Any transport failure -> None (the S4 check fails closed). Parsing/validation is done by
+        stops.parse_balance at the call site so the mismatch/units check can be journaled."""
+        try:
+            if self._balance_get is not None:
+                return self._balance_get()
+            return self.proxy.rest_get("/portfolio/balance", {})
+        except Exception as e:  # noqa: BLE001 - a balance-fetch failure fails closed to None
+            logger.warning("[RUN] balance fetch failed: %s", e)
             return None
 
     def _read_positions(self) -> dict[str, Decimal]:
@@ -583,25 +602,36 @@ class WindowService:
         degraded = False
         degrade_reason = None
         if mode in ("armed", "dry"):
-            from service.stops import StopConfig, arming_check
+            from service.stops import (
+                StopConfig,
+                arming_check,
+                latched_stop_kind,
+                read_day_guard,
+            )
 
             stop_cfg = StopConfig()
             health = self._fetch_health()
             arm_decision = arming_check(self.falsifier_path, health, policy_verified)
             # F9: value-agreement between the proxy /health caps and the executor/pilot caps.
             caps_ok, caps_reason = self._caps_agree(health)
-            # F3: the S4/A4 day-locks derived from the ledger's UTC-day totals.
+            # A4 day-lock (guard trips) still derives from the ledger's UTC-day totals; the ledger
+            # realized total is now the SECONDARY, reported figure (S4 is balance-based, checked below).
             loss_today, trips_today = self._ledger_day_totals()
             self._day_totals = (loss_today, trips_today)
-            s4_locked = loss_today <= -stop_cfg.daily_loss_cap_dollars
             a4_locked = trips_today >= stop_cfg.guard_trips_standdown
+            # BUG-3 repair: a day-halting stop (S1-S4) latched earlier today (persisted to the
+            # day-scoped guard file) refuses arming for the rest of the UTC day. A CORRUPT guard file
+            # fails closed (cannot confirm no latch -> refuse).
+            guard = read_day_guard(self._day_guard_path, self._utc_day)
+            self._day_guard = guard
+            latched_kind = latched_stop_kind(guard)
             extra: list[str] = []
             if not caps_ok:
                 extra.append(f"caps disagreement (F9): {caps_reason}")
-            if s4_locked:
-                extra.append(
-                    f"S4 day-lock: realized {loss_today} today <= -{stop_cfg.daily_loss_cap_dollars}"
-                )
+            if guard.corrupt:
+                extra.append(f"day-guard file corrupt at {os.path.basename(self._day_guard_path)} (fail closed)")
+            if latched_kind is not None:
+                extra.append(f"{latched_kind} latched earlier today -> day halted (falsifier: a stop halts the DAY)")
             if a4_locked:
                 extra.append(
                     f"A4 day-lock: {trips_today} guard trips today >= {stop_cfg.guard_trips_standdown}"
@@ -614,9 +644,10 @@ class WindowService:
                     "reasons": list(arm_decision.reasons),
                     "caps_ok": caps_ok,
                     "caps_reason": caps_reason,
-                    "day_realized": str(loss_today),
+                    "day_realized_ledger": str(loss_today),
                     "day_guard_trips": trips_today,
-                    "s4_day_locked": s4_locked,
+                    "stop_latched": latched_kind,
+                    "day_guard_corrupt": guard.corrupt,
                     "a4_day_locked": a4_locked,
                     "health_present": health is not None,
                 },
@@ -645,6 +676,14 @@ class WindowService:
                  "inherited": {t: str(v) for t, v in inherited.items()}},
             )
             if inherited:
+                # BUG-3 (S4 balance): positions are open at wake, so the balance is NOT clean cash
+                # and the loss compare would be meaningless -> record a skip rather than compare
+                # (Brad's ruling note a). The baseline is also not snapshotted from a dirty balance.
+                self._journal(
+                    "balance_check_skipped_open_positions",
+                    {"inherited": {t: str(v) for t, v in inherited.items()},
+                     "note": "open positions at wake -> S4 balance compare skipped (dirty balance)"},
+                )
                 self._journal(
                     "inherited_position_refusal",
                     {"inherited": {t: str(v) for t, v in inherited.items()},
@@ -664,6 +703,118 @@ class WindowService:
                             stand_down_reason=f"cannot confirm flat (armed): {e}",
                             policy=policy, arm_decision=arm_decision)
             # dry/shakedown: no orders, continue after an alarm
+
+        # (c2) S4 DAILY LOSS from the ACCOUNT BALANCE (Brad's ruling 2026-08-26). The wake is a flat
+        # point (all prior windows have settled), so the balance is clean cash and its delta == P&L.
+        # First wake of the UTC day: snapshot balance_start into the day-guard file. Every wake:
+        # loss = balance_start - balance_now; loss >= cap -> latch S4 (refuse to arm, degrade to dry,
+        # loud journal record). A missing/failed balance read FAILS CLOSED (do not arm). The repaired
+        # ledger realized stays as the SECONDARY figure; ledger_vs_balance_delta is journaled so a
+        # divergence between our books and the venue is visible.
+        if mode in ("armed", "dry"):
+            from service.stops import (
+                StopConfig,
+                ensure_balance_start,
+                parse_balance,
+                record_latched_stop,
+                s4_balance_breached,
+            )
+
+            stop_cfg = StopConfig()
+
+            def _degrade(reason: str) -> None:
+                nonlocal armed, effective_mode, degraded, degrade_reason
+                if mode != "armed":
+                    return  # dry mode is already non-arming; nothing to degrade
+                armed = False
+                effective_mode = "dry"
+                degraded = True
+                degrade_reason = "; ".join(r for r in [degrade_reason, reason] if r)
+                self._journal(
+                    "degrade_to_dry",
+                    {"reasons": [reason],
+                     "note": "S4 gate failed -> running DRY, orders frozen"},
+                )
+
+            guard = self._day_guard
+            if guard is not None and guard.corrupt:
+                # F3: a corrupt guard is NEVER self-healed. Arming was already refused in step (b);
+                # here we ALSO skip the balance snapshot/compare entirely (never write over it) so the
+                # latches/baseline survive and every wake this day keeps refusing until a human fixes
+                # the file.
+                self._journal(
+                    "stops_guard_corrupt",
+                    {"path": os.path.basename(self._day_guard_path),
+                     "note": "day-guard corrupt -> refuse to arm, no balance snapshot, no overwrite"},
+                )
+            else:
+                payload = self._fetch_balance_payload()
+                if payload is None:
+                    self._journal(
+                        "s4_balance_read_failed",
+                        {"note": "balance read failed/absent at wake -> fail closed (no arm)"},
+                    )
+                    _degrade("S4 balance read failed (fail closed)")
+                else:
+                    br = parse_balance(payload)
+                    if not br.ok:
+                        # A units mismatch (cents vs dollars disagree) gets its own loud record.
+                        if br.status == "mismatch":
+                            self._journal(
+                                "balance_parse_mismatch",
+                                {"balance_cents": br.cents, "note": "balance vs balance_dollars "
+                                 "disagree by >= 0.01 -> fail closed (no arm)"},
+                            )
+                        else:
+                            self._journal(
+                                "s4_balance_read_failed",
+                                {"status": br.status,
+                                 "note": "balance payload unusable -> fail closed (no arm)"},
+                            )
+                        _degrade(f"S4 balance unusable ({br.status})")
+                    else:
+                        start, first_wake = ensure_balance_start(
+                            self._day_guard_path, self._utc_day, br.dollars, self.clock()
+                        )
+                        breached, loss_dollars = s4_balance_breached(
+                            start, br.dollars, stop_cfg.daily_loss_cap_dollars
+                        )
+                        # Secondary: the repaired ledger realized today + the venue-vs-ledger delta.
+                        ledger_realized_today = self._day_totals[0]
+                        balance_pnl = -loss_dollars  # balance_now - balance_start
+                        self._journal(
+                            "s4_balance_check",
+                            {
+                                "balance_start_dollars": str(start),
+                                "balance_now_dollars": str(br.dollars),
+                                "balance_cents": br.cents,
+                                "portfolio_value": br.portfolio_value,
+                                "first_wake": first_wake,
+                                "loss_dollars": str(loss_dollars),
+                                "cap_dollars": str(stop_cfg.daily_loss_cap_dollars),
+                                "breached": breached,
+                                "ledger_realized_today": str(ledger_realized_today),
+                                "ledger_vs_balance_delta": str(ledger_realized_today - balance_pnl),
+                            },
+                        )
+                        if breached:
+                            record_latched_stop(
+                                self._day_guard_path, self._utc_day, "S4",
+                                f"S4 balance: loss {loss_dollars} >= cap "
+                                f"{stop_cfg.daily_loss_cap_dollars} (start ${start} -> now "
+                                f"${br.dollars})",
+                                self.close_time, self.clock(),
+                            )
+                            self._journal(
+                                "s4_balance_latch",
+                                {"loss_dollars": str(loss_dollars),
+                                 "cap_dollars": str(stop_cfg.daily_loss_cap_dollars),
+                                 "note": "S4 balance cap breached -> latched for the day"},
+                            )
+                            _degrade(
+                                f"S4 balance day-lock: loss {loss_dollars} >= "
+                                f"{stop_cfg.daily_loss_cap_dollars}"
+                            )
 
         # (d) wake discovery
         try:
@@ -741,7 +892,13 @@ class WindowService:
         if self._post_fn is not None:
             kwargs["post_fn"] = self._post_fn
         self.executor = HarnessExecutor(self.journal, cfg, clock=self.clock, **kwargs)
-        self.stops = StopController(self.executor, self.journal, StopConfig(), clock=self.clock)
+        # BUG-3 repair: the controller persists day-halting trips (S1-S4) to the day-scoped guard
+        # file so the NEXT window refuses to arm for the rest of the UTC day.
+        self.stops = StopController(
+            self.executor, self.journal, StopConfig(), clock=self.clock,
+            latch_path=self._day_guard_path, utc_day=self._utc_day, window=self.close_time,
+            flatten_sink=self._fold_flatten_response,
+        )
         # F3: seed the per-process StopState's S4 daily-loss + A4 guard-trip counters from the
         # ledger's UTC-day totals so the caps are enforced PER UTC DAY, not per window.
         loss_today, trips_today = self._day_totals
@@ -1111,6 +1268,17 @@ class WindowService:
             self.ledger_state = record_response(self.ledger_state, r)
         self._post_entry_checks(intent, result, action.t_minus_s)
 
+    def _fold_flatten_response(self, intent: Intent, result: Any) -> None:
+        """F1: fold a stop-authorized flatten (its intent + fills) into the in-process ledger so a
+        filled flatten is booked as a round-trip (the sold leg reduces net, dropping out of
+        unsettled_legs and out of the naked cash-outlay booking). Called by StopController.trip for
+        every flatten it dispatches."""
+        if self.ledger_state is None:
+            return
+        self.ledger_state = record_intent(self.ledger_state, intent)
+        for r in getattr(result, "responses", ()):
+            self.ledger_state = record_response(self.ledger_state, r)
+
     def _post_entry_checks(self, intent: Intent, result: Any, t_minus_s: float | None) -> None:
         from service.stops import S1_ARITH, check_s1, check_slippage_alarms
 
@@ -1413,6 +1581,7 @@ class WindowService:
         imbalance_events = 0
         s1_violation = False
         second_pair_book_walk: Any = None
+        unsettled_legs: list[dict[str, Any]] = []
         ls = self.ledger_state
         if ls is not None:
             rec = fills_record(ls)
@@ -1425,22 +1594,20 @@ class WindowService:
                     "avg_price": None if lg["avg_price"] is None else str(lg["avg_price"]),
                     "avg_fee": str(lg["avg_fee"]),
                 })
-            if rec["realized_payoff"] is not None:
-                # Finding 4: `realized_payoff` = state.realized_min() = matched*$1 - net cash out.
-                # For a SUB-$1 FLIP that $1/pair is a GUARANTEED settlement floor -> booking it is
-                # conservative and correct. For a Q1-STRANGLE the same number is the WINNING-outcome
-                # BEST case (a strangle pays $1 only if price lands OUTSIDE the corridor, $0 inside),
-                # so booking it here would feed an OPTIMISTIC win into the S4 daily-loss cap
-                # (_ledger_day_totals sums realized_delta) -- an unsafe UNDER-count of losses and a
-                # violation of the honest-fills law. At window close a strangle is UNSETTLED (cost is
-                # committed, payout unknown until settlement is confirmed): book 0/unsettled here. The
-                # true realized is filled in later (next-day reconcile / paired report at settlement);
-                # S4 must never see an assumed strangle win. Any non-sub-$1 source books conservatively.
-                if ls.source == SUB_DOLLAR_FLIP:
-                    realized_delta = rec["realized_payoff"]
-                else:
-                    realized_delta = Decimal(0)
-                    realized_unsettled = True
+            # BUG-2 repair: book a realized_delta for EVERY window with any fill.
+            #   * ``realized_at_close`` = settlement-independent cash flow (proceeds - costs, all fees)
+            #     + the sub-$1 flip's GUARANTEED >= $1/pair floor on matched pairs. This captures BOTH
+            #     the flatten/round-trip case (formerly booked 0 when matched_pairs == 0) AND the naked
+            #     leg's cash OUTLAY (formerly booked 0), always in the SAFE direction (never an assumed
+            #     win). A Q1-STRANGLE has no floor, so its matched pairs contribute only cash flow here.
+            #   * ``unsettled_legs`` are the held legs whose settlement PAYOFF is still pending; they
+            #     ride into the pilot-ledger entry so the settlement backfill (pilot_ledger backfill)
+            #     can add the winning payoff once the market result is known. S4 never sees an assumed
+            #     win: the close booking is the worst case, the backfill only ever corrects it UP.
+            if rec["any_fill"]:
+                realized_delta = rec["realized_at_close"]
+                unsettled_legs = list(rec["unsettled_legs"])
+                realized_unsettled = bool(unsettled_legs)
             imbalance_events = sum(
                 1 for i in ls.intents if i.purpose in (PURPOSE_REBALANCE_BUY, PURPOSE_REBALANCE_SELL)
             )
@@ -1508,6 +1675,7 @@ class WindowService:
             "guard_trips": guard_trips,
             "realized_delta": str(realized_delta),
             "realized_unsettled": realized_unsettled,
+            "unsettled_legs": unsettled_legs,
             "day_realized_seed": str(self._day_totals[0]),
             "day_guard_trips_seed": self._day_totals[1],
             "s4_running_total": str(s4_running),

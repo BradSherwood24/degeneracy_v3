@@ -129,11 +129,31 @@ def _outcome(**kw):
 _FIXED_NOW = float(close_epoch("2026-08-21T21:00:05Z"))
 
 
+def _balance_payload(dollars):
+    """A realistic proxy /portfolio/balance payload (both cents + dollars, agreeing)."""
+    cents = int((Decimal(str(dollars)) * 100).to_integral_value())
+    return {"balance": cents, "balance_dollars": str(dollars), "portfolio_value": 0}
+
+
 def _svc(tmp_path, cli_mode, *, wake=None, outcome=None, health=GOOD_HEALTH,
          positions_body=None, falsifier_path=None, window_driver=None, pairs=1,
-         anchor_fetcher=None, clock=None, poll_sleep=None):
+         anchor_fetcher=None, clock=None, poll_sleep=None, balance="10000",
+         balance_payload=None):
     if positions_body is None:
         positions_body = {"market_positions": []}
+    # S4 is balance-based (Brad 2026-08-26): armed/dry need a clean balance read at wake. Default a
+    # healthy balance ($10,000, dollars string); a fresh tmp_path guard snapshots it as the day
+    # baseline (first wake -> no loss). Pass balance=None to exercise the fail-closed path, or
+    # balance_payload=<dict> for a raw (e.g. mismatched) payload.
+    def _raise():
+        raise RuntimeError("balance transport failure")
+
+    if balance_payload is not None:
+        balance_get = (lambda: balance_payload)
+    elif balance is None:
+        balance_get = _raise  # simulate a transport failure -> _fetch_balance_payload returns None
+    else:
+        balance_get = (lambda: _balance_payload(balance))
     w = wake if wake is not None else _wake()
     if anchor_fetcher is None:
         # PHASE B: default to a fetcher returning the strike-bearing co-settling 15M leg markets, so
@@ -152,6 +172,7 @@ def _svc(tmp_path, cli_mode, *, wake=None, outcome=None, health=GOOD_HEALTH,
         sigma_feed=FakeSigma(outcome if outcome is not None else _outcome()),
         health_get=(lambda: health),
         positions_reader=(lambda: positions_body),
+        balance_get=balance_get,
         ev_curve=FakeEV(),
         window_driver=window_driver,
         anchor_fetcher=anchor_fetcher,
@@ -388,20 +409,27 @@ def _filled_pair_ledger(source):
     return ls
 
 
-def test_strangle_realized_books_zero_unsettled_and_excluded_from_s4(tmp_path):
+def test_strangle_realized_books_conservative_cashflow_never_the_optimistic_win(tmp_path):
+    # BUG-2 repair: a strangle has NO floor, so at close it books the CONSERVATIVE cash OUTLAY
+    # (proceeds - costs, here all-buys = negative), NEVER the optimistic realized_min win, and marks
+    # the held legs unsettled for the settlement backfill. (Old behavior booked 0; that hid the
+    # committed cost from S4.)
     svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path))
     ls = _filled_pair_ledger("Q1-strangle")
-    assert ls.realized_min() > 0  # the OPTIMISTIC strangle-win number the old booking used
+    assert ls.realized_min() > 0  # the OPTIMISTIC strangle-win number the old booking must never use
     svc.ledger_state = ls
     entry = svc._build_ledger_entry(Plan(effective_mode="armed", armed=True), None, 0, "j.jsonl", 0)
-    # finding 4: a strangle at close is UNSETTLED -> 0, never the optimistic win.
-    assert entry["realized_delta"] == "0"
+    assert Decimal(entry["realized_delta"]) == ls.realized_cashflow()  # = -0.82, conservative
+    assert Decimal(entry["realized_delta"]) < 0  # a committed cost, not an assumed win
+    assert Decimal(entry["realized_delta"]) < ls.realized_min()  # never the optimistic win
     assert entry["realized_unsettled"] is True
-    assert entry["filled"] is True  # the pair DID fill; only the P&L is deferred
-    # and the S4 daily-loss total excludes the assumed win: append it, the day sum stays 0.
+    assert entry["filled"] is True  # the pair DID fill; the settlement payoff is deferred
+    # both held legs are recorded for the settlement backfill
+    assert len(entry["unsettled_legs"]) == 2
+    # S4 total reflects the conservative outlay (safe direction), never the +0.18 optimistic win.
     append_entry(entry, svc.ledger_path)
     from service.pilot_ledger import s4_running_loss
-    assert s4_running_loss(load_entries(svc.ledger_path)) == Decimal(0)
+    assert s4_running_loss(load_entries(svc.ledger_path)) == ls.realized_cashflow()
 
 
 def test_sub1_pair_still_books_its_floor_arithmetic_unchanged(tmp_path):
@@ -477,14 +505,106 @@ def _ledger_path(tmp_path):
     return os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
 
 
-def test_F3_armed_refused_by_s4_day_lock_from_ledger(tmp_path):
-    lp = _ledger_path(tmp_path)
-    append_entry({"close_time": "2026-08-21T20:00:00Z", "realized_delta": "-3.00", "guard_trips": 0}, lp)
-    append_entry({"close_time": "2026-08-21T21:00:00Z", "realized_delta": "-2.50", "guard_trips": 0}, lp)
+def test_armed_refused_by_s4_balance_loss(tmp_path):
+    # BUG-3 (S4 balance): a prior baseline in the day-guard file + a lower balance-now = a loss >=
+    # cap ($3.00) -> refuse to arm (degrade to dry).
+    from service.stops import DayGuard, _write_day_guard, day_guard_path
+    gp = day_guard_path(str(tmp_path), "2026-08-21")
+    _write_day_guard(gp, DayGuard(utc_day="2026-08-21", balance_start_dollars="10000", latched=()))
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path),
+               balance="9997")  # $3.00 loss, exactly the cap
+    plan = svc.prepare()
+    assert plan.armed is False and plan.degraded is True
+    assert "S4 balance day-lock" in plan.degrade_reason
+
+
+def test_armed_refused_by_latched_stop_in_day_guard(tmp_path):
+    # BUG-3 (stop latching): a day-halting stop latched earlier today (persisted to the guard file)
+    # refuses arming for the rest of the UTC day (falsifier: a stop halts the DAY).
+    from service.stops import DayGuard, _write_day_guard, day_guard_path
+    gp = day_guard_path(str(tmp_path), "2026-08-21")
+    _write_day_guard(gp, DayGuard(
+        utc_day="2026-08-21", balance_start_dollars="10000",
+        latched=({"kind": "S2", "reason": "imbalance unrestorable", "window": "2026-08-21T20:00:00Z",
+                  "ts": 1.0},)))
     svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path))
     plan = svc.prepare()
     assert plan.armed is False and plan.degraded is True
-    assert "S4 day-lock" in plan.degrade_reason
+    assert "S2 latched earlier today" in plan.degrade_reason
+
+
+def test_armed_refused_when_day_guard_corrupt(tmp_path):
+    # A corrupt guard file fails closed: cannot confirm no latch -> refuse to arm.
+    from service.stops import day_guard_path
+    gp = day_guard_path(str(tmp_path), "2026-08-21")
+    os.makedirs(os.path.dirname(gp), exist_ok=True)
+    with open(gp, "w", encoding="utf-8") as f:
+        f.write("{ this is not valid json")
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path))
+    plan = svc.prepare()
+    assert plan.armed is False and plan.degraded is True
+    assert "corrupt" in plan.degrade_reason
+
+
+def test_armed_refused_when_balance_read_fails(tmp_path):
+    # A missing/failed balance read at wake fails closed (never arm).
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path), balance=None)
+    plan = svc.prepare()
+    assert plan.armed is False and plan.degraded is True
+    assert "balance read failed" in plan.degrade_reason
+
+
+def test_first_wake_snapshots_balance_start_and_arms(tmp_path):
+    # BUG-3 (S4 balance): the FIRST wake of the day snapshots balance_start into the guard file and,
+    # with no loss, arms. The s4_balance_check record carries first_wake + ledger_vs_balance_delta.
+    from decimal import Decimal
+    from service.stops import day_guard_path, read_day_guard
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path), balance="10000")
+    plan = svc.prepare()
+    assert plan.armed is True
+    g = read_day_guard(day_guard_path(str(tmp_path), CLOSE[:10]), CLOSE[:10])
+    assert g.balance_start() == Decimal("10000")
+    checks = [r["obj"] for r in svc.journal.records() if r["kind"] == "s4_balance_check"]
+    assert checks and checks[0]["first_wake"] is True
+    assert "ledger_vs_balance_delta" in checks[0] and "portfolio_value" in checks[0]
+
+
+def test_armed_refused_on_balance_parse_mismatch(tmp_path):
+    # F2 (review): cents and dollars disagree -> fail closed with a balance_parse_mismatch record.
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path),
+               balance_payload={"balance": 1000, "balance_dollars": "52.97", "portfolio_value": 0})
+    plan = svc.prepare()
+    assert plan.armed is False and plan.degraded is True
+    kinds = [r["kind"] for r in svc.journal.records()]
+    assert "balance_parse_mismatch" in kinds
+
+
+def test_corrupt_guard_is_not_self_healed(tmp_path):
+    # F3 (review): a corrupt guard is refused AND never overwritten (no balance snapshot), so it
+    # keeps refusing every wake until repaired by hand.
+    from service.stops import day_guard_path
+    gp = day_guard_path(str(tmp_path), CLOSE[:10])
+    os.makedirs(os.path.dirname(gp), exist_ok=True)
+    with open(gp, "w", encoding="utf-8") as f:
+        f.write("{corrupt guard")
+    before = open(gp).read()
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path))
+    plan = svc.prepare()
+    assert plan.armed is False
+    assert open(gp).read() == before  # NOT self-healed
+    kinds = [r["kind"] for r in svc.journal.records()]
+    assert "stops_guard_corrupt" in kinds
+
+
+def test_open_positions_at_wake_skip_balance_compare(tmp_path):
+    # Brad's ruling note (a): open positions at wake -> the balance is not clean cash, so record a
+    # skip rather than compare. reconcile-first still stands the window down.
+    svc = _svc(tmp_path, "armed", falsifier_path=_frozen_falsifier(tmp_path),
+               positions_body={"market_positions": [{"ticker": "KXBTCD-HELD", "position": -1}]})
+    plan = svc.prepare()
+    assert plan.stand_down is True
+    kinds = [r["kind"] for r in svc.journal.records()]
+    assert "balance_check_skipped_open_positions" in kinds
 
 
 def test_F3_armed_refused_by_a4_day_lock_from_ledger(tmp_path):

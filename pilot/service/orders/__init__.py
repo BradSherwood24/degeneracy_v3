@@ -16,6 +16,7 @@ from service.orders.envelope import (  # noqa: F401
     build_batch,
     build_entry,
     new_client_order_id,
+    normalize_fill_to_side,
     parse_batch_response,
     parse_single_response,
 )
