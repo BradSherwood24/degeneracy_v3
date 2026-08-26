@@ -1,6 +1,6 @@
 {
   "roster_name": "box-v1",
-  "description": "The wide-box roster (Brad's late-window deep-ITM box): at an hourly close T, pair the :45 15-minute market (anchor A) with the hourly ladder strike whose deep-ITM leg mid is nearest 0.95, scanning T-10min..T-1min and firing the first qualifying instant. 15M leg buys the side toward the anchor (NO if BTC<A, YES if BTC>A); hourly leg buys the opposite deep-ITM side (YES on a strike below A, NO on a strike above A). Values are the scratch wide_box study (TARGET=0.95, MIN15=0.85, start_min=10) mapped to a live book. Not live in Phase 1.",
+  "description": "The wide-box roster (Brad's late-window deep-ITM box): at an hourly close T, pair the :45 15-minute market (anchor A) with the hourly ladder strike whose deep-ITM leg mid is nearest 0.95, scanning T-10min..T-1min and firing the first qualifying instant. 15M leg buys the side toward the anchor (NO if BTC<A, YES if BTC>A); hourly leg buys the opposite deep-ITM side (YES on a strike below A, NO on a strike above A). Values are the scratch wide_box study (TARGET=0.95, MIN15=0.85, start_min=10) mapped to a live book. pair_cost_max is the S1_box booked-cost ceiling (both legs, fees in): a box whose two deep-ITM legs cost more than this is a guaranteed loss against the $2 pinned ceiling and trips S1 (halts the day).",
   "target_mid": "0.95",
   "hourly_ask_min": "0.90",
   "hourly_ask_max": "0.99",
@@ -11,5 +11,6 @@
   "entry_end_s": 60,
   "freshness_max_leg_age_s": 1.0,
   "no_orders_after_s_to_settle": 1,
-  "contracts": 1
+  "contracts": 1,
+  "pair_cost_max": "1.99"
 }

@@ -214,7 +214,8 @@ def _oracle_decimal(h: dict) -> tuple[int, Decimal, str, Decimal] | None:
             cands.append((K, h_ask, h_mid))
         if leg15_ask < MIN15 or not cands:
             continue
-        K, h_ask, h_mid = min(cands, key=lambda x: (abs(x[2] - TARGET), abs(x[0] - A)))
+        # tie -> WIDEST gap from A (Brad 2026-08-26): -abs(K - A) so min() picks the largest gap.
+        K, h_ask, h_mid = min(cands, key=lambda x: (abs(x[2] - TARGET), -abs(x[0] - A)))
         if not (H_MIN <= h_ask <= H_MAX):
             continue
         C = h_ask + fee(h_ask) + leg15_ask + fee(leg15_ask)
@@ -264,7 +265,8 @@ def _oracle_float(h: dict) -> tuple[int, float, str] | None:
                 cands.append((Kf, 1 - hyb, 1 - (hya + hyb) / 2))
         if leg15_ask < 0.85 or not cands:
             continue
-        Kf, h_ask, h_mid = min(cands, key=lambda x: (abs(x[2] - 0.95), abs(x[0] - A)))
+        # tie -> WIDEST gap from A (Brad 2026-08-26): -abs(K - A) so min() picks the largest gap.
+        Kf, h_ask, h_mid = min(cands, key=lambda x: (abs(x[2] - 0.95), -abs(x[0] - A)))
         if not (0.90 <= h_ask <= 0.99):
             continue
         return mins, Kf, side
@@ -305,8 +307,13 @@ def test_golden_parity_select_box_vs_scratch_oracle():
         os.path.basename(p)[:-6] not in _SEALED_DAYS for p in _files_read
     ), "a sealed-day candle file was opened"
 
-    if len(hours) < 200:
-        pytest.skip(f"only {len(hours)} hours available (< 200)")
+    # Phase-1 review carry-over (spec item 6a): when historical-data IS present (the module-level
+    # skipif already gated its absence) but fewer than 200 hours are found, that is a FAILURE of the
+    # corpus, not a silent skip — the golden guarantee needs the >= 200-hour bar.
+    assert len(hours) >= 200, (
+        f"historical-data present but only {len(hours)} qualifying hours found (< 200) — "
+        f"the golden parity guarantee requires >= 200 hours"
+    )
 
     mismatches: list[str] = []
     fires = 0
@@ -351,8 +358,10 @@ def test_golden_decide_box_reproduces_scan_on_winning_snapshot():
     freshness gate, the entry-window bound, and the action/limit construction on REAL data,
     without the cross-minute staleness confound (documented in CONFESSIONS)."""
     hours = _build_hours()
-    if len(hours) < 200:
-        pytest.skip(f"only {len(hours)} hours available (< 200)")
+    # Phase-1 review carry-over (spec item 6a): present-but-short is a FAILURE, not a skip.
+    assert len(hours) >= 200, (
+        f"historical-data present but only {len(hours)} qualifying hours found (< 200)"
+    )
 
     checked = 0
     for h in hours:

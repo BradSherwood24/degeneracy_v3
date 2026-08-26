@@ -106,15 +106,31 @@ def test_selection_is_nearest_target_mid():
     assert sel.strike_K == Decimal("64200")     # mid exactly 0.95
 
 
-def test_tie_break_prefers_strike_nearer_anchor():
-    # two candidates equidistant in mid from 0.95 (0.94 and 0.96); nearer A wins.
+def test_tie_break_prefers_widest_gap_from_anchor():
+    # Brad 2026-08-26: when two candidates are equally near 0.95 by mid, the WIDEST gap from A wins
+    # (the wider box gives the larger pin region). Candidates on BOTH sides of the target mid (0.94
+    # below and 0.96 above) both have |mid-0.95|=0.01 -> tie -> the strike farther from A (63000).
     m15 = top(yes_ask="0.20", yes_bid="0.14")
     ladder = {
         "H-T63000": (Decimal("63000"), top(yes_ask="0.95", yes_bid="0.93")),   # mid .94, |A-K|=2000
         "H-T64000": (Decimal("64000"), top(yes_ask="0.97", yes_bid="0.95")),   # mid .96, |A-K|=1000
     }
     sel = select_box(A, "M15", m15, ladder, PARAMS)
-    assert sel.strike_K == Decimal("64000")     # both |mid-0.95|=0.01 -> nearer A
+    assert sel.strike_K == Decimal("63000")     # both |mid-0.95|=0.01 -> WIDEST gap from A
+
+
+def test_tie_break_only_applies_among_equal_mid_candidates():
+    # A strictly-nearer-mid candidate still wins outright; the widest-gap tie-break only decides ties.
+    # Here 64000 (mid 0.95, exact) beats 63000 (mid 0.94) even though 63000 has the wider gap.
+    m15 = top(yes_ask="0.20", yes_bid="0.14")
+    ladder = {
+        "H-T63000": (Decimal("63000"), top(yes_ask="0.95", yes_bid="0.93")),   # mid .94  |mid-t|=.01
+        "H-T64000": (Decimal("64000"), top(yes_ask="0.96", yes_bid="0.94")),   # mid .95  |mid-t|=.00
+        "H-T64200": (Decimal("64200"), top(yes_ask="0.97", yes_bid="0.93")),   # mid .95  |mid-t|=.00
+    }
+    # 64000 and 64200 tie on mid (both exactly 0.95); among the tie, 64000 has the wider gap from A.
+    sel = select_box(A, "M15", m15, ladder, PARAMS)
+    assert sel.strike_K == Decimal("64000")
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +432,7 @@ def test_default_load_self_verifies():
     assert p.entry_start_s == 600 and p.entry_end_s == 60
     assert p.freshness_max_leg_age_s == 1.0
     assert p.no_orders_after_s_to_settle == 1 and p.contracts == 1
+    assert p.pair_cost_max == Decimal("1.99")
 
 
 def test_canonical_sha_key_order_invariant():

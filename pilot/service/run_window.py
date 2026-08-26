@@ -56,6 +56,14 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from service.book import TopOfBook
+from service.box import (
+    WIDE_BOX,
+    BoxPolicyShaMismatch,
+    BoxState,
+    DEFAULT_BOX_POLICY_PATH,
+    load_box_policy,
+)
+from service.box_runner import BoxWindowRecorder
 from service.executor import Executor, ExecutorConfig
 from service.journal import Journal
 from service.ledger import (
@@ -72,7 +80,16 @@ from service.ledger import (
     record_response,
 )
 from service.orders.envelope import new_client_order_id
-from service.pilot_ledger import DEFAULT_LEDGER_PATH, append_entry, load_entries, s4_running_loss
+from service.pilot_ledger import (
+    A5_ONE_LEGGED_RATE_MAX,
+    DEFAULT_LEDGER_PATH,
+    already_backfilled,
+    append_entry,
+    box_one_legged_rate,
+    build_backfill_entry,
+    load_entries,
+    s4_running_loss,
+)
 from service.policy import (
     DEFAULT_POLICY_PATH,
     Q1_STRANGLE,
@@ -117,11 +134,33 @@ logger = logging.getLogger(__name__)
 
 _PILOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_FALSIFIER_PATH = os.path.join(_PILOT_DIR, "ceremony", "falsifier.md")
+# F2 (Phase-4): the box arms against ITS OWN ceremonial falsifier, never the corridor's. S5 checks
+# THIS file's STATUS line when strategy == box; the corridor keeps checking falsifier.md.
+DEFAULT_BOX_FALSIFIER_PATH = os.path.join(_PILOT_DIR, "ceremony", "box_falsifier.md")
 DEFAULT_MODE_TXT = os.path.join(_PILOT_DIR, "ops", "mode.txt")
 DEFAULT_LOG_DIR = os.path.join(_PILOT_DIR, "logs")
 
 VALID_MODES = ("shakedown", "dry", "armed")
 TICKER_PREFIXES = ("KXBTC15M", "KXBTCD")
+
+# Strategy selection lever (spec item 1). ops/strategy.txt is read fresh each wake, like mode.txt;
+# --strategy overrides, --strategy-file points elsewhere. An unknown/missing value fails CLOSED: run
+# the corridor decision core, DRY (never armed). The file ships set to "corridor" (Brad flips it to
+# "box" at Phase 4 alongside mode.txt).
+VALID_STRATEGIES = ("corridor", "box")
+DEFAULT_STRATEGY_TXT = os.path.join(_PILOT_DIR, "ops", "strategy.txt")
+
+A5_ONE_LEGGED = "A5"  # box one-legged-entry-rate alarm (notify + journal, keep running)
+
+# F4: the one-legged flatten is bounded at 3 attempts total (box_falsifier.md: "up to 3 attempts at
+# fresh bids"). Max orders one box window can emit = 2 entry legs + 3 flatten = 5. Retries are
+# EVENT-DRIVEN: the next attempt is issued on the next later book event for the held ticker whose bid
+# is present, OR on the next later event once >= _FLATTEN_RETRY_MIN_ELAPSED_S of ENGINE time has
+# passed since the last attempt (whichever comes first). Engine time = event server_ts, never wall
+# clock, so this stays replay-deterministic and can never price a stale frozen book (the review's F4).
+_FLATTEN_MAX_ATTEMPTS = 3
+_FLATTEN_RETRY_MIN_ELAPSED_S = 0.250
+A_FLATTEN_EXHAUSTED = "A_FLATTEN_EXHAUSTED"  # all flatten attempts missed -> held naked, alarm
 
 # The pilot is capped at DUAL size; sizing to 5 requires a new commission (falsifier/commission).
 # The proxy's per-order cap must not exceed this ceiling and must not be looser than the executor's.
@@ -176,6 +215,19 @@ def resolve_mode(cli_mode: str | None, mode_txt_path: str) -> str:
     raw = cli_mode if cli_mode else read_mode_file(mode_txt_path)
     m = (raw or "").strip().lower()
     return m if m in VALID_MODES else "shakedown"
+
+
+def resolve_strategy(cli_strategy: str | None, strategy_txt_path: str) -> tuple[str, bool]:
+    """The effective strategy + a validity flag. CLI --strategy wins; else read strategy.txt.
+
+    Returns ``(strategy, valid)``. A known value -> ``(value, True)``. An unknown/absent value ->
+    ``("corridor", False)``: the caller then runs the corridor decision core DRY (never armed), and
+    journals ``strategy_invalid`` (spec item 1 fail-closed)."""
+    raw = cli_strategy if cli_strategy else read_mode_file(strategy_txt_path)
+    s = (raw or "").strip().lower()
+    if s in VALID_STRATEGIES:
+        return s, True
+    return "corridor", False
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +375,11 @@ class Plan:
     arm_decision: Any = None                # stops.ArmDecision | None
     inherited: dict[str, Decimal] | None = None
     trailing_tape: list[dict] | None = None  # PHASE A prefetch: σ̂ trailing 15M anchors (T-900..T-7200)
+    # --- box strategy (spec item 2) ---
+    strategy: str = "corridor"
+    strategy_valid: bool = True
+    box_policy: Any = None                   # box.BoxParams | None (the sha-pinned box roster)
+    box_state: Any = None                    # box.BoxState | None (built at phase B from the anchor)
 
 
 WindowDriver = Callable[[WindowRecorder, float], None]
@@ -341,6 +398,7 @@ class WindowService:
         proxy: Any = None,
         policy_path: str = DEFAULT_POLICY_PATH,
         falsifier_path: str = DEFAULT_FALSIFIER_PATH,
+        box_falsifier_path: str = DEFAULT_BOX_FALSIFIER_PATH,
         mode_txt_path: str = DEFAULT_MODE_TXT,
         journal_dir: str = DEFAULT_JOURNAL_DIR,
         ledger_path: str = DEFAULT_LEDGER_PATH,
@@ -358,12 +416,17 @@ class WindowService:
         post_fn: Any = None,
         anchor_fetcher: Callable[[], list[dict]] | None = None,
         poll_sleep: Callable[[float], None] = time.sleep,
+        cli_strategy: str | None = None,
+        strategy_txt_path: str = DEFAULT_STRATEGY_TXT,
+        box_policy_path: str = DEFAULT_BOX_POLICY_PATH,
+        market_result_getter: Callable[[str], str | None] | None = None,
     ) -> None:
         self.close_time = close_time
         self.cli_mode = cli_mode
         self.pairs = int(pairs)
         self.policy_path = policy_path
         self.falsifier_path = falsifier_path
+        self.box_falsifier_path = box_falsifier_path
         self.mode_txt_path = mode_txt_path
         self.journal_dir = journal_dir
         self.ledger_path = ledger_path
@@ -382,6 +445,24 @@ class WindowService:
         self._post_fn = post_fn
         self._anchor_fetcher = anchor_fetcher
         self._poll_sleep = poll_sleep
+        # Strategy lever (spec item 1). Resolved in prepare(); stored so the whole lifecycle branches.
+        self.cli_strategy = cli_strategy
+        self.strategy_txt_path = strategy_txt_path
+        self.box_policy_path = box_policy_path
+        self._market_result_getter = market_result_getter
+        self._strategy = "corridor"
+        self._strategy_valid = True
+        self._box_policy: Any = None
+        self._current_box_state: BoxState | None = None
+        # F3: box_one_legged = "exactly one ENTRY leg filled" (set at entry, NEVER reset by a flatten)
+        # -> the A5 counter measures entry quality, not whether we later escaped the naked leg.
+        self._box_one_legged = False
+        # F3: the flatten OUTCOME is recorded separately (None = no flatten attempted; True = the
+        # one-legged leg was flattened flat; False = flatten missed/no-bid/cutoff -> held naked).
+        self._box_flatten_filled: bool | None = None
+        # F4: an in-flight one-legged flatten whose retries are EVENT-DRIVEN (each retry prices a
+        # fresh bid on a later book event). None when no flatten is pending.
+        self._pending_flatten: dict[str, Any] | None = None
 
         self.armed = False
         self.executor: Any = None
@@ -571,6 +652,11 @@ class WindowService:
     # -----------------------------------------------------------------------
     def prepare(self) -> Plan:
         mode = resolve_mode(self.cli_mode, self.mode_txt_path)
+        # (1) strategy lever (spec item 1). Resolved fresh each wake; an unknown/missing value fails
+        # closed to the corridor core, DRY (never armed).
+        strategy, strategy_valid = resolve_strategy(self.cli_strategy, self.strategy_txt_path)
+        self._strategy = strategy
+        self._strategy_valid = strategy_valid
         self._journal(
             "window_start",
             {
@@ -578,22 +664,43 @@ class WindowService:
                 "requested_mode": mode,
                 "pairs": self.pairs,
                 "cli_mode": self.cli_mode,
+                "strategy": strategy,
+                "strategy_valid": strategy_valid,
             },
         )
+        self._journal("strategy_selected", {"strategy": strategy, "valid": strategy_valid,
+                                            "cli_strategy": self.cli_strategy})
+        if not strategy_valid:
+            self._journal(
+                "strategy_invalid",
+                {"raw_cli": self.cli_strategy, "strategy_file": self.strategy_txt_path,
+                 "note": "unknown/missing strategy -> running the corridor core DRY, never armed "
+                         "(fail closed)"},
+            )
 
-        # (a) policy + sha check
+        # (a) policy + sha check. The box loads ITS sha-pinned roster (box-v1); the corridor loads the
+        # pilot roster. Only one policy is loaded per window (the selected strategy's).
+        policy: PolicyParams | None = None
         try:
-            policy = load_policy(self.policy_path)
-            policy_verified = True
-            self._journal("policy_loaded", {"sha256": policy.sha256, "roster": policy.roster_name})
-        except PolicyShaMismatch as e:
+            if strategy == "box":
+                self._box_policy = load_box_policy(self.box_policy_path)
+                policy_verified = True
+                self._journal("policy_loaded",
+                              {"sha256": self._box_policy.sha256,
+                               "roster": self._box_policy.roster_name})
+            else:
+                policy = load_policy(self.policy_path)
+                policy_verified = True
+                self._journal("policy_loaded",
+                              {"sha256": policy.sha256, "roster": policy.roster_name})
+        except (PolicyShaMismatch, BoxPolicyShaMismatch) as e:
             self._journal("policy_refusal", {"error": str(e)})
-            return Plan(effective_mode=mode, stand_down=True,
-                        stand_down_reason=f"policy sha mismatch (S5): {e}")
+            return Plan(effective_mode=mode, strategy=strategy, strategy_valid=strategy_valid,
+                        stand_down=True, stand_down_reason=f"policy sha mismatch (S5): {e}")
         except (OSError, KeyError, ValueError) as e:
             self._journal("policy_refusal", {"error": str(e)})
-            return Plan(effective_mode=mode, stand_down=True,
-                        stand_down_reason=f"policy unreadable: {e}")
+            return Plan(effective_mode=mode, strategy=strategy, strategy_valid=strategy_valid,
+                        stand_down=True, stand_down_reason=f"policy unreadable: {e}")
 
         # (b) arming (S5) — armed exercises it for real; dry exercises it for observability
         armed = False
@@ -611,7 +718,18 @@ class WindowService:
 
             stop_cfg = StopConfig()
             health = self._fetch_health()
-            arm_decision = arming_check(self.falsifier_path, health, policy_verified)
+            # F2: the box arms against box_falsifier.md and requires the resolved strategy to be
+            # exactly "box"; the corridor keeps arming against falsifier.md. The box roster sha being
+            # verified rides in policy_verified (load_box_policy self-checks the pinned sha above).
+            if strategy == "box":
+                active_falsifier = self.box_falsifier_path
+                arm_decision = arming_check(
+                    active_falsifier, health, policy_verified,
+                    strategy=strategy, expected_strategy="box",
+                )
+            else:
+                active_falsifier = self.falsifier_path
+                arm_decision = arming_check(active_falsifier, health, policy_verified)
             # F9: value-agreement between the proxy /health caps and the executor/pilot caps.
             caps_ok, caps_reason = self._caps_agree(health)
             # A4 day-lock (guard trips) still derives from the ledger's UTC-day totals; the ledger
@@ -626,6 +744,8 @@ class WindowService:
             self._day_guard = guard
             latched_kind = latched_stop_kind(guard)
             extra: list[str] = []
+            if not self._strategy_valid:
+                extra.append("strategy invalid -> corridor core, never armed (fail closed)")
             if not caps_ok:
                 extra.append(f"caps disagreement (F9): {caps_reason}")
             if guard.corrupt:
@@ -642,6 +762,9 @@ class WindowService:
                     "mode": mode,
                     "armed": arm_decision.armed,
                     "reasons": list(arm_decision.reasons),
+                    "falsifier_path": active_falsifier,
+                    "falsifier_basename": os.path.basename(active_falsifier),
+                    "strategy": strategy,
                     "caps_ok": caps_ok,
                     "caps_reason": caps_reason,
                     "day_realized_ledger": str(loss_today),
@@ -675,6 +798,11 @@ class WindowService:
                 {"observed": {t: str(v) for t, v in observed.items()},
                  "inherited": {t: str(v) for t, v in inherited.items()}},
             )
+            # Settlement-backfill automation (spec item 5): for any prior ledger row still marked
+            # realized_unsettled, fetch each held ticker's settled result via the proxy /markets
+            # (read-only) and run the existing backfill. Idempotent, fail-closed (an unsettled/absent
+            # result just waits for a later wake); never breaks startup.
+            self._settlement_backfill_sweep()
             if inherited:
                 # BUG-3 (S4 balance): positions are open at wake, so the balance is NOT clean cash
                 # and the loss compare would be meaningless -> record a skip rather than compare
@@ -851,11 +979,17 @@ class WindowService:
         # to PHASE B (execute() -> _resolve_anchor, at leg open). What IS available at :40 and
         # prefetched now: the 8 trailing σ̂ anchors T-900..T-7200 (all present with strikes at :40).
         # A prefetch failure is fail-closed to None (phase B re-fetches inside assign()).
-        try:
-            trailing_tape: list[dict] | None = self._sigma().fetch_trailing_15m(self.close_time)
-        except Exception as e:  # noqa: BLE001 - a prefetch failure degrades to a phase-B re-fetch
-            logger.warning("[RUN] σ̂ trailing prefetch failed: %s", e)
-            trailing_tape = None
+        trailing_tape: list[dict] | None = None
+        if self._strategy == "box":
+            # The box has NO σ̂/quintile — the trailing-anchor tape is corridor-only, so skip the
+            # prefetch entirely (spec item 2: quintile assignment is corridor-only).
+            logger.info("[RUN] box strategy: skipping σ̂ trailing prefetch (no quintile)")
+        else:
+            try:
+                trailing_tape = self._sigma().fetch_trailing_15m(self.close_time)
+            except Exception as e:  # noqa: BLE001 - a prefetch failure degrades to a phase-B re-fetch
+                logger.warning("[RUN] σ̂ trailing prefetch failed: %s", e)
+                trailing_tape = None
         self._journal(
             "phase_a",
             {
@@ -872,13 +1006,15 @@ class WindowService:
         )
 
         if armed:
-            self._build_armed_stack(policy)
+            self._build_armed_stack(self._box_policy if self._strategy == "box" else policy)
 
         return Plan(effective_mode=effective_mode, armed=armed, degraded=degraded,
                     degrade_reason=degrade_reason, stand_down=False, wake=wake, policy=policy,
-                    arm_decision=arm_decision, trailing_tape=trailing_tape)
+                    arm_decision=arm_decision, trailing_tape=trailing_tape,
+                    strategy=self._strategy, strategy_valid=self._strategy_valid,
+                    box_policy=self._box_policy)
 
-    def _build_armed_stack(self, policy: PolicyParams) -> None:
+    def _build_armed_stack(self, policy: Any) -> None:
         from service.stops import StopConfig, StopController
 
         cfg = ExecutorConfig(
@@ -905,9 +1041,15 @@ class WindowService:
         self.stops.state = replace(
             self.stops.state, daily_realized=loss_today, guard_trips=trips_today
         )
-        self.reconciler = PositionsReconciler(
-            lambda path, params=None: self.proxy.rest_get(path, params or {})
-        )
+        # The corridor's positions reconciler drives the imbalance/S3 protocol; the box has NO
+        # rebalance and its own post-fill policy (immediate flatten / hold), so it runs WITHOUT a
+        # reconciler (leaving it None also keeps the WS window's S3 poll loop from ever starting).
+        if self._strategy == "box":
+            self.reconciler = None
+        else:
+            self.reconciler = PositionsReconciler(
+                lambda path, params=None: self.proxy.rest_get(path, params or {})
+            )
         self._policy_cache = policy
 
     # -----------------------------------------------------------------------
@@ -1143,43 +1285,10 @@ class WindowService:
         try:
             if plan.stand_down:
                 return exit_code
-            # PHASE B: resolve the current-window anchor by polling at leg open (live finding
-            # 2026-08-21). Only after the strike materializes can we pair/score/quintile the window.
-            outcome = self._resolve_anchor(plan)
-            if outcome is None:
-                # the strike never arrived before the poll timeout -> a LEGITIMATE stand-down.
-                plan.stand_down = True
-                plan.stand_down_reason = (
-                    "EXCL_NO_ANCHOR (15M strike did not materialize before the poll timeout)"
-                )
-                self._journal(
-                    "phase_b_timeout",
-                    {"reason": plan.stand_down_reason,
-                     "note": "no anchor -> no pairing, no C computation (both legs' prices needed) "
-                             "-> whole window stands down (sub-$1 also requires the anchor)"},
-                )
-                return exit_code
-            if outcome.stand_down:
-                # anchor materialized but no clean pair (no hourly leg / nearest-tie / degenerate G):
-                # no C can be computed for EITHER source -> whole window stands down.
-                plan.outcome = outcome
-                plan.stand_down = True
-                plan.stand_down_reason = outcome.reason
-                return exit_code
-            self._apply_outcome(plan, outcome)
-            recorder = self._build_recorder(plan)
-            self._recorder = recorder
-            deadline = close_epoch(plan.wake.close_time) + GRACE_SECONDS
-            self._connect_not_before = self._connect_gate(plan.wake)
-            if self._connect_not_before is not None:
-                self._journal(
-                    "connect_gate",
-                    {"fifteen_open_time": plan.wake.fifteen_leg.open_time,
-                     "connect_not_before": self._connect_not_before,
-                     "margin_seconds": _CONNECT_MARGIN_S,
-                     "note": "15M leg is 'initialized' at wake; holding the WS dial until ~open_time"},
-                )
-            self._window_driver(recorder, deadline)
+            if plan.strategy == "box":
+                recorder = self._run_box_window(plan)
+            else:
+                recorder = self._run_corridor_window(plan)
         except KeyboardInterrupt:
             logger.warning("[RUN] Ctrl+C — flushing buffered journal.")
             self._journal("interrupt", {"note": "keyboard interrupt; flushing buffered journal"})
@@ -1194,8 +1303,484 @@ class WindowService:
             logger.error("[RUN] unhandled exception:\n%s", tb)
             self._journal("unhandled_exception", {"traceback": tb})
         finally:
-            self._finalize(plan, recorder, exit_code)
+            # A crash AFTER the recorder was built loses `recorder` (the assignment above never
+            # completed), but self._recorder was set inside the run method — finalize needs it so the
+            # buffered journal is flushed via the recorder (crash-flush law).
+            self._finalize(plan, recorder if recorder is not None else self._recorder, exit_code)
         return exit_code
+
+    def _run_corridor_window(self, plan: Plan) -> WindowRecorder | None:
+        """The corridor PHASE B + window run (unchanged from the single-strategy harness). Returns the
+        recorder, or None on a legitimate phase-B stand-down."""
+        # PHASE B: resolve the current-window anchor by polling at leg open (live finding
+        # 2026-08-21). Only after the strike materializes can we pair/score/quintile the window.
+        outcome = self._resolve_anchor(plan)
+        if outcome is None:
+            # the strike never arrived before the poll timeout -> a LEGITIMATE stand-down.
+            plan.stand_down = True
+            plan.stand_down_reason = (
+                "EXCL_NO_ANCHOR (15M strike did not materialize before the poll timeout)"
+            )
+            self._journal(
+                "phase_b_timeout",
+                {"reason": plan.stand_down_reason,
+                 "note": "no anchor -> no pairing, no C computation (both legs' prices needed) "
+                         "-> whole window stands down (sub-$1 also requires the anchor)"},
+            )
+            return None
+        if outcome.stand_down:
+            # anchor materialized but no clean pair (no hourly leg / nearest-tie / degenerate G):
+            # no C can be computed for EITHER source -> whole window stands down.
+            plan.outcome = outcome
+            plan.stand_down = True
+            plan.stand_down_reason = outcome.reason
+            return None
+        self._apply_outcome(plan, outcome)
+        recorder = self._build_recorder(plan)
+        self._recorder = recorder
+        deadline = close_epoch(plan.wake.close_time) + GRACE_SECONDS
+        self._connect_not_before = self._connect_gate(plan.wake)
+        if self._connect_not_before is not None:
+            self._journal(
+                "connect_gate",
+                {"fifteen_open_time": plan.wake.fifteen_leg.open_time,
+                 "connect_not_before": self._connect_not_before,
+                 "margin_seconds": _CONNECT_MARGIN_S,
+                 "note": "15M leg is 'initialized' at wake; holding the WS dial until ~open_time"},
+            )
+        self._window_driver(recorder, deadline)
+        return recorder
+
+    # -----------------------------------------------------------------------
+    # BOX strategy — PHASE B (anchor poll, no quintile) + window run + post-fill policy
+    # -----------------------------------------------------------------------
+    def _run_box_window(self, plan: Plan) -> WindowRecorder | None:
+        """The box PHASE B + window run. Polls the 15M leg for its strike (anchor A + the 15M ticker),
+        builds a BoxState from the CHOSEN hourly generation's ladder, subscribes the FULL ladder + 15M
+        (regardless of --max-hourly-strikes), and drives ``decide_box``. Returns the recorder, or None
+        on a legitimate stand-down."""
+        wake = plan.wake
+        assert wake is not None and plan.box_policy is not None
+        anchor = self._resolve_box_anchor(plan)
+        if anchor is None:
+            plan.stand_down = True
+            plan.stand_down_reason = (
+                "EXCL_NO_ANCHOR (box: 15M strike did not materialize before the poll timeout)"
+            )
+            self._journal("box_phase_b_timeout", {"reason": plan.stand_down_reason})
+            return None
+        anchor_A, a_ticker = anchor
+        # Ladder strikes (Decimal) from the SELECTED hourly generation's wake market records — the same
+        # generation the ladder-map check validated. F1 pooled-generation logic does NOT apply to the
+        # box (spec item 2): use the selected generation.
+        strikes: dict[str, Decimal] = {}
+        for m in wake.hourly_leg.markets:
+            tk = m.get("ticker")
+            fs = m.get("floor_strike")
+            if tk and fs is not None:
+                strikes[str(tk)] = Decimal(str(fs))
+        if not strikes:
+            plan.stand_down = True
+            plan.stand_down_reason = "box: chosen hourly generation has no strikes"
+            self._journal("box_phase_b_no_strikes", {"reason": plan.stand_down_reason})
+            return None
+        box_state = BoxState.new(
+            close_time=self.close_time,
+            anchor_A=anchor_A,
+            m15_ticker=a_ticker,
+            strikes=strikes,
+            shakedown=(not plan.armed),
+            T=int(close_epoch(self.close_time)),
+        )
+        self._current_box_state = box_state
+        plan.box_state = box_state
+        self._journal(
+            "box_state",
+            {
+                "anchor_A": str(anchor_A),
+                "m15_ticker": a_ticker,
+                "hourly_event": wake.hourly_leg.event_ticker,
+                "ladder_strikes": len(strikes),
+                "shakedown": box_state.shakedown,
+                "T": box_state.T,
+                "ladder_alarm": wake.ladder.alarm,
+                "note": "box ladder-map deviation is an A2 alarm only, never a box stand-down",
+            },
+        )
+        recorder = self._build_box_recorder(plan, box_state, a_ticker)
+        self._recorder = recorder
+        deadline = close_epoch(wake.close_time) + GRACE_SECONDS
+        self._connect_not_before = self._connect_gate(wake)
+        if self._connect_not_before is not None:
+            self._journal(
+                "connect_gate",
+                {"fifteen_open_time": wake.fifteen_leg.open_time,
+                 "connect_not_before": self._connect_not_before,
+                 "margin_seconds": _CONNECT_MARGIN_S,
+                 "note": "15M leg is 'initialized' at wake; holding the WS dial until ~open_time"},
+            )
+        self._window_driver(recorder, deadline)
+        return recorder
+
+    def _resolve_box_anchor(self, plan: Plan) -> tuple[Decimal, str] | None:
+        """PHASE B for the box: poll the 15M market at leg open until its floor_strike materializes,
+        returning (anchor_A Decimal, 15M ticker), or None on the poll timeout (EXCL_NO_ANCHOR). Does
+        NOT require σ̂/quintile (the box has none). Bounded by open_time+ANCHOR_POLL_TIMEOUT_S and the
+        window deadline; ``poll_sleep``/``clock`` are injectable so tests drive it with a fake clock."""
+        wake = plan.wake
+        assert wake is not None
+        try:
+            open_epoch = float(close_epoch(wake.fifteen_leg.open_time))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            open_epoch = float(close_epoch(wake.close_time) - 900)
+        window_deadline = float(close_epoch(wake.close_time) + GRACE_SECONDS)
+        poll_deadline = min(open_epoch + ANCHOR_POLL_TIMEOUT_S, window_deadline)
+        self._journal(
+            "box_phase_b_start",
+            {"fifteen_ticker": wake.fifteen_leg.primary_ticker,
+             "open_time": wake.fifteen_leg.open_time, "open_epoch": open_epoch,
+             "poll_deadline": poll_deadline, "poll_interval_s": ANCHOR_POLL_INTERVAL_S},
+        )
+        polls = 0
+        while True:
+            now = self.clock()
+            if now < open_epoch:
+                self._poll_sleep(max(0.0, min(open_epoch - now, poll_deadline - now)))
+                if self.clock() < open_epoch:
+                    return None
+                continue
+            markets_15m = self._fetch_current_15m()
+            polls += 1
+            A, a_ticker = _anchor_at(markets_15m, self.close_time)
+            if A is not None and a_ticker:
+                self._journal("box_phase_b_anchor",
+                              {"anchor_A": A, "anchor_ticker": a_ticker, "polls": polls})
+                return Decimal(str(A)), a_ticker
+            now = self.clock()
+            if now >= poll_deadline:
+                return None
+            self._poll_sleep(max(0.0, min(ANCHOR_POLL_INTERVAL_S, poll_deadline - now)))
+
+    def _box_subscription_tickers(self, wake: WakeResult, a_ticker: str) -> list[str]:
+        """Box subscription: the FULL selected hourly ladder + the 15M market(s), regardless of
+        --max-hourly-strikes (spec item 2). The anchor ticker is always included."""
+        hourly = list(wake.hourly_leg.market_tickers)
+        fifteen = list(wake.fifteen_leg.market_tickers)
+        extra = [a_ticker] if a_ticker else []
+        return list(dict.fromkeys(hourly + fifteen + extra))
+
+    def _build_box_recorder(self, plan: Plan, box_state: BoxState, a_ticker: str) -> WindowRecorder:
+        wake = plan.wake
+        assert wake is not None and plan.box_policy is not None
+        recorder = BoxWindowRecorder(
+            wake, self.journal, plan.box_policy, box_state, clock=self.clock,
+            capture_tops=(not plan.armed), on_action=self._on_box_action,
+            on_book_event=self._box_on_book_event,
+        )
+        tickers = self._box_subscription_tickers(wake, a_ticker)
+        recorder.ws_client = KalshiWebSocketClient(
+            proxy_auth=self.proxy,
+            tickers=tickers,
+            callbacks=recorder.callbacks,
+            include_private=plan.armed,
+            record=recorder.tap,
+            clock=self.clock,
+        )
+        return recorder
+
+    # -----------------------------------------------------------------------
+    # BOX order routing + post-fill policy (armed-only; dry/shakedown emit WouldFire)
+    # -----------------------------------------------------------------------
+    def _on_box_action(self, action: Action) -> None:
+        if action.kind != FIRE or not self.armed or self.executor is None:
+            return
+        sel = self._current_box_state.fired_selection if self._current_box_state else None
+        hourly_ticker = sel.hourly_ticker if sel is not None else action.legs[0].ticker
+        m15_ticker = sel.m15_ticker if sel is not None else action.legs[1].ticker
+        legs = tuple(
+            IntentLeg(
+                ticker=lg.ticker, side=lg.side, action="buy",
+                count=int(lg.count), limit_price=lg.limit_price,
+                client_order_id=new_client_order_id(),
+            )
+            for lg in action.legs
+        )
+        intent = Intent(window=self.close_time, source=WIDE_BOX, purpose=PURPOSE_ENTRY,
+                        legs=legs, t_minus_s=action.t_minus_s)
+        # Ledger slot mapping (documented): the ledger's high/low are just two storage slots. For the
+        # box, high_ticker <- the hourly leg, low_ticker <- the 15M leg (there is no strike ordering
+        # between a $-strike hourly market and the 15M anchor market). The held sides are captured
+        # from the entry legs by record_intent (high_side=hourly_side, low_side=m15_side).
+        self.ledger_state = record_intent(
+            new_ledger(self.close_time, WIDE_BOX, high_ticker=hourly_ticker, low_ticker=m15_ticker),
+            intent,
+        )
+        result = self.executor.execute(intent, t_minus_s=action.t_minus_s)
+        for r in result.responses:
+            self.ledger_state = record_response(self.ledger_state, r)
+        self._box_post_entry(action.t_minus_s if action.t_minus_s is not None else 0.0)
+
+    def _box_post_entry(self, t_minus_s: float) -> None:
+        """The box post-fill policy (spec item 4 — REPLACES the corridor rebalance protocol entirely:
+        no retries, no rebalance, no I1 ceiling). Both legs filled -> hold to settlement (the $1 floor
+        is booked at close, +$1 backfilled if pinned). Exactly one leg filled -> flatten it reduce-only
+        at the best bid (any price); the first attempt fires now, retries are EVENT-DRIVEN on later
+        book frames (F4), 3 attempts max; no bid -> A_FLATTEN_NO_BID + hold. Then S1_box (units +
+        booked-cost) and the A5 one-legged alarm.
+
+        F3: ``_box_one_legged`` records the ENTRY quality (exactly one leg filled) and is NEVER reset by
+        a later flatten; the flatten OUTCOME is recorded separately in ``_box_flatten_filled``."""
+        from service.stops import S1_ARITH, check_s1_box
+
+        assert self.ledger_state is not None and self.stops is not None
+        ls = self.ledger_state
+        hi_net, lo_net = ls.net("high"), ls.net("low")
+        both = hi_net > 0 and lo_net > 0
+        one_leg = (hi_net > 0) != (lo_net > 0)
+        self._box_one_legged = one_leg  # F3: entry quality, latched (never reset by the flatten)
+        if both:
+            self._journal(
+                "box_post_fill",
+                {"outcome": "both_filled_hold",
+                 "realized_at_close": str(ls.realized_at_close()),
+                 "matched_pairs": str(ls.matched_pairs()),
+                 "note": "box pair holds to settlement; $1 floor booked, +$1 backfill if pinned"},
+            )
+        elif one_leg:
+            self._box_begin_flatten(ls, t_minus_s)
+        else:
+            self._journal("box_post_fill", {"outcome": "no_fill", "note": "neither box leg filled"})
+        # S1_box: freeze the DAY on a units/booked-cost violation, but do NOT run the corridor
+        # position_policy (ledger_state omitted from trip()): a both-filled box is floor-protected and
+        # HELD; a one-legged box's flatten is in flight / already resolved above.
+        reason = check_s1_box(self.ledger_state, self._box_policy.pair_cost_max)
+        if reason:
+            self._journal("box_s1", {"reason": reason})
+            self.stops.trip(S1_ARITH, reason)
+        self._box_a5_alarm()
+
+    def _box_leg_bid(self, ticker: str, side: str) -> Decimal | None:
+        """The current best bid to flatten a held ``side`` on ``ticker`` (sell YES at yes_bid; sell NO
+        at no_bid), from the recorder's live book. None if unknown."""
+        if self._recorder is None:
+            return None
+        book = self._recorder.books.get(ticker)
+        if book is None:
+            return None
+        top = book.top_of_book()
+        return top.yes_bid if side == "yes" else top.no_bid
+
+    def _box_begin_flatten(self, ls: LedgerState, t_minus_s: float) -> None:
+        """Start the one-legged flatten: record the pending state and issue the FIRST attempt now (it
+        prices the entry-time bid). If it misses, ``_pending_flatten`` stays set and later book frames
+        drive the retries (F4). The flatten is the ONLY order class after the entry."""
+        which = "high" if ls.net("high") > 0 else "low"
+        pos = ls.position(which)
+        if pos is None or pos.net <= 0:
+            return
+        ticker, side, count = pos.ticker, pos.side, int(pos.net)
+        self._journal(
+            "box_flatten",
+            {"stage": "start", "ticker": ticker, "side": side, "count": count,
+             "note": f"one-legged box -> reduce-only flatten at best bid (any price, "
+                     f"{_FLATTEN_MAX_ATTEMPTS} attempts max, retries event-driven)"},
+        )
+        self._pending_flatten = {
+            "which": which, "ticker": ticker, "side": side, "count": count,
+            "attempts": 0, "last_ts": None,
+        }
+        # First attempt now, at the fresh entry-time bid. server_ts is event-derived (T - t_minus_s).
+        server_ts = (self._current_box_state.T - t_minus_s) if self._current_box_state else None
+        self._box_flatten_attempt(t_minus_s, server_ts)
+
+    def _box_flatten_attempt(self, t_minus_s: float, server_ts: float | None) -> None:
+        """Execute one reduce-only flatten attempt against the CURRENT best bid. Clears
+        ``_pending_flatten`` when the leg goes flat, when there is no bid (A_FLATTEN_NO_BID), when the
+        no-orders-to-settle cutoff is reached, or when all attempts are exhausted (A_FLATTEN_EXHAUSTED).
+        Otherwise the pending state persists for the next event-driven retry."""
+        from service.stops import PositionAction, build_flatten_intent
+
+        pf = self._pending_flatten
+        if pf is None:
+            return
+        which = pf["which"]
+        # Already flat (a prior attempt filled, or the leg never existed) -> done.
+        if self.ledger_state is None or self.ledger_state.net(which) <= 0:
+            self._pending_flatten = None
+            return
+        ticker, side, count = pf["ticker"], pf["side"], int(pf["count"])
+        # The no-orders cutoff (t < no_orders_after_s_to_settle, ~1s) STILL stops flatten attempts:
+        # hold the naked leg to settlement rather than pound a refusing executor.
+        cutoff = self._box_policy.no_orders_after_s_to_settle if self._box_policy is not None else 1
+        if t_minus_s is not None and t_minus_s < cutoff:
+            self._journal(
+                "box_flatten",
+                {"stage": "cutoff_hold", "ticker": ticker, "t_minus_s": t_minus_s,
+                 "attempts": pf["attempts"],
+                 "note": "within no-orders-to-settle cutoff -> hold naked to settlement"},
+            )
+            self._box_flatten_filled = False
+            self._pending_flatten = None
+            return
+        bid = self._box_leg_bid(ticker, side)
+        if bid is None:
+            self.stops.raise_alarm(
+                "A_FLATTEN_NO_BID",
+                f"box flatten of {ticker} skipped: no bid to price against (held, alerting)",
+                {"ticker": ticker, "count": count, "attempt": pf["attempts"] + 1},
+            )
+            self._journal("box_flatten",
+                          {"stage": "no_bid_hold", "ticker": ticker, "attempt": pf["attempts"] + 1})
+            self._box_flatten_filled = False
+            self._pending_flatten = None
+            return
+        attempt_no = pf["attempts"] + 1
+        action = PositionAction("flatten", ticker, side, count, "box one-legged flatten")
+        intent = build_flatten_intent(action, self.close_time, WIDE_BOX, bid, new_client_order_id())
+        res = self.executor.execute(intent, t_minus_s=t_minus_s, stop_authorized=True)
+        # Book the flatten (intent + fills) as a round-trip via the SAME folding path the corridor's
+        # stop-authorized flattens use (repairs/instruments F1): a filled flatten reduces net -> drops
+        # out of unsettled_legs, never a phantom naked leg.
+        self._fold_flatten_response(intent, res)
+        pf["attempts"] = attempt_no
+        pf["last_ts"] = server_ts
+        if self.ledger_state.net(which) <= 0:
+            self._box_flatten_filled = True  # F3: the flatten OUTCOME (entry one-legged flag stays)
+            self._pending_flatten = None
+            self._journal("box_flatten",
+                          {"stage": "flat", "ticker": ticker, "attempt": attempt_no, "bid": str(bid)})
+            return
+        if attempt_no >= _FLATTEN_MAX_ATTEMPTS:
+            self.stops.raise_alarm(
+                A_FLATTEN_EXHAUSTED,
+                f"box flatten of {ticker} missed all {_FLATTEN_MAX_ATTEMPTS} attempts (held naked)",
+                {"ticker": ticker, "count": count, "attempts": attempt_no},
+            )
+            self._journal(
+                "box_flatten",
+                {"stage": "giveup_hold", "ticker": ticker, "attempts": attempt_no,
+                 "remaining": str(self.ledger_state.net(which)),
+                 "note": "flatten missed after all attempts -> hold to settlement (naked)"},
+            )
+            self._box_flatten_filled = False
+            self._pending_flatten = None
+            return
+        # Missed but attempts remain: stay pending; a later book frame drives the next attempt.
+        self._journal(
+            "box_flatten",
+            {"stage": "miss_retry", "ticker": ticker, "attempt": attempt_no, "bid": str(bid),
+             "remaining": str(self.ledger_state.net(which))},
+        )
+
+    def _box_on_book_event(self, market: str, server_ts: float) -> None:
+        """F4 retry trigger: called by the recorder after each subscribed book frame. Issues the next
+        pending flatten attempt when the frame is a LATER event and either (a) it is the held ticker
+        and its best bid is present, or (b) >= _FLATTEN_RETRY_MIN_ELAPSED_S of engine time has passed
+        since the last attempt (whichever first). The 'later event' guard stops a retry from re-pricing
+        the SAME frozen frame the previous attempt already saw (the review's F4 bug)."""
+        pf = self._pending_flatten
+        if pf is None:
+            return
+        last_ts = pf["last_ts"]
+        if last_ts is not None and server_ts <= last_ts:
+            return  # same or earlier frame -> not a fresh bid; wait for a later one
+        held_has_bid = (
+            market == pf["ticker"] and self._box_leg_bid(pf["ticker"], pf["side"]) is not None
+        )
+        elapsed = None if last_ts is None else (server_ts - last_ts)
+        time_fallback = elapsed is not None and elapsed >= _FLATTEN_RETRY_MIN_ELAPSED_S
+        if not (held_has_bid or time_fallback):
+            return
+        t_minus_s = (self._current_box_state.T - server_ts) if self._current_box_state else None
+        self._box_flatten_attempt(t_minus_s, server_ts)
+
+    def _box_a5_alarm(self) -> None:
+        """A5: over the rolling last 20 box fires (this window included), if one-legged/fires > 0.10,
+        raise an alarm (notify + journal, keep running)."""
+        if self.stops is None:
+            return
+        try:
+            past = load_entries(self.ledger_path)
+        except Exception as e:  # noqa: BLE001 - a ledger read must never break the post-fill path
+            logger.warning("[RUN] A5 ledger read failed: %s", e)
+            past = []
+        synthetic = {"fires": 1, "fired_source": WIDE_BOX, "box_one_legged": self._box_one_legged}
+        rate, one_legged, total = box_one_legged_rate(past + [synthetic], n=20)
+        if rate is not None and rate > A5_ONE_LEGGED_RATE_MAX:
+            self.stops.raise_alarm(
+                A5_ONE_LEGGED,
+                f"box one-legged rate {rate} ({one_legged}/{total}) > {A5_ONE_LEGGED_RATE_MAX}",
+                {"one_legged": one_legged, "fires": total, "rate": str(rate)},
+            )
+            self._journal("box_a5",
+                          {"one_legged": one_legged, "fires": total, "rate": str(rate)})
+
+    # -----------------------------------------------------------------------
+    # Settlement-backfill automation (spec item 5) — read-only, idempotent, fail-closed
+    # -----------------------------------------------------------------------
+    def _fetch_market_result(self, ticker: str) -> str | None:
+        """The settled market result ('yes'/'no') for ``ticker`` via the proxy /markets (read-only),
+        or None if not settled / unavailable (injectable for tests). Fail-closed to None."""
+        if self._market_result_getter is not None:
+            try:
+                return self._market_result_getter(ticker)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[RUN] market-result fetch failed for %s: %s", ticker, e)
+                return None
+        try:
+            resp = self.proxy.rest_get("/markets", {"ticker": ticker})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[RUN] market-result fetch failed for %s: %s", ticker, e)
+            return None
+        return _parse_market_result(resp, ticker)
+
+    def _settlement_backfill_sweep(self) -> None:
+        """At reconcile-first, backfill any prior ledger row still marked realized_unsettled once its
+        held tickers have settled. Idempotent (skips already-backfilled windows) and fail-closed (an
+        absent/unsettled result just waits for a later wake). Never raises out of startup."""
+        from service.ledger import settlement_payoff
+
+        try:
+            entries = load_entries(self.ledger_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[RUN] settlement-backfill: ledger read failed: %s", e)
+            return
+        pending: dict[str, dict[str, Any]] = {}
+        for e in entries:
+            if e.get("realized_unsettled") and e.get("unsettled_legs"):
+                pending[str(e.get("close_time"))] = e  # most-recent row per window wins
+        for window, entry in pending.items():
+            if already_backfilled(entries, window):
+                continue
+            legs = entry.get("unsettled_legs") or []
+            results: dict[str, str] = {}
+            settled = True
+            for leg in legs:
+                tk = leg["ticker"] if isinstance(leg, dict) else leg[0]
+                res = self._fetch_market_result(tk)
+                if res not in ("yes", "no"):
+                    settled = False
+                    break
+                results[tk] = res
+            if not settled:
+                continue
+            try:
+                payoff = settlement_payoff(legs, results)
+            except Exception as ex:  # noqa: BLE001 - a malformed row must not break startup
+                logger.warning("[RUN] settlement-backfill payoff failed for %s: %s", window, ex)
+                continue
+            bf = build_backfill_entry(entry, results, payoff, self.clock())
+            try:
+                append_entry(bf, self.ledger_path)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("[RUN] settlement-backfill append failed for %s: %s", window, ex)
+                continue
+            entries.append(bf)  # so already_backfilled sees it within this sweep
+            self._journal(
+                "settlement_backfill",
+                {"window": window, "results": results, "settlement_payoff": str(payoff),
+                 "floor_netted": bf.get("floor_netted"), "realized_delta": bf.get("realized_delta")},
+            )
 
     def _build_recorder(self, plan: Plan) -> WindowRecorder:
         wake, policy, state = plan.wake, plan.policy, plan.state
@@ -1555,7 +2140,10 @@ class WindowService:
         except Exception as e:  # noqa: BLE001 - finalize must never raise
             logger.error("[RUN] journal flush failed: %s", e)
         try:
-            entry = self._build_ledger_entry(plan, recorder, exit_code, journal_path, records)
+            if plan.strategy == "box":
+                entry = self._build_box_ledger_entry(plan, recorder, exit_code, journal_path, records)
+            else:
+                entry = self._build_ledger_entry(plan, recorder, exit_code, journal_path, records)
             append_entry(entry, self.ledger_path)
         except Exception as e:  # noqa: BLE001
             logger.error("[RUN] pilot-ledger append failed: %s", e)
@@ -1641,6 +2229,7 @@ class WindowService:
         arm = plan.arm_decision
         entry: dict[str, Any] = {
             "close_time": self.close_time,
+            "strategy": plan.strategy,
             "mode": plan.effective_mode,
             "requested_mode": resolve_mode(self.cli_mode, self.mode_txt_path),
             "pairs": self.pairs,
@@ -1680,6 +2269,126 @@ class WindowService:
             "day_guard_trips_seed": self._day_totals[1],
             "s4_running_total": str(s4_running),
             "second_pair_book_walk": second_pair_book_walk,
+            "alarms": alarms,
+            "stops": stops,
+            "inherited": (None if plan.inherited is None
+                          else {t: str(v) for t, v in plan.inherited.items()}),
+            "journal_path": os.path.abspath(journal_path),
+            "records": records,
+            "flushed_at": self.clock(),
+        }
+        return entry
+
+    def _build_box_ledger_entry(
+        self, plan: Plan, recorder: WindowRecorder | None, exit_code: int,
+        journal_path: str, records: int,
+    ) -> dict[str, Any]:
+        """The box's pilot-ledger row. Mirrors the corridor row's shape for the shared fields (mode,
+        arming, alarms/stops, s4 total) but records box-specifics: the anchor, the ledger high/low
+        slot mapping (hourly leg / 15M leg), the $1 floor booked at close (``floor_booked``, so the
+        settlement backfill nets it), ``box_one_legged`` (the A5 counter), and S1_box."""
+        from service.ledger import fills_record
+
+        actions: list[Action] = []
+        if recorder is not None and hasattr(recorder, "driver"):
+            actions = list(recorder.driver.actions)
+        would_fires = sum(1 for a in actions if a.kind == WOULD_FIRE)
+        fires = sum(1 for a in actions if a.kind == FIRE)
+        fired_source = WIDE_BOX if fires > 0 else None
+
+        fills: list[dict[str, Any]] = []
+        filled = False
+        realized_delta = Decimal(0)
+        realized_unsettled = False
+        unsettled_legs: list[dict[str, Any]] = []
+        floor_booked = Decimal(0)
+        s1_violation = False
+        slippage: list[str] = []
+        ls = self.ledger_state
+        if ls is not None:
+            rec = fills_record(ls)
+            filled = bool(rec["filled"])
+            for lg in rec["legs"]:
+                fills.append({
+                    "ticker": lg["ticker"], "side": lg["side"],
+                    "count": (int(lg["count"]) if isinstance(lg["count"], (int, Decimal)) else lg["count"]),
+                    "avg_price": None if lg["avg_price"] is None else str(lg["avg_price"]),
+                    "avg_fee": str(lg["avg_fee"]),
+                })
+            if rec["any_fill"]:
+                realized_delta = rec["realized_at_close"]
+                unsettled_legs = list(rec["unsettled_legs"])
+                realized_unsettled = bool(unsettled_legs)
+                # The box's matched pair is floor-booked ($1) at close; record it so the settlement
+                # backfill nets the floor (payoff $2 pinned -> +$1; $1 not pinned -> +$0).
+                floor_booked = ls.matched_pairs() * Decimal("1.00")
+            if self._box_policy is not None:
+                from service.stops import check_s1_box
+                s1_violation = check_s1_box(ls, self._box_policy.pair_cost_max) is not None
+            slippage = self._entry_slippage(ls)
+
+        alarms: list[dict[str, str]] = []
+        stops: list[dict[str, str]] = []
+        if self.stops is not None:
+            for n in self.stops.state.alarms:
+                alarms.append({"kind": n.kind, "reason": n.reason})
+            for n in self.stops.state.notifications:
+                if n.kind.startswith("S"):
+                    stops.append({"kind": n.kind, "reason": n.reason})
+        if plan.wake is not None and plan.wake.ladder.alarm:
+            alarms.append({"kind": "A2", "reason": f"ladder-map: {plan.wake.ladder.reason}"})
+
+        orders_attempted = int(getattr(self.executor, "dispatch_count", 0)) if self.executor else 0
+        guard_trips = int(self.stops.state.guard_trips) if self.stops is not None else 0
+        s4_running = realized_delta
+        try:
+            s4_running = s4_running_loss(load_entries(self.ledger_path)) + realized_delta
+        except Exception:  # noqa: BLE001
+            pass
+
+        box_state = plan.box_state
+        arm = plan.arm_decision
+        entry: dict[str, Any] = {
+            "close_time": self.close_time,
+            "strategy": "box",
+            "mode": plan.effective_mode,
+            "requested_mode": resolve_mode(self.cli_mode, self.mode_txt_path),
+            "pairs": self.pairs,
+            "armed": plan.armed,
+            "degraded_to_dry": plan.degraded,
+            "degrade_reason": plan.degrade_reason,
+            "arm_decision": None if arm is None else {"would_arm": arm.armed, "reasons": list(arm.reasons)},
+            "stand_down": plan.stand_down,
+            "stand_down_reason": plan.stand_down_reason,
+            "exit_code": exit_code,
+            "policy_sha": plan.box_policy.sha256 if plan.box_policy is not None else None,
+            "roster": plan.box_policy.roster_name if plan.box_policy is not None else None,
+            "ladder_ok": plan.wake.ladder.ok if plan.wake is not None else None,
+            "anchor_A": None if box_state is None else str(box_state.anchor_A),
+            "m15_ticker": None if box_state is None else box_state.m15_ticker,
+            # ledger slot mapping: high_ticker = hourly leg, low_ticker = 15M leg.
+            "hourly_ticker": (ls.high_ticker if ls is not None else None),
+            "low_ticker": (ls.low_ticker if ls is not None else None),
+            "signals": would_fires + fires,
+            "would_fires": would_fires,
+            "fires": fires,
+            "fired_source": fired_source,
+            "orders_attempted": orders_attempted,
+            "fills": fills,
+            "filled": filled,
+            # F3: box_one_legged = ENTRY quality (exactly one leg filled), counted by A5 regardless of
+            # whether the flatten later filled. box_flatten_filled = the flatten OUTCOME, recorded
+            # separately (None = no flatten; True = flattened flat; False = held naked).
+            "box_one_legged": bool(self._box_one_legged and fires > 0),
+            "box_flatten_filled": self._box_flatten_filled,
+            "s1_violation": s1_violation,
+            "slippage_abs_per_side": slippage,
+            "guard_trips": guard_trips,
+            "realized_delta": str(realized_delta),
+            "realized_unsettled": realized_unsettled,
+            "unsettled_legs": unsettled_legs,
+            "floor_booked": str(floor_booked),
+            "s4_running_total": str(s4_running),
             "alarms": alarms,
             "stops": stops,
             "inherited": (None if plan.inherited is None
@@ -1732,6 +2441,30 @@ def _safe_close(close_iso: str) -> str:
     return close_iso.replace(":", "").replace("-", "")
 
 
+def _parse_market_result(resp: Any, ticker: str) -> str | None:
+    """Extract a settled market result ('yes'/'no') for ``ticker`` from a proxy /markets payload.
+    Accepts {"market": {...}} or {"markets": [...]}; returns None until the market carries a
+    ``result`` of exactly 'yes'/'no' (fail-closed: an empty/absent result means not-yet-settled).
+
+    F1 (Phase-4): the record's ``ticker`` MUST equal ``ticker`` exactly, in BOTH shapes. There is NO
+    fallback to ``markets[0]`` and NO trust of an unlabelled ``{"market": {...}}`` — a foreign
+    market's ``result`` must never be attributed to our leg (that booked fictitious P&L). If the
+    requested ticker is absent, return None and let the backfill wait for a later wake."""
+    if not isinstance(resp, dict):
+        return None
+    rec: Any = None
+    market = resp.get("market")
+    markets = resp.get("markets")
+    if isinstance(market, dict):
+        rec = market if market.get("ticker") == ticker else None
+    elif isinstance(markets, list):
+        rec = next((m for m in markets if isinstance(m, dict) and m.get("ticker") == ticker), None)
+    if not isinstance(rec, dict):
+        return None
+    result = rec.get("result")
+    return result if result in ("yes", "no") else None
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1739,13 +2472,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Run one pilot window (Phase 4 harness).")
     ap.add_argument("--mode", default=None, choices=list(VALID_MODES),
                     help="Override the rung. If omitted, read from --mode-file (mode.txt).")
+    ap.add_argument("--strategy", default=None, choices=list(VALID_STRATEGIES),
+                    help="Override the strategy. If omitted, read from --strategy-file (strategy.txt). "
+                         "Unknown/missing -> corridor core, DRY (fail closed).")
+    ap.add_argument("--strategy-file", default=DEFAULT_STRATEGY_TXT)
     ap.add_argument("--close-time", default=None, help="Target close ISO (UTC). Default: next :00.")
     ap.add_argument("--pairs", type=int, default=1, choices=[1, 2], help="Contract pairs per entry.")
     ap.add_argument("--max-hourly-strikes", type=int, default=0,
                     help="Hourly ladder tickers to subscribe (0 = the paired strike only; a positive "
                          "N widens; omit-as-negative for the full ladder). Decision pair always kept.")
     ap.add_argument("--policy", default=DEFAULT_POLICY_PATH)
-    ap.add_argument("--falsifier", default=DEFAULT_FALSIFIER_PATH)
+    ap.add_argument("--falsifier", default=DEFAULT_FALSIFIER_PATH,
+                    help="Corridor falsifier (S5 when strategy=corridor).")
+    ap.add_argument("--box-falsifier", default=DEFAULT_BOX_FALSIFIER_PATH,
+                    help="Box falsifier (S5 when strategy=box). Its STATUS line must be FROZEN to arm.")
     ap.add_argument("--mode-file", default=DEFAULT_MODE_TXT)
     ap.add_argument("--journal-dir", default=DEFAULT_JOURNAL_DIR)
     ap.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
@@ -1780,11 +2520,14 @@ def main(argv: list[str] | None = None) -> int:
         proxy=proxy,
         policy_path=args.policy,
         falsifier_path=args.falsifier,
+        box_falsifier_path=args.box_falsifier,
         mode_txt_path=args.mode_file,
         journal_dir=args.journal_dir,
         ledger_path=args.ledger,
         proxy_base=args.proxy_base,
         max_hourly=max_hourly,
+        cli_strategy=args.strategy,
+        strategy_txt_path=args.strategy_file,
     )
     return svc.run()
 
