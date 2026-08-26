@@ -10,6 +10,8 @@ pilot/logs/
 # --- runtime state (machine-local, not source) ---
 pilot/ledger/
 pilot/ops/mode.txt
+# generated box-report artifacts (regenerated on each run; only the README is tracked)
+pilot/reports/*.json
 
 # --- scratch / caches ---
 _reviewA_tmp/
