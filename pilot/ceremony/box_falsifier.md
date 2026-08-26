@@ -69,7 +69,11 @@ as a round-trip. That flatten is the ONLY order after the entry — a box window
 
 - R1 SLIPPAGE: after **30** [pin] two-leg fills, mean (fill − decided ask) summed over both legs
   > **+1.0¢** [pin] → the edge is gone at the venue; stop, report, redesign as maker.
-- R2 ECONOMICS: after **60** [pin] fills, mean realized per pair < **−3¢** [pin] → stop.
+- R2 ECONOMICS: after 60 fills (any fill), mean realized per FIRE — one-legged flatten losses
+  included — < **−3¢** [pin] → stop. (Coordinator ruling 2026-08-26: one-legged flatten losses
+  are real money and belong in the economics; the STATUS is the per-FIRE mean over ALL fires with any
+  fill, two-leg + one-legged. The two-leg-only "per pair" mean stays reported beside it but does not
+  drive the stop. R1 and R3 stay two-leg-only.)
   Power note: per-pair SD ≈ 28¢ → SE ≈ 3.6¢ at n=60; R2 catches a broken premise, not a small
   edge. The sharp instrument is R1.
 - R3 PIN RATE: after 60 fills, pin rate < **0.80** [pin] against the 0.90 backtest → stop, read.

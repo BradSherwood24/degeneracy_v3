@@ -29,8 +29,9 @@ unsettled — from the backfill's `settlement_payoff`: $2 = pinned, $1 = not), r
 booking + settlement backfill), and for a one-legged window the flatten attempts + outcome.
 
 **Aggregates** (cumulative and per UTC day): fires / two-leg / one-legged / none / fill rate; R1
-(mean summed slippage ¢ + SE vs +1.0¢ / 30), R2 (mean realized per pair ¢ + SE + deterministic
-bootstrap 95% CI vs −3¢ / 60), R3 (pin rate vs 0.80 / 60, with the 0.90 backtest and the mean
+(mean summed slippage ¢ + SE vs +1.0¢ / 30), R2 (mean realized per FIRE ¢ — one-legged flatten
+losses INCLUDED — + SE + deterministic bootstrap 95% CI vs −3¢ / 60, with the two-leg-only per_pair
+mean shown beside it), R3 (pin rate vs 0.80 / 60, with the 0.90 backtest and the mean
 implied pin beside it), R4 (toward 100), A1 (legs slip > 2¢, listed + running mean), A5 (one-legged
 rate over the rolling last 20 fires vs 0.10), the level-bump count + bump-size distribution, the
 candle-staleness proxy (C paid vs C_mid), and S4 (day-guard balance_start / latest balance / loss vs
@@ -101,12 +102,17 @@ fill to the journal's observed ask by ticker.
    quietly None for it rather than raising — a deliberate fail-soft (a report must not crash on a
    partial window), but it means a silent rename would show as blanks, not an error.
 
-2. **R1–R4 count over TWO-LEG fills; the falsifier says "fills".** The falsifier phrases R1 as "30
-   two-leg fills", R2 as "realized per pair" (power note: "per-pair SD ≈ 28¢"), R3 as a pin rate (a
-   pair pins or not), so I read R1–R4's `n` as the number of two-leg fills. One-legged and no-fill
-   fires are counted and reported separately (fill breakdown, A5) but do NOT advance R1–R4. If Brad
-   intends R2's economics to include one-legged flatten losses, that is a one-line change to the
-   denominator; I chose the reading the falsifier's own wording supports and flagged it here.
+2. **R2 counts over ALL any-fill fires (coordinator ruling 2026-08-26); R1/R3/R4 stay two-leg-only.**
+   I first shipped R2 over two-leg fills only (the falsifier's "per pair" wording) and flagged the
+   open question. The coordinator ruled: R2's STATUS is the mean realized per FIRE over ALL box fires
+   with any fill (two-leg + one-legged; one-legged flatten losses INCLUDED — they are real money;
+   zero-fill fires excluded), TRIPPED after 60 such fills if that per-fire mean < −3¢. The
+   two-leg-only "per pair" mean is still computed and displayed (`per_pair_mean_realized_cents`,
+   `n_pairs`) but does NOT drive the status. R1 (slippage) and R3 (pin rate) remain two-leg-only —
+   both need both legs — and R4 counts two-leg fills toward 100. The falsifier R2 line was updated to
+   match (below its DRAFT STATUS line). Tests cover the mix where per_pair alone would HOLD (−2¢) but
+   the per-fire figure including one-legged −95¢ losses TRIPS (−33¢), and a one-legged-only run that
+   advances R2 while R1/R3 stay at zero.
 
 3. **R3 pin rate is computed over SETTLED two-leg fills; the gate count is two-leg fills.** A pinned
    vs not-pinned verdict only exists once the settlement backfill lands. The `n` shown against the

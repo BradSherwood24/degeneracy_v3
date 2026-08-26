@@ -37,8 +37,10 @@ met). No judgment text. The thresholds mirror the falsifier (Brad's pins 2026-08
 
 - **R1 SLIPPAGE** — after 30 two-leg fills, mean (fill − decided ask) summed over both legs (¢),
   with SE; trips if the mean > +1.0¢. The sharp instrument.
-- **R2 ECONOMICS** — after 60 fills, mean realized per pair (¢) with SE and a deterministic
-  bootstrap 95% CI; trips if the mean < −3¢.
+- **R2 ECONOMICS** — after 60 fills (any fill), mean realized per FIRE (¢) with SE and a
+  deterministic bootstrap 95% CI; trips if the per-fire mean < −3¢. One-legged flatten losses are
+  INCLUDED (they are real money); the two-leg-only "per pair" mean is shown beside it but does not
+  drive the stop (coordinator ruling 2026-08-26).
 - **R3 PIN RATE** — after 60 fills, pin rate (pinned/settled) vs 0.80; trips if < 0.80. Shown beside
   the 0.90 backtest and the mean implied pin.
 - **R4 MATCH** — none of R1–R3 tripped by 100 fills → the candle number stands live-confirmed at 1

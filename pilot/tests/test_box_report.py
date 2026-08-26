@@ -296,8 +296,10 @@ def test_r2_tripped_below_minus3c():
     j, led = _both_filled(60, realized_delta="-0.10", settlement="1.00", bf_realized="0.00")
     agg = br.build_report(j, led, {})["cumulative"]["aggregates"]
     r2 = agg["R2"]
-    assert r2["n_fills"] == 60
-    assert r2["mean_realized_cents"] == Decimal("-10")
+    assert r2["n_fills"] == 60                       # all any-fill fires (here all two-leg)
+    assert r2["n_pairs"] == 60
+    assert r2["mean_realized_cents"] == Decimal("-10")   # per-FIRE (decisive)
+    assert r2["per_pair_mean_realized_cents"] == Decimal("-10")  # two-leg-only, same when no one-legged
     assert r2["status"] == br.STATUS_TRIPPED
     assert r2["bootstrap_ci95_cents"] is not None
 
@@ -314,6 +316,50 @@ def test_r2_not_yet_below_60():
     j, led = _both_filled(59, realized_delta="-0.10", settlement="1.00", bf_realized="0.00")
     r2 = br.build_report(j, led, {})["cumulative"]["aggregates"]["R2"]
     assert r2["status"].startswith("NOT YET (59/60)")
+
+
+def test_r2_status_on_per_fire_includes_one_legged():
+    """Coordinator ruling: one-legged flatten losses are IN R2's status. Two-leg-only mean is
+    HOLDING (-2c) but the per-fire mean including 20 one-legged -95c flatten losses is < -3c ->
+    TRIPPED. The per_pair figure is still reported and still shows the HOLDING-side number."""
+    journals, ledger = [], []
+    for i in range(40):  # two-leg, realized -0.02 (-2c) -> per_pair alone would HOLD
+        ct = f"2026-08-26T r2mix both {i:03d}"
+        journals.append(("x", fire_journal(ct)))
+        ledger.append(ledger_box_row(ct, realized_delta="-0.02", realized_unsettled=False))
+    for i in range(20):  # one-legged flatten loss -0.95 (-95c)
+        ct = f"2026-08-26T r2mix one {i:03d}"
+        journals.append(("x", fire_journal(ct)))
+        ledger.append(ledger_box_row(ct, filled=False, box_one_legged=True,
+                                     box_flatten_filled=True, realized_delta="-0.95",
+                                     realized_unsettled=False))
+    r2 = br.build_report(journals, ledger, {})["cumulative"]["aggregates"]["R2"]
+    assert r2["n_fills"] == 60          # 40 two-leg + 20 one-legged, all any-fill
+    assert r2["n_pairs"] == 40          # two-leg only
+    # per-fire mean = (40*-2 + 20*-95)/60 = -1980/60 = -33c
+    assert r2["mean_realized_cents"] == Decimal("-33")
+    assert r2["per_pair_mean_realized_cents"] == Decimal("-2")  # two-leg-only stays -2c (HOLDING-side)
+    assert r2["status"] == br.STATUS_TRIPPED  # decided on the per-fire figure
+
+
+def test_r2_one_legged_only_still_counts():
+    """A run of only one-legged fires still advances R2 (any fill), and R1/R3 do not (need two legs)."""
+    journals, ledger = [], []
+    for i in range(60):
+        ct = f"2026-08-26T r2one {i:03d}"
+        journals.append(("x", fire_journal(ct)))
+        ledger.append(ledger_box_row(ct, filled=False, box_one_legged=True,
+                                     box_flatten_filled=True, realized_delta="-0.02",
+                                     realized_unsettled=False))
+    agg = br.build_report(journals, ledger, {})["cumulative"]["aggregates"]
+    assert agg["R2"]["n_fills"] == 60
+    assert agg["R2"]["n_pairs"] == 0
+    assert agg["R2"]["mean_realized_cents"] == Decimal("-2")   # -2c > -3c pin
+    assert agg["R2"]["per_pair_mean_realized_cents"] is None
+    assert agg["R2"]["status"] == br.STATUS_HOLDING
+    # R1 (slippage) and R3 (pin) need two legs -> still NOT YET at 0.
+    assert agg["R1"]["status"].startswith("NOT YET")
+    assert agg["R3"]["n_fills"] == 0
 
 
 def test_r3_tripped_low_pin_rate():

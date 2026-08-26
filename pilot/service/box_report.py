@@ -392,23 +392,32 @@ def r1_slippage(windows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def r2_economics(windows: list[dict[str, Any]]) -> dict[str, Any]:
-    """R2 ECONOMICS: over the two-leg fills, mean realized per pair (cents) with SE + bootstrap 95%
-    CI; TRIPPED after 60 fills if the mean < -3c."""
-    realized_cents = [w["realized"] * _CENT for w in windows
-                      if w["fill_class"] == "both" and w["realized"] is not None]
-    n = len(realized_cents)
-    mean = _mean(realized_cents)
-    se = _se(realized_cents)
-    ci = _bootstrap_ci(realized_cents)
+    """R2 ECONOMICS (coordinator ruling 2026-08-26): the STATUS is computed on the mean realized per
+    FIRE over ALL box fires with any fill (two-leg + one-legged; one-legged flatten losses INCLUDED;
+    zero-fill fires excluded) -- one-legged losses are real money and belong in the economics.
+    TRIPPED after 60 such fills if that per-fire mean < -3c. The two-leg-only 'per pair' mean is kept
+    as a second displayed figure (``per_pair_mean_realized_cents``) but does NOT drive the status.
+    R1 (slippage) and R3 (pin rate) stay two-leg-only -- both need both legs."""
+    per_fire = [w["realized"] * _CENT for w in windows
+                if w["fill_class"] in ("both", "one-legged") and w["realized"] is not None]
+    per_pair = [w["realized"] * _CENT for w in windows
+                if w["fill_class"] == "both" and w["realized"] is not None]
+    n = len(per_fire)
+    mean = _mean(per_fire)          # per-FIRE; the status is computed on THIS
+    se = _se(per_fire)
+    ci = _bootstrap_ci(per_fire)
+    per_pair_mean = _mean(per_pair)  # two-leg-only; displayed, not decisive
     unsettled = sum(1 for w in windows
-                    if w["fill_class"] == "both" and not w["realized_settled"])
+                    if w["fill_class"] in ("both", "one-legged") and not w["realized_settled"])
     tripped = mean is not None and mean < R2_MIN_MEAN_REALIZED_CENTS
     return {
-        "n_fills": n,
-        "mean_realized_cents": mean,
+        "n_fills": n,                                    # all fires with any fill
+        "n_pairs": len(per_pair),                        # two-leg fills only
+        "mean_realized_cents": mean,                     # per-FIRE (decisive)
         "se_cents": se,
         "bootstrap_ci95_cents": ci,
-        "unsettled_pairs": unsettled,
+        "per_pair_mean_realized_cents": per_pair_mean,   # two-leg-only, displayed
+        "unsettled": unsettled,
         "pin_cents": R2_MIN_MEAN_REALIZED_CENTS,
         "min_fills": R2_MIN_FILLS,
         "status": _gate_status(n, R2_MIN_FILLS, bool(tripped and n >= R2_MIN_FILLS)),
@@ -719,9 +728,10 @@ def _render_aggregate(agg: dict[str, Any], lines: list[str]) -> None:
     ci = r2["bootstrap_ci95_cents"]
     ci_s = f"[{_fc(ci[0])},{_fc(ci[1])}]" if ci else "-"
     lines.append(
-        f"  R2 ECONOMICS : {r2['status']:16}  n={r2['n_fills']}  "
-        f"mean_realized={_fc(r2['mean_realized_cents'])} SE={_fc(r2['se_cents'])} "
-        f"CI95={ci_s}  pin=<{_fc(r2['pin_cents'])}  unsettled={r2['unsettled_pairs']}"
+        f"  R2 ECONOMICS : {r2['status']:16}  n={r2['n_fills']}(anyfill)  "
+        f"mean_realized/fire={_fc(r2['mean_realized_cents'])} SE={_fc(r2['se_cents'])} "
+        f"CI95={ci_s}  per_pair={_fc(r2['per_pair_mean_realized_cents'])}(n={r2['n_pairs']})  "
+        f"pin=<{_fc(r2['pin_cents'])}  unsettled={r2['unsettled']}"
     )
     r3 = agg["R3"]
     lines.append(
