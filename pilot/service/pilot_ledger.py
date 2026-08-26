@@ -356,9 +356,16 @@ def _cmd_backfill(entries: list[dict[str, Any]], args: argparse.Namespace) -> in
     if entry is None:
         print(json.dumps({"error": "no_unsettled_window", "window": window}, sort_keys=True))
         return 1
-    results = _parse_results(args.result, args.results_file)
     legs = entry.get("unsettled_legs") or []
-    payoff = settlement_payoff(legs, results)  # fail-closed on a missing/invalid result
+    # F6: a missing/invalid result yields a clean one-line error, not a raw traceback.
+    try:
+        results = _parse_results(args.result, args.results_file)
+        payoff = settlement_payoff(legs, results)  # fail-closed on a missing/invalid result
+    except (KeyError, ValueError, OSError) as e:
+        print(json.dumps(
+            {"error": "invalid_results", "window": window, "detail": str(e),
+             "unsettled_legs": legs}, sort_keys=True))
+        return 1
     backfill = build_backfill_entry(entry, results, payoff, time.time())
     append_entry(backfill, args.ledger)
     print(json.dumps(
