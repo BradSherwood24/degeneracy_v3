@@ -179,6 +179,12 @@ def build_backfill_entry(
         "close_time": window_entry.get("close_time"),
         "mode": "backfill",
         "backfill_of": window_entry.get("close_time"),
+        # F2 (box-report review 2026-08-26): tag the settled window's source/strategy so a report
+        # joining a backfill to a fire by close_time can require it to be the SAME strategy, never
+        # attribute another strategy's backfill that happened to share the close_time. Additive:
+        # copied from the settled window entry (None on a legacy window that carried neither).
+        "source": window_entry.get("fired_source"),
+        "strategy": window_entry.get("strategy"),
         "pairs": window_entry.get("pairs"),
         "fires": 0,
         "filled": False,

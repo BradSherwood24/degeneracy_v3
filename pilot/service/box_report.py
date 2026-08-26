@@ -146,20 +146,38 @@ def _flatten_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Ledger indexing
 # ---------------------------------------------------------------------------
+def _is_box_backfill(row: dict[str, Any]) -> bool:
+    return row.get("source") == WIDE_BOX or row.get("strategy") == "box"
+
+
 def index_ledger(entries: list[dict[str, Any]]) -> tuple[dict[str, dict], dict[str, dict]]:
     """(box_fire_rows_by_window, backfill_rows_by_window). A box FIRE row: fires > 0 AND
     (strategy == 'box' OR fired_source == wide-box). A backfill row: carries ``backfill_of``.
-    Latest row per window wins (append order)."""
+
+    F2 (review 2026-08-26): the backfill join is NOT close_time alone. Among the backfill rows for a
+    close_time, a WIDE_BOX-tagged row wins (the tag is written by ``build_backfill_entry``); a single
+    untagged legacy row is tolerated only when it is the ONLY backfill for that close_time; a
+    non-box-tagged row (a corridor / sub-$1 flip backfill that happened to share the close_time) or an
+    ambiguous set of untagged rows yields NO box backfill (the window reads unsettled — the safe
+    direction, never another strategy's payoff). Latest row wins within the chosen class."""
     fires: dict[str, dict] = {}
-    backfills: dict[str, dict] = {}
+    backfill_candidates: dict[str, list[dict]] = {}
     for e in entries:
         bf = e.get("backfill_of")
         if bf:
-            backfills[str(bf)] = e
+            backfill_candidates.setdefault(str(bf), []).append(e)
             continue
         is_box = e.get("strategy") == "box" or e.get("fired_source") == WIDE_BOX
         if is_box and int(e.get("fires", 0) or 0) > 0:
             fires[str(e.get("close_time"))] = e
+    backfills: dict[str, dict] = {}
+    for ct, rows in backfill_candidates.items():
+        box_rows = [r for r in rows if _is_box_backfill(r)]
+        if box_rows:
+            backfills[ct] = box_rows[-1]
+        elif len(rows) == 1 and rows[0].get("source") is None and rows[0].get("strategy") is None:
+            backfills[ct] = rows[0]  # legacy single untagged row -> best-effort
+        # else: non-box-tagged or ambiguous untagged -> no box backfill (window reads unsettled)
     return fires, backfills
 
 
@@ -392,35 +410,45 @@ def r1_slippage(windows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def r2_economics(windows: list[dict[str, Any]]) -> dict[str, Any]:
-    """R2 ECONOMICS (coordinator ruling 2026-08-26): the STATUS is computed on the mean realized per
-    FIRE over ALL box fires with any fill (two-leg + one-legged; one-legged flatten losses INCLUDED;
-    zero-fill fires excluded) -- one-legged losses are real money and belong in the economics.
-    TRIPPED after 60 such fills if that per-fire mean < -3c. The two-leg-only 'per pair' mean is kept
-    as a second displayed figure (``per_pair_mean_realized_cents``) but does NOT drive the status.
-    R1 (slippage) and R3 (pin rate) stay two-leg-only -- both need both legs."""
-    per_fire = [w["realized"] * _CENT for w in windows
-                if w["fill_class"] in ("both", "one-legged") and w["realized"] is not None]
-    per_pair = [w["realized"] * _CENT for w in windows
-                if w["fill_class"] == "both" and w["realized"] is not None]
-    n = len(per_fire)
-    mean = _mean(per_fire)          # per-FIRE; the status is computed on THIS
+    """R2 ECONOMICS. The STATUS is computed on the mean realized per FIRE over the SETTLED box fires
+    with any fill (two-leg + one-legged; one-legged flatten losses INCLUDED — coordinator ruling
+    2026-08-26; zero-fill fires excluded). TRIPPED after 60 SETTLED such fills if that mean < -3c.
+
+    F1 (review 2026-08-26): only SETTLED fires enter the mean/SE/CI AND the 60-count gate. A wide-box
+    both-filled fire is ``realized_unsettled`` at close, booked at the conservative $1-floor
+    (-C_paid + $1): a fire that will settle PINNED reads -$0.90 there instead of +$0.10, so counting
+    unsettled fires let settlement TIMING alone false-trip R2. A one-legged FLATTENED fire is settled
+    immediately (its round-trip P&L is final). ``unsettled`` (fires with any fill not yet settled) and
+    ``n_settled`` are reported; ``n_fills`` = all any-fill fires for transparency. The two-leg-only
+    ``per_pair_mean_realized_cents`` is displayed but does NOT drive the status. R1 (slippage, known at
+    fill) and R3 (already settled-gated for its rate) are unaffected."""
+    settled = [w for w in windows
+               if w["fill_class"] in ("both", "one-legged")
+               and w["realized"] is not None and w["realized_settled"]]
+    per_fire = [w["realized"] * _CENT for w in settled]
+    per_pair = [w["realized"] * _CENT for w in settled if w["fill_class"] == "both"]
+    n_settled = len(per_fire)
+    n_all = sum(1 for w in windows
+                if w["fill_class"] in ("both", "one-legged") and w["realized"] is not None)
+    mean = _mean(per_fire)           # per-FIRE over SETTLED; the status is computed on THIS
     se = _se(per_fire)
     ci = _bootstrap_ci(per_fire)
-    per_pair_mean = _mean(per_pair)  # two-leg-only; displayed, not decisive
+    per_pair_mean = _mean(per_pair)  # two-leg-only, settled; displayed, not decisive
     unsettled = sum(1 for w in windows
                     if w["fill_class"] in ("both", "one-legged") and not w["realized_settled"])
     tripped = mean is not None and mean < R2_MIN_MEAN_REALIZED_CENTS
     return {
-        "n_fills": n,                                    # all fires with any fill
-        "n_pairs": len(per_pair),                        # two-leg fills only
-        "mean_realized_cents": mean,                     # per-FIRE (decisive)
+        "n_fills": n_all,                                # all any-fill fires (transparency)
+        "n_settled": n_settled,                          # settled any-fill fires (the gate)
+        "n_pairs": len(per_pair),                        # settled two-leg fills only
+        "mean_realized_cents": mean,                     # per-FIRE over settled (decisive)
         "se_cents": se,
         "bootstrap_ci95_cents": ci,
-        "per_pair_mean_realized_cents": per_pair_mean,   # two-leg-only, displayed
+        "per_pair_mean_realized_cents": per_pair_mean,   # two-leg-only, settled, displayed
         "unsettled": unsettled,
         "pin_cents": R2_MIN_MEAN_REALIZED_CENTS,
         "min_fills": R2_MIN_FILLS,
-        "status": _gate_status(n, R2_MIN_FILLS, bool(tripped and n >= R2_MIN_FILLS)),
+        "status": _gate_status(n_settled, R2_MIN_FILLS, bool(tripped and n_settled >= R2_MIN_FILLS)),
     }
 
 
@@ -620,6 +648,7 @@ def compute_s4(day: str, guard: dict[str, Any] | None,
     """S4: today's balance_start / latest balance / loss vs $3.00 (guard file) + the wake journal
     ``s4_balance_check`` records (latest by local_ts). ``ledger_vs_balance_delta`` reported beside it.
     TRIPPED if the loss >= cap OR any day-halting stop is latched today."""
+    corrupt = bool(guard.get("corrupt")) if guard else False
     balance_start = _dec(guard.get("balance_start_dollars")) if guard else None
     latched = list(guard.get("latched", []) or []) if guard else []
     latched_kinds = sorted({str(x.get("kind")) for x in latched if x.get("kind")})
@@ -635,12 +664,17 @@ def compute_s4(day: str, guard: dict[str, Any] | None,
 
     have_data = balance_start is not None or loss is not None or bool(latched)
     tripped = bool(latched) or breached_flag or (loss is not None and loss >= S4_DAILY_LOSS_CAP)
-    if not have_data:
+    # F5 (review 2026-08-26): a corrupt guard file is NOT "no balance data" — its latch state is
+    # UNKNOWN and arming is refused for the day. Surface it distinctly so it is never read as clean.
+    if corrupt:
+        status = "GUARD CORRUPT"
+    elif not have_data:
         status = f"{STATUS_NOT_YET} (no balance data)"
     else:
         status = STATUS_TRIPPED if tripped else STATUS_HOLDING
     return {
         "day": day,
+        "corrupt": corrupt,
         "balance_start_dollars": balance_start,
         "balance_now_dollars": balance_now,
         "loss_dollars": loss,
@@ -728,7 +762,7 @@ def _render_aggregate(agg: dict[str, Any], lines: list[str]) -> None:
     ci = r2["bootstrap_ci95_cents"]
     ci_s = f"[{_fc(ci[0])},{_fc(ci[1])}]" if ci else "-"
     lines.append(
-        f"  R2 ECONOMICS : {r2['status']:16}  n={r2['n_fills']}(anyfill)  "
+        f"  R2 ECONOMICS : {r2['status']:16}  n_settled={r2['n_settled']}(of {r2['n_fills']} anyfill)  "
         f"mean_realized/fire={_fc(r2['mean_realized_cents'])} SE={_fc(r2['se_cents'])} "
         f"CI95={ci_s}  per_pair={_fc(r2['per_pair_mean_realized_cents'])}(n={r2['n_pairs']})  "
         f"pin=<{_fc(r2['pin_cents'])}  unsettled={r2['unsettled']}"
@@ -766,6 +800,9 @@ def _render_aggregate(agg: dict[str, Any], lines: list[str]) -> None:
 
 
 def _render_s4(s4: dict[str, Any], lines: list[str]) -> None:
+    if s4.get("corrupt"):
+        lines.append("  S4 DAILY LOSS: GUARD CORRUPT - arming refused (guard file unparseable)")
+        return
     lines.append(
         f"  S4 DAILY LOSS: {s4['status']:16}  start=${_f(s4['balance_start_dollars'],2)} "
         f"now=${_f(s4['balance_now_dollars'],2)} loss=${_f(s4['loss_dollars'],2)} "
@@ -823,9 +860,11 @@ def render_text(report: dict[str, Any]) -> str:
         _render_aggregate(cum["aggregates"], lines)
         s4s = cum.get("s4_days", [])
         latched_days = [s["day"] for s in s4s if s["any_stop_latched"]]
+        corrupt_days = [s["day"] for s in s4s if s.get("corrupt")]
         lines.append(
             f"  S4 (daily): {len(s4s)} day(s) with balance data; "
-            f"latched: {', '.join(latched_days) if latched_days else 'none'}"
+            f"latched: {', '.join(latched_days) if latched_days else 'none'}; "
+            f"GUARD CORRUPT: {', '.join(corrupt_days) if corrupt_days else 'none'}"
         )
     lines.append("")
     return "\n".join(lines)
@@ -920,32 +959,39 @@ REPORT_KINDS = (
 )
 
 
-_WS_MARKER = '"kind": "kalshi_ws"'
+_KIND_TOKEN = '"kind": "'
 
 
 def load_journal_file(path: str, keep_kinds: tuple[str, ...] = REPORT_KINDS) -> list[dict[str, Any]]:
     """Read one flushed JSONL journal into a raw record list (each: idx, kind, local_ts, obj),
     keeping ONLY records whose kind is in ``keep_kinds``. Streams line by line (no full-file
-    materialization) with a two-stage substring gate: a single fast reject of the dominant
-    ``kalshi_ws`` frames, then the ``"kind": "<k>"`` marker test, BEFORE paying for json.loads
-    (~0.3s over a 150MB / 440k-line journal vs minutes if every line is parsed). A truncated trailing
-    line from a crash mid-flush is skipped, not raised."""
-    markers = tuple(f'"kind": "{k}"' for k in keep_kinds)
+    materialization) and reads the TOP-LEVEL kind directly from the ``"kind": "<value>"`` token BEFORE
+    paying for json.loads (~0.3s over a 150MB / 440k-line journal vs minutes if every line is parsed).
+
+    F3 (review 2026-08-26): the gate reads the ACTUAL top-level kind value, not a substring anywhere in
+    the line. The journal is written ``json.dumps(sort_keys=True)`` (``journal.py``), so the top-level
+    keys serialize sorted (idx, kind, local_ts, obj) and the FIRST ``"kind": "`` in the line is the
+    top-level one — an ``obj`` that embeds ``"kind": "kalshi_ws"`` (or a keep-marker) in a nested field
+    is never confused for the record's kind, in either direction. A truncated final line (or any
+    unparseable line) is skipped, not raised."""
+    keep = set(keep_kinds)
+    tok = _KIND_TOKEN
     out: list[dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as f:
         for ln in f:
-            if _WS_MARKER in ln:
+            i = ln.find(tok)
+            if i == -1:
                 continue
-            if not any(m in ln for m in markers):
+            j = ln.find('"', i + len(tok))
+            if j == -1:
                 continue
-            ln = ln.strip()
-            if not ln:
+            if ln[i + len(tok):j] not in keep:  # exact top-level kind value
                 continue
             try:
                 rec = json.loads(ln)
             except json.JSONDecodeError:
                 continue  # a truncated final line (or any unparseable line) is skipped
-            if rec.get("kind") in keep_kinds:
+            if rec.get("kind") in keep:  # belt-and-suspenders after the exact prefilter
                 out.append(rec)
     return out
 

@@ -37,10 +37,14 @@ met). No judgment text. The thresholds mirror the falsifier (Brad's pins 2026-08
 
 - **R1 SLIPPAGE** — after 30 two-leg fills, mean (fill − decided ask) summed over both legs (¢),
   with SE; trips if the mean > +1.0¢. The sharp instrument.
-- **R2 ECONOMICS** — after 60 fills (any fill), mean realized per FIRE (¢) with SE and a
+- **R2 ECONOMICS** — after 60 **settled** fills, mean realized per FIRE (¢) with SE and a
   deterministic bootstrap 95% CI; trips if the per-fire mean < −3¢. One-legged flatten losses are
   INCLUDED (they are real money); the two-leg-only "per pair" mean is shown beside it but does not
-  drive the stop (coordinator ruling 2026-08-26).
+  drive the stop (coordinator ruling 2026-08-26). Only SETTLED fires enter the mean AND the 60-count
+  gate — an unsettled both-filled fire is booked at the conservative $1 floor (a will-pin fire reads
+  −$0.90 not +$0.10), so counting it would let settlement TIMING alone false-trip R2 (review fix
+  2026-08-26). A one-legged flattened fire is settled immediately (round-trip P&L is final). The line
+  shows `n_settled(of N anyfill)` and `unsettled=`.
 - **R3 PIN RATE** — after 60 fills, pin rate (pinned/settled) vs 0.80; trips if < 0.80. Shown beside
   the 0.90 backtest and the mean implied pin.
 - **R4 MATCH** — none of R1–R3 tripped by 100 fills → the candle number stands live-confirmed at 1
@@ -49,7 +53,8 @@ met). No judgment text. The thresholds mirror the falsifier (Brad's pins 2026-08
 - **A5** — one-legged rate over the rolling last 20 box fires vs 0.10.
 - **S4** — today's balance_start / latest balance / loss vs $3.00 (from the day-guard file + the
   `s4_balance_check` wake records), whether any stop is latched today, and the
-  `ledger_vs_balance_delta`.
+  `ledger_vs_balance_delta`. A corrupt/unparseable day-guard reads `GUARD CORRUPT - arming refused`
+  (its latch state is unknown), NOT "no balance data" (review fix 2026-08-26).
 - **LEVEL BUMPS** — legs whose fill > the decided ask (Brad: "it's okay if an order bumps up a
   level, we'll note it"), with the distribution of bump sizes.
 - **CANDLE STALENESS** — per fire, C paid vs C_mid at decision (paid-vs-mid only on both-filled

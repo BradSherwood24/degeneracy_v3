@@ -90,12 +90,21 @@ def ledger_box_row(close_time, *, hourly_fill="0.93", m15_fill="0.90",
     }
 
 
-def backfill_row(close_time, *, settlement_payoff="2.00", realized_delta="1.00", floor_netted="1.00"):
-    return {
+def backfill_row(close_time, *, settlement_payoff="2.00", realized_delta="1.00", floor_netted="1.00",
+                 source=br.WIDE_BOX, strategy="box"):
+    """A settlement-backfill row. Carries the F2 source/strategy tag by default (as
+    ``pilot_ledger.build_backfill_entry`` now writes); pass source=None, strategy=None for a legacy
+    untagged row."""
+    row = {
         "close_time": close_time, "backfill_of": close_time, "fires": 0, "filled": False,
         "realized_delta": realized_delta, "settlement_payoff": settlement_payoff,
         "floor_netted": floor_netted, "realized_unsettled": False,
     }
+    if source is not None:
+        row["source"] = source
+    if strategy is not None:
+        row["strategy"] = strategy
+    return row
 
 
 def _one_window(journal, ledger):
@@ -568,3 +577,157 @@ def test_load_journal_file_fast_reject(tmp_path):
     kinds = [r["kind"] for r in recs]
     assert "kalshi_ws" not in kinds
     assert "window_start" in kinds and "box_fire" in kinds
+
+
+# ---------------------------------------------------------------------------
+# F1 (review 2026-08-26): R2 status over SETTLED fires only; settlement timing must not flip it
+# ---------------------------------------------------------------------------
+def _w(realized, settled, cls="both"):
+    return {"fill_class": cls, "realized": Decimal(str(realized)), "realized_settled": settled}
+
+
+def test_r2_settled_60_all_settled_holding():
+    # True operating point at pin rate 0.90: 54 pinned +0.10, 6 not -0.90; all settled -> mean 0c.
+    windows = [_w("0.10", True)] * 54 + [_w("-0.90", True)] * 6
+    r2 = br.r2_economics(windows)
+    assert r2["n_settled"] == 60
+    assert r2["mean_realized_cents"] == Decimal("0")
+    assert r2["status"] == br.STATUS_HOLDING
+
+
+def test_r2_unsettled_will_pin_do_not_flip_status():
+    # Same 60-settled reality PLUS 2 unsettled-will-pin fires booked at the conservative floor
+    # (-0.90). The 2 unsettled enter NEITHER the mean NOR the gate -> status stays HOLDING at the
+    # 60-settled mean (0c); settlement TIMING alone cannot retire R2.
+    windows = ([_w("0.10", True)] * 54 + [_w("-0.90", True)] * 6
+               + [_w("-0.90", False)] * 2)
+    r2 = br.r2_economics(windows)
+    assert r2["n_settled"] == 60
+    assert r2["n_fills"] == 62          # all any-fill fires
+    assert r2["unsettled"] == 2
+    assert r2["mean_realized_cents"] == Decimal("0")
+    assert r2["status"] == br.STATUS_HOLDING
+
+
+def test_r2_reviewer_repro_false_trip_is_gone():
+    # The reviewer's exact repro TRIPPED under the OLD code (mean -3.33c): 52 pinned +0.10 settled,
+    # 6 not -0.90 settled, 2 unsettled-will-pin booked at floor -0.90 (60 total). With the fix, only
+    # 58 are settled -> NOT YET (58/60), and never TRIPPED.
+    windows = ([_w("0.10", True)] * 52 + [_w("-0.90", True)] * 6
+               + [_w("-0.90", False)] * 2)
+    r2 = br.r2_economics(windows)
+    assert r2["n_settled"] == 58
+    assert r2["status"].startswith("NOT YET (58/60)")
+    assert r2["status"] != br.STATUS_TRIPPED
+
+
+def test_r2_all_unsettled_day_not_yet():
+    windows = [_w("-0.90", False)] * 12
+    r2 = br.r2_economics(windows)
+    assert r2["n_settled"] == 0
+    assert r2["unsettled"] == 12
+    assert r2["mean_realized_cents"] is None
+    assert r2["status"].startswith("NOT YET (0/60)")
+
+
+def test_r2_one_legged_flatten_counts_as_settled():
+    # A one-legged FLATTENED fire is settled immediately (round-trip P&L is final) -> it enters R2.
+    windows = [_w("-0.04", True, cls="one-legged")] * 60
+    r2 = br.r2_economics(windows)
+    assert r2["n_settled"] == 60
+    assert r2["n_pairs"] == 0
+    assert r2["mean_realized_cents"] == Decimal("-4")
+    assert r2["status"] == br.STATUS_TRIPPED  # -4c < -3c
+
+
+# ---------------------------------------------------------------------------
+# F2 (review): backfill join requires the box source tag
+# ---------------------------------------------------------------------------
+def test_backfill_join_requires_box_source():
+    ct = "2026-08-26T05:00:00Z"
+    # a foreign (non-box) backfill sharing the close_time is appended LAST; the box one must still win.
+    foreign = backfill_row(ct, settlement_payoff="1.00", realized_delta="0.00",
+                           source="sub-dollar-flip", strategy="flip")
+    box_bf = backfill_row(ct, settlement_payoff="2.00", realized_delta="1.00")
+    led = [ledger_box_row(ct, realized_delta="-0.86"), box_bf, foreign]
+    w = _one_window(fire_journal(ct), led)
+    assert w["outcome"] == "pinned"           # picked the WIDE_BOX backfill, not the foreign one
+    assert w["realized"] == Decimal("0.14")
+
+
+def test_backfill_legacy_untagged_single_tolerated():
+    ct = "2026-08-26T06:00:00Z"
+    legacy = backfill_row(ct, settlement_payoff="2.00", realized_delta="1.00",
+                          source=None, strategy=None)
+    w = _one_window(fire_journal(ct), [ledger_box_row(ct, realized_delta="-0.86"), legacy])
+    assert w["outcome"] == "pinned"           # single untagged row -> best-effort accepted
+
+
+def test_backfill_ambiguous_untagged_skipped():
+    ct = "2026-08-26T07:00:00Z"
+    a = backfill_row(ct, settlement_payoff="2.00", realized_delta="1.00", source=None, strategy=None)
+    b = backfill_row(ct, settlement_payoff="1.00", realized_delta="0.00", source=None, strategy=None)
+    w = _one_window(fire_journal(ct), [ledger_box_row(ct), a, b])
+    assert w["outcome"] == "unsettled"        # two untagged rows -> ambiguous -> no backfill
+
+
+def test_backfill_nonbox_only_skipped():
+    ct = "2026-08-26T08:00:00Z"
+    foreign = backfill_row(ct, settlement_payoff="1.00", realized_delta="0.00",
+                           source="corridor", strategy="corridor")
+    w = _one_window(fire_journal(ct), [ledger_box_row(ct), foreign])
+    assert w["outcome"] == "unsettled"        # non-box tag -> never attributed to the box window
+
+
+def test_build_backfill_entry_carries_source_tag():
+    from service.pilot_ledger import build_backfill_entry
+    window_entry = {"close_time": "2026-08-26T05:00:00Z", "fired_source": br.WIDE_BOX,
+                    "strategy": "box", "floor_booked": "1.00",
+                    "unsettled_legs": [{"ticker": _HOURLY, "side": "no", "count": 1}]}
+    bf = build_backfill_entry(window_entry, {_HOURLY: "no"}, Decimal("2.00"), 1.0)
+    assert bf["source"] == br.WIDE_BOX
+    assert bf["strategy"] == "box"
+
+
+# ---------------------------------------------------------------------------
+# F3 (review): fast-reject reads the exact top-level kind, not any substring
+# ---------------------------------------------------------------------------
+def test_load_journal_file_keeps_record_with_ws_marker_in_field(tmp_path):
+    p = tmp_path / "j.jsonl"
+    sel = _selection()
+    sel["reason_note"] = 'contains "kind": "kalshi_ws" inside a string field'
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(json.dumps(_rec("window_start", {"close_time": "2026-08-26T05:00:00Z"})) + "\n")
+        # a real box_fire whose obj embeds the ws marker in a nested string -> must be KEPT
+        f.write(json.dumps(_rec("box_fire", {"selection": sel})) + "\n")
+        # a real kalshi_ws whose obj embeds a keep-marker in a string -> must be DROPPED
+        f.write(json.dumps(_rec("kalshi_ws", {"note": 'has "kind": "box_fire" in a string'})) + "\n")
+    recs = br.load_journal_file(str(p))
+    kinds = [r["kind"] for r in recs]
+    assert "box_fire" in kinds          # not dropped despite the embedded ws marker
+    assert "kalshi_ws" not in kinds     # not kept despite the embedded keep-marker
+    assert kinds.count("box_fire") == 1
+
+
+# ---------------------------------------------------------------------------
+# F5 (review): a corrupt day-guard surfaces distinctly, not as "no balance data"
+# ---------------------------------------------------------------------------
+def test_s4_corrupt_guard_surfaced():
+    s4 = br.compute_s4("2026-08-26", {"utc_day": "2026-08-26", "corrupt": True, "latched": []}, [])
+    assert s4["corrupt"] is True
+    assert s4["status"] == "GUARD CORRUPT"
+    lines = []
+    br._render_s4(s4, lines)
+    assert any("GUARD CORRUPT - arming refused" in ln for ln in lines)
+
+
+def test_s4_corrupt_guard_in_cumulative(tmp_path):
+    # a corrupt guard file must show under cumulative "GUARD CORRUPT", not vanish.
+    ops = tmp_path / "ops"
+    ops.mkdir()
+    (ops / "stops_2026-08-26.json").write_text("{ this is not valid json", encoding="utf-8")
+    guards = br.load_guards(str(ops))
+    assert guards["2026-08-26"].get("corrupt") is True
+    rep = br.build_report([], [], guards)
+    text = br.render_text(rep)
+    assert "GUARD CORRUPT: 2026-08-26" in text
