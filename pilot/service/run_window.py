@@ -399,7 +399,7 @@ class WindowService:
         policy_path: str = DEFAULT_POLICY_PATH,
         falsifier_path: str = DEFAULT_FALSIFIER_PATH,
         box_falsifier_path: str = DEFAULT_BOX_FALSIFIER_PATH,
-        mode_txt_path: str = DEFAULT_MODE_TXT,
+        mode_txt_path: str | None = None,
         journal_dir: str = DEFAULT_JOURNAL_DIR,
         ledger_path: str = DEFAULT_LEDGER_PATH,
         proxy_base: str = "http://127.0.0.1:8642",
@@ -417,7 +417,7 @@ class WindowService:
         anchor_fetcher: Callable[[], list[dict]] | None = None,
         poll_sleep: Callable[[float], None] = time.sleep,
         cli_strategy: str | None = None,
-        strategy_txt_path: str = DEFAULT_STRATEGY_TXT,
+        strategy_txt_path: str | None = None,
         box_policy_path: str = DEFAULT_BOX_POLICY_PATH,
         market_result_getter: Callable[[str], str | None] | None = None,
     ) -> None:
@@ -427,7 +427,12 @@ class WindowService:
         self.policy_path = policy_path
         self.falsifier_path = falsifier_path
         self.box_falsifier_path = box_falsifier_path
-        self.mode_txt_path = mode_txt_path
+        # Lever paths resolve to the MODULE-LEVEL defaults at call time (not import time) so a
+        # monkeypatch of run_window.DEFAULT_MODE_TXT / DEFAULT_STRATEGY_TXT (the test-isolation
+        # fixture) is honored. Callers that pass explicit paths are unaffected. The day-guard/ops
+        # dir is derived from the resolved mode path below, so redirecting mode.txt also redirects
+        # the stops_YYYY-MM-DD.json guard files.
+        self.mode_txt_path = mode_txt_path if mode_txt_path is not None else DEFAULT_MODE_TXT
         self.journal_dir = journal_dir
         self.ledger_path = ledger_path
         self.proxy_base = proxy_base
@@ -447,7 +452,9 @@ class WindowService:
         self._poll_sleep = poll_sleep
         # Strategy lever (spec item 1). Resolved in prepare(); stored so the whole lifecycle branches.
         self.cli_strategy = cli_strategy
-        self.strategy_txt_path = strategy_txt_path
+        self.strategy_txt_path = (
+            strategy_txt_path if strategy_txt_path is not None else DEFAULT_STRATEGY_TXT
+        )
         self.box_policy_path = box_policy_path
         self._market_result_getter = market_result_getter
         self._strategy = "corridor"
@@ -476,7 +483,7 @@ class WindowService:
         self._day_totals: tuple[Decimal, int] = (Decimal(0), 0)  # (realized_today, guard_trips_today)
         # BUG-3 repair: day-scoped guard file (stop latching + S4 balance baseline) at ops/.
         self._utc_day = str(close_time)[:10]
-        self._ops_dir = os.path.dirname(os.path.abspath(mode_txt_path))
+        self._ops_dir = os.path.dirname(os.path.abspath(self.mode_txt_path))
         self._day_guard_path = os.path.join(self._ops_dir, f"stops_{self._utc_day}.json")
         self._day_guard: Any = None
 
