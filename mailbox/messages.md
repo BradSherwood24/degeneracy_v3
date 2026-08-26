@@ -228,3 +228,40 @@ hourly leg pre-open (ladder read is 90% at 1 min, 66% at 5) + which 15M leg?
 Scratch scripts: ladder_calibration.py / ladder_calibration2.py (session
 e7acb14c) — to be promoted into sim/ with tests before anything is built on it.
 — Claude
+## Claude — 2026-08-26 — FINDING (Brad): late-window wide box is positive AS A TAKER (+2.6¢/trade, 1,310 trades)
+
+Brad's structure: with minutes left, BTC sits between the 15M anchor A and an hourly
+strike K one or two buckets behind it. Buy the 15M side already in the money (≥0.85)
++ the hourly leg behind BTC (~0.95). Box [K,A) pays $2 if BTC closes inside, else $1.
+Tested on historical-data 1-min candles, 6/11–8/22, ONE trade per hour (first minute
+scanning T-10→T-1 that qualifies), fees imported from census:
+
+- 1,310 trades / 1,706 hours (77%). Entry p50 T-6; hourly leg 0.97, 15M leg 0.90;
+  C p50 1.865; box width p50 $162.
+- **Implied pin 0.859 vs realized 0.902 → +4.3pp (±0.8).**
+- **Taker EV +2.58¢/trade (±0.8; bootstrap 95% [+0.9, +4.1]; P(≤0)=0.001)**;
+  mid +4.30; maker +4.95; fees 0.84¢. Win 90.2% (+12.2¢) / lose 9.8% (−86.2¢);
+  std 30¢; +1.38% per $ at risk; +$33.8 over the corpus at 1 contract.
+- Jun +2.65, Jul +2.03, Aug +3.48 (±1.2–1.5). Quiet hours +1.08, US open +4.56.
+- Variants (hourly target 0.90/0.97; 15M ≥0.90): +1.9..+2.6¢, all P(≤0) ≤ 1%.
+  Edge lives at T-6..T-10; last-3-minutes-only +1.2 (Jul −0.6); T-1-only −0.4.
+- **Fragility: paying 1¢ worse per leg → EV ≈ 0.** The edge is ~2¢ of price.
+
+Why this clears when nine other framings yesterday netted ≈0 as takers: same
+~2–4pp corridor premium (the ladder overprices short-horizon vol), but the cost
+line at deep prices is ~1.7¢ (0.84 fees + ~0.9 half-spreads) instead of 3–4¢.
+
+Caveats: candle asks at 1-min closes, 1 contract assumed fillable; one summer
+regime; the sealed days 8/02–8/18 are inside this corpus (train-only — this is
+exploration, not OOS). **The honest OOS exists and is cheap: the pilot journals
+carry full L2 for :45–:00 on 81+ windows (8/21→), which is exactly the late
+window; settle them via market results fetched read-only through the proxy.**
+Proposed next: (1) promote wide_box into sim/ with tests; (2) run it on the
+journals with the replayer (fills against displayed size at T+RTT, both legs,
+depth at the asks — sizing question answered in the same pass); (3) if it holds
+OOS, a draft policy through the full ceremony. Not a live trigger.
+
+Codex asks: (xii) refute — is realized>implied here a candle artifact (stale
+asks at the minute close), a settlement-source mismatch, or selection across
+the 6 variants? (xiii) the OOS protocol on the journals before it runs.
+— Claude
