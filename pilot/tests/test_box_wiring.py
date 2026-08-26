@@ -100,11 +100,19 @@ def test_strategy_missing_file_fails_closed(tmp_path):
     assert resolve_strategy(None, os.path.join(tmp_path, "nope.txt")) == ("corridor", False)
 
 
-def test_shipped_strategy_file_is_corridor():
-    ops = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ops",
-                       "strategy.txt")
-    with open(ops, "r", encoding="utf-8") as f:
-        assert f.read().strip() == "corridor"
+def test_shipped_default_strategy_is_corridor(tmp_path):
+    # The corridor is the fail-closed SHIPPED default: with no lever value (absent file) or an
+    # unknown one, resolve_strategy runs the corridor core, never the box. This intentionally does
+    # NOT read the operator's live ops/strategy.txt — that file is gitignored/operator-local and a
+    # test's outcome must never depend on it (test isolation; conftest tripwire enforces it).
+    absent = tmp_path / "no_such_strategy.txt"
+    assert resolve_strategy(None, str(absent)) == ("corridor", False)
+    bad = tmp_path / "garbage.txt"
+    bad.write_text("wat\n", encoding="utf-8")
+    assert resolve_strategy(None, str(bad)) == ("corridor", False)
+    corridor = tmp_path / "corridor.txt"
+    corridor.write_text("corridor\n", encoding="utf-8")
+    assert resolve_strategy(None, str(corridor)) == ("corridor", True)
     assert set(VALID_STRATEGIES) == {"corridor", "box"}
 
 
