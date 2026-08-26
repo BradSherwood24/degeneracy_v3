@@ -135,7 +135,8 @@ def test_invalid_strategy_runs_corridor_dry_never_armed(tmp_path):
         ledger_path=os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl"),
         wake_context=FakeWake(_corridor_wake()),
         health_get=(lambda: GOOD_HEALTH), positions_reader=(lambda: {"market_positions": []}),
-        balance_get=(lambda: {"balance": 1000000}),
+        balance_get=(lambda: {"balance": 1000000, "balance_dollars": "10000.00",
+                              "portfolio_value": "0"}),
         window_driver=(lambda r, d: None),
         anchor_fetcher=(lambda: list(_corridor_wake().fifteen_leg.markets)),
         clock=(lambda: _FIXED_NOW), poll_sleep=(lambda d: None),
@@ -289,7 +290,11 @@ def _box_svc(tmp_path, *, mode="armed", window_driver=None, post_fn=None, wake=N
         wake_context=FakeWake(w),
         health_get=(lambda: GOOD_HEALTH),
         positions_reader=(lambda: {"market_positions": []}),
-        balance_get=(None if balance is None else (lambda: {"balance": balance})),
+        # repairs/instruments F2: parse_balance requires BOTH balance (int cents) and balance_dollars.
+        balance_get=(None if balance is None
+                     else (lambda: {"balance": balance,
+                                    "balance_dollars": str(Decimal(balance) / 100),
+                                    "portfolio_value": "0"})),
         window_driver=window_driver,
         post_fn=post_fn,
         anchor_fetcher=(lambda: list(w.fifteen_leg.markets)),

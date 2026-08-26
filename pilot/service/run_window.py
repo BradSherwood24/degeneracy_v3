@@ -1559,10 +1559,11 @@ class WindowService:
             action = PositionAction("flatten", ticker, side, count, "box one-legged flatten")
             intent = build_flatten_intent(action, self.close_time, WIDE_BOX, bid,
                                           new_client_order_id())
-            self.ledger_state = record_intent(self.ledger_state, intent)
             res = self.executor.execute(intent, t_minus_s=t_minus_s, stop_authorized=True)
-            for r in res.responses:
-                self.ledger_state = record_response(self.ledger_state, r)
+            # Book the flatten (intent + fills) as a round-trip via the SAME folding path the
+            # corridor's stop-authorized flattens use (repairs/instruments F1): a filled flatten
+            # reduces net -> drops out of unsettled_legs, never a phantom naked leg.
+            self._fold_flatten_response(intent, res)
             if self.ledger_state.net(which) <= 0:
                 self._box_one_legged = False  # successfully flattened -> not a held one-legged entry
                 self._journal("box_flatten",
