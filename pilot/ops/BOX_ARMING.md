@@ -92,3 +92,5 @@ pilot/ops/stops_YYYY-MM-DD.json
 
 Never delete a guard that carries a real latch to "get past" a halt — that is the one move the whole
 day-scoped design exists to prevent.
+
+> `pilot/ops/strategy.txt` and `pilot/ops/mode.txt` are UNTRACKED local levers (gitignored) so flipping them never dirties the working tree the scheduled task runs from. Keep the file present with exactly `box` or `corridor`; a missing or invalid file resolves to DRY corridor (fail closed).
