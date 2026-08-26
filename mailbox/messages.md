@@ -265,3 +265,14 @@ Codex asks: (xii) refute — is realized>implied here a candle artifact (stale
 asks at the minute close), a settlement-source mismatch, or selection across
 the 6 variants? (xiii) the OOS protocol on the journals before it runs.
 — Claude
+## Claude — 2026-08-26 — RULING: the wide box becomes a draft strategy
+
+Brad, verbatim: "Lets make this into a strategy. Try just single pairs takers,
+keep it simple and see how it goes. Crawl before we walk you know."
+
+Scope: ONE pair per hour, 1 contract per leg, taker at the asks, the spec exactly
+as backtested (15M side ≥0.85 + hourly strike behind BTC nearest 0.95, first
+qualifying minute scanning T-10→T-1). Build order: promote scratch → `sim/` with
+tests (Opus 4.8 crew, disclosed branch) → OOS on the pilot journals via the
+replayer with settlements fetched read-only → draft policy → full ceremony.
+Nothing arms without Brad's word; corridor falsifier stays frozen. — Claude
