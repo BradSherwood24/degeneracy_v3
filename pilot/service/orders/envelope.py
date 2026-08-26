@@ -35,7 +35,7 @@ to buy/sell. For a whole-cent input this is byte-identical to translate's price 
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -118,7 +118,17 @@ def build_batch(entries: list[dict[str, Any]]) -> dict[str, Any]:
 @dataclass(frozen=True)
 class OrderResponse:
     """Parsed per-entry order result. ``no_fill`` distinguishes a zero-fill / error / transport
-    failure from a real (possibly partial) fill; ``error`` carries the classifier string."""
+    failure from a real (possibly partial) fill; ``error`` carries the classifier string.
+
+    UNITS (Phase-3a units repair, 2026-08-26): ``average_fill_price`` is in the ORDER'S side-space
+    — directly comparable to the leg's ``limit_price`` — for EVERY consumer (ledger, stops, parity,
+    reports). Kalshi reports a NO-side order's price in YES-space (a NO fill at 0.97 comes back as
+    0.0300 == 1 - 0.97), so the parse layer converts it exactly once via ``normalize_fill_to_side``
+    (price_no = 1 - price_yes). ``raw_reported_price`` preserves the untouched venue value (the
+    YES-space number for a NO order) so the journal keeps the raw truth and normalization stays
+    idempotent (it always re-derives from ``raw_reported_price``). ``average_fee_paid`` is a dollar
+    amount and is side-INDEPENDENT (venue-verified against Kalshi's realized on the 2026-08-23 fills)
+    — it is never flipped."""
 
     client_order_id: str | None
     order_id: str | None
@@ -127,6 +137,7 @@ class OrderResponse:
     average_fill_price: Decimal | None
     average_fee_paid: Decimal | None
     ts_ms: int | None
+    raw_reported_price: Decimal | None = None
     error: str | None = None
     no_fill: bool = False
 
@@ -148,6 +159,31 @@ def _dec(v: object) -> Decimal | None:
 def _dec0(v: object) -> Decimal:
     d = _dec(v)
     return d if d is not None else Decimal(0)
+
+
+def normalize_fill_to_side(resp: OrderResponse, side: str) -> OrderResponse:
+    """THE units choke point: return ``resp`` with ``average_fill_price`` in ``side``'s space.
+
+    Kalshi reports a NO-side order's price in YES-space (a NO fill at 0.97 -> 0.0300); this converts
+    it to NO-space (price_no = 1 - price_yes) so every downstream consumer sees a price directly
+    comparable to the leg's ``limit_price``. ``side`` is the order's outcome side ('yes'/'no').
+
+    Idempotent: the normalized price is ALWAYS derived from ``raw_reported_price`` (the untouched
+    venue value), so calling this twice — or on an already-normalized response — yields the same
+    result. When ``raw_reported_price`` is unset (a freshly parsed slot), the current
+    ``average_fill_price`` is treated as the raw venue value and captured as ``raw_reported_price``.
+    A None price (no-fill / error) passes through untouched. Fees are side-independent — never
+    flipped here."""
+    raw = resp.raw_reported_price if resp.raw_reported_price is not None else resp.average_fill_price
+    if raw is None:
+        return resp
+    if side == "no":
+        norm = _ONE - raw
+    elif side == "yes":
+        norm = raw
+    else:
+        raise ValueError(f"normalize_fill_to_side: unexpected side={side!r}")
+    return replace(resp, average_fill_price=norm, raw_reported_price=raw)
 
 
 def no_fill_response(client_order_id: str | None, error: str) -> OrderResponse:
@@ -175,6 +211,11 @@ def parse_entry_response(slot: dict[str, Any]) -> OrderResponse:
     """
     if not isinstance(slot, dict):
         return no_fill_response(None, f"malformed_response_slot:{type(slot).__name__}")
+    # The venue price is captured RAW here (YES-space for a NO order). Side-normalization is applied
+    # by the caller via ``normalize_fill_to_side`` once the leg's side is known (single: below;
+    # batch: the executor's _align_batch, keyed by client_order_id). ``raw_reported_price`` mirrors
+    # the parsed value so normalization is idempotent no matter how many times it runs.
+    raw_price = _dec(slot.get("average_fill_price"))
     err = slot.get("error")
     if err:
         return OrderResponse(
@@ -182,9 +223,10 @@ def parse_entry_response(slot: dict[str, Any]) -> OrderResponse:
             order_id=slot.get("order_id"),
             fill_count=_dec0(slot.get("fill_count")),
             remaining_count=_dec0(slot.get("remaining_count")),
-            average_fill_price=_dec(slot.get("average_fill_price")),
+            average_fill_price=raw_price,
             average_fee_paid=_dec(slot.get("average_fee_paid")),
             ts_ms=_int(slot.get("ts_ms")),
+            raw_reported_price=raw_price,
             error=str(err),
             no_fill=True,
         )
@@ -193,9 +235,10 @@ def parse_entry_response(slot: dict[str, Any]) -> OrderResponse:
         order_id=slot.get("order_id"),
         fill_count=_dec0(slot.get("fill_count")),
         remaining_count=_dec0(slot.get("remaining_count")),
-        average_fill_price=_dec(slot.get("average_fill_price")),
+        average_fill_price=raw_price,
         average_fee_paid=_dec(slot.get("average_fee_paid")),
         ts_ms=_int(slot.get("ts_ms")),
+        raw_reported_price=raw_price,
         error=None,
         no_fill=False,
     )
@@ -210,12 +253,18 @@ def _int(v: object) -> int | None:
         return None
 
 
-def parse_single_response(body: dict[str, Any]) -> OrderResponse:
+def parse_single_response(body: dict[str, Any], side: str | None = None) -> OrderResponse:
     """Parse a single-order create response. Kalshi wraps the order in {"order": {...}}; a bare
-    object is also accepted (defensive)."""
+    object is also accepted (defensive).
+
+    ``side`` is the submitted order's outcome side ('yes'/'no'); when given, the reported price is
+    normalized into that side's space (the units choke point). Omitting it leaves the raw venue
+    value (back-compat for callers that normalize later)."""
     if isinstance(body, dict) and isinstance(body.get("order"), dict):
-        return parse_entry_response(body["order"])
-    return parse_entry_response(body)
+        resp = parse_entry_response(body["order"])
+    else:
+        resp = parse_entry_response(body)
+    return normalize_fill_to_side(resp, side) if side is not None else resp
 
 
 def parse_batch_response(body: dict[str, Any]) -> list[OrderResponse]:

@@ -35,11 +35,15 @@ confirmed by Brad before Phase 5.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from service.ledger import (
     PURPOSE_FLATTEN,
@@ -66,11 +70,21 @@ _FROZEN_LINE = "STATUS: FROZEN"
 @dataclass(frozen=True)
 class StopConfig:
     slippage_alarm_dollars: Decimal = Decimal("0.02")
-    daily_loss_cap_dollars: Decimal = Decimal("5.00")
+    # S4 daily-loss cap (dollars). Brad's ruling 2026-08-26: S4's SOURCE OF TRUTH is the ACCOUNT
+    # BALANCE (this account runs no other strategy, so balance delta == P&L), checked at each wake;
+    # the repaired ledger realized is the SECONDARY, reported figure. Default $3.00 as a constant for
+    # now — the box falsifier will pin it.
+    daily_loss_cap_dollars: Decimal = Decimal("3.00")
     guard_trips_standdown: int = 5
     # PENDING-BRAD (F8) — see module docstring.
     hold_complete_floor_pairs_to_settlement: bool = True
     flatten_unprotected_exposure: bool = True
+
+
+# Stops that HALT THE DAY (the falsifier: a stop halts the DAY, not just the window). These latch to
+# the day-scoped guard file and refuse arming for the rest of the UTC day. S5 is an arming refusal
+# (never a trip), so it is not in this set.
+DAY_HALTING_STOPS = (S1_ARITH, S2_IMBALANCE, S3_RECON, S4_DAILY_LOSS)
 
 
 @dataclass(frozen=True)
@@ -327,6 +341,160 @@ def arming_check(
 
 
 # ---------------------------------------------------------------------------
+# Day-scoped guard file (BUG-3 repair): stop LATCHING + S4 balance baseline across the
+# process-per-window boundary. One file per UTC day at ops/stops_YYYY-MM-DD.json holds:
+#   * ``latched``: the day-halting stops (S1-S4) tripped so far today -> refuse to arm for the rest
+#     of the day (the falsifier: a stop halts the DAY). Each window is a fresh :40 process, so this
+#     FILE is the only thing that persists a trip; nothing else does.
+#   * ``balance_start_cents``: the account balance snapshot at the FIRST wake of the day. S4's source
+#     of truth is the account balance (Brad 2026-08-26): loss = balance_start - balance_now at every
+#     wake; loss >= cap -> latch S4.
+# A NEW UTC day gets a fresh file (path is day-scoped). A CORRUPT/unreadable file FAILS CLOSED: the
+# arming check treats it as "cannot confirm no latch" and refuses to arm.
+# ---------------------------------------------------------------------------
+_DAY_GUARD_PREFIX = "stops_"
+
+
+@dataclass(frozen=True)
+class DayGuard:
+    """Parsed day-guard file. ``corrupt`` True means the file existed but could not be trusted
+    (unparseable / wrong shape) -> callers must fail closed (refuse to arm)."""
+
+    utc_day: str
+    balance_start_cents: int | None = None
+    latched: tuple[dict, ...] = ()
+    corrupt: bool = False
+    exists: bool = False
+
+
+def day_guard_path(ops_dir: str, utc_day: str) -> str:
+    """The day-scoped guard file path: ops/stops_YYYY-MM-DD.json (UTC day)."""
+    return os.path.join(ops_dir, f"{_DAY_GUARD_PREFIX}{utc_day}.json")
+
+
+def read_day_guard(path: str, utc_day: str) -> DayGuard:
+    """Read the day-guard file. Missing -> a fresh empty guard (not corrupt). Present but
+    unparseable/wrong-shape/wrong-day -> corrupt=True (fail closed at the call site)."""
+    if not os.path.exists(path):
+        return DayGuard(utc_day=utc_day, exists=False)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        logger.error("[STOPS] day-guard file unreadable/corrupt: %s", path)
+        return DayGuard(utc_day=utc_day, corrupt=True, exists=True)
+    if not isinstance(data, dict) or data.get("utc_day") != utc_day:
+        logger.error("[STOPS] day-guard file malformed or wrong day: %s", path)
+        return DayGuard(utc_day=utc_day, corrupt=True, exists=True)
+    latched = data.get("latched")
+    if not isinstance(latched, list) or not all(isinstance(x, dict) for x in latched):
+        logger.error("[STOPS] day-guard 'latched' malformed: %s", path)
+        return DayGuard(utc_day=utc_day, corrupt=True, exists=True)
+    bsc = data.get("balance_start_cents")
+    if bsc is not None:
+        try:
+            bsc = int(bsc)
+        except (TypeError, ValueError):
+            logger.error("[STOPS] day-guard 'balance_start_cents' malformed: %s", path)
+            return DayGuard(utc_day=utc_day, corrupt=True, exists=True)
+    return DayGuard(
+        utc_day=utc_day, balance_start_cents=bsc, latched=tuple(latched), exists=True
+    )
+
+
+def _write_day_guard(path: str, guard: DayGuard) -> None:
+    """Atomically write the guard file (temp + os.replace)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    payload = {
+        "utc_day": guard.utc_day,
+        "balance_start_cents": guard.balance_start_cents,
+        "latched": list(guard.latched),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def latched_stop_kind(guard: DayGuard) -> str | None:
+    """The first day-halting stop kind latched in the guard, else None. (A corrupt guard is handled
+    separately by the caller — this only reports explicit latches.)"""
+    for entry in guard.latched:
+        kind = entry.get("kind")
+        if kind in DAY_HALTING_STOPS:
+            return kind
+    return None
+
+
+def record_latched_stop(
+    path: str, utc_day: str, kind: str, reason: str, window: str | None, ts: float
+) -> None:
+    """Append a day-halting stop latch to the guard file (read-modify-write). Preserves any existing
+    balance baseline and prior latches. Idempotent per kind is NOT required — repeated trips just
+    append; ``latched_stop_kind`` reports the first day-halting kind regardless."""
+    guard = read_day_guard(path, utc_day)
+    # Even a corrupt guard must not swallow a latch: rebuild a minimal guard carrying THIS latch so
+    # the day still refuses to arm (the corrupt read already fails closed independently).
+    latched = tuple(guard.latched) if not guard.corrupt else ()
+    bsc = guard.balance_start_cents if not guard.corrupt else None
+    new = DayGuard(
+        utc_day=utc_day,
+        balance_start_cents=bsc,
+        latched=latched + ({"kind": kind, "reason": reason, "window": window, "ts": ts},),
+    )
+    _write_day_guard(path, new)
+
+
+def ensure_balance_start(
+    path: str, utc_day: str, balance_now_cents: int, ts: float
+) -> tuple[int, bool]:
+    """Ensure the day's balance baseline exists. If the guard has no ``balance_start_cents`` yet
+    (first wake of the day), snapshot ``balance_now_cents`` and persist it. Returns
+    (balance_start_cents, first_wake). A corrupt guard is NOT overwritten here (the caller fails
+    closed on corruption before reaching this)."""
+    guard = read_day_guard(path, utc_day)
+    if guard.balance_start_cents is not None:
+        return guard.balance_start_cents, False
+    new = DayGuard(
+        utc_day=utc_day, balance_start_cents=int(balance_now_cents), latched=tuple(guard.latched)
+    )
+    _write_day_guard(path, new)
+    return int(balance_now_cents), True
+
+
+def parse_balance_cents(payload: Any) -> int | None:
+    """Extract the account balance as an INTEGER number of CENTS from a proxy /portfolio/balance
+    payload. Kalshi returns cents as integers (e.g. {"balance": 100000} == $1000.00); the common
+    ``balance``/``available``/``portfolio_value`` spellings are accepted. Returns None (fail closed)
+    when no integer-cents field is present."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("balance", "available_balance", "available", "portfolio_value"):
+        v = payload.get(key)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def balance_loss_dollars(balance_start_cents: int, balance_now_cents: int) -> Decimal:
+    """The realized loss in DOLLARS since the day's baseline: (start - now) cents / 100. Positive =
+    a loss (balance fell); negative = a gain."""
+    return (Decimal(int(balance_start_cents)) - Decimal(int(balance_now_cents))) / Decimal(100)
+
+
+def s4_balance_breached(
+    balance_start_cents: int, balance_now_cents: int, cap_dollars: Decimal
+) -> tuple[bool, Decimal]:
+    """S4 (balance): (breached, loss_dollars). Breached iff loss >= cap. loss = start - now."""
+    loss = balance_loss_dollars(balance_start_cents, balance_now_cents)
+    return (loss >= cap_dollars, loss)
+
+
+# ---------------------------------------------------------------------------
 # Controller — the thin shell: pure state + Executor freeze + flatten dispatch + journal
 # ---------------------------------------------------------------------------
 class StopController:
@@ -341,6 +509,9 @@ class StopController:
         config: StopConfig | None = None,
         clock: Callable[[], float] = None,  # type: ignore[assignment]
         new_client_order_id: Callable[[], str] | None = None,
+        latch_path: str | None = None,
+        utc_day: str | None = None,
+        window: str | None = None,
     ) -> None:
         import time as _time
 
@@ -351,7 +522,23 @@ class StopController:
         self.config = config or StopConfig()
         self._clock = clock or _time.time
         self._mint = new_client_order_id or _mint
+        # BUG-3 repair: persist day-halting trips (S1-S4) to the day-scoped guard file so the NEXT
+        # window's arming check refuses to arm for the rest of the UTC day.
+        self._latch_path = latch_path
+        self._utc_day = utc_day
+        self._window = window
         self.state = StopState()
+
+    def _persist_latch(self, stop: str, reason: str, window: str | None) -> None:
+        if self._latch_path is None or self._utc_day is None or stop not in DAY_HALTING_STOPS:
+            return
+        try:
+            record_latched_stop(
+                self._latch_path, self._utc_day, stop, reason,
+                window or self._window, self._clock(),
+            )
+        except Exception as e:  # noqa: BLE001 - a persist failure must never break the freeze
+            logger.error("[STOPS] failed to persist %s latch to %s: %s", stop, self._latch_path, e)
 
     def _journal_note(self, note: Notification) -> None:
         if self._journal is None:
@@ -383,6 +570,11 @@ class StopController:
         # ALWAYS freeze strategy order placement.
         if self.executor is not None:
             self.executor.set_armed(False)
+        # BUG-3 repair: LATCH the day-halting trip to the day-scoped guard file (persists across the
+        # process-per-window boundary so the next window refuses to arm).
+        self._persist_latch(
+            stop, reason, ledger_state.window if ledger_state is not None else None
+        )
         if ledger_state is None:
             return ()
         actions = position_policy(ledger_state, self.config)

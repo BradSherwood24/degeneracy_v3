@@ -49,6 +49,7 @@ from service.orders.envelope import (
     build_batch,
     build_entry,
     no_fill_response,
+    normalize_fill_to_side,
     parse_batch_response,
     parse_single_response,
 )
@@ -245,7 +246,8 @@ class Executor:
 
         body_json = resp.json()
         if single:
-            responses = (parse_single_response(body_json),)
+            # Units choke point: normalize the reported price into the leg's side-space at parse.
+            responses = (parse_single_response(body_json, side=intent.legs[0].side),)
         else:
             parsed = parse_batch_response(body_json)
             responses = tuple(self._align_batch(intent, parsed))
@@ -262,11 +264,12 @@ class Executor:
         for leg in intent.legs:
             matched = by_cid.pop(leg.client_order_id, None)
             if matched is not None:
-                out.append(matched)
+                # Units choke point: normalize the reported price into THIS leg's side-space.
+                out.append(normalize_fill_to_side(matched, leg.side))
             elif leftover:
                 r = leftover.pop(0)
-                # stamp the leg's cid so the ledger can match it
-                out.append(_with_cid(r, leg.client_order_id))
+                # stamp the leg's cid so the ledger can match it, then normalize to its side-space
+                out.append(normalize_fill_to_side(_with_cid(r, leg.client_order_id), leg.side))
             else:
                 out.append(no_fill_response(leg.client_order_id, "no_matching_batch_slot"))
         return out

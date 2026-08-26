@@ -41,7 +41,7 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
-from service.orders.envelope import OrderResponse
+from service.orders.envelope import OrderResponse, normalize_fill_to_side
 from service.policy import Q1_STRANGLE, SUB_DOLLAR_FLIP
 
 # --- intent purposes ---
@@ -176,6 +176,49 @@ class LedgerState:
         settlement, so this is the arithmetic-floor check for S1."""
         return self.matched_pairs() * MIN_PAIR_PAYOUT - self.pair_net_cash_out()
 
+    def realized_cashflow(self) -> Decimal:
+        """Settlement-INDEPENDENT realized cash from ACTUAL fills on both legs: proceeds - costs
+        (all fees included) == -pair_net_cash_out(). For a fully-closed position (every leg net 0 —
+        the flatten / round-trip case) this is the COMPLETE realized P&L, known immediately. For a
+        position still holding net, it is the cash OUTLAY only; the held legs' settlement payoff is
+        added later by the settlement backfill (see ``unsettled_legs``)."""
+        return -self.pair_net_cash_out()
+
+    def realized_at_close(self) -> Decimal:
+        """The realized P&L booked at window close (BUG-2 repair): the settlement-independent cash
+        flow, PLUS the sub-$1 flip's guaranteed >= $1/pair floor on the matched portion (a genuine
+        settlement floor, so booking it is conservative and correct). Naked/overhang legs and any
+        non-flip held legs contribute only their cash OUTLAY here (a conservative, safe-direction
+        loss); their settlement payoff arrives via the backfill. Zero when nothing filled."""
+        base = self.realized_cashflow()
+        if self.source == SUB_DOLLAR_FLIP:
+            base = base + self.matched_pairs() * MIN_PAIR_PAYOUT
+        return base
+
+    def unsettled_legs(self) -> tuple[tuple[str, str, int], ...]:
+        """(ticker, side, count) for each held leg whose settlement payoff is NOT yet booked at
+        close — the input to the settlement backfill. For a sub-$1 flip the matched portion is
+        floor-booked in ``realized_at_close`` and excluded here; only the naked OVERHANG (net beyond
+        the matched count) remains pending. For any other source (no guaranteed floor) EVERY held
+        leg is pending. Empty when the window ended flat/closed."""
+        matched = self.matched_pairs()
+        out: list[tuple[str, str, int]] = []
+        for which in ("high", "low"):
+            pos = self.position(which)
+            if pos is None or pos.net <= 0:
+                continue
+            if self.source == SUB_DOLLAR_FLIP:
+                held = pos.net - min(pos.net, matched)  # overhang only (matched is floor-booked)
+            else:
+                held = pos.net  # no floor -> the whole held net is pending settlement
+            if held > 0:
+                out.append((pos.ticker, pos.side, int(held)))
+        return tuple(out)
+
+    def has_any_fill(self) -> bool:
+        """True iff any leg saw a real fill (a buy or a sell) this window."""
+        return any(p.bought > 0 or p.sold > 0 for p in self.positions.values())
+
     def inflight_cids(self) -> tuple[str, ...]:
         """client_order_ids that were journaled as intents but have no matching response yet."""
         return tuple(cid for cid in self.cid_to_leg if cid not in self.responded_cids)
@@ -267,6 +310,36 @@ def record_response(state: LedgerState, resp: OrderResponse) -> LedgerState:
     return replace(new_state, positions=new_positions)
 
 
+def settlement_payoff(
+    unsettled_legs: list[dict[str, Any]] | tuple[Any, ...],
+    results: dict[str, str],
+) -> Decimal:
+    """The settlement-backfill delta (BUG-2 repair, part c): given each held ticker's market result
+    ('yes'/'no'), the payoff of the unsettled legs. A Kalshi contract pays MIN_PAIR_PAYOUT ($1) per
+    contract iff its held outcome ``side`` matches the market ``result``, else $0. This payoff is
+    ADDED to the window's realized — the legs' cash OUTLAY was already booked conservatively at close,
+    so: a leg that loses adds $0 (close's conservative loss stands); a leg that wins adds count*$1
+    (correcting the close's worst-case assumption up to the true realized).
+
+    Fail-closed: a missing result for a held ticker, or a result that is not exactly 'yes'/'no',
+    raises — a backfill is never guessed."""
+    total = Decimal(0)
+    for leg in unsettled_legs:
+        ticker = leg["ticker"] if isinstance(leg, dict) else leg[0]
+        side = leg["side"] if isinstance(leg, dict) else leg[1]
+        count = leg["count"] if isinstance(leg, dict) else leg[2]
+        res = results.get(ticker)
+        if res is None:
+            raise KeyError(f"settlement_payoff: no settlement result for held ticker {ticker}")
+        if res not in ("yes", "no"):
+            raise ValueError(
+                f"settlement_payoff: result for {ticker} must be 'yes' or 'no', got {res!r}"
+            )
+        if res == side:
+            total += Decimal(str(count)) * MIN_PAIR_PAYOUT
+    return total
+
+
 def retries_for_side(state: LedgerState, ticker: str, purpose: str) -> int:
     """Count recorded rebalance intents of ``purpose`` that targeted ``ticker`` (the per-side
     retry budget counter, derived from the intent record — no separate mutable counter)."""
@@ -341,6 +414,16 @@ def fills_record(state: LedgerState) -> dict[str, Any]:
         "realized_payoff": realized,
         "matched_pairs": matched,
         "legs": legs,
+        # BUG-2 repair: a realized number for EVERY window with any fill.
+        # ``realized_cashflow`` is settlement-independent (complete for a closed/flattened position);
+        # ``realized_at_close`` adds the sub-$1 flip guaranteed floor on matched pairs; ``unsettled_legs``
+        # are the held legs still awaiting the settlement backfill.
+        "any_fill": state.has_any_fill(),
+        "realized_cashflow": state.realized_cashflow(),
+        "realized_at_close": state.realized_at_close(),
+        "unsettled_legs": [
+            {"ticker": t, "side": s, "count": c} for (t, s, c) in state.unsettled_legs()
+        ],
     }
 
 
@@ -424,8 +507,14 @@ def response_to_record(resp: OrderResponse) -> dict[str, Any]:
         "order_id": resp.order_id,
         "fill_count": str(resp.fill_count),
         "remaining_count": str(resp.remaining_count),
+        # ``average_fill_price`` is SIDE-NORMALIZED (order's side-space); ``raw_reported_price`` keeps
+        # the untouched venue value (YES-space for a NO order) so the journal preserves the raw truth
+        # and re-derivation is exact. A record WITHOUT ``raw_reported_price`` is a pre-2026-08-26
+        # (units-bug) journal whose ``average_fill_price`` is the raw venue value — rebuild_from_journal
+        # normalizes those using the matching intent's side.
         "average_fill_price": None if resp.average_fill_price is None else str(resp.average_fill_price),
         "average_fee_paid": None if resp.average_fee_paid is None else str(resp.average_fee_paid),
+        "raw_reported_price": None if resp.raw_reported_price is None else str(resp.raw_reported_price),
         "ts_ms": resp.ts_ms,
         "error": resp.error,
         "no_fill": resp.no_fill,
@@ -444,6 +533,7 @@ def response_from_record(d: dict[str, Any]) -> OrderResponse:
         average_fill_price=_d(d.get("average_fill_price")),
         average_fee_paid=_d(d.get("average_fee_paid")),
         ts_ms=d.get("ts_ms"),
+        raw_reported_price=_d(d.get("raw_reported_price")),
         error=d.get("error"),
         no_fill=bool(d.get("no_fill", False)),
     )
@@ -468,7 +558,23 @@ def rebuild_from_journal(
         if kind == "order_intent":
             state = record_intent(state, intent_from_record(obj))
         elif kind == "order_response":
-            state = record_response(state, response_from_record(obj))
+            resp = response_from_record(obj)
+            # LEGACY MIGRATION: a record predating the units repair has no ``raw_reported_price`` KEY
+            # at all, and its stored ``average_fill_price`` is the RAW venue value (YES-space for a NO
+            # order). Normalize it now, using the side of the intent leg it was submitted for (already
+            # recorded, since intents are journaled before their responses). New journals carry the key
+            # (even as null) and are already side-normalized -> left untouched.
+            if (
+                "raw_reported_price" not in (obj or {})
+                and resp.average_fill_price is not None
+                and resp.client_order_id
+            ):
+                leg = state.cid_to_leg.get(resp.client_order_id)
+                if leg is not None:
+                    resp = normalize_fill_to_side(
+                        replace(resp, raw_reported_price=resp.average_fill_price), leg.side
+                    )
+            state = record_response(state, resp)
     return state
 
 
@@ -485,6 +591,7 @@ __all__ = [
     "record_intent",
     "record_response",
     "retries_for_side",
+    "settlement_payoff",
     "fills_record",
     "to_window_fills",
     "rebuild_from_journal",

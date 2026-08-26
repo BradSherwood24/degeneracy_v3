@@ -11,7 +11,9 @@ from service.orders.envelope import (
     build_batch,
     build_entry,
     new_client_order_id,
+    normalize_fill_to_side,
     parse_batch_response,
+    parse_entry_response,
     parse_single_response,
     wire_price,
 )
@@ -115,3 +117,51 @@ def test_parse_batch_response_per_entry_error_is_no_fill():
 def test_parse_batch_response_malformed_body_fails_closed():
     assert parse_batch_response({"nope": 1})[0].no_fill
     assert parse_batch_response("garbage")[0].no_fill
+
+
+# ---------------------------------------------------------------------------
+# BUG-1 (units): NO-side prices come back in YES-space -> normalize at the parse choke point.
+# Ground truth from the real 2026-08-23 14:00Z fills: a NO buy @0.97 reported avg_fill 0.0300; a NO
+# reduce-only sell @0.95 reported 0.0500 (both exactly 1 - limit); Kalshi's realized was -0.0255.
+# ---------------------------------------------------------------------------
+def test_normalize_no_side_flips_yes_space_price_to_no_space():
+    r = parse_entry_response({"client_order_id": "c", "fill_count": "1", "remaining_count": "0",
+                              "average_fill_price": "0.0300", "average_fee_paid": "0.0021"})
+    n = normalize_fill_to_side(r, "no")
+    assert n.average_fill_price == Decimal("0.9700")   # 1 - 0.0300, comparable to the 0.97 limit
+    assert n.raw_reported_price == Decimal("0.0300")   # the untouched venue value is preserved
+    assert n.average_fee_paid == Decimal("0.0021")     # fee is side-independent, never flipped
+
+
+def test_normalize_yes_side_is_passthrough():
+    r = parse_entry_response({"client_order_id": "c", "fill_count": "1", "remaining_count": "0",
+                              "average_fill_price": "0.4600", "average_fee_paid": "0.01"})
+    n = normalize_fill_to_side(r, "yes")
+    assert n.average_fill_price == Decimal("0.4600")
+    assert n.raw_reported_price == Decimal("0.4600")
+
+
+def test_normalize_is_idempotent_derives_from_raw():
+    r = parse_entry_response({"client_order_id": "c", "fill_count": "1", "remaining_count": "0",
+                              "average_fill_price": "0.0300", "average_fee_paid": "0.0021"})
+    once = normalize_fill_to_side(r, "no")
+    twice = normalize_fill_to_side(once, "no")
+    assert twice.average_fill_price == Decimal("0.9700")  # not double-flipped
+    assert twice.raw_reported_price == Decimal("0.0300")
+
+
+def test_normalize_none_price_passthrough():
+    r = parse_entry_response({"client_order_id": "c", "fill_count": "0", "remaining_count": "0",
+                              "average_fill_price": None, "average_fee_paid": None})
+    n = normalize_fill_to_side(r, "no")
+    assert n.average_fill_price is None and n.raw_reported_price is None
+
+
+def test_parse_single_response_normalizes_when_side_given():
+    body = {"order": {"client_order_id": "c", "fill_count": "1", "remaining_count": "0",
+                      "average_fill_price": "0.0500", "average_fee_paid": "0.0034"}}
+    r = parse_single_response(body, side="no")
+    assert r.average_fill_price == Decimal("0.9500") and r.raw_reported_price == Decimal("0.0500")
+    # without side (back-compat): the raw venue value is left as-is
+    r2 = parse_single_response(body)
+    assert r2.average_fill_price == Decimal("0.0500")

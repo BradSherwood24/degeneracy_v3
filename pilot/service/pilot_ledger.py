@@ -20,9 +20,12 @@ import argparse
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+
+from service.ledger import settlement_payoff
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +97,59 @@ def entries_for_day(entries: list[dict[str, Any]], day: str) -> list[dict[str, A
 
 
 def s4_running_loss(entries: list[dict[str, Any]]) -> Decimal:
-    """Total realized P&L across all entries (negative = net loss). Sums ``realized_delta``."""
+    """Total realized P&L across all entries (negative = net loss). Sums ``realized_delta`` — window
+    entries AND settlement-backfill entries alike, so a backfilled winning payoff is reflected."""
     return sum((_dec(e.get("realized_delta")) for e in entries), Decimal(0))
+
+
+# ---------------------------------------------------------------------------
+# Settlement backfill (BUG-2 repair, part c)
+#
+# A window that ends holding a naked/overhang leg books only that leg's cash OUTLAY at close (the
+# safe direction — see run_window._build_ledger_entry) and records the held legs under
+# ``unsettled_legs``. Once the market RESULT for each held ticker is known, this backfill appends a
+# SEPARATE ledger entry whose ``realized_delta`` is the settlement PAYOFF (count*$1 for each held
+# leg whose outcome won, $0 otherwise). Because the outlay was already booked, the payoff is purely
+# additive: a losing leg adds $0 (the close loss stands); a winning leg adds count*$1.
+#
+# The result map is supplied explicitly (``--result TICKER=yes`` or ``--results-file``), which is
+# the simplest CORRECT source and is fully testable offline. The auto-step alternative — reading the
+# result from the proxy's /markets REST helper at the next window's reconcile-first — is documented
+# in the build report; it is NOT wired here so this module keeps opening no socket (house law).
+# ---------------------------------------------------------------------------
+def already_backfilled(entries: list[dict[str, Any]], window: str) -> bool:
+    """True iff a settlement-backfill entry for ``window`` is already present (idempotency guard)."""
+    return any(e.get("backfill_of") == window for e in entries)
+
+
+def find_unsettled_window(entries: list[dict[str, Any]], window: str) -> dict[str, Any] | None:
+    """The most recent window entry whose close_time == ``window`` that still has unsettled legs."""
+    match = None
+    for e in entries:
+        if str(e.get("close_time")) == window and e.get("unsettled_legs"):
+            match = e
+    return match
+
+
+def build_backfill_entry(
+    window_entry: dict[str, Any], results: dict[str, str], payoff: Decimal, now: float
+) -> dict[str, Any]:
+    """A ledger line recording a settlement backfill. ``fires``/``filled`` are zeroed so the promotion
+    counters ignore it; only ``realized_delta`` (the payoff) feeds ``s4_running_loss`` and the day
+    total. ``close_time`` mirrors the settled window so it lands on the right UTC day."""
+    return {
+        "close_time": window_entry.get("close_time"),
+        "mode": "backfill",
+        "backfill_of": window_entry.get("close_time"),
+        "pairs": window_entry.get("pairs"),
+        "fires": 0,
+        "filled": False,
+        "realized_delta": str(payoff),
+        "realized_unsettled": False,
+        "settled_legs": window_entry.get("unsettled_legs"),
+        "settlement_results": results,
+        "flushed_at": now,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +327,47 @@ def _cmd_gate(entries: list[dict[str, Any]], args: argparse.Namespace) -> int:
     return 0 if result.passed else 1
 
 
+def _parse_results(pairs: list[str] | None, results_file: str | None) -> dict[str, str]:
+    """Build the {ticker: 'yes'/'no'} result map from ``--result TICKER=yes`` pairs and/or a JSON
+    ``--results-file``. Fail-closed on a malformed pair."""
+    results: dict[str, str] = {}
+    if results_file:
+        with open(results_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("--results-file must be a JSON object of {ticker: 'yes'/'no'}")
+        results.update({str(k): str(v) for k, v in data.items()})
+    for p in pairs or []:
+        if "=" not in p:
+            raise ValueError(f"--result must be TICKER=yes|no, got {p!r}")
+        k, v = p.split("=", 1)
+        results[k.strip()] = v.strip()
+    return results
+
+
+def _cmd_backfill(entries: list[dict[str, Any]], args: argparse.Namespace) -> int:
+    """Append a settlement-backfill entry for one settled window. Idempotent: refuses if the window
+    was already backfilled (unless --force)."""
+    window = args.window
+    if already_backfilled(entries, window) and not args.force:
+        print(json.dumps({"error": "already_backfilled", "window": window}, sort_keys=True))
+        return 1
+    entry = find_unsettled_window(entries, window)
+    if entry is None:
+        print(json.dumps({"error": "no_unsettled_window", "window": window}, sort_keys=True))
+        return 1
+    results = _parse_results(args.result, args.results_file)
+    legs = entry.get("unsettled_legs") or []
+    payoff = settlement_payoff(legs, results)  # fail-closed on a missing/invalid result
+    backfill = build_backfill_entry(entry, results, payoff, time.time())
+    append_entry(backfill, args.ledger)
+    print(json.dumps(
+        {"window": window, "payoff": str(payoff), "settled_legs": legs, "results": results},
+        sort_keys=True,
+    ))
+    return 0
+
+
 def _cmd_summary(entries: list[dict[str, Any]], args: argparse.Namespace) -> int:
     print(json.dumps(
         {
@@ -287,9 +382,11 @@ def _cmd_summary(entries: list[dict[str, Any]], args: argparse.Namespace) -> int
 
 
 def main(argv: list[str] | None = None) -> int:
-    # --ledger is a PARENT option so it is accepted before OR after the subcommand.
+    # --ledger is a PARENT option so it is accepted before OR after the subcommand. Use SUPPRESS so
+    # the subparser's copy does NOT clobber a value supplied BEFORE the subcommand with its default
+    # (the classic argparse shared-parent-default bug); the effective default is applied post-parse.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
+    common.add_argument("--ledger", default=argparse.SUPPRESS)
 
     ap = argparse.ArgumentParser(description="Query the pilot ledger (read-only).", parents=[common])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -309,7 +406,18 @@ def main(argv: list[str] | None = None) -> int:
     p_sum = sub.add_parser("summary", parents=[common], help="windows + realized total + both gates")
     p_sum.set_defaults(func=_cmd_summary)
 
+    p_bf = sub.add_parser("backfill", parents=[common],
+                          help="append a settlement-backfill realized entry for a settled window")
+    p_bf.add_argument("--window", required=True, help="the window close_time (e.g. 2026-08-24T05:00:00Z)")
+    p_bf.add_argument("--result", action="append", default=[],
+                      help="TICKER=yes|no settlement result (repeatable)")
+    p_bf.add_argument("--results-file", default=None, help="JSON {ticker: 'yes'/'no'} result map")
+    p_bf.add_argument("--force", action="store_true", help="backfill even if already backfilled")
+    p_bf.set_defaults(func=_cmd_backfill)
+
     args = ap.parse_args(argv)
+    if not hasattr(args, "ledger"):
+        args.ledger = DEFAULT_LEDGER_PATH
     entries = load_entries(args.ledger)
     return args.func(entries, args)
 

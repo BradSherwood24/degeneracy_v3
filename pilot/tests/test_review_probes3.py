@@ -136,7 +136,12 @@ def test_crash_mid_rebalance_via_executor_journal():
 # R3 MARKER — S4 / A4 counters reset per window (per-process StopState).        #
 # --------------------------------------------------------------------------- #
 def test_MARKER_s4_daily_loss_resets_with_a_fresh_state_per_window():
-    cfg = StopConfig()
+    # Explicit $5.00 cap so this marker's arithmetic is independent of the default (now $3.00).
+    # NOTE (Phase-3a, BUG-3): the DOCUMENTED GAP below is now CLOSED — the day-scoped guard file
+    # persists latched stops AND the S4 balance baseline across the process-per-window boundary. The
+    # in-process ``on_realized`` tally still resets per process (it is only the in-window backstop);
+    # the cross-window S4 truth is the account-balance check at wake (stops.s4_balance_breached).
+    cfg = StopConfig(daily_loss_cap_dollars=Decimal("5.00"))
     # window 1: accumulate -4.00 (no stop; cap is -5.00)
     s = StopState()
     s, tripped = on_realized(s, Decimal("-4.00"), cfg)

@@ -235,3 +235,43 @@ def test_stop_authorized_only_for_flatten():
     ex = Executor(Journal(), ExecutorConfig(armed=False), post_fn=lambda p, b: FakeResp(200, {}))
     r = ex.execute(entry(), stop_authorized=True)  # entry is not a flatten
     assert r.refused == "stop_authorized_non_flatten"
+
+
+# ---------------------------------------------------------------------------
+# BUG-1 (units): the executor normalizes the reported price into each leg's side-space at parse, so
+# every consumer (ledger/stops/parity) sees a price comparable to the leg's limit. A NO leg's venue
+# price comes back in YES-space (1 - true); a YES leg is passed through.
+# ---------------------------------------------------------------------------
+def _no_yes_entry():
+    legs = (
+        IntentLeg(HI, "no", "buy", 1, Decimal("0.97"), "h"),   # NO leg, limit 0.97
+        IntentLeg(LO, "yes", "buy", 1, Decimal("0.0250"), "l"),  # YES leg, limit 0.025
+    )
+    return Intent(CT, "sub$1-flip", PURPOSE_ENTRY, legs, t_minus_s=300.0)
+
+
+def test_batch_normalizes_no_leg_to_no_space_yes_leg_passthrough():
+    # venue reports the NO leg's fill in YES-space (0.0300 == 1-0.97); YES leg reported as-is.
+    post = batch_ok({"h": (1, "0.0300", "0.0021"), "l": (1, "0.0250", "0.0017")})
+    ex = Executor(Journal(), armed_cfg(max_contracts=2), post_fn=post)
+    r = ex.execute(_no_yes_entry())
+    by_cid = {resp.client_order_id: resp for resp in r.responses}
+    assert by_cid["h"].average_fill_price == Decimal("0.9700")   # normalized to NO-space
+    assert by_cid["h"].raw_reported_price == Decimal("0.0300")   # raw venue value preserved
+    assert by_cid["l"].average_fill_price == Decimal("0.0250")   # YES leg unchanged
+    assert by_cid["l"].raw_reported_price == Decimal("0.0250")
+
+
+def test_single_reduce_only_no_sell_normalizes_to_no_space():
+    # a NO reduce-only sell @0.95 fills; venue reports 0.0500 (1-0.95) -> normalize to 0.95.
+    leg = IntentLeg(HI, "no", "sell", 1, Decimal("0.95"), "s", reduce_only=True)
+    intent = Intent(CT, "sub$1-flip", "flatten", (leg,), t_minus_s=300.0)
+    def post(path, body):
+        return FakeResp(200, {"order": {"order_id": "o", "client_order_id": "s",
+                                        "fill_count": "1", "remaining_count": "0",
+                                        "average_fill_price": "0.0500", "average_fee_paid": "0.0034",
+                                        "ts_ms": 1}})
+    ex = Executor(Journal(), armed_cfg(), post_fn=post)
+    r = ex.execute(intent, stop_authorized=True)
+    assert r.responses[0].average_fill_price == Decimal("0.9500")
+    assert r.responses[0].raw_reported_price == Decimal("0.0500")
