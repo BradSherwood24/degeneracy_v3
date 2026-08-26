@@ -23,7 +23,7 @@ The strategy, per hourly close T:
     region [A, K).
   * A candidate qualifies only if it has both bid and ask present and spread <= max_spread.
   * Choose the candidate whose hourly-leg MID is nearest ``target_mid`` (0.95); ties -> the
-    strike nearer A.
+    strike with the WIDEST gap from A (Brad 2026-08-26: the wider box gives the larger pin region).
   * Filters: 15M leg ask >= ``min15_ask`` (0.85); hourly leg ask in
     [``hourly_ask_min``, ``hourly_ask_max``] (0.90 .. 0.99). Either fails => no fire.
   * Legs: ``contracts`` each, limit = the observed ask for that leg. Real cost
@@ -187,10 +187,12 @@ def select_box(
     if not cands:
         return NoBox("no qualifying hourly candidate")
 
-    # Nearest hourly-mid to target; ties -> strike nearer A. Deterministic key.
+    # Nearest hourly-mid to target; ties -> the WIDEST gap from A (Brad 2026-08-26: the wider box ->
+    # larger pin region). Deterministic key: min on (|mid - target|, -|K - A|) picks nearest-mid,
+    # then the largest |K - A| among ties. Decimal-safe (Decimal negation).
     def _key(c: tuple[str, Decimal, Decimal, Decimal, Decimal]) -> tuple[Decimal, Decimal]:
         _tk, K, _h_ask, _h_bid, h_mid = c
-        return (abs(h_mid - params.target_mid), abs(K - anchor_A))
+        return (abs(h_mid - params.target_mid), -abs(K - anchor_A))
 
     chosen_tk, K, h_ask, h_bid, h_mid = min(cands, key=_key)
     if not (params.hourly_ask_min <= h_ask <= params.hourly_ask_max):
@@ -240,6 +242,10 @@ class BoxState:
     entered: bool = False
     fired_selection: BoxSelection | None = None
     standdown_emitted: bool = False
+    # F5: the current selection view (BoxSelection | NoBox | None), computed ONCE per relevant book
+    # fold in decide_box and reused by the driver's box_eval so select_box does not run twice per tick.
+    # compare=False so it never perturbs golden-state equality; repr=False to keep reprs quiet.
+    view: "BoxSelection | NoBox | None" = field(default=None, compare=False, repr=False)
 
     @classmethod
     def new(
@@ -278,6 +284,16 @@ def _leg_fresh(state: BoxState, ticker: str, now: float, params: "BoxParams") ->
     return age <= params.freshness_max_leg_age_s
 
 
+def _view_of(params: "BoxParams", state: BoxState) -> "BoxSelection | NoBox | None":
+    """The box's current selection view from ``state.tops`` (None until the 15M top is known). Pure;
+    this is the single point that runs ``select_box`` for a given book (F5)."""
+    m15_top = state.tops.get(state.m15_ticker)
+    if m15_top is None:
+        return None
+    ladder = {tk: (K, state.tops[tk]) for tk, K in state.strikes.items() if tk in state.tops}
+    return select_box(state.anchor_A, state.m15_ticker, m15_top, ladder, params)
+
+
 # ---------------------------------------------------------------------------
 # The decision
 # ---------------------------------------------------------------------------
@@ -288,7 +304,10 @@ def decide_box(
     now = event.server_ts
     st = state
 
-    # 1) fold a book update into state (only the 15M leg or a subscribed ladder strike).
+    # 1) fold a book update into state (only the 15M leg or a subscribed ladder strike). F5: recompute
+    #    the cached selection view ONCE here, so the driver's box_eval reuses it (no 2nd select_box per
+    #    tick). A ClockTick or an unsubscribed-market update does not change tops -> the cached view
+    #    carries forward correctly, so select_box runs at most once per relevant book frame.
     if isinstance(event, BookUpdate):
         if event.market == st.m15_ticker or event.market in st.strikes:
             st = replace(
@@ -296,6 +315,7 @@ def decide_box(
                 tops={**st.tops, event.market: event.top},
                 ts={**st.ts, event.market: now},
             )
+            st = replace(st, view=_view_of(params, st))
         else:
             return st, []
 
@@ -326,12 +346,11 @@ def decide_box(
     if not (params.entry_end_s <= t_minus <= params.entry_start_s):
         return st, []
 
-    # 5) select the box from the CURRENT book (the strike may change instant to instant).
-    m15_top = st.tops.get(st.m15_ticker)
-    if m15_top is None:
-        return st, []
-    ladder = {tk: (K, st.tops[tk]) for tk, K in st.strikes.items() if tk in st.tops}
-    sel = select_box(st.anchor_A, st.m15_ticker, m15_top, ladder, params)
+    # 5) select the box from the CURRENT book (the strike may change instant to instant). F5: reuse
+    #    the view cached at the fold above (recomputed only when a relevant book frame changed tops);
+    #    for a ClockTick the tops are unchanged so the cached view is exactly what select_box would
+    #    return now.
+    sel = st.view
     if not isinstance(sel, BoxSelection):
         return st, []
 

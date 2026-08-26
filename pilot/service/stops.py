@@ -366,9 +366,17 @@ def arming_check(
     falsifier_path: str,
     health: Any,
     policy_verified: bool,
+    *,
+    strategy: str | None = None,
+    expected_strategy: str | None = None,
 ) -> ArmDecision:
     """S5 gate. armed=True ONLY if the falsifier is FROZEN, the policy sha is verified, and the
-    proxy /health shows caps + orders_enabled. Any failure => refuse (armed=False) with reasons."""
+    proxy /health shows caps + orders_enabled. Any failure => refuse (armed=False) with reasons.
+
+    F2 (Phase-4): when the caller pins ``expected_strategy`` (the box does, to "box"), the RESOLVED
+    strategy must equal it exactly — otherwise refuse. ``falsifier_path`` is the caller's choice: the
+    box passes its own ``box_falsifier.md``; the corridor passes ``falsifier.md``. The box roster sha
+    being verified is carried in ``policy_verified`` (``load_box_policy`` self-checks the pinned sha)."""
     reasons: list[str] = []
     if not policy_verified:
         reasons.append("policy sha not verified (load_policy must succeed against the frozen pin)")
@@ -378,6 +386,10 @@ def arming_check(
         )
     if not health_has_caps(health):
         reasons.append("proxy /health missing caps block or orders_enabled is not true")
+    if expected_strategy is not None and strategy != expected_strategy:
+        reasons.append(
+            f"resolved strategy is {strategy!r}, not exactly {expected_strategy!r} (S5)"
+        )
     return ArmDecision(armed=not reasons, reasons=tuple(reasons))
 
 

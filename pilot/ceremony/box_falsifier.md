@@ -27,8 +27,9 @@ Everything else is recording we keep because it is cheap.
 
 ## Policy (roster `box-v1`, `pilot/policy/box_params.json`, sha-pinned; loader refuses drift)
 
-15M deep-ITM side (ask ≥ 0.85) + hourly strike behind BTC whose leg mid is nearest 0.95 with ask
-in [0.90, 0.99]; entry window T−600s..T−60s; first qualifying instant fires; ONE pair per hour;
+15M deep-ITM side (ask ≥ 0.85) + hourly strike behind BTC whose leg mid is nearest 0.95 (tie →
+widest gap from A) with ask in [0.90, 0.99]; entry window T−600s..T−60s; first qualifying instant
+fires; ONE pair per hour;
 1 contract per leg; IOC with limit = observed ask + 0.03, capped 0.99 (a level bump is noted,
 not fought). Payoff $2 if BTC settles between the two strikes, $1 otherwise — the pair has a
 guaranteed $1 floor; the loss branch is (cost − $1).

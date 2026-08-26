@@ -42,7 +42,7 @@ from service.run_window import (
     resolve_strategy,
 )
 from service.signal import BookUpdate, ClockTick
-from service.stops import check_s1, check_s1_box
+from service.stops import ArmDecision, arming_check, check_s1, check_s1_box
 from service.wake import LadderCheck, Leg, WakeResult, close_epoch
 from service import box as box_mod
 from service import ledger as ledger_mod
@@ -267,15 +267,23 @@ def _box_wake():
 _FIXED_NOW = float(close_epoch("2026-08-21T21:45:05Z"))  # after 15M open -> poll resolves at once
 
 
-def _frozen_falsifier(tmp_path):
-    p = os.path.join(tmp_path, "falsifier_frozen.md")
+def _frozen_falsifier(tmp_path, name="falsifier_frozen.md"):
+    p = os.path.join(tmp_path, name)
     with open(p, "w", encoding="utf-8") as f:
         f.write("# X\nSTATUS: FROZEN\n")
     return p
 
 
+def _draft_box_falsifier(tmp_path, name="box_falsifier_draft.md"):
+    p = os.path.join(tmp_path, name)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("# BOX FALSIFIER\nSTATUS: DRAFT\n")
+    return p
+
+
 def _box_svc(tmp_path, *, mode="armed", window_driver=None, post_fn=None, wake=None,
-             market_result_getter=None, balance=1000000, ledger_path=None):
+             market_result_getter=None, balance=1000000, ledger_path=None,
+             box_falsifier_path=None):
     w = wake if wake is not None else _box_wake()
     return WindowService(
         close_time=CLOSE,
@@ -284,6 +292,11 @@ def _box_svc(tmp_path, *, mode="armed", window_driver=None, post_fn=None, wake=N
         pairs=1,
         proxy=FakeProxy(),
         falsifier_path=_frozen_falsifier(tmp_path),
+        # F2: the box arms against its OWN falsifier; default the tests to a FROZEN box falsifier so
+        # the armed-path wiring tests can arm. Tests that probe the S5 gate pass their own path.
+        box_falsifier_path=(box_falsifier_path
+                            if box_falsifier_path is not None
+                            else _frozen_falsifier(tmp_path, "box_falsifier_frozen.md")),
         mode_txt_path=os.path.join(tmp_path, "mode.txt"),
         journal_dir=os.path.join(tmp_path, "journals"),
         ledger_path=ledger_path or os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl"),
@@ -521,32 +534,79 @@ def test_box_one_leg_flatten_fills(tmp_path):
         _fire_below(recorder, populate_books={HOURLY_TICKER: top(yes_ask="0.95", yes_bid="0.93")})
 
     svc = _box_svc(tmp_path, mode="armed", window_driver=driver, post_fn=post)
-    svc.execute(svc.prepare())
+    plan = svc.prepare()
+    svc.execute(plan)
     ls = svc.ledger_state
     assert ls.net("high") == 0   # hourly flattened flat
-    assert svc._box_one_legged is False  # a successful flatten is NOT a held one-legged entry
+    # F3: the ENTRY was one-legged (latched, NOT reset by the flatten); the flatten OUTCOME is
+    # recorded separately and here it filled.
+    assert svc._box_one_legged is True
+    assert svc._box_flatten_filled is True
     # exactly two dispatches: the entry batch + one flatten single (single has no "orders" list)
     assert len(post.calls) == 2
     assert isinstance(post.calls[0][1].get("orders"), list)
     assert not isinstance(post.calls[1][1].get("orders"), list)
+    # the ledger row carries both fields (A5 uses box_one_legged; box_flatten_filled is the outcome)
+    row = svc._build_box_ledger_entry(plan, svc._recorder, 0, "j", 0)
+    assert row["box_one_legged"] is True and row["box_flatten_filled"] is True
 
 
 def test_box_one_leg_flatten_misses_then_retries_then_holds(tmp_path):
+    # F4: retries are EVENT-DRIVEN, each priced at the FRESH bid of a later book frame. The flatten
+    # never fills -> 3 attempts max, then A_FLATTEN_EXHAUSTED + hold naked. This asserts (a) the bid
+    # CHANGES between attempts are used, (b) at most 3 attempts, (c) a 4th frame is a no-op.
     post = FakePost(entry_fills={HOURLY_TICKER: (1, "0.94", "0.01")}, flatten_fill=None)  # never fills
 
     def driver(recorder, deadline):
+        # fire + first flatten attempt at bid 0.93
         _fire_below(recorder, populate_books={HOURLY_TICKER: top(yes_ask="0.95", yes_bid="0.93")})
+        # each later frame carries a FRESH bid and a later server_ts (t_minus shrinks toward settle)
+        recorder.books[HOURLY_TICKER] = _FakeBook(top(yes_ask="0.94", yes_bid="0.90"))
+        recorder._on_book_event(HOURLY_TICKER, T - 299)   # attempt 2 @ 0.90
+        recorder.books[HOURLY_TICKER] = _FakeBook(top(yes_ask="0.93", yes_bid="0.88"))
+        recorder._on_book_event(HOURLY_TICKER, T - 298)   # attempt 3 @ 0.88 -> exhausted
+        recorder.books[HOURLY_TICKER] = _FakeBook(top(yes_ask="0.92", yes_bid="0.86"))
+        recorder._on_book_event(HOURLY_TICKER, T - 297)   # pending cleared -> no-op
 
     svc = _box_svc(tmp_path, mode="armed", window_driver=driver, post_fn=post)
     svc.execute(svc.prepare())
     ls = svc.ledger_state
     assert ls.net("high") == 1   # still held (flatten never filled)
-    assert svc._box_one_legged is True
-    # entry batch + 4 flatten attempts (one + up to 3 retries)
+    assert svc._box_one_legged is True         # entry quality latched
+    assert svc._box_flatten_filled is False    # held naked (flatten never filled)
+    assert svc._pending_flatten is None        # cleared after exhaustion
+    # entry batch + exactly 3 flatten attempts (F4: 3 max, not the old 4)
     flatten_calls = [c for c in post.calls if not isinstance(c[1].get("orders"), list)]
-    assert len(flatten_calls) == 4
+    assert len(flatten_calls) == 3
+    # each attempt priced a DIFFERENT fresh bid (a YES sell wires price == the yes_bid it saw)
+    prices = [Decimal(c[1]["price"]) for c in flatten_calls]
+    assert prices == [Decimal("0.93"), Decimal("0.90"), Decimal("0.88")]
+    alarms = [n.kind for n in svc.stops.state.alarms]
+    assert "A_FLATTEN_EXHAUSTED" in alarms
     kinds = [r["kind"] for r in svc.journal.records()]
     assert "box_flatten" in kinds
+
+
+def test_box_flatten_retry_respects_no_orders_cutoff(tmp_path):
+    # F4: the no-orders-to-settle cutoff (t < 1s) STILL stops flatten retries -> hold naked, no order.
+    post = FakePost(entry_fills={HOURLY_TICKER: (1, "0.94", "0.01")}, flatten_fill=None)  # never fills
+
+    def driver(recorder, deadline):
+        _fire_below(recorder, populate_books={HOURLY_TICKER: top(yes_ask="0.95", yes_bid="0.93")})
+        # a later frame INSIDE the settle cutoff (t_minus = 0.5s < 1s): must NOT place a retry
+        recorder.books[HOURLY_TICKER] = _FakeBook(top(yes_ask="0.94", yes_bid="0.90"))
+        recorder._on_book_event(HOURLY_TICKER, T - 0.5)
+
+    svc = _box_svc(tmp_path, mode="armed", window_driver=driver, post_fn=post)
+    svc.execute(svc.prepare())
+    # only attempt 1 (at T-300, outside the cutoff) was dispatched; the T-0.5 frame was held
+    flatten_calls = [c for c in post.calls if not isinstance(c[1].get("orders"), list)]
+    assert len(flatten_calls) == 1
+    assert svc._pending_flatten is None
+    assert svc._box_flatten_filled is False
+    assert "A_FLATTEN_EXHAUSTED" not in [n.kind for n in svc.stops.state.alarms]
+    stages = [r["obj"].get("stage") for r in svc.journal.records() if r["kind"] == "box_flatten"]
+    assert "cutoff_hold" in stages
 
 
 def test_box_one_leg_flatten_no_bid_holds_and_alarms(tmp_path):
@@ -559,10 +619,76 @@ def test_box_one_leg_flatten_no_bid_holds_and_alarms(tmp_path):
     svc.execute(svc.prepare())
     ls = svc.ledger_state
     assert ls.net("high") == 1   # held (no bid to flatten against)
+    assert svc._box_one_legged is True         # entry quality latched
+    assert svc._box_flatten_filled is False    # held naked (no bid to flatten into)
+    assert svc._pending_flatten is None
     # no flatten order was ever dispatched
     assert len(post.calls) == 1
     alarms = [n.kind for n in svc.stops.state.alarms]
     assert "A_FLATTEN_NO_BID" in alarms
+
+
+# ===========================================================================
+# F2) box arms against ITS OWN falsifier (box_falsifier.md), never the corridor's
+# ===========================================================================
+def _arming_record(svc):
+    return next((r["obj"] for r in svc.journal.records() if r["kind"] == "arming"), None)
+
+
+def test_box_arming_refuses_draft_box_falsifier(tmp_path):
+    # box + a DRAFT box falsifier -> S5 refuses; even though the CORRIDOR falsifier (default) is FROZEN.
+    draft = _draft_box_falsifier(tmp_path)
+    svc = _box_svc(tmp_path, mode="armed", window_driver=(lambda r, d: None),
+                   box_falsifier_path=draft)
+    plan = svc.prepare()
+    assert plan.armed is False and plan.degraded is True
+    assert "STATUS: FROZEN" in (plan.degrade_reason or "")
+    arm = _arming_record(svc)
+    assert arm is not None
+    assert arm["falsifier_basename"] == os.path.basename(draft)
+    assert arm["strategy"] == "box"
+    assert arm["armed"] is False
+
+
+def test_box_arms_with_frozen_box_falsifier(tmp_path):
+    # box + a FROZEN box falsifier + frozen roster sha + good health -> arms, against the BOX file.
+    frozen_box = _frozen_falsifier(tmp_path, "box_falsifier_frozen.md")
+    svc = _box_svc(tmp_path, mode="armed", window_driver=(lambda r, d: None),
+                   box_falsifier_path=frozen_box)
+    plan = svc.prepare()
+    assert plan.armed is True
+    arm = _arming_record(svc)
+    assert arm["falsifier_basename"] == os.path.basename(frozen_box)
+    assert arm["strategy"] == "box"
+
+
+def test_box_never_consults_corridor_falsifier(tmp_path):
+    # The corridor falsifier is FROZEN (default in _box_svc) but the box falsifier is DRAFT: the box
+    # must STILL refuse — proof S5 reads box_falsifier.md for the box, not falsifier.md.
+    draft = _draft_box_falsifier(tmp_path)
+    svc = _box_svc(tmp_path, mode="armed", window_driver=(lambda r, d: None),
+                   box_falsifier_path=draft)
+    plan = svc.prepare()
+    assert plan.armed is False
+    # the reason names the BOX falsifier basename, never the corridor's
+    assert os.path.basename(draft) in (plan.degrade_reason or "")
+    assert "falsifier_frozen.md" not in (plan.degrade_reason or "")
+
+
+def test_arming_check_strategy_gate_and_falsifier_selection():
+    # unit level: with expected_strategy pinned, a non-"box" resolved strategy refuses even when
+    # everything else is green; and without expected_strategy the strategy is ignored (corridor path).
+    import tempfile
+    d = tempfile.mkdtemp()
+    fp = os.path.join(d, "f.md")
+    open(fp, "w", encoding="utf-8").write("STATUS: FROZEN\n")
+    dec_ok = arming_check(fp, GOOD_HEALTH, True, strategy="box", expected_strategy="box")
+    assert isinstance(dec_ok, ArmDecision) and dec_ok.armed is True
+    dec_bad = arming_check(fp, GOOD_HEALTH, True, strategy="corridor", expected_strategy="box")
+    assert dec_bad.armed is False and any("strategy" in r for r in dec_bad.reasons)
+    # corridor path (no expected_strategy) ignores the strategy value entirely
+    dec_corr = arming_check(fp, GOOD_HEALTH, True)
+    assert dec_corr.armed is True
 
 
 # ===========================================================================
@@ -671,6 +797,23 @@ def test_parse_market_result():
     assert _parse_market_result({"markets": [{"ticker": "X", "result": "no"}]}, "X") == "no"
     assert _parse_market_result({"markets": [{"ticker": "X", "result": ""}]}, "X") is None
     assert _parse_market_result({}, "X") is None
+
+
+def test_parse_market_result_requires_exact_ticker_F1():
+    # F1: a FOREIGN market's result must NEVER be attributed to our ticker (that booked a fictitious
+    # win). Both shapes require an exact ticker match; a mismatch returns None -> the backfill waits.
+    # list branch: requested ticker absent -> None (no markets[0] fallback)
+    assert _parse_market_result(
+        {"markets": [{"ticker": "KXBTCD-99999", "result": "yes"}]}, "KXBTCD-64000") is None
+    # {"market": {...}} branch: unlabelled/foreign market is NOT trusted
+    assert _parse_market_result({"market": {"ticker": "whatever", "result": "no"}},
+                                "KXBTCD-64000") is None
+    # a market with no ticker key at all -> None
+    assert _parse_market_result({"market": {"result": "yes"}}, "X") is None
+    # happy path still returns the exact match even when foreign markets share the list
+    assert _parse_market_result(
+        {"markets": [{"ticker": "KXBTCD-99999", "result": "yes"},
+                     {"ticker": "KXBTCD-64000", "result": "no"}]}, "KXBTCD-64000") == "no"
 
 
 # ===========================================================================

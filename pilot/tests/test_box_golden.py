@@ -214,7 +214,8 @@ def _oracle_decimal(h: dict) -> tuple[int, Decimal, str, Decimal] | None:
             cands.append((K, h_ask, h_mid))
         if leg15_ask < MIN15 or not cands:
             continue
-        K, h_ask, h_mid = min(cands, key=lambda x: (abs(x[2] - TARGET), abs(x[0] - A)))
+        # tie -> WIDEST gap from A (Brad 2026-08-26): -abs(K - A) so min() picks the largest gap.
+        K, h_ask, h_mid = min(cands, key=lambda x: (abs(x[2] - TARGET), -abs(x[0] - A)))
         if not (H_MIN <= h_ask <= H_MAX):
             continue
         C = h_ask + fee(h_ask) + leg15_ask + fee(leg15_ask)
@@ -264,7 +265,8 @@ def _oracle_float(h: dict) -> tuple[int, float, str] | None:
                 cands.append((Kf, 1 - hyb, 1 - (hya + hyb) / 2))
         if leg15_ask < 0.85 or not cands:
             continue
-        Kf, h_ask, h_mid = min(cands, key=lambda x: (abs(x[2] - 0.95), abs(x[0] - A)))
+        # tie -> WIDEST gap from A (Brad 2026-08-26): -abs(K - A) so min() picks the largest gap.
+        Kf, h_ask, h_mid = min(cands, key=lambda x: (abs(x[2] - 0.95), -abs(x[0] - A)))
         if not (0.90 <= h_ask <= 0.99):
             continue
         return mins, Kf, side

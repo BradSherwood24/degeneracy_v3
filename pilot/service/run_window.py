@@ -134,6 +134,9 @@ logger = logging.getLogger(__name__)
 
 _PILOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_FALSIFIER_PATH = os.path.join(_PILOT_DIR, "ceremony", "falsifier.md")
+# F2 (Phase-4): the box arms against ITS OWN ceremonial falsifier, never the corridor's. S5 checks
+# THIS file's STATUS line when strategy == box; the corridor keeps checking falsifier.md.
+DEFAULT_BOX_FALSIFIER_PATH = os.path.join(_PILOT_DIR, "ceremony", "box_falsifier.md")
 DEFAULT_MODE_TXT = os.path.join(_PILOT_DIR, "ops", "mode.txt")
 DEFAULT_LOG_DIR = os.path.join(_PILOT_DIR, "logs")
 
@@ -148,6 +151,16 @@ VALID_STRATEGIES = ("corridor", "box")
 DEFAULT_STRATEGY_TXT = os.path.join(_PILOT_DIR, "ops", "strategy.txt")
 
 A5_ONE_LEGGED = "A5"  # box one-legged-entry-rate alarm (notify + journal, keep running)
+
+# F4: the one-legged flatten is bounded at 3 attempts total (box_falsifier.md: "up to 3 attempts at
+# fresh bids"). Max orders one box window can emit = 2 entry legs + 3 flatten = 5. Retries are
+# EVENT-DRIVEN: the next attempt is issued on the next later book event for the held ticker whose bid
+# is present, OR on the next later event once >= _FLATTEN_RETRY_MIN_ELAPSED_S of ENGINE time has
+# passed since the last attempt (whichever comes first). Engine time = event server_ts, never wall
+# clock, so this stays replay-deterministic and can never price a stale frozen book (the review's F4).
+_FLATTEN_MAX_ATTEMPTS = 3
+_FLATTEN_RETRY_MIN_ELAPSED_S = 0.250
+A_FLATTEN_EXHAUSTED = "A_FLATTEN_EXHAUSTED"  # all flatten attempts missed -> held naked, alarm
 
 # The pilot is capped at DUAL size; sizing to 5 requires a new commission (falsifier/commission).
 # The proxy's per-order cap must not exceed this ceiling and must not be looser than the executor's.
@@ -385,6 +398,7 @@ class WindowService:
         proxy: Any = None,
         policy_path: str = DEFAULT_POLICY_PATH,
         falsifier_path: str = DEFAULT_FALSIFIER_PATH,
+        box_falsifier_path: str = DEFAULT_BOX_FALSIFIER_PATH,
         mode_txt_path: str = DEFAULT_MODE_TXT,
         journal_dir: str = DEFAULT_JOURNAL_DIR,
         ledger_path: str = DEFAULT_LEDGER_PATH,
@@ -412,6 +426,7 @@ class WindowService:
         self.pairs = int(pairs)
         self.policy_path = policy_path
         self.falsifier_path = falsifier_path
+        self.box_falsifier_path = box_falsifier_path
         self.mode_txt_path = mode_txt_path
         self.journal_dir = journal_dir
         self.ledger_path = ledger_path
@@ -439,7 +454,15 @@ class WindowService:
         self._strategy_valid = True
         self._box_policy: Any = None
         self._current_box_state: BoxState | None = None
-        self._box_one_legged = False       # this window's box entry ended one-legged (for A5 + ledger)
+        # F3: box_one_legged = "exactly one ENTRY leg filled" (set at entry, NEVER reset by a flatten)
+        # -> the A5 counter measures entry quality, not whether we later escaped the naked leg.
+        self._box_one_legged = False
+        # F3: the flatten OUTCOME is recorded separately (None = no flatten attempted; True = the
+        # one-legged leg was flattened flat; False = flatten missed/no-bid/cutoff -> held naked).
+        self._box_flatten_filled: bool | None = None
+        # F4: an in-flight one-legged flatten whose retries are EVENT-DRIVEN (each retry prices a
+        # fresh bid on a later book event). None when no flatten is pending.
+        self._pending_flatten: dict[str, Any] | None = None
 
         self.armed = False
         self.executor: Any = None
@@ -695,7 +718,18 @@ class WindowService:
 
             stop_cfg = StopConfig()
             health = self._fetch_health()
-            arm_decision = arming_check(self.falsifier_path, health, policy_verified)
+            # F2: the box arms against box_falsifier.md and requires the resolved strategy to be
+            # exactly "box"; the corridor keeps arming against falsifier.md. The box roster sha being
+            # verified rides in policy_verified (load_box_policy self-checks the pinned sha above).
+            if strategy == "box":
+                active_falsifier = self.box_falsifier_path
+                arm_decision = arming_check(
+                    active_falsifier, health, policy_verified,
+                    strategy=strategy, expected_strategy="box",
+                )
+            else:
+                active_falsifier = self.falsifier_path
+                arm_decision = arming_check(active_falsifier, health, policy_verified)
             # F9: value-agreement between the proxy /health caps and the executor/pilot caps.
             caps_ok, caps_reason = self._caps_agree(health)
             # A4 day-lock (guard trips) still derives from the ledger's UTC-day totals; the ledger
@@ -728,6 +762,9 @@ class WindowService:
                     "mode": mode,
                     "armed": arm_decision.armed,
                     "reasons": list(arm_decision.reasons),
+                    "falsifier_path": active_falsifier,
+                    "falsifier_basename": os.path.basename(active_falsifier),
+                    "strategy": strategy,
                     "caps_ok": caps_ok,
                     "caps_reason": caps_reason,
                     "day_realized_ledger": str(loss_today),
@@ -1438,6 +1475,7 @@ class WindowService:
         recorder = BoxWindowRecorder(
             wake, self.journal, plan.box_policy, box_state, clock=self.clock,
             capture_tops=(not plan.armed), on_action=self._on_box_action,
+            on_book_event=self._box_on_book_event,
         )
         tickers = self._box_subscription_tickers(wake, a_ticker)
         recorder.ws_client = KalshiWebSocketClient(
@@ -1485,9 +1523,13 @@ class WindowService:
     def _box_post_entry(self, t_minus_s: float) -> None:
         """The box post-fill policy (spec item 4 — REPLACES the corridor rebalance protocol entirely:
         no retries, no rebalance, no I1 ceiling). Both legs filled -> hold to settlement (the $1 floor
-        is booked at close, +$1 backfilled if pinned). Exactly one leg filled -> immediately flatten
-        it reduce-only at the best bid (any price; retry at the new bid up to 3 more times; no bid ->
-        A_FLATTEN_NO_BID + hold). Then S1_box (units + booked-cost) and the A5 one-legged alarm."""
+        is booked at close, +$1 backfilled if pinned). Exactly one leg filled -> flatten it reduce-only
+        at the best bid (any price); the first attempt fires now, retries are EVENT-DRIVEN on later
+        book frames (F4), 3 attempts max; no bid -> A_FLATTEN_NO_BID + hold. Then S1_box (units +
+        booked-cost) and the A5 one-legged alarm.
+
+        F3: ``_box_one_legged`` records the ENTRY quality (exactly one leg filled) and is NEVER reset by
+        a later flatten; the flatten OUTCOME is recorded separately in ``_box_flatten_filled``."""
         from service.stops import S1_ARITH, check_s1_box
 
         assert self.ledger_state is not None and self.stops is not None
@@ -1495,7 +1537,7 @@ class WindowService:
         hi_net, lo_net = ls.net("high"), ls.net("low")
         both = hi_net > 0 and lo_net > 0
         one_leg = (hi_net > 0) != (lo_net > 0)
-        self._box_one_legged = one_leg
+        self._box_one_legged = one_leg  # F3: entry quality, latched (never reset by the flatten)
         if both:
             self._journal(
                 "box_post_fill",
@@ -1505,12 +1547,12 @@ class WindowService:
                  "note": "box pair holds to settlement; $1 floor booked, +$1 backfill if pinned"},
             )
         elif one_leg:
-            self._box_flatten(ls, t_minus_s)
+            self._box_begin_flatten(ls, t_minus_s)
         else:
             self._journal("box_post_fill", {"outcome": "no_fill", "note": "neither box leg filled"})
         # S1_box: freeze the DAY on a units/booked-cost violation, but do NOT run the corridor
         # position_policy (ledger_state omitted from trip()): a both-filled box is floor-protected and
-        # HELD; a one-legged box was already flattened above.
+        # HELD; a one-legged box's flatten is in flight / already resolved above.
         reason = check_s1_box(self.ledger_state, self._box_policy.pair_cost_max)
         if reason:
             self._journal("box_s1", {"reason": reason})
@@ -1528,13 +1570,10 @@ class WindowService:
         top = book.top_of_book()
         return top.yes_bid if side == "yes" else top.no_bid
 
-    def _box_flatten(self, ls: LedgerState, t_minus_s: float) -> None:
-        """Immediately flatten the single filled box leg reduce-only at the current best bid (Brad's
-        standing ruling: at ANY price). One attempt; if the IOC misses, retry at the NEW bid up to 3
-        more times, then hold and journal. No bid -> A_FLATTEN_NO_BID + hold. This is the ONLY order
-        after the entry."""
-        from service.stops import PositionAction, build_flatten_intent
-
+    def _box_begin_flatten(self, ls: LedgerState, t_minus_s: float) -> None:
+        """Start the one-legged flatten: record the pending state and issue the FIRST attempt now (it
+        prices the entry-time bid). If it misses, ``_pending_flatten`` stays set and later book frames
+        drive the retries (F4). The flatten is the ONLY order class after the entry."""
         which = "high" if ls.net("high") > 0 else "low"
         pos = ls.position(which)
         if pos is None or pos.net <= 0:
@@ -1543,43 +1582,117 @@ class WindowService:
         self._journal(
             "box_flatten",
             {"stage": "start", "ticker": ticker, "side": side, "count": count,
-             "note": "one-legged box -> reduce-only flatten at best bid (any price, up to 4 attempts)"},
+             "note": f"one-legged box -> reduce-only flatten at best bid (any price, "
+                     f"{_FLATTEN_MAX_ATTEMPTS} attempts max, retries event-driven)"},
         )
-        for attempt in range(1, 5):  # one attempt + up to 3 retries at the new bid
-            bid = self._box_leg_bid(ticker, side)
-            if bid is None:
-                self.stops.raise_alarm(
-                    "A_FLATTEN_NO_BID",
-                    f"box flatten of {ticker} skipped: no bid to price against (held, alerting)",
-                    {"ticker": ticker, "count": count, "attempt": attempt},
-                )
-                self._journal("box_flatten",
-                              {"stage": "no_bid_hold", "ticker": ticker, "attempt": attempt})
-                return
-            action = PositionAction("flatten", ticker, side, count, "box one-legged flatten")
-            intent = build_flatten_intent(action, self.close_time, WIDE_BOX, bid,
-                                          new_client_order_id())
-            res = self.executor.execute(intent, t_minus_s=t_minus_s, stop_authorized=True)
-            # Book the flatten (intent + fills) as a round-trip via the SAME folding path the
-            # corridor's stop-authorized flattens use (repairs/instruments F1): a filled flatten
-            # reduces net -> drops out of unsettled_legs, never a phantom naked leg.
-            self._fold_flatten_response(intent, res)
-            if self.ledger_state.net(which) <= 0:
-                self._box_one_legged = False  # successfully flattened -> not a held one-legged entry
-                self._journal("box_flatten",
-                              {"stage": "flat", "ticker": ticker, "attempt": attempt, "bid": str(bid)})
-                return
+        self._pending_flatten = {
+            "which": which, "ticker": ticker, "side": side, "count": count,
+            "attempts": 0, "last_ts": None,
+        }
+        # First attempt now, at the fresh entry-time bid. server_ts is event-derived (T - t_minus_s).
+        server_ts = (self._current_box_state.T - t_minus_s) if self._current_box_state else None
+        self._box_flatten_attempt(t_minus_s, server_ts)
+
+    def _box_flatten_attempt(self, t_minus_s: float, server_ts: float | None) -> None:
+        """Execute one reduce-only flatten attempt against the CURRENT best bid. Clears
+        ``_pending_flatten`` when the leg goes flat, when there is no bid (A_FLATTEN_NO_BID), when the
+        no-orders-to-settle cutoff is reached, or when all attempts are exhausted (A_FLATTEN_EXHAUSTED).
+        Otherwise the pending state persists for the next event-driven retry."""
+        from service.stops import PositionAction, build_flatten_intent
+
+        pf = self._pending_flatten
+        if pf is None:
+            return
+        which = pf["which"]
+        # Already flat (a prior attempt filled, or the leg never existed) -> done.
+        if self.ledger_state is None or self.ledger_state.net(which) <= 0:
+            self._pending_flatten = None
+            return
+        ticker, side, count = pf["ticker"], pf["side"], int(pf["count"])
+        # The no-orders cutoff (t < no_orders_after_s_to_settle, ~1s) STILL stops flatten attempts:
+        # hold the naked leg to settlement rather than pound a refusing executor.
+        cutoff = self._box_policy.no_orders_after_s_to_settle if self._box_policy is not None else 1
+        if t_minus_s is not None and t_minus_s < cutoff:
             self._journal(
                 "box_flatten",
-                {"stage": "miss_retry", "ticker": ticker, "attempt": attempt, "bid": str(bid),
-                 "remaining": str(self.ledger_state.net(which))},
+                {"stage": "cutoff_hold", "ticker": ticker, "t_minus_s": t_minus_s,
+                 "attempts": pf["attempts"],
+                 "note": "within no-orders-to-settle cutoff -> hold naked to settlement"},
             )
+            self._box_flatten_filled = False
+            self._pending_flatten = None
+            return
+        bid = self._box_leg_bid(ticker, side)
+        if bid is None:
+            self.stops.raise_alarm(
+                "A_FLATTEN_NO_BID",
+                f"box flatten of {ticker} skipped: no bid to price against (held, alerting)",
+                {"ticker": ticker, "count": count, "attempt": pf["attempts"] + 1},
+            )
+            self._journal("box_flatten",
+                          {"stage": "no_bid_hold", "ticker": ticker, "attempt": pf["attempts"] + 1})
+            self._box_flatten_filled = False
+            self._pending_flatten = None
+            return
+        attempt_no = pf["attempts"] + 1
+        action = PositionAction("flatten", ticker, side, count, "box one-legged flatten")
+        intent = build_flatten_intent(action, self.close_time, WIDE_BOX, bid, new_client_order_id())
+        res = self.executor.execute(intent, t_minus_s=t_minus_s, stop_authorized=True)
+        # Book the flatten (intent + fills) as a round-trip via the SAME folding path the corridor's
+        # stop-authorized flattens use (repairs/instruments F1): a filled flatten reduces net -> drops
+        # out of unsettled_legs, never a phantom naked leg.
+        self._fold_flatten_response(intent, res)
+        pf["attempts"] = attempt_no
+        pf["last_ts"] = server_ts
+        if self.ledger_state.net(which) <= 0:
+            self._box_flatten_filled = True  # F3: the flatten OUTCOME (entry one-legged flag stays)
+            self._pending_flatten = None
+            self._journal("box_flatten",
+                          {"stage": "flat", "ticker": ticker, "attempt": attempt_no, "bid": str(bid)})
+            return
+        if attempt_no >= _FLATTEN_MAX_ATTEMPTS:
+            self.stops.raise_alarm(
+                A_FLATTEN_EXHAUSTED,
+                f"box flatten of {ticker} missed all {_FLATTEN_MAX_ATTEMPTS} attempts (held naked)",
+                {"ticker": ticker, "count": count, "attempts": attempt_no},
+            )
+            self._journal(
+                "box_flatten",
+                {"stage": "giveup_hold", "ticker": ticker, "attempts": attempt_no,
+                 "remaining": str(self.ledger_state.net(which)),
+                 "note": "flatten missed after all attempts -> hold to settlement (naked)"},
+            )
+            self._box_flatten_filled = False
+            self._pending_flatten = None
+            return
+        # Missed but attempts remain: stay pending; a later book frame drives the next attempt.
         self._journal(
             "box_flatten",
-            {"stage": "giveup_hold", "ticker": ticker,
-             "remaining": str(self.ledger_state.net(which)),
-             "note": "flatten missed after all attempts -> hold to settlement (naked)"},
+            {"stage": "miss_retry", "ticker": ticker, "attempt": attempt_no, "bid": str(bid),
+             "remaining": str(self.ledger_state.net(which))},
         )
+
+    def _box_on_book_event(self, market: str, server_ts: float) -> None:
+        """F4 retry trigger: called by the recorder after each subscribed book frame. Issues the next
+        pending flatten attempt when the frame is a LATER event and either (a) it is the held ticker
+        and its best bid is present, or (b) >= _FLATTEN_RETRY_MIN_ELAPSED_S of engine time has passed
+        since the last attempt (whichever first). The 'later event' guard stops a retry from re-pricing
+        the SAME frozen frame the previous attempt already saw (the review's F4 bug)."""
+        pf = self._pending_flatten
+        if pf is None:
+            return
+        last_ts = pf["last_ts"]
+        if last_ts is not None and server_ts <= last_ts:
+            return  # same or earlier frame -> not a fresh bid; wait for a later one
+        held_has_bid = (
+            market == pf["ticker"] and self._box_leg_bid(pf["ticker"], pf["side"]) is not None
+        )
+        elapsed = None if last_ts is None else (server_ts - last_ts)
+        time_fallback = elapsed is not None and elapsed >= _FLATTEN_RETRY_MIN_ELAPSED_S
+        if not (held_has_bid or time_fallback):
+            return
+        t_minus_s = (self._current_box_state.T - server_ts) if self._current_box_state else None
+        self._box_flatten_attempt(t_minus_s, server_ts)
 
     def _box_a5_alarm(self) -> None:
         """A5: over the rolling last 20 box fires (this window included), if one-legged/fires > 0.10,
@@ -2263,7 +2376,11 @@ class WindowService:
             "orders_attempted": orders_attempted,
             "fills": fills,
             "filled": filled,
+            # F3: box_one_legged = ENTRY quality (exactly one leg filled), counted by A5 regardless of
+            # whether the flatten later filled. box_flatten_filled = the flatten OUTCOME, recorded
+            # separately (None = no flatten; True = flattened flat; False = held naked).
             "box_one_legged": bool(self._box_one_legged and fires > 0),
+            "box_flatten_filled": self._box_flatten_filled,
             "s1_violation": s1_violation,
             "slippage_abs_per_side": slippage,
             "guard_trips": guard_trips,
@@ -2327,18 +2444,21 @@ def _safe_close(close_iso: str) -> str:
 def _parse_market_result(resp: Any, ticker: str) -> str | None:
     """Extract a settled market result ('yes'/'no') for ``ticker`` from a proxy /markets payload.
     Accepts {"market": {...}} or {"markets": [...]}; returns None until the market carries a
-    ``result`` of exactly 'yes'/'no' (fail-closed: an empty/absent result means not-yet-settled)."""
+    ``result`` of exactly 'yes'/'no' (fail-closed: an empty/absent result means not-yet-settled).
+
+    F1 (Phase-4): the record's ``ticker`` MUST equal ``ticker`` exactly, in BOTH shapes. There is NO
+    fallback to ``markets[0]`` and NO trust of an unlabelled ``{"market": {...}}`` — a foreign
+    market's ``result`` must never be attributed to our leg (that booked fictitious P&L). If the
+    requested ticker is absent, return None and let the backfill wait for a later wake."""
     if not isinstance(resp, dict):
         return None
     rec: Any = None
     market = resp.get("market")
     markets = resp.get("markets")
     if isinstance(market, dict):
-        rec = market
+        rec = market if market.get("ticker") == ticker else None
     elif isinstance(markets, list):
         rec = next((m for m in markets if isinstance(m, dict) and m.get("ticker") == ticker), None)
-        if rec is None and markets and isinstance(markets[0], dict):
-            rec = markets[0]
     if not isinstance(rec, dict):
         return None
     result = rec.get("result")
@@ -2362,7 +2482,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="Hourly ladder tickers to subscribe (0 = the paired strike only; a positive "
                          "N widens; omit-as-negative for the full ladder). Decision pair always kept.")
     ap.add_argument("--policy", default=DEFAULT_POLICY_PATH)
-    ap.add_argument("--falsifier", default=DEFAULT_FALSIFIER_PATH)
+    ap.add_argument("--falsifier", default=DEFAULT_FALSIFIER_PATH,
+                    help="Corridor falsifier (S5 when strategy=corridor).")
+    ap.add_argument("--box-falsifier", default=DEFAULT_BOX_FALSIFIER_PATH,
+                    help="Box falsifier (S5 when strategy=box). Its STATUS line must be FROZEN to arm.")
     ap.add_argument("--mode-file", default=DEFAULT_MODE_TXT)
     ap.add_argument("--journal-dir", default=DEFAULT_JOURNAL_DIR)
     ap.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
@@ -2397,6 +2520,7 @@ def main(argv: list[str] | None = None) -> int:
         proxy=proxy,
         policy_path=args.policy,
         falsifier_path=args.falsifier,
+        box_falsifier_path=args.box_falsifier,
         mode_txt_path=args.mode_file,
         journal_dir=args.journal_dir,
         ledger_path=args.ledger,

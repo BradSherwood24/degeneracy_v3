@@ -32,7 +32,6 @@ from service.box import (
     ClockTick,
     NoBox,
     decide_box,
-    select_box,
 )
 from service.record_window import WindowRecorder
 from service.wake import WakeResult
@@ -149,13 +148,10 @@ class BoxSignalDriver:
 
     # --- box_eval (throttled observability) ---
     def _current_view(self) -> BoxSelection | NoBox | None:
-        """The box's current selection view from state tops (None until the 15M top is known)."""
-        st = self.state
-        m15_top = st.tops.get(st.m15_ticker)
-        if m15_top is None:
-            return None
-        ladder = {tk: (K, st.tops[tk]) for tk, K in st.strikes.items() if tk in st.tops}
-        return select_box(st.anchor_A, st.m15_ticker, m15_top, ladder, self.params)
+        """The box's current selection view. F5: this is the view decide_box cached on the state at the
+        last relevant book fold (None until the 15M top is known) — reused here so select_box does not
+        run a second time per tick."""
+        return self.state.view
 
     def _maybe_journal_eval(self, now: float) -> None:
         view = self._current_view()
@@ -205,9 +201,13 @@ class BoxWindowRecorder(WindowRecorder):
         clock: Callable[[], float] = time.time,
         capture_tops: bool = True,
         on_action: Callable[[Action], None] | None = None,
+        on_book_event: Callable[[str, float], None] | None = None,
     ) -> None:
         super().__init__(wake_result, journal, clock=clock, capture_tops=capture_tops)
         self.driver = BoxSignalDriver(params, state, journal, clock=clock, on_action=on_action)
+        # F4: fired after each subscribed book frame is driven, carrying (market, server_ts). The
+        # runner uses it to issue EVENT-DRIVEN one-legged-flatten retries against fresh bids.
+        self._on_book_event = on_book_event
 
     def _drive(self, market: str, payload: dict) -> None:
         book = self.books.get(market)
@@ -225,6 +225,9 @@ class BoxWindowRecorder(WindowRecorder):
             )
             return
         self.driver.on_book_update(market, book.top_of_book(), server_ts)
+        # F4: a fresh, server-timestamped frame -> let the runner run any pending flatten retry.
+        if self._on_book_event is not None:
+            self._on_book_event(market, server_ts)
 
     def _on_snapshot(self, market: str, payload: dict) -> None:
         super()._on_snapshot(market, payload)
