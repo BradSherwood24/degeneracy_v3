@@ -326,3 +326,66 @@ so 1.5s and 0.5s were indistinguishable and I picked a number.
 Analysis scripts are session scratch (not committed); the replayer that makes
 them reproducible is the first build item. — Claude
 
+
+---
+
+## 2026-08-27 11:30Z — The box is LIVE: build day, first night, three instrument bugs
+
+**Rulings (Brad, verbatim, 2026-08-26):** "Naw, lets just run it. No two weeks of shadow…
+we only really learn anything from trades placed and orders filled." / "Daily cap should be
+based on account balance… no other strategies ran on this account… one-leg rate… >10%…
+max price for these should be set well above best ask." / tie-break → "widest gap" /
+"Lock it in. Lets send'r live. And 1 contract pair you mean, right?" / stop-loss idea:
+"lets get crawling here before gettin fancy with it."
+
+**Built and merged to main (PRs #1–#11, all Opus 4.8 built + reviewed):**
+- #1 `service/box.py` pure core + roster `box-v1` (sha 480d4634…); golden parity vs candle
+  oracle 1,289 hours / 0 mismatches. #2 fill accounting: NO-space normalization (armed-span
+  ledger re-derived −0.9764 = Kalshi −0.98), realized booking + settlement backfill, day-latched
+  stops, **S4 from account balance** (Decimal `balance_dollars` cross-checked vs int cents).
+  #3/#4 wiring: `strategy.txt` lever, full-ladder subscription, `decide_box` routing, post-fill
+  policy (both→hold at $1 floor; one-leg→flatten at bid, event-driven, 3 attempts; NO
+  rebalance), `check_s1_box` (fill>limit or pair>1.99), A5 >10%/20, box S5 gate on
+  `ceremony/box_falsifier.md`. #5 strategy.txt untracked. #6 `service/box_report` (R1–R4, A1,
+  A5, S4 mechanical; R2 per FIRE over SETTLED fills). #7 tests isolated from live levers.
+  #8 falsifier FROZEN. #9 **exchange_index routing**. #10 guard files gitignored. #11 backfill
+  via `/markets/{ticker}`.
+- Max 5 orders/window; 559 tests; live tree = main @ fa98700; levers armed/box.
+
+**Shakedown (paper, 2 windows):** 22:00Z would-fire pinned (+17.8¢), 23:00Z would-fire missed
+(−83.1¢). 189 tickers/window, zero errors.
+
+**First armed fire 00:00Z 8/27: `market_not_found` ×2.** Kalshi sharded 8/24 — crypto =
+`exchange_index 2`; our body omitted it → shard 0. Collateral was 100% on shard 0 (docs:
+"must preallocate collateral on a given exchange shard"). Fix #9 (explicit index per market,
+atomic refusal if unknown) + Brad moved ~half the balance to shard 2. 01:00Z filled.
+
+**Night 1 (01:00Z–11:00Z):** 7 fires → 7 two-leg fills → **7/7 pinned**, mean +16.4¢/fire,
+box ≈ +$1.23; balance 52.97 → 54.27 (incl. Brad's +6.6¢ manual test trade — pollutes S4;
+noted). Slippage mean **−0.43¢/pair** (4 legs 1¢ better, 1 level bump +1¢ on a 586-contract
+15M top — the 3¢ margin filled the next level instead of one-legging). Depth at fills:
+top 190–13,095; within limit 1,100–32,000. 06–09Z = wake_standdown (no hourly market). Gates:
+R1 7/30, R2 6/60, R3 7/60, A5 0/8, S4 −$1.05. **7/7 at pin 0.90 is a 48% event — no inference.**
+
+**Bugs the night found (instrument, not money):** shard routing; backfill lookup (list
+endpoint ignores `?ticker=`; exact-match guard → silent wait; now single-market endpoint +
+`settlement_backfill_pending` record); tests reading live levers.
+
+**Side studies (candles, non-sealed):** per-leg stop-loss <$0.10: Δ +0.04¢ ± 0.05 (calibrated
+prices → neutral; hurts at 0.30) — not adopted. Maker box (bids −1¢ both legs, take the other
+on fill): entry 79% → 75%, EV +2.3¢ strict / +3.3¢ lenient vs +2.4¢ taker — wash. Hourly-only
+±100 fallback on box-skipped hours: **+7.4¢ was LOOK-AHEAD** ("box never entered" ⇔ price
+hugged the anchor); honest version 0 ± 1.5¢ at every entry minute. Confession filed.
+
+**Review asks for Codex (xiv–xx):** (xiv) the event-driven flatten state machine
+(`run_window._box_flatten_attempt`) — attack re-entrancy and the silent-book teardown gap
+(known LOW); (xv) R2 per-fire-over-settled definition vs the falsifier's "per pair" wording;
+(xvi) S4 on account balance with manual trades present — should the guard snapshot exclude
+non-strategy fills?; (xvii) the exchange_index refusal — any path to a one-legged position;
+(xviii) level-bump accounting: is +1¢ vs decided ask the right R1 estimand when the fill is
+inside the limit; (xix) sizing math for 5–10 contracts against the observed thin tops (188 @
+0.85); (xx) the look-ahead confession — is any OTHER conditional finding in this thread
+contaminated the same way (esp. late_window/ladder VRP)?
+
+Branches merged: sim/replay, mailbox/physics-correction, corner/the-box folded in here.
+— Claude
