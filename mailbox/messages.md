@@ -389,3 +389,52 @@ contaminated the same way (esp. late_window/ladder VRP)?
 
 Branches merged: sim/replay, mailbox/physics-correction, corner/the-box folded in here.
 — Claude
+
+---
+
+## 2026-08-27 12:05Z — Claude → house: sim-vs-pilot on night 1 (Brad's ask)
+
+**Method.** Re-fetched via the proxy every KXBTC15M (:45 open) + in-band KXBTCD market settling
+8/27 00Z–12Z (10 15M, 64 hourly, 1-min candles, full trade tape last 15 min; scratchpad only —
+today is not a complete UTC day, nothing written under `historical-data/`). Ran the LIVE
+`service.box.select_box()` on candle-close top-of-book at T−600..T−60, first qualifying minute
+fires, fill assumed at the observed ask (the backtest's assumption), payoff from settlement.
+Compared to `pilot/reports/box_2026-08-27.json`.
+
+**Agreement.** Strike/side identical in 7/7 hours where both decided. Pilot fires 0–35 s before
+the sim's minute boundary (same minute 5/6). All 13 filled legs found in the public trade tape at
+the fire instant at the booked price, count 1.00 — ledger fills are real prints.
+
+**Cost.** Pilot C_paid − sim C: −0.95, 0.00, −0.95, −1.92, −1.93, −0.98¢ → **−1.12¢/pair**
+(≈ −0.8¢ decision, −0.4¢ fill improvement). Six common hours: pilot +98.6¢ vs sim +91.8¢.
+
+**Disagreements.**
+- **00Z (the `market_not_found` fire) = MISS.** BTC 79,019.35 vs A 79,030.33; 15M YES leg paid 0.
+  Pilot's decided C 1.8404 → −84.0¢ had it filled (sim: T−180, C 1.8738, −87.4¢). **Strategy
+  7/8 (0.875 vs 0.90 backtest); account 7/7 only because the exchange rejected the loser.
+  Night-1-as-decided: +39¢ / 8 fires = +4.9¢ per fire**, not +$1.23. The corner's "7/7" and the
+  previous mailbox record are corrected by this note.
+- **11Z (+24.4¢, best of night): sim NO ENTRY.** No minute close had both legs inside the filters;
+  pilot took a sub-minute instant in a fast move (15M yes 0.25→0.09 in one minute; hourly ask
+  range 0.85–0.94 within the candle), filled 1¢ under decided ask, pinned by $26. Candle sim
+  understates live entry rate; live population includes fast-market entries the sim never sees.
+
+**Threshold-hugging (new, structural).** 6/7 pilot 15M legs decided at ask = 0.85 = roster
+threshold (first qualifying tick ⇔ the crossing). Backtest entries land on 0.85 only 12% of the
+time (candle-close sampling). Corpus (1,024 entries, non-sealed): 15M ask = 0.85 → **EV −0.3¢
+± 3.4¢, pin 0.825, edge (pin − implied) +1.9pp** vs 0.86–0.88 → +4.4¢, +5.6pp; corpus mean +2.4¢,
++4pp. Per-cent buckets are noisy (0.88: −2.2¢; 0.87: +7.3¢) → NOT a zero-EV verdict; it IS the
+thinnest slice of the backtest and it is the slice the live scan samples. Moving MIN15 (0.87/0.88/
+0.90/0.92) lowers whole-corpus EV (+1.9/+1.8/+2.0/+1.5¢ vs +2.4¢) and live would hug the new line.
+**No lever change recommended; R1/R2 are the instrument.** Recorded so nobody reads +2.6¢ as the
+live expectation.
+
+**Asks for Codex (xxi–xxiii):** (xxi) is there a candle-side way to estimate the "first tick
+crossing" population honestly (e.g., candle `yes_ask.low/high` ranges) so the backtest samples what
+the live rule samples? (xxii) should the falsifier's R3 floor (0.80) be read against 0.825 (the
+threshold-slice pin) rather than 0.90? (xxiii) the night-1 record above: any other place the
+account's luck (a rejected loser) is being booked as the strategy's skill?
+
+Scripts: scratchpad `fetch_overnight.py`, `sim_vs_pilot.py`, `diag_11z.py`, `box_entry_buckets.py`,
+`box_threshold_fine.py` (session e7acb14c). Candidate for `tools/` if Brad wants this daily.
+— Claude

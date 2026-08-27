@@ -131,3 +131,79 @@ $1 floor books, the flatten path stays quiet, and the balance moves by exactly
 what the arithmetic says.
 
 Crawl before we walk. 🐀⚓
+
+---
+
+## Addendum, 2026-08-27 12:00Z — the water, re-measured
+
+Brad's first question this morning: pull the night's markets back down from
+the historical API and run the sim over them. Compare what the candle
+backtest *would have decided* with what the pilot *did*. Good question —
+the candle sim is the thing that promised +2.6¢, and it had never once been
+laid next to a real fill.
+
+I fed the live `select_box()` (frozen roster, sha `480d46…`) the 1-minute
+candle closes for every hourly ladder and 15M market that settled between
+00Z and 12Z, scanning T−600..T−60 exactly like the backtest. Then I pulled
+the public trade tape for the same markets and looked for our prints.
+
+**The decisions agree.** Seven hours where both the sim and the pilot chose a
+box: same strike, same side, all seven. The pilot fires 0–35 seconds before
+the sim's minute boundary (same minute in 5 of 6 filled hours) because it
+sees every tick and the sim sees one per minute.
+
+**The prints are real.** All 13 filled legs sit in Kalshi's public tape at the
+fire instant, at the booked price, count 1.00. The ledger is not telling
+itself stories.
+
+**The pilot is cheaper than the sim by 1.1¢ a pair.** Decided cost about
+0.8¢ under the sim's, plus 0.4¢ of fill improvement (limit 0.99, filled
+0.97). Over the six hours both filled: pilot +98.6¢, sim +91.8¢. The reason
+for the 0.8¢ is the important part and it cuts both ways — see below.
+
+**Where they disagree, in both directions:**
+
+- *00Z, the rejected fire.* The sim enters at T−180 and the box **misses** by
+  eleven dollars — BTC settled 79,019.35 against an anchor of 79,030.33, so
+  the 15M YES leg paid nothing. The pilot had decided the same strike and
+  side at T−227 for C = 1.8404; had Kalshi not thrown `market_not_found`, the
+  night books −84¢ on that hour. So the honest night is not 7/7. **The
+  strategy went 7 for 8 (0.875 against a 0.90 backtest); the account went 7
+  for 7 because the exchange rejected the loser.** Brad's "looks like we got
+  an example of all possible outcomes" was truer than either of us knew.
+  Night 1 as the strategy would have booked it: **+39¢ over 8 fires, +4.9¢
+  per fire** — not +$1.23.
+
+- *11Z, the pilot's best trade (+24¢).* The sim never enters. At no minute
+  close were both legs inside the filters; the pilot caught a sub-minute
+  instant during a violent move (15M yes 0.25 → 0.09 in one minute, the
+  hourly leg's ask ranging 0.85–0.94 inside the same candle) and got filled
+  a cent under the decided ask. It pinned by $26 on the 15M side. The candle
+  sim structurally cannot see these entries; the live scan takes them.
+
+**The thing I did not expect.** Six of the pilot's seven filled 15M legs were
+decided at ask = 0.85 — exactly the roster threshold. Of course they were:
+the 15M ask is the binding filter most of the window, and the first
+qualifying *tick* is the crossing itself. The candle backtest samples minute
+closes, so its 15M entry asks spread 0.85–0.99 (only 12% land on 0.85). The
+live pilot's population is concentrated in the one slice the backtest barely
+weights.
+
+So I went back to the corpus and bucketed the 1,024 backtest entries by the
+15M ask at entry. At exactly 0.85: **EV −0.3¢ ± 3.4¢, pin 0.825, edge over
+the market's implied pin +1.9pp** (n = 126). At 0.86–0.88: +4.4¢, edge +5.6pp.
+The whole-corpus average is +2.4¢, edge +4pp. The per-cent buckets are noisy
+enough that 0.88 comes out negative and 0.87 strongly positive, so I will
+not call the threshold slice zero-EV — the honest statement is that it is
+the *thinnest* slice of the backtest and it is the slice we are actually
+trading. Moving the threshold does not fix it (every alternative 0.87–0.92
+lowers the overall EV; live entries would simply hug the new line). What
+fixes it, if it needs fixing, is the falsifier doing its job: R2 at 60
+fills, R1 at 30.
+
+I am not recommending a lever change. I am recording that the backtest
+number Brad froze on was an average over a population the live pilot does
+not sample uniformly, and that the seven pins so far tell us nothing about
+that — the eighth, the one that missed, tells us a little.
+
+Same standing orders. The rat keeps crawling. 🐀
