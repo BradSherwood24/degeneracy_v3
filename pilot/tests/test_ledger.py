@@ -170,3 +170,39 @@ def test_rebuild_round_trips_through_flush(tmp_path):
     st = rebuild_from_journal(reloaded.records(), CT, SUB_DOLLAR_FLIP, HI, LO)
     assert st.is_balanced() and st.matched_pairs() == 1
     assert st.realized_min() == Decimal("0.17")
+
+
+def test_intent_record_round_trips_exchange_index():
+    from service.ledger import intent_from_record
+    legs = (
+        IntentLeg(HI, "no", "buy", 1, Decimal("0.57"), "h", exchange_index=2),
+        IntentLeg(LO, "yes", "buy", 1, Decimal("0.24"), "l", exchange_index=2),
+    )
+    intent = Intent(window=CT, source=SUB_DOLLAR_FLIP, purpose=PURPOSE_ENTRY, legs=legs)
+    rec = intent_to_record(intent)
+    assert all(lg["exchange_index"] == 2 for lg in rec["legs"])
+    back = intent_from_record(rec)
+    assert all(lg.exchange_index == 2 for lg in back.legs)
+
+
+def test_rebuild_pre_fix_journal_without_exchange_index_key():
+    # A journal written BEFORE this fix has order_intent leg dicts with NO exchange_index key at all.
+    # Rebuild must still work (rebuild never dispatches); the legs default to exchange_index None.
+    from service.ledger import intent_from_record
+    pre_fix = {
+        "window": CT, "source": SUB_DOLLAR_FLIP, "purpose": PURPOSE_ENTRY, "t_minus_s": 300.0,
+        "legs": [
+            {"ticker": HI, "side": "no", "action": "buy", "count": 1, "limit_price": "0.57",
+             "client_order_id": "h", "reduce_only": None},   # NOTE: no "exchange_index" key
+            {"ticker": LO, "side": "yes", "action": "buy", "count": 1, "limit_price": "0.24",
+             "client_order_id": "l", "reduce_only": None},
+        ],
+    }
+    intent = intent_from_record(pre_fix)
+    assert all(lg.exchange_index is None for lg in intent.legs)
+    j = Journal()
+    j.append("order_intent", pre_fix, 0.0)
+    j.append("order_response", response_to_record(resp("h", 1, "0.57", "0.01")), 0.1)
+    j.append("order_response", response_to_record(resp("l", 1, "0.24", "0.01")), 0.2)
+    st = rebuild_from_journal(j.records(), CT, SUB_DOLLAR_FLIP, HI, LO)
+    assert st.is_balanced() and st.matched_pairs() == 1

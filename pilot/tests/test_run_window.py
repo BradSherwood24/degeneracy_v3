@@ -731,14 +731,16 @@ def test_F8_flatten_exempt_from_rate_budget_but_strategy_is_not():
     cfg = ExecutorConfig(armed=False, window_token_budget=0, tokens_per_entry=10)
     ex = HarnessExecutor(ThreadSafeJournal(), cfg, post_fn=post, clock=lambda: 0.0)
     flat = Intent("W", "sub$1-flip", PURPOSE_FLATTEN,
-                  (IntentLeg("KXBTC15M-A", "no", "sell", 1, Decimal("0.40"), "c1", reduce_only=True),))
+                  (IntentLeg("KXBTC15M-A", "no", "sell", 1, Decimal("0.40"), "c1", reduce_only=True,
+                             exchange_index=0),))
     res = ex.execute(flat, t_minus_s=10.0, stop_authorized=True)
     assert res.refused is None       # F8: NOT rate_budget_exhausted
     assert posted == [SINGLE_CREATE_PATH]  # a POST happened, via the envelope's events-path constant
     # a strategy order under the same exhausted budget IS refused
     ex.set_armed(True)
     entry = Intent("W", "sub$1-flip", PURPOSE_ENTRY,
-                   (IntentLeg("KXBTC15M-A", "yes", "buy", 1, Decimal("0.40"), "c2"),))
+                   (IntentLeg("KXBTC15M-A", "yes", "buy", 1, Decimal("0.40"), "c2",
+                              exchange_index=0),))
     res2 = ex.execute(entry, t_minus_s=10.0)
     assert res2.refused == "rate_budget_exhausted"
 

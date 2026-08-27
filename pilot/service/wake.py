@@ -83,6 +83,28 @@ BALANCE_PATH = "/portfolio/balance"
 _MAX_PAGES = 50  # pagination safety cap
 
 
+def coerce_exchange_index(v: Any) -> int | None:
+    """Fail-closed coercion of a market record's ``exchange_index`` field to int | None.
+
+    Exchange sharding (Kalshi changelog 2026-08-24: "Crypto… provisioned on dedicated exchange
+    instances"): KXBTC15M / KXBTCD markets now carry ``exchange_index`` (0, 2, …). An order that
+    omits it did NOT auto-route on 2026-08-27 (both IOC legs -> ``market_not_found`` on shard 0),
+    so routing MUST be explicit. A record whose ``exchange_index`` is absent, None, or non-integral
+    yields None -> the dispatch layer REFUSES rather than sending an unrouted order (fail closed)."""
+    if v is None:
+        return None
+    try:
+        # Reject bools (bool is an int subclass) and non-integral floats; accept "2"/2/2.0.
+        if isinstance(v, bool):
+            return None
+        iv = int(v)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(v, float) and float(iv) != v:
+        return None
+    return iv
+
+
 class WakeError(Exception):
     """Unrecoverable error assembling the wake context (a stand-down is NOT an error — see below)."""
 
@@ -183,6 +205,25 @@ class WakeResult:
     # full pool run_window pairs against at phase B (census h1_by_ct semantics). Empty on a
     # back-compat construction -> callers fall back to the single selected generation.
     hourly_ladders: tuple[Leg, ...] = ()
+
+    @property
+    def exchange_index_by_ticker(self) -> dict[str, int | None]:
+        """{ticker: exchange_index} for EVERY market discovered this wake — the 15M leg PLUS the full
+        hourly ladder pool (all live generations, or the selected generation on a back-compat
+        construction). A market whose record lacks ``exchange_index`` maps to None (fail closed).
+
+        The dispatch layer (``run_window`` box + corridor paths, ``stops`` flatten) reads THIS map to
+        stamp ``IntentLeg.exchange_index``; the Executor REFUSES to dispatch a leg whose exchange_index
+        is None (the 2026-08-27 ``market_not_found`` incident: omission did not auto-route). Both legs
+        of a box/strangle — the hourly ladder market chosen at phase B and the 15M anchor — are
+        present here, so every dispatched leg can be routed explicitly."""
+        out: dict[str, int | None] = {}
+        for m in tuple(self.fifteen_leg.markets) + self.hourly_pool_markets:
+            tk = m.get("ticker")
+            if tk is None:
+                continue
+            out[str(tk)] = coerce_exchange_index(m.get("exchange_index"))
+        return out
 
     @property
     def hourly_pool_markets(self) -> tuple[dict, ...]:

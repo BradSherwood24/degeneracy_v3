@@ -170,6 +170,20 @@ class Executor:
             if cap is not None:
                 return self._refuse(intent, cap)
 
+            # (2b) exchange-sharding route (2026-08-27 market_not_found incident): NEVER send an
+            # unrouted order. A leg whose exchange_index is None was not resolved to a shard at wake;
+            # omission did NOT auto-route (both IOC legs 404'd on shard 0), so refuse and treat as
+            # no-fill rather than route to the wrong shard.
+            missing = [leg.ticker for leg in intent.legs if getattr(leg, "exchange_index", None) is None]
+            if missing:
+                self._journal.append(
+                    "order_refused_no_exchange_index",
+                    {"window": intent.window, "purpose": intent.purpose, "source": intent.source,
+                     "tickers": missing},
+                    self._clock(),
+                )
+                return self._refuse(intent, f"no_exchange_index:{','.join(missing)}")
+
             # (3) no-orders-after-settle cutoff (I3) — event-derived time, never wall clock
             if t_minus_s is not None and t_minus_s < self._cfg.no_orders_after_s_to_settle:
                 return self._refuse(

@@ -478,6 +478,11 @@ class WindowService:
         self.ledger_state: LedgerState | None = None
         self._current_state: WindowState | None = None
         self._recorder: WindowRecorder | None = None
+        # Exchange-sharding route map {ticker: exchange_index} captured from the wake sweep (set in
+        # _run_box_window / _run_corridor_window). Every dispatched IntentLeg (entry, rebalance,
+        # flatten) is stamped from this so orders route to the right shard (2026-08-27 incident);
+        # a ticker absent here -> None -> the Executor refuses rather than send an unrouted order.
+        self._exchange_index_by_ticker: dict[str, int | None] = {}
         self._connect_not_before: float | None = None  # WS-dial gate (15M open_time); set in execute()
         self._finalized = False
         self._day_totals: tuple[Decimal, int] = (Decimal(0), 0)  # (realized_today, guard_trips_today)
@@ -637,7 +642,8 @@ class WindowService:
             from service.stops import S3_RECON
 
             self.stops.trip(S3_RECON, f"reconcile mismatch {result.mismatches}",
-                            ledger_state=ls, bids=self._bids())
+                            ledger_state=ls, bids=self._bids(),
+                            exchange_index=self._exchange_index_by_ticker)
 
     def _sub_only_quintile(self, policy: PolicyParams) -> int:
         """A routing bucket whose sources are sub-$1-flip WITHOUT the strangle — used when the
@@ -1343,6 +1349,9 @@ class WindowService:
             plan.stand_down_reason = outcome.reason
             return None
         self._apply_outcome(plan, outcome)
+        # Exchange-sharding route map for every dispatched leg this window (2026-08-27 incident).
+        assert plan.wake is not None
+        self._exchange_index_by_ticker = plan.wake.exchange_index_by_ticker
         recorder = self._build_recorder(plan)
         self._recorder = recorder
         deadline = close_epoch(plan.wake.close_time) + GRACE_SECONDS
@@ -1368,6 +1377,8 @@ class WindowService:
         on a legitimate stand-down."""
         wake = plan.wake
         assert wake is not None and plan.box_policy is not None
+        # Exchange-sharding route map for every dispatched leg this window (2026-08-27 incident).
+        self._exchange_index_by_ticker = wake.exchange_index_by_ticker
         anchor = self._resolve_box_anchor(plan)
         if anchor is None:
             plan.stand_down = True
@@ -1509,6 +1520,7 @@ class WindowService:
                 ticker=lg.ticker, side=lg.side, action="buy",
                 count=int(lg.count), limit_price=lg.limit_price,
                 client_order_id=new_client_order_id(),
+                exchange_index=self._xi(lg.ticker),
             )
             for lg in action.legs
         )
@@ -1643,7 +1655,8 @@ class WindowService:
             return
         attempt_no = pf["attempts"] + 1
         action = PositionAction("flatten", ticker, side, count, "box one-legged flatten")
-        intent = build_flatten_intent(action, self.close_time, WIDE_BOX, bid, new_client_order_id())
+        intent = build_flatten_intent(action, self.close_time, WIDE_BOX, bid, new_client_order_id(),
+                                      exchange_index=self._xi(ticker))
         res = self.executor.execute(intent, t_minus_s=t_minus_s, stop_authorized=True)
         # Book the flatten (intent + fills) as a round-trip via the SAME folding path the corridor's
         # stop-authorized flattens use (repairs/instruments F1): a filled flatten reduces net -> drops
@@ -1847,6 +1860,7 @@ class WindowService:
                 ticker=lg.ticker, side=lg.side, action="buy",
                 count=int(lg.count) * self.pairs, limit_price=lg.limit_price,
                 client_order_id=new_client_order_id(),
+                exchange_index=self._xi(lg.ticker),
             )
             for lg in action.legs
         )
@@ -1881,7 +1895,8 @@ class WindowService:
         assert self.ledger_state is not None
         reason = check_s1(self.ledger_state)
         if reason:
-            self.stops.trip(S1_ARITH, reason, ledger_state=self.ledger_state, bids=self._bids())
+            self.stops.trip(S1_ARITH, reason, ledger_state=self.ledger_state, bids=self._bids(),
+                            exchange_index=self._exchange_index_by_ticker)
             return
         # imbalance protocol
         self._maybe_rebalance(t_minus_s if t_minus_s is not None else 0.0)
@@ -1932,6 +1947,11 @@ class WindowService:
             out[ls.low_ticker] = lb
         return out
 
+    def _xi(self, ticker: str) -> int | None:
+        """The wake-captured exchange_index (shard) for ``ticker``, or None if the wake map did not
+        carry it (fail closed: the Executor refuses an unrouted leg)."""
+        return self._exchange_index_by_ticker.get(ticker)
+
     def _ceiling_per_pair(self, policy: PolicyParams, source: str) -> Decimal:
         if source == SUB_DOLLAR_FLIP:
             return policy.imbalance.pair_cost_ceiling_sub1
@@ -1957,7 +1977,8 @@ class WindowService:
                 break
             if isinstance(prop, GiveUp):
                 self.stops.trip(S2_IMBALANCE, prop.reason,
-                                ledger_state=self.ledger_state, bids=self._bids())
+                                ledger_state=self.ledger_state, bids=self._bids(),
+                                exchange_index=self._exchange_index_by_ticker)
                 break
             purpose = PURPOSE_REBALANCE_BUY if isinstance(prop, RetryBuy) else PURPOSE_REBALANCE_SELL
             action = "buy" if isinstance(prop, RetryBuy) else "sell"
@@ -1965,7 +1986,7 @@ class WindowService:
             leg = IntentLeg(
                 ticker=prop.ticker, side=prop.side, action=action, count=int(prop.count),
                 limit_price=prop.limit_price, client_order_id=new_client_order_id(),
-                reduce_only=reduce_only,
+                reduce_only=reduce_only, exchange_index=self._xi(prop.ticker),
             )
             intent = Intent(window=self.close_time, source=self.ledger_state.source,
                             purpose=purpose, legs=(leg,), t_minus_s=t_minus_s)

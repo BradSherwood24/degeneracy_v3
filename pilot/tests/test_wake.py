@@ -364,6 +364,33 @@ def test_subscribe_tickers_and_limit() -> None:
     assert len(r.subscribe_tickers(hourly_limit=3)) == 4  # 1 + 3
 
 
+# === exchange_index_by_ticker (sharding route map) ===
+
+
+def test_exchange_index_by_ticker_maps_both_legs_and_fails_closed():
+    from service.wake import coerce_exchange_index
+
+    close = "2026-08-26T20:00:00Z"
+    # Real tonight record shape (2026-08-27 incident): crypto markets carry exchange_index 2.
+    m15 = fifteen("KXBTC15M-26AUG262000", "KXBTC15M-26AUG262000-00", close, "2026-08-26T19:45:00Z")
+    m15[0]["exchange_index"] = 2
+    mh = hourly_ladder("KXBTCD-26AUG2620", close, "2026-08-26T19:00:00Z", 79000.0, 100.0, 4)
+    for m in mh:
+        m["exchange_index"] = 2
+    # one ladder market whose record LACKS the field -> None (fail closed: run_window refuses it)
+    del mh[1]["exchange_index"]
+    f, h = discover_legs(m15, mh, close, NOW)
+    r = WakeResult(close, f, h, ladder_check(h))
+    xmap = r.exchange_index_by_ticker
+    assert xmap["KXBTC15M-26AUG262000-00"] == 2
+    assert xmap[mh[0]["ticker"]] == 2
+    assert xmap[mh[1]["ticker"]] is None          # missing field -> None (never routed to shard 0)
+    # coercion is fail-closed on junk / bools / non-integral floats
+    assert coerce_exchange_index("2") == 2 and coerce_exchange_index(0) == 0
+    assert coerce_exchange_index(None) is None and coerce_exchange_index("x") is None
+    assert coerce_exchange_index(True) is None and coerce_exchange_index(2.5) is None
+
+
 # === sweep shell (fake proxy) ===
 
 

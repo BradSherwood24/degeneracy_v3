@@ -19,10 +19,11 @@ from service.orders.envelope import (
 )
 
 
-def leg(ticker, side, action, count, price, cid="c1", reduce_only=None):
+def leg(ticker, side, action, count, price, cid="c1", reduce_only=None, exchange_index=None):
     return IntentLeg(
         ticker=ticker, side=side, action=action, count=count,
         limit_price=Decimal(str(price)), client_order_id=cid, reduce_only=reduce_only,
+        exchange_index=exchange_index,
     )
 
 
@@ -75,6 +76,58 @@ def test_wire_price_matches_translate_on_whole_cents():
     for side, p, want in [("yes", "0.46", "0.4600"), ("no", "0.55", "0.4500"),
                           ("yes", "0.83", "0.8300"), ("no", "0.82", "0.1800")]:
         assert wire_price(side, Decimal(p)) == want
+
+
+# ---------------------------------------------------------------------------
+# Exchange sharding (Kalshi 2026-08-24; 2026-08-27 market_not_found incident): the wire body MUST
+# carry exchange_index when the leg is routed to a shard, and MUST omit it when unset.
+# ---------------------------------------------------------------------------
+def test_wire_body_carries_exchange_index_both_box_orientations():
+    # BELOW box: hourly YES (bid) + 15M NO (ask) — both on shard 2.
+    e_hourly_yes = build_entry(leg("KXBTCD-K", "yes", "buy", 1, "0.94", exchange_index=2))
+    e_m15_no = build_entry(leg("KXBTC15M-A", "no", "buy", 1, "0.86", exchange_index=2))
+    assert e_hourly_yes["exchange_index"] == 2 and e_hourly_yes["side"] == "bid"
+    assert e_m15_no["exchange_index"] == 2 and e_m15_no["side"] == "ask"
+    # ABOVE box: hourly NO (ask) + 15M YES (bid) — both on shard 2.
+    e_hourly_no = build_entry(leg("KXBTCD-K2", "no", "buy", 1, "0.94", exchange_index=2))
+    e_m15_yes = build_entry(leg("KXBTC15M-A", "yes", "buy", 1, "0.86", exchange_index=2))
+    assert e_hourly_no["exchange_index"] == 2 and e_m15_yes["exchange_index"] == 2
+
+
+def test_wire_body_flatten_carries_exchange_index():
+    # a reduce-only flatten sell routed to shard 2 carries the field
+    e = build_entry(leg("KXBTCD-K", "yes", "sell", 1, "0.93", reduce_only=True, exchange_index=2))
+    assert e["exchange_index"] == 2 and e["reduce_only"] is True
+
+
+def test_wire_body_omits_exchange_index_when_none():
+    # back-compat: an un-routed leg (exchange_index None) produces NO exchange_index key. (Live legs
+    # always carry it; the Executor refuses a None-routed leg before it can reach the wire.)
+    e = build_entry(leg("KXBTCD-K", "yes", "buy", 1, "0.94"))
+    assert "exchange_index" not in e
+
+
+def test_wire_body_tonight_two_legs_after_fix():
+    # The two legs of the 2026-08-27 00:00Z first armed wide-box fire (journal box_fire record),
+    # AS THEY WIRE AFTER THE FIX. Before the fix both omitted exchange_index and 404'd on shard 0.
+    hourly = build_entry(leg("KXBTCD-26AUG2620-T79199.99", "no", "buy", 1, "0.99",
+                             cid="ab69dc5b-74a3-4188-ab6d-a4d80fa1d39e", exchange_index=2))
+    m15 = build_entry(leg("KXBTC15M-26AUG262000-00", "yes", "buy", 1, "0.8800",
+                          cid="45f261c9-0f66-4e2a-be9c-69ff130b39fe", exchange_index=2))
+    # hourly NO @0.99 -> sell YES @ 1-0.99 = 0.01 (ask); routed to shard 2
+    assert hourly == {
+        "ticker": "KXBTCD-26AUG2620-T79199.99", "side": "ask", "count": "1.00",
+        "price": "0.0100", "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+        "client_order_id": "ab69dc5b-74a3-4188-ab6d-a4d80fa1d39e", "exchange_index": 2,
+    }
+    # 15M YES @0.88 -> buy YES @ 0.88 (bid); routed to shard 2
+    assert m15 == {
+        "ticker": "KXBTC15M-26AUG262000-00", "side": "bid", "count": "1.00",
+        "price": "0.8800", "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+        "client_order_id": "45f261c9-0f66-4e2a-be9c-69ff130b39fe", "exchange_index": 2,
+    }
 
 
 def test_build_batch_shape():
