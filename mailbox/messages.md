@@ -438,3 +438,37 @@ account's luck (a rejected loser) is being booked as the strategy's skill?
 Scripts: scratchpad `fetch_overnight.py`, `sim_vs_pilot.py`, `diag_11z.py`, `box_entry_buckets.py`,
 `box_threshold_fine.py` (session e7acb14c). Candidate for `tools/` if Brad wants this daily.
 — Claude
+
+---
+
+## 2026-08-27 13:02Z — Claude → house: first live MISS (12Z window) — booked to the cent
+
+**Trade.** 12:00Z close, side below, A 79,437.09, hourly YES K 79,199.99 (ask 0.93, filled 0.93),
+15M NO (ask 0.85, filled 0.84 — raw 0.16 normalized). C_paid 1.7841, implied pin 0.765 (lowest of
+the campaign; 15M at the threshold again). BTC settled **79,476.70 = $40 above A** → 15M NO paid 0,
+hourly YES paid $1. Realized **−78.41¢**. Fired T−537s.
+
+**Plumbing, verified live for the first time on the miss branch:**
+- `box_post_fill both_filled_hold`, floor −0.7841 booked at fill; zero flatten records; no stop/alarm.
+- 13Z wake `settlement_backfill` for 12Z: results {15M: yes, hourly: yes}, **payoff 1.00,
+  realized_delta 0.0000, floor_netted 1.0000** — exactly the $1-floor semantics.
+- Balance 54.2672 (11:40Z wake) → 53.4831 = −1.7841 + 1.0000 to the cent.
+- `ledger_vs_balance_delta` went from −1.0657 to **−0.0657 = Brad's manual test trade exactly**
+  (predicted before the wake). The −1.00 seen every prior wake was a timing artifact: `_ledger_day_totals()`
+  runs at arming, BEFORE that wake's backfill posts the just-settled +$1. **LOW fix:** recompute the
+  day total after `_settlement_backfill_sweep` so the S4 secondary figure is same-instant with the
+  balance (S4 primary is balance-based; money unaffected).
+
+**Scoreboard (UTC 8/27):** 9 fires, 8 two-leg fills, 7 pins / 1 miss (0.875), 1 rejected
+(would-be miss). Account +$0.51 on the day (+6.6¢ of it Brad's trade) → box +$0.45 on the account;
+**as decided incl. the rejected 00Z loser: −39¢ over 9 fires**. Both misses were 0.85-threshold
+15M legs (n=2, noted, no inference). 13Z window: no fire. Gates: R1 8/30 (−0.50¢), R2 8/60, R3 7/8.
+
+**Monte Carlo (Brad's ask, scratchpad `box_mc.py` + `box_mc_2026-08-27.html`):** per pair, pin
++7–11% of stake, miss −45% → Kelly f* = 0.52 (corpus 0.90) / 0.11 (threshold slice 0.825) / 0.78
+(live 7/8). Trading 100% of balance — every-round OR step-reset — ruins under every outcome model
+(corpus: 85% / 52% ruin by day 90). Knee ≈ 25% of balance under the corpus (median ×27 in 90 days,
+p5 ≈ 2× start, median max DD 65%); same rule under the threshold slice → −87%. Fraction dominates;
+reset cadence is second-order. Sizing waits on R1/R2 distinguishing 0.90 from 0.825 (~60 fills).
+Not modeled: slippage vs size, proxy caps (max 2/order, 100/day — Brad's levers).
+— Claude
