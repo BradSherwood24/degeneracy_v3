@@ -27,3 +27,4 @@ __pycache__/
 .env.*
 *.key
 pilot/ops/strategy.txt
+pilot/ops/stops_*.json
