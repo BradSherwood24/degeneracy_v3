@@ -276,3 +276,53 @@ qualifying minute scanning T-10→T-1). Build order: promote scratch → `sim/` 
 tests (Opus 4.8 crew, disclosed branch) → OOS on the pilot journals via the
 replayer with settlements fetched read-only → draft policy → full ceremony.
 Nothing arms without Brad's word; corridor falsifier stays frozen. — Claude
+## Claude — 2026-08-25 — CORRECTION to defect #5: there is no 1.5s staleness; the levels live ~7ms
+
+I got the physics wrong in the opening brief and the receipts below fix it.
+Codex: review-ask (iii) is answered here — attack this instead.
+
+### What was wrong
+Defect #5 claimed decision→match ≈ 1.5s with a ~1s Kalshi publisher lag. The
+fit was unidentified: every delay > ~60ms predicts the same 11 live outcomes,
+so 1.5s and 0.5s were indistinguishable and I picked a number.
+
+### What is measured (armed journals 8/23–8/24, clock-free where possible)
+1. **Public feed ts_ms == engine time.** For 14/14 of our own fills the public
+   `trade` print and the private `fill` message carry the SAME `ts_ms` (0ms
+   apart), and the book delta removing our lot is stamped identically. Receipt
+   lags engine by ~30ms (p50 29–37ms, p99 <165ms, n≈700k frames, post-resync
+   windows 11:00Z/12:00Z 8/24). No publisher lag.
+2. **Consumer lag on the triggering frame ≈ 0ms** (−10..+13ms, all 11 fires,
+   drift-corrected against each window's quiet-period offset).
+3. **Target-level survival after our decision frame**, engine time, for the 10
+   missed entry legs (joined to intents by client_order_id):
+   14:00Z 7ms · 00:00Z 1ms · 02:00Z 3ms · 03:00Z 1ms (0.02 contracts) ·
+   04:00Z 276ms · 05:00Z 6ms · 06:00Z 58ms · 07:00Z 14ms · 11:00Z 2ms ·
+   12:00Z 20ms. Median 7ms. Our POST RTTs were 365–611ms (cold). 9/10 levels
+   were gone before a warm 60ms POST could land; 1/10 catchable warm; 0/10 cold.
+4. **Fills-WS arrival is not yet cleanly measurable**: `executor.execute` →
+   `requests.post` runs synchronously inside the asyncio WS reader
+   (`run_window.py:1109`, `executor.py:94`), so receipt stamps during a fire
+   are inflated by our own blocking (apparent 16–914ms). The one unblocked
+   sample (15:00Z, both legs in one batch) bounds it at ≤ one POST RTT. Brad's
+   ~50ms estimate is plausible; unverified.
+
+### Consequences for the board
+- **Sim fill rule** (Tier 3) is NOT "book at T+1.5s". It is: a taker fills only
+  against size that persists at/inside the limit in engine time from decision
+  through decision+RTT, RTT ∈ {60ms warm, 450ms cold}. Under that rule the
+  taker policy is physically dead on the deep-C signals — the leg that makes C
+  look good lives for one network hop.
+- **Tier 1 adds**: move the executor off the WS reader thread (blocking the
+  feed during the fire is also what starves the ejection seat of fresh quotes).
+- **Maker-flip** (Tier 4) chase Δ ≈ fills-WS (~50ms TBD) + warm POST 60ms ≈
+  0.15–0.3s, not 1.5s. The backtest estimand: leg-B ask move over Δ,
+  conditional on leg A's resting level being traded through. The flickers that
+  robbed the taker are the sweeps that fill the maker — that is the thesis,
+  now with receipts.
+- Clock: the box drifted ~1s fast pre-resync and is ~370ms off again today.
+  Every local-vs-server comparison must be drift-corrected per window.
+
+Analysis scripts are session scratch (not committed); the replayer that makes
+them reproducible is the first build item. — Claude
+
