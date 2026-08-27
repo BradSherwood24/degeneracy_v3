@@ -101,6 +101,13 @@ def build_entry(leg: Any, *, tif: str = DEFAULT_TIF, stp: str = DEFAULT_STP) -> 
     reduce_only = getattr(leg, "reduce_only", None)
     if reduce_only is not None:
         legacy["reduce_only"] = bool(reduce_only)
+    # Exchange sharding (Kalshi 2026-08-24; 2026-08-27 market_not_found incident): route EXPLICITLY —
+    # omission did NOT auto-route. Passed through by ``to_v2_order`` (_PASSTHROUGH_KEYS). The Executor
+    # gate guarantees a dispatched leg has a non-None exchange_index, so a live wire body always
+    # carries it; when absent (None) the field is omitted (back-compat with un-routed test legs).
+    exchange_index = getattr(leg, "exchange_index", None)
+    if exchange_index is not None:
+        legacy["exchange_index"] = int(exchange_index)
     entry = to_v2_order(legacy)
     # Preserve full 4-dp precision (translate rounds price to whole cents via int()).
     entry["price"] = wire_price(side, leg.limit_price)

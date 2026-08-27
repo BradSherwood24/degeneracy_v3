@@ -247,17 +247,20 @@ class FakePost:
 
 def _box_wake():
     """A wake whose 15M leg anchors at A and whose hourly ladder has a qualifying K=64000 (< A)."""
+    # exchange_index=2: the crypto markets live on the dedicated shard (Kalshi 2026-08-24). The wake
+    # map carries it -> every dispatched leg (entry + flatten) is routed to shard 2 explicitly.
     fifteen = Leg(
         series="KXBTC15M", event_ticker="KXBTC15M-EV", open_time="2026-08-21T21:45:00Z",
         close_time=CLOSE, window_seconds=900, market_tickers=(M15_TICKER,),
         floor_strikes=(65000.0,),
         markets=({"ticker": M15_TICKER, "floor_strike": 65000.0, "close_time": CLOSE,
                   "open_time": "2026-08-21T21:45:00Z", "status": "active",
-                  "event_ticker": "KXBTC15M-EV"},),
+                  "exchange_index": 2, "event_ticker": "KXBTC15M-EV"},),
     )
     hmarkets = tuple(
         {"ticker": tk, "floor_strike": fs, "close_time": CLOSE,
-         "open_time": "2026-08-21T21:00:00Z", "status": "active", "event_ticker": "KXBTCD-EV"}
+         "open_time": "2026-08-21T21:00:00Z", "status": "active", "exchange_index": 2,
+         "event_ticker": "KXBTCD-EV"}
         for tk, fs in (("KXBTCD-63500", 63500.0), (HOURLY_TICKER, 64000.0), ("KXBTCD-66000", 66000.0))
     )
     hourly = Leg(
@@ -446,6 +449,11 @@ def test_box_fire_builds_intent_and_ledger_mapping(tmp_path):
     assert legs[M15_TICKER].side == BUY_NO and legs[M15_TICKER].count == 1
     assert legs[M15_TICKER].limit_price == Decimal("0.89")      # 0.86 + 0.03
     assert entry.source == WIDE_BOX
+    # exchange sharding (2026-08-27 incident): both legs carry the wake shard, and the wire body
+    # routes explicitly to exchange_index 2 (both box orientations: hourly YES + 15M NO).
+    assert legs[HOURLY_TICKER].exchange_index == 2 and legs[M15_TICKER].exchange_index == 2
+    wire_orders = post.calls[0][1]["orders"]
+    assert all(o["exchange_index"] == 2 for o in wire_orders)
     # both filled -> held (net 1 each), NO flatten order was sent (only the entry batch)
     assert ls.net("high") == 1 and ls.net("low") == 1
     assert len(post.calls) == 1 and isinstance(post.calls[0][1].get("orders"), list)
@@ -554,6 +562,8 @@ def test_box_one_leg_flatten_fills(tmp_path):
     assert len(post.calls) == 2
     assert isinstance(post.calls[0][1].get("orders"), list)
     assert not isinstance(post.calls[1][1].get("orders"), list)
+    # the flatten single is routed explicitly to the wake shard (2026-08-27 incident)
+    assert post.calls[1][1]["exchange_index"] == 2
     # the ledger row carries both fields (A5 uses box_one_legged; box_flatten_filled is the outcome)
     row = svc._build_box_ledger_entry(plan, svc._recorder, 0, "j", 0)
     assert row["box_one_legged"] is True and row["box_flatten_filled"] is True

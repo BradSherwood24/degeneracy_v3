@@ -67,8 +67,9 @@ MAX_CONTRACTS = 2
 PREFIXES = ("KXBTC15M", "KXBTCD")
 
 
-def leg(ticker, side, action, count, price, cid="c1"):
-    return IntentLeg(ticker, side, action, count, Decimal(str(price)), cid)
+def leg(ticker, side, action, count, price, cid="c1", exchange_index=None):
+    return IntentLeg(ticker, side, action, count, Decimal(str(price)), cid,
+                     exchange_index=exchange_index)
 
 
 def _passes_caps(entries):
@@ -115,6 +116,19 @@ def test_fifteen_minute_deci_cent_ticker_passes():
 
     entries = PROXY["parse_order_entries"](json.dumps(e).encode(), is_batch=False)
     assert _passes_caps(entries) is None
+
+
+def test_shard2_entry_with_exchange_index_passes_proxy_parser():
+    # Exchange sharding (2026-08-27 incident): the wire body now carries exchange_index. The REAL
+    # proxy cap parser must still accept the entry (it reads count/ticker/price only; the extra key
+    # is ignored), and the proxy forwards the body bytes UNCHANGED so exchange_index reaches Kalshi.
+    import json
+    e = build_entry(leg("KXBTCD-26AUG2620-T79199.99", "no", "buy", 1, "0.99", exchange_index=2))
+    assert e["exchange_index"] == 2
+    entries = PROXY["parse_order_entries"](json.dumps(e).encode(), is_batch=False)
+    assert _passes_caps(entries) is None
+    # the parsed entry retains the field (proof it is not stripped before forwarding)
+    assert entries[0].get("exchange_index") == 2
 
 
 def test_over_max_contracts_is_rejected_by_proxy():

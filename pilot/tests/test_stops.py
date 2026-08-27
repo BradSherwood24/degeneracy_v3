@@ -203,10 +203,12 @@ def test_controller_trip_freezes_executor_and_flattens_strangle():
     ctrl = StopController(ex, Journal())
     st = filled_flip(source=Q1_STRANGLE)  # both legs unprotected -> flatten both
     actions = ctrl.trip(S1_ARITH, "test", ledger_state=st,
-                        bids={HI: Decimal("0.55"), LO: Decimal("0.22")})
+                        bids={HI: Decimal("0.55"), LO: Decimal("0.22")},
+                        exchange_index={HI: 2, LO: 2})  # explicit shard routing (2026-08-27 incident)
     assert ex.armed is False                       # frozen ALWAYS
     assert ctrl.state.has(S1_ARITH)
     assert len(posts) == 2                          # two flatten sells dispatched
+    assert all(p[1].get("exchange_index") == 2 for p in posts)  # both flattens routed to shard 2
     assert all(p[0] == "/trade-api/v2/portfolio/events/orders" for p in posts)
     assert all(a.kind == "flatten" for a in actions)
 

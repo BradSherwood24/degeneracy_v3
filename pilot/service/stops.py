@@ -310,10 +310,15 @@ def build_flatten_intent(
     source: str,
     bid_price: Decimal,
     client_order_id: str,
+    exchange_index: int | None = None,
 ) -> Intent:
     """Turn a 'flatten' PositionAction into a reduce_only SELL intent at the observed bid (IOC).
     A sell of the held outcome reduces the position; reduce_only guarantees it can never open the
-    opposite side."""
+    opposite side.
+
+    ``exchange_index`` is the shard the ticker lives on (from the wake map). It MUST be routed
+    explicitly (2026-08-27 market_not_found incident); a None here means the caller could not resolve
+    the shard, and the Executor will REFUSE the flatten rather than send it unrouted (fail closed)."""
     leg = IntentLeg(
         ticker=action.ticker,
         side=action.side,
@@ -322,6 +327,7 @@ def build_flatten_intent(
         limit_price=bid_price,
         client_order_id=client_order_id,
         reduce_only=True,
+        exchange_index=exchange_index,
     )
     return Intent(window=window, source=source, purpose=PURPOSE_FLATTEN, legs=(leg,))
 
@@ -659,11 +665,15 @@ class StopController:
         ledger_state: LedgerState | None = None,
         bids: dict[str, Decimal] | None = None,
         detail: dict | None = None,
+        exchange_index: dict[str, int | None] | None = None,
     ) -> tuple[PositionAction, ...]:
         """Latch ``stop``, freeze the executor, journal the notification, and (if a ledger_state is
         given) compute + dispatch the position policy. ``bids`` maps ticker -> observed bid used to
         price each flatten (a flatten with no bid is emitted as a HOLD-and-alert, never a blind
-        market sell). Returns the PositionActions taken."""
+        market sell). ``exchange_index`` maps ticker -> shard so each flatten is routed explicitly
+        (2026-08-27 market_not_found incident); a ticker absent from it flattens with exchange_index
+        None -> the Executor refuses that flatten rather than send it unrouted. Returns the
+        PositionActions taken."""
         self.state = apply_stop(self.state, stop, reason, detail)
         self._journal_note(self.state.notifications[-1])
         # ALWAYS freeze strategy order placement.
@@ -689,8 +699,10 @@ class StopController:
                     {"ticker": act.ticker, "count": act.count},
                 )
                 continue
+            xi = (exchange_index or {}).get(act.ticker)
             intent = build_flatten_intent(
-                act, ledger_state.window, ledger_state.source, bid, self._mint()
+                act, ledger_state.window, ledger_state.source, bid, self._mint(),
+                exchange_index=xi,
             )
             # stop-authorized flatten bypasses the arm freeze (risk reduction only, reduce_only).
             result = self.executor.execute(intent, stop_authorized=True)

@@ -182,7 +182,8 @@ def test_MARKER_stop_flatten_dispatches_inside_settle_cutoff():
     ex = Executor(Journal(), ExecutorConfig(armed=False), post_fn=post)
     # a flatten intent as build_flatten_intent makes it: t_minus_s defaults to None
     flat = Intent(CT, SUB_DOLLAR_FLIP, "flatten",
-                  (IntentLeg(HI, "no", "sell", 1, Decimal("0.55"), "f1", reduce_only=True),))
+                  (IntentLeg(HI, "no", "sell", 1, Decimal("0.55"), "f1", reduce_only=True,
+                             exchange_index=0),))
     assert flat.t_minus_s is None
     # StopController.trip calls execute(intent, stop_authorized=True) with NO t_minus -> cutoff skipped
     r = ex.execute(flat, stop_authorized=True)

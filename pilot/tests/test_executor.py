@@ -45,10 +45,12 @@ def batch_ok(entries_by_cid):
     return post
 
 
-def entry(count=1, hi_cid="h", lo_cid="l"):
+def entry(count=1, hi_cid="h", lo_cid="l", xi=0):
+    # xi = exchange_index (shard); routed explicitly (2026-08-27 market_not_found incident) so the
+    # dispatch gate (never send an unrouted order) admits the leg.
     legs = (
-        IntentLeg(HI, "no", "buy", count, Decimal("0.57"), hi_cid),
-        IntentLeg(LO, "yes", "buy", count, Decimal("0.24"), lo_cid),
+        IntentLeg(HI, "no", "buy", count, Decimal("0.57"), hi_cid, exchange_index=xi),
+        IntentLeg(LO, "yes", "buy", count, Decimal("0.24"), lo_cid, exchange_index=xi),
     )
     return Intent(CT, "sub$1-flip", PURPOSE_ENTRY, legs, t_minus_s=300.0)
 
@@ -143,7 +145,7 @@ def test_rate_budget_exhaustion_refuses():
     assert ex.execute(entry()).dispatched
     # budget is per-window; a follow-on rebalance in the same window has no tokens left
     reb = Intent(CT, "s", PURPOSE_REBALANCE_BUY,
-                 (IntentLeg(HI, "no", "buy", 1, Decimal("0.55"), "r1"),), t_minus_s=300)
+                 (IntentLeg(HI, "no", "buy", 1, Decimal("0.55"), "r1", exchange_index=0),), t_minus_s=300)
     r = ex.execute(reb)
     assert r.refused == "rate_budget_exhausted"
 
@@ -154,7 +156,7 @@ def test_single_flight_refuses_key_already_in_flight():
     # simulate an outstanding order for (window, side='no', purpose=rebalance-buy)
     ex._inflight.add((CT, "no", PURPOSE_REBALANCE_BUY))
     reb = Intent(CT, "s", PURPOSE_REBALANCE_BUY,
-                 (IntentLeg(HI, "no", "buy", 1, Decimal("0.55"), "r1"),), t_minus_s=300)
+                 (IntentLeg(HI, "no", "buy", 1, Decimal("0.55"), "r1", exchange_index=0),), t_minus_s=300)
     assert ex.execute(reb).refused == "single_flight"
 
 
@@ -180,7 +182,7 @@ def test_mutex_serializes_concurrent_dispatch():
 
     ex = Executor(Journal(), armed_cfg(), post_fn=post)
     reb = Intent("W2", "s", PURPOSE_REBALANCE_BUY,
-                 (IntentLeg(HI, "no", "buy", 1, Decimal("0.55"), "r1"),), t_minus_s=300)
+                 (IntentLeg(HI, "no", "buy", 1, Decimal("0.55"), "r1", exchange_index=0),), t_minus_s=300)
     threads = [
         threading.Thread(target=ex.execute, args=(entry(),)),
         threading.Thread(target=ex.execute, args=(reb,)),
@@ -225,10 +227,52 @@ def test_stop_authorized_flatten_dispatches_while_unarmed():
                                         "ts_ms": 1}})
     ex = Executor(Journal(), ExecutorConfig(armed=False), post_fn=post)  # UNARMED
     flat = Intent(CT, "sub$1-flip", "flatten",
-                  (IntentLeg(HI, "no", "sell", 1, Decimal("0.55"), "f1", reduce_only=True),))
+                  (IntentLeg(HI, "no", "sell", 1, Decimal("0.55"), "f1", reduce_only=True,
+                             exchange_index=0),))
     r = ex.execute(flat, t_minus_s=300, stop_authorized=True)
     assert r.dispatched and len(posts) == 1
     assert posts[0][0] == "/trade-api/v2/portfolio/events/orders"  # single create (live path)
+
+
+def test_refuses_leg_without_exchange_index_and_journals(tmp_path=None):
+    # Exchange sharding (2026-08-27 market_not_found incident): a leg whose exchange_index is None was
+    # never resolved to a shard -> REFUSE (never send an unrouted order). No POST happens.
+    posts = []
+    j = Journal()
+    ex = Executor(j, armed_cfg(), post_fn=lambda p, b: posts.append((p, b)) or FakeResp(200, {}))
+    unrouted = entry(xi=None)  # both legs have exchange_index None
+    r = ex.execute(unrouted)
+    assert r.refused.startswith("no_exchange_index:")
+    assert posts == []                                   # nothing was sent to the venue
+    assert all(resp.no_fill for resp in r.responses)
+    kinds = [rec["kind"] for rec in j.records()]
+    assert "order_refused_no_exchange_index" in kinds
+    # the refusal record names the offending tickers
+    ref = next(rec["obj"] for rec in j.records() if rec["kind"] == "order_refused_no_exchange_index")
+    assert set(ref["tickers"]) == {HI, LO}
+
+
+def test_partial_exchange_index_still_refuses_whole_intent():
+    # even one None-routed leg in a batch refuses the whole intent (never send a half-routed pair)
+    posts = []
+    ex = Executor(Journal(), armed_cfg(), post_fn=lambda p, b: posts.append(1) or FakeResp(200, {}))
+    legs = (
+        IntentLeg(HI, "no", "buy", 1, Decimal("0.57"), "h", exchange_index=2),
+        IntentLeg(LO, "yes", "buy", 1, Decimal("0.24"), "l"),  # exchange_index None
+    )
+    r = ex.execute(Intent(CT, "sub$1-flip", PURPOSE_ENTRY, legs, t_minus_s=300.0))
+    assert r.refused == f"no_exchange_index:{LO}" and posts == []
+
+
+def test_shard2_entry_wire_body_routes_to_shard2():
+    posts = []
+    def post(path, body):
+        posts.append((path, body))
+        return batch_ok({"h": (1, "0.57", "0.01"), "l": (1, "0.24", "0.01")})(path, body)
+    ex = Executor(Journal(), armed_cfg(), post_fn=post)
+    r = ex.execute(entry(xi=2))
+    assert r.dispatched
+    assert all(o["exchange_index"] == 2 for o in posts[0][1]["orders"])
 
 
 def test_stop_authorized_only_for_flatten():
@@ -244,8 +288,8 @@ def test_stop_authorized_only_for_flatten():
 # ---------------------------------------------------------------------------
 def _no_yes_entry():
     legs = (
-        IntentLeg(HI, "no", "buy", 1, Decimal("0.97"), "h"),   # NO leg, limit 0.97
-        IntentLeg(LO, "yes", "buy", 1, Decimal("0.0250"), "l"),  # YES leg, limit 0.025
+        IntentLeg(HI, "no", "buy", 1, Decimal("0.97"), "h", exchange_index=0),   # NO leg, limit 0.97
+        IntentLeg(LO, "yes", "buy", 1, Decimal("0.0250"), "l", exchange_index=0),  # YES leg, limit 0.025
     )
     return Intent(CT, "sub$1-flip", PURPOSE_ENTRY, legs, t_minus_s=300.0)
 
@@ -264,7 +308,7 @@ def test_batch_normalizes_no_leg_to_no_space_yes_leg_passthrough():
 
 def test_single_reduce_only_no_sell_normalizes_to_no_space():
     # a NO reduce-only sell @0.95 fills; venue reports 0.0500 (1-0.95) -> normalize to 0.95.
-    leg = IntentLeg(HI, "no", "sell", 1, Decimal("0.95"), "s", reduce_only=True)
+    leg = IntentLeg(HI, "no", "sell", 1, Decimal("0.95"), "s", reduce_only=True, exchange_index=0)
     intent = Intent(CT, "sub$1-flip", "flatten", (leg,), t_minus_s=300.0)
     def post(path, body):
         return FakeResp(200, {"order": {"order_id": "o", "client_order_id": "s",

@@ -78,6 +78,11 @@ class IntentLeg:
     limit_price: Decimal
     client_order_id: str
     reduce_only: bool | None = None
+    # Exchange-sharding route (Kalshi changelog 2026-08-24; 2026-08-27 ``market_not_found`` incident).
+    # The shard the ticker lives on, captured from the wake market record. None = unknown -> the
+    # Executor REFUSES to dispatch (never sends an unrouted order). Defaults to None so pre-fix
+    # journals (records without the field) rebuild unchanged; ``rebuild_from_journal`` never dispatches.
+    exchange_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -477,6 +482,8 @@ def _leg_from_record(d: dict[str, Any]) -> IntentLeg:
         limit_price=Decimal(str(d["limit_price"])),
         client_order_id=d["client_order_id"],
         reduce_only=d.get("reduce_only"),
+        # Absent in pre-fix journals -> None (back-compat; rebuild never dispatches).
+        exchange_index=d.get("exchange_index"),
     )
 
 
@@ -496,6 +503,7 @@ def intent_to_record(intent: Intent) -> dict[str, Any]:
                 "limit_price": str(leg.limit_price),
                 "client_order_id": leg.client_order_id,
                 "reduce_only": leg.reduce_only,
+                "exchange_index": leg.exchange_index,
             }
             for leg in intent.legs
         ],
