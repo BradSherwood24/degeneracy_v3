@@ -104,3 +104,288 @@ Branches: repairs land on `repairs/instruments` (Tier 1) and
 `repairs/ejection-seat` (Tier 2) — disclosed here as they open. Brad merges.
 — Claude
 
+## Claude — 2026-08-25 — REPLAYER BUILT + MAKER-FLIP BACKTEST v1 (branch sim/replay @ 28e55dc)
+
+Built by the Opus 4.8 crew on Brad's go; 19 tests pass; results under
+`sim/out/replay/maker_flip_20260825T175025Z.*` (gitignored, on-box).
+
+### Replayer (`sim/replay/`)
+Engine-time (ts_ms) L2 folding of both legs, integer arithmetic (dust kill at
+<0.005 contracts), BookMirror top-of-book agreement tested on synthetic + a
+20k-frame real excerpt. SELFCHECK: 81/81 processed windows reconcile 100.00% —
+2,327,701 trade prints each matched a same-ms negative delta on the hit side.
+11 windows skipped (no legs: stand-down/shakedown). Sanity anchor reproduced:
+05:00Z 8/24 hourly yes-bid 0.54 = 1 contract at ts …727209, 0 at …727217 —
+gone 6–8ms after the fire frame. Runtime 479s / 91 windows / 8 workers.
+
+### Maker-flip v1 (rest 1¢ under each ask while taker-model C ≤ θ; first maker
+fill → chase the other leg at its ask Δ later; one pair per window)
+Funnel at θ=1.00, STRICT trade-through, Δ=0.15s, maker fee 25%:
+- 81 active windows → **26 ever had C ≤ 1.00** (rest time p50 0s; p90 22s)
+- → **7 first fills** (5 TRAIN / 2 HOLDOUT) → **6 pairs < $1.00**
+  (TRAIN 4/5, HOLDOUT 2/2). Costs: 0.9815, 0.9887, 0.9669, 0.9900, 1.0072
+  (TRAIN); 0.9716, 0.9717 (HOLDOUT). Chase gap p50 0¢, p90 2–3¢.
+- LENIENT (queue) adds 3 fills incl. the 05:00Z 8/24 blow-out (qA 0.48 →
+  chase 1.0716, gap 11¢): HOLDOUT P(<1)=0.75. Truth is between STRICT and LENIENT.
+- **Both-maker completions: 0 in every cell.** Every pair is maker + chase.
+- Δ from 0.10→1.0s moves mean cost ~0.3–0.5¢. Maker-fee 25% vs 0%: ~0.2–0.4¢.
+  Neither is the lever; **fill scarcity is** (~7–12% of windows bank a pair).
+- Tighter θ (0.99/0.98/0.97): 0–2 fills each, all < $1 when they occur
+  (medians 0.983 / 0.957 / 0.949) — too few to grade.
+
+### Read
+Conditional on a strict through-fill, the pair clears sub-$1 at 6/7 with 1–3¢
+locked plus the pin lottery — a different animal from the taker path
+(1/11 live, +0.07¢). Unconditionally it is a ~1-in-10-windows event at
+1 contract. n=7 certifies nothing; it says the geometry is right and the
+question is volume. Levers to test next, in order: (a) 71 days of historical
+trade prints as a STRICT fill oracle (through-trades need no book) to get
+n into the hundreds; (b) rest-depth sweep (0/1/2¢ under ask) and rest-only-
+in-last-N-s; (c) size >1 with ask-size gating on the chase. Caveats in
+`sim/replay/README.md` (instant replace/cancel, no impact, counterfactual Δ).
+
+Codex asks: (vi) attack the STRICT rule — is "print strictly through our
+price" too generous when the through-print is a single sweep that would have
+exhausted our level anyway? (vii) the historical-prints oracle protocol
+before it runs. — Claude
+## Claude — 2026-08-25 — MAKER-FLIP v2: rest modes (sim/replay @ 20c084a) — more fills, worse cost; the scoreboard was wrong
+
+Why v1 had 7 fills: C ≤ $1 crossings are flickers — 1,031 episodes / 35 windows,
+median 28 ms, 65% < 100 ms, 92% < 1 s; asks revert (median move 0 at +1 s/+5 s;
+both asks up in 8%). v1 cancelled the instant C > θ, so bids lived ~28 ms.
+
+v2 adds rest modes: `leave` (place at first crossing's ask−1¢, never cancel)
+and `requote` (re-quote to each new crossing's ask−1¢, never cancel).
+θ=1.00, STRICT, Δ=0.15 s, maker fee 25%:
+
+| split | mode | fills | P(<1.00) | P(<1.02) | P(>1.05) | median cost | median time-to-fill |
+|---|---|---|---|---|---|---|---|
+| TRAIN (41) | cancel | 5 | 0.80 | 1.00 | 0 | 0.9887 | — |
+| TRAIN | leave | 13 | 0.31 | 0.77 | 0 | 1.0047 | 1.7 s |
+| TRAIN | requote | 13 | 0.31 | 0.77 | 0.08 | 1.0058 | 5.0 s |
+| HOLDOUT (40) | cancel | 2 | 1.00 | 1.00 | 0 | 0.9716 | — |
+| HOLDOUT | leave | 13 | 0.38 | 0.69 | 0.15 (+1 unhedged) | 1.0070 | 2.7 s |
+| HOLDOUT | requote | 13 | 0.31 | 0.69 | 0.15 (+1 unhedged) | 1.0059 | 2.5 s |
+
+Both-maker: 0 in every cell of the whole grid. leave ≈ requote (Δ ≤ 0.001).
+Mechanism, from the per-fill list: C at fill > θ in nearly every leave/requote
+fill — the bid is hit by a genuine move on leg A after the crossing reverted,
+and leg B has stepped up by then. The maker fill is informative in the wrong
+direction (correlated legs), except when it happens INSIDE the 28 ms crossing
+(that is the cancel-mode subset: 6/7 sub-$1, gap 0).
+
+**Scoreboard correction.** P(cost < $1) is the wrong estimand. A flip pair pays
+$1 outside the corridor and $2 inside (pin), so EV per pair =
+P(pin | G, t) − (cost − 1). A pair at 1.005 is a ticket costing 0.5¢ on a pin
+worth $1; the frozen census EV curve (`tape_sim.EVCurve`, 0.6 pp pin per $ of
+gap in the census) is the in-house price of that ticket. v3 must score every
+simulated pair by pin-adjusted EV using the imported curve and the window's G,
+then compare modes on EV/window, not on P(<1). Until then: cancel-mode pairs
+are ~+2¢ locked + pin; leave-mode pairs are ~−1¢ + pin with an 8–15% >5¢ tail.
+At 1 contract both are fractions of a cent per window; size is the question.
+
+Housekeeping: 4 pre-existing failures in `sim/tests` (`test_unseal15`,
+`test_unseal_refusal`) assert `ceremony/falsifier.md` is a DRAFT; it has been
+FROZEN since 2026-08-20. Tests need the ceremony's blessing to update — not
+touched on this branch.
+
+Codex asks: (viii) is EV = P(pin) − (cost−1) the right scoreboard, and is the
+census pin curve applicable at these G and entry times (t_A to close 0–900 s)?
+(ix) refute the "informative in the wrong direction" reading of C_fill > θ.
+— Claude
+## Claude — 2026-08-25 — FINDING (Brad's hypothesis): the hourly ladder overprices the 15-min move by ~2pp
+
+Brad: "fair for the 1 hour isn't exactly the same as fair for the 15 minute."
+Tested on historical-data 1-min candles + 15M markets, n=1,699 :45 hours (6/11–8/22).
+Method: hourly strike prices (yes bid/ask mid) at :46 vs realized settlement
+(15M `expiration_value` = BTC at :00); 15M anchor A = `floor_strike`.
+
+- 15M itself is calibrated: yes mid 0.504 vs realized P(BTC≥A) 0.505.
+- Hourly K1 (first strike above A): implied P(BTC<K1) 0.734, realized 0.752 (+1.7pp ±1.0).
+  K2 (~+100): 0.931 vs 0.944 (+1.2 ±0.6). Below-side symmetric (K0 −1.0, Km1 −0.5).
+  Edge rises with G: +0.4pp (G<25) → +3.2pp (G 75–100).
+- **Corridor pin [A,K1): implied 23.4%, realized 25.7% → +2.2pp; bootstrap 95% CI
+  [+0.1, +4.2]pp; P(edge≤0)=0.017.** Positive every month (Jun +3.1, Jul +1.1,
+  Aug +3.1) and every hour regime (quiet +1.4, US open +5.3, other +2.1).
+- Pre-open, NO hindsight (levels relative to ladder-implied spot at T−1/−3/−5 min):
+  same sign at every level and minute (P1 +0.8/+2.3/+1.8pp; P2 +0.7/+0.8/+1.1pp;
+  P0 −1.2/−2.6/−2.9pp; Pm1 −0.9/−1.2/−0.8pp).
+
+Reading: a variance risk premium on the hourly ladder — the corridor buyer sells
+vol and is paid ~2pp. It is the exact complement of the census kill: VRP credit
+≈ 2pp vs taker fees 3.2pp + spreads. Maker-both ≈ +1¢/pair, mixed ≈ 0, taker ≈ −1¢.
+The identity cost = 1 + P(pin) holds at the market's implied P(pin); the market's
+implied P(pin) is ~2pp low.
+
+Every earlier early-leg backtest today (50/50 side, cheaper side, far strike,
+T−16..−20) netted −1¢ before fees and −4¢ after — consistent with a ~2pp VRP
+minus ~3pp of spreads paid as a taker. Cost structure decides the sign.
+
+Codex asks: (x) refute the VRP reading — is realized < implied an artifact of the
+mid (skewed asks at the deep strikes), of settlement-source mismatch, or of one
+calm regime (kurtosis 24)? (xi) if it stands, the cheapest legal harvest: maker
+hourly leg pre-open (ladder read is 90% at 1 min, 66% at 5) + which 15M leg?
+Scratch scripts: ladder_calibration.py / ladder_calibration2.py (session
+e7acb14c) — to be promoted into sim/ with tests before anything is built on it.
+— Claude
+## Claude — 2026-08-26 — FINDING (Brad): late-window wide box is positive AS A TAKER (+2.6¢/trade, 1,310 trades)
+
+Brad's structure: with minutes left, BTC sits between the 15M anchor A and an hourly
+strike K one or two buckets behind it. Buy the 15M side already in the money (≥0.85)
++ the hourly leg behind BTC (~0.95). Box [K,A) pays $2 if BTC closes inside, else $1.
+Tested on historical-data 1-min candles, 6/11–8/22, ONE trade per hour (first minute
+scanning T-10→T-1 that qualifies), fees imported from census:
+
+- 1,310 trades / 1,706 hours (77%). Entry p50 T-6; hourly leg 0.97, 15M leg 0.90;
+  C p50 1.865; box width p50 $162.
+- **Implied pin 0.859 vs realized 0.902 → +4.3pp (±0.8).**
+- **Taker EV +2.58¢/trade (±0.8; bootstrap 95% [+0.9, +4.1]; P(≤0)=0.001)**;
+  mid +4.30; maker +4.95; fees 0.84¢. Win 90.2% (+12.2¢) / lose 9.8% (−86.2¢);
+  std 30¢; +1.38% per $ at risk; +$33.8 over the corpus at 1 contract.
+- Jun +2.65, Jul +2.03, Aug +3.48 (±1.2–1.5). Quiet hours +1.08, US open +4.56.
+- Variants (hourly target 0.90/0.97; 15M ≥0.90): +1.9..+2.6¢, all P(≤0) ≤ 1%.
+  Edge lives at T-6..T-10; last-3-minutes-only +1.2 (Jul −0.6); T-1-only −0.4.
+- **Fragility: paying 1¢ worse per leg → EV ≈ 0.** The edge is ~2¢ of price.
+
+Why this clears when nine other framings yesterday netted ≈0 as takers: same
+~2–4pp corridor premium (the ladder overprices short-horizon vol), but the cost
+line at deep prices is ~1.7¢ (0.84 fees + ~0.9 half-spreads) instead of 3–4¢.
+
+Caveats: candle asks at 1-min closes, 1 contract assumed fillable; one summer
+regime; the sealed days 8/02–8/18 are inside this corpus (train-only — this is
+exploration, not OOS). **The honest OOS exists and is cheap: the pilot journals
+carry full L2 for :45–:00 on 81+ windows (8/21→), which is exactly the late
+window; settle them via market results fetched read-only through the proxy.**
+Proposed next: (1) promote wide_box into sim/ with tests; (2) run it on the
+journals with the replayer (fills against displayed size at T+RTT, both legs,
+depth at the asks — sizing question answered in the same pass); (3) if it holds
+OOS, a draft policy through the full ceremony. Not a live trigger.
+
+Codex asks: (xii) refute — is realized>implied here a candle artifact (stale
+asks at the minute close), a settlement-source mismatch, or selection across
+the 6 variants? (xiii) the OOS protocol on the journals before it runs.
+— Claude
+## Claude — 2026-08-26 — RULING: the wide box becomes a draft strategy
+
+Brad, verbatim: "Lets make this into a strategy. Try just single pairs takers,
+keep it simple and see how it goes. Crawl before we walk you know."
+
+Scope: ONE pair per hour, 1 contract per leg, taker at the asks, the spec exactly
+as backtested (15M side ≥0.85 + hourly strike behind BTC nearest 0.95, first
+qualifying minute scanning T-10→T-1). Build order: promote scratch → `sim/` with
+tests (Opus 4.8 crew, disclosed branch) → OOS on the pilot journals via the
+replayer with settlements fetched read-only → draft policy → full ceremony.
+Nothing arms without Brad's word; corridor falsifier stays frozen. — Claude
+## Claude — 2026-08-25 — CORRECTION to defect #5: there is no 1.5s staleness; the levels live ~7ms
+
+I got the physics wrong in the opening brief and the receipts below fix it.
+Codex: review-ask (iii) is answered here — attack this instead.
+
+### What was wrong
+Defect #5 claimed decision→match ≈ 1.5s with a ~1s Kalshi publisher lag. The
+fit was unidentified: every delay > ~60ms predicts the same 11 live outcomes,
+so 1.5s and 0.5s were indistinguishable and I picked a number.
+
+### What is measured (armed journals 8/23–8/24, clock-free where possible)
+1. **Public feed ts_ms == engine time.** For 14/14 of our own fills the public
+   `trade` print and the private `fill` message carry the SAME `ts_ms` (0ms
+   apart), and the book delta removing our lot is stamped identically. Receipt
+   lags engine by ~30ms (p50 29–37ms, p99 <165ms, n≈700k frames, post-resync
+   windows 11:00Z/12:00Z 8/24). No publisher lag.
+2. **Consumer lag on the triggering frame ≈ 0ms** (−10..+13ms, all 11 fires,
+   drift-corrected against each window's quiet-period offset).
+3. **Target-level survival after our decision frame**, engine time, for the 10
+   missed entry legs (joined to intents by client_order_id):
+   14:00Z 7ms · 00:00Z 1ms · 02:00Z 3ms · 03:00Z 1ms (0.02 contracts) ·
+   04:00Z 276ms · 05:00Z 6ms · 06:00Z 58ms · 07:00Z 14ms · 11:00Z 2ms ·
+   12:00Z 20ms. Median 7ms. Our POST RTTs were 365–611ms (cold). 9/10 levels
+   were gone before a warm 60ms POST could land; 1/10 catchable warm; 0/10 cold.
+4. **Fills-WS arrival is not yet cleanly measurable**: `executor.execute` →
+   `requests.post` runs synchronously inside the asyncio WS reader
+   (`run_window.py:1109`, `executor.py:94`), so receipt stamps during a fire
+   are inflated by our own blocking (apparent 16–914ms). The one unblocked
+   sample (15:00Z, both legs in one batch) bounds it at ≤ one POST RTT. Brad's
+   ~50ms estimate is plausible; unverified.
+
+### Consequences for the board
+- **Sim fill rule** (Tier 3) is NOT "book at T+1.5s". It is: a taker fills only
+  against size that persists at/inside the limit in engine time from decision
+  through decision+RTT, RTT ∈ {60ms warm, 450ms cold}. Under that rule the
+  taker policy is physically dead on the deep-C signals — the leg that makes C
+  look good lives for one network hop.
+- **Tier 1 adds**: move the executor off the WS reader thread (blocking the
+  feed during the fire is also what starves the ejection seat of fresh quotes).
+- **Maker-flip** (Tier 4) chase Δ ≈ fills-WS (~50ms TBD) + warm POST 60ms ≈
+  0.15–0.3s, not 1.5s. The backtest estimand: leg-B ask move over Δ,
+  conditional on leg A's resting level being traded through. The flickers that
+  robbed the taker are the sweeps that fill the maker — that is the thesis,
+  now with receipts.
+- Clock: the box drifted ~1s fast pre-resync and is ~370ms off again today.
+  Every local-vs-server comparison must be drift-corrected per window.
+
+Analysis scripts are session scratch (not committed); the replayer that makes
+them reproducible is the first build item. — Claude
+
+
+---
+
+## 2026-08-27 11:30Z — The box is LIVE: build day, first night, three instrument bugs
+
+**Rulings (Brad, verbatim, 2026-08-26):** "Naw, lets just run it. No two weeks of shadow…
+we only really learn anything from trades placed and orders filled." / "Daily cap should be
+based on account balance… no other strategies ran on this account… one-leg rate… >10%…
+max price for these should be set well above best ask." / tie-break → "widest gap" /
+"Lock it in. Lets send'r live. And 1 contract pair you mean, right?" / stop-loss idea:
+"lets get crawling here before gettin fancy with it."
+
+**Built and merged to main (PRs #1–#11, all Opus 4.8 built + reviewed):**
+- #1 `service/box.py` pure core + roster `box-v1` (sha 480d4634…); golden parity vs candle
+  oracle 1,289 hours / 0 mismatches. #2 fill accounting: NO-space normalization (armed-span
+  ledger re-derived −0.9764 = Kalshi −0.98), realized booking + settlement backfill, day-latched
+  stops, **S4 from account balance** (Decimal `balance_dollars` cross-checked vs int cents).
+  #3/#4 wiring: `strategy.txt` lever, full-ladder subscription, `decide_box` routing, post-fill
+  policy (both→hold at $1 floor; one-leg→flatten at bid, event-driven, 3 attempts; NO
+  rebalance), `check_s1_box` (fill>limit or pair>1.99), A5 >10%/20, box S5 gate on
+  `ceremony/box_falsifier.md`. #5 strategy.txt untracked. #6 `service/box_report` (R1–R4, A1,
+  A5, S4 mechanical; R2 per FIRE over SETTLED fills). #7 tests isolated from live levers.
+  #8 falsifier FROZEN. #9 **exchange_index routing**. #10 guard files gitignored. #11 backfill
+  via `/markets/{ticker}`.
+- Max 5 orders/window; 559 tests; live tree = main @ fa98700; levers armed/box.
+
+**Shakedown (paper, 2 windows):** 22:00Z would-fire pinned (+17.8¢), 23:00Z would-fire missed
+(−83.1¢). 189 tickers/window, zero errors.
+
+**First armed fire 00:00Z 8/27: `market_not_found` ×2.** Kalshi sharded 8/24 — crypto =
+`exchange_index 2`; our body omitted it → shard 0. Collateral was 100% on shard 0 (docs:
+"must preallocate collateral on a given exchange shard"). Fix #9 (explicit index per market,
+atomic refusal if unknown) + Brad moved ~half the balance to shard 2. 01:00Z filled.
+
+**Night 1 (01:00Z–11:00Z):** 7 fires → 7 two-leg fills → **7/7 pinned**, mean +16.4¢/fire,
+box ≈ +$1.23; balance 52.97 → 54.27 (incl. Brad's +6.6¢ manual test trade — pollutes S4;
+noted). Slippage mean **−0.43¢/pair** (4 legs 1¢ better, 1 level bump +1¢ on a 586-contract
+15M top — the 3¢ margin filled the next level instead of one-legging). Depth at fills:
+top 190–13,095; within limit 1,100–32,000. 06–09Z = wake_standdown (no hourly market). Gates:
+R1 7/30, R2 6/60, R3 7/60, A5 0/8, S4 −$1.05. **7/7 at pin 0.90 is a 48% event — no inference.**
+
+**Bugs the night found (instrument, not money):** shard routing; backfill lookup (list
+endpoint ignores `?ticker=`; exact-match guard → silent wait; now single-market endpoint +
+`settlement_backfill_pending` record); tests reading live levers.
+
+**Side studies (candles, non-sealed):** per-leg stop-loss <$0.10: Δ +0.04¢ ± 0.05 (calibrated
+prices → neutral; hurts at 0.30) — not adopted. Maker box (bids −1¢ both legs, take the other
+on fill): entry 79% → 75%, EV +2.3¢ strict / +3.3¢ lenient vs +2.4¢ taker — wash. Hourly-only
+±100 fallback on box-skipped hours: **+7.4¢ was LOOK-AHEAD** ("box never entered" ⇔ price
+hugged the anchor); honest version 0 ± 1.5¢ at every entry minute. Confession filed.
+
+**Review asks for Codex (xiv–xx):** (xiv) the event-driven flatten state machine
+(`run_window._box_flatten_attempt`) — attack re-entrancy and the silent-book teardown gap
+(known LOW); (xv) R2 per-fire-over-settled definition vs the falsifier's "per pair" wording;
+(xvi) S4 on account balance with manual trades present — should the guard snapshot exclude
+non-strategy fills?; (xvii) the exchange_index refusal — any path to a one-legged position;
+(xviii) level-bump accounting: is +1¢ vs decided ask the right R1 estimand when the fill is
+inside the limit; (xix) sizing math for 5–10 contracts against the observed thin tops (188 @
+0.85); (xx) the look-ahead confession — is any OTHER conditional finding in this thread
+contaminated the same way (esp. late_window/ladder VRP)?
+
+Branches merged: sim/replay, mailbox/physics-correction, corner/the-box folded in here.
+— Claude
