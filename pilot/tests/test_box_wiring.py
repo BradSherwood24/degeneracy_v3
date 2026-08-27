@@ -810,6 +810,102 @@ def test_settlement_backfill_waits_when_unsettled(tmp_path):
     assert not any(r.get("backfill_of") for r in rows)
 
 
+class _MarketProxy:
+    """A proxy that serves the single-market endpoint shape ({"market": {...}}) from a ticker->result
+    map and records every path/params so a test can assert the singular /markets/{ticker} endpoint
+    is used (the fix) rather than the list /markets?ticker= endpoint (the bug). A None/absent result
+    yields a market carrying no ``result`` -> not-yet-settled."""
+
+    def __init__(self, results, payload=None):
+        self.results = results
+        self.payload = payload  # if set, returned verbatim for every path (shape-probe tests)
+        self.paths: list[tuple[str, object]] = []
+
+    def rest_get(self, path, params=None):
+        self.paths.append((path, params))
+        if self.payload is not None:
+            return self.payload
+        tk = path.split("/markets/", 1)[1] if path.startswith("/markets/") else None
+        res = self.results.get(tk)
+        return {"market": {"ticker": tk, "result": res}} if res else {"market": {"ticker": tk}}
+
+
+def _pending_box_row(ledger_path, *, legs, floor="1.00"):
+    append_entry({
+        "close_time": "2026-08-21T20:00:00Z", "strategy": "box", "fires": 1,
+        "fired_source": WIDE_BOX, "pairs": 1, "realized_delta": "-0.82",
+        "realized_unsettled": True, "floor_booked": floor, "unsettled_legs": legs,
+    }, ledger_path)
+
+
+_BOTH_LEGS = [{"ticker": HOURLY_TICKER, "side": "yes", "count": 1},
+              {"ticker": M15_TICKER, "side": "no", "count": 1}]
+
+
+def test_settlement_backfill_single_market_endpoint_backfills(tmp_path):
+    # The fix: _fetch_market_result hits the singular /markets/{ticker} endpoint, whose {"market":
+    # {...}} shape the parser accepts on an exact ticker match -> the pinned pair settles (+$1).
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    _pending_box_row(ledger_path, legs=_BOTH_LEGS)
+    svc = _box_svc(tmp_path, mode="shakedown", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, market_result_getter=None)
+    svc.proxy = _MarketProxy({HOURLY_TICKER: "yes", M15_TICKER: "no"})
+    svc._settlement_backfill_sweep()
+    rows = load_entries(ledger_path)
+    bf = [r for r in rows if r.get("backfill_of") == "2026-08-21T20:00:00Z"]
+    assert len(bf) == 1
+    assert Decimal(bf[0]["realized_delta"]) == Decimal(1)  # +$1 pinned bonus, floor netted
+    # proof of the fix: the singular /markets/{ticker} path was used, with NO list ?ticker= param
+    assert svc.proxy.paths
+    for path, params in svc.proxy.paths:
+        assert path.startswith("/markets/") and params is None
+
+
+def test_settlement_backfill_foreign_ticker_shape_waits(tmp_path):
+    # A {"market": {...}} whose ticker is FOREIGN (the wrong market) must NOT be attributed to our
+    # leg (F1). The exact-ticker guard returns None -> the sweep waits, nothing settled.
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    _pending_box_row(ledger_path, legs=[{"ticker": HOURLY_TICKER, "side": "yes", "count": 1}], floor="0")
+    svc = _box_svc(tmp_path, mode="shakedown", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, market_result_getter=None)
+    svc.proxy = _MarketProxy({}, payload={"market": {"ticker": "KXBTCD-FOREIGN", "result": "yes"}})
+    svc._settlement_backfill_sweep()
+    assert not any(r.get("backfill_of") for r in load_entries(ledger_path))
+
+
+def test_settlement_backfill_list_shape_100_unrelated_waits(tmp_path):
+    # Defence-in-depth: even if a list payload of 100 unrelated markets ever comes back (the old
+    # buggy /markets?ticker= behaviour), no markets[0] fallback fires -> the sweep waits.
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    _pending_box_row(ledger_path, legs=[{"ticker": HOURLY_TICKER, "side": "yes", "count": 1}], floor="0")
+    unrelated = {"markets": [{"ticker": f"KXMVECROSS-SHARD{i}", "result": "yes"} for i in range(100)]}
+    svc = _box_svc(tmp_path, mode="shakedown", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, market_result_getter=None)
+    svc.proxy = _MarketProxy({}, payload=unrelated)
+    svc._settlement_backfill_sweep()
+    assert not any(r.get("backfill_of") for r in load_entries(ledger_path))
+
+
+def test_settlement_backfill_pending_is_journalled(tmp_path):
+    # When a pending row cannot yet settle (one leg still unsettled), the sweep journals a compact
+    # settlement_backfill_pending record so the silent wait is visible offline.
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    _pending_box_row(ledger_path, legs=_BOTH_LEGS)
+    # hourly settled, 15M still open -> pending_leg is the 15M leg
+    svc = _box_svc(tmp_path, mode="shakedown", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path,
+                   market_result_getter=(lambda tk: "yes" if tk == HOURLY_TICKER else None))
+    svc._settlement_backfill_sweep()
+    recs = [r for r in svc.journal.records() if r["kind"] == "settlement_backfill_pending"]
+    assert len(recs) == 1
+    obj = recs[0]["obj"]
+    assert obj["window"] == "2026-08-21T20:00:00Z"
+    assert obj["unsettled_leg"] == M15_TICKER
+    assert set(obj["tickers"]) == {HOURLY_TICKER, M15_TICKER}
+    assert obj["settled_legs"] == [HOURLY_TICKER]
+    assert not any(r.get("backfill_of") for r in load_entries(ledger_path))  # nothing settled yet
+
+
 def test_parse_market_result():
     assert _parse_market_result({"market": {"ticker": "X", "result": "yes"}}, "X") == "yes"
     assert _parse_market_result({"markets": [{"ticker": "X", "result": "no"}]}, "X") == "no"

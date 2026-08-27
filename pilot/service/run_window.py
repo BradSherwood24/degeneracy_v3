@@ -1748,7 +1748,11 @@ class WindowService:
                 logger.warning("[RUN] market-result fetch failed for %s: %s", ticker, e)
                 return None
         try:
-            resp = self.proxy.rest_get("/markets", {"ticker": ticker})
+            # Single-market endpoint (/markets/{ticker}) returns {"market": {...}} for the exact
+            # ticker. The list endpoint (/markets?ticker=) IGNORES the singular param and returns
+            # 100 unrelated markets, so _parse_market_result's exact-ticker guard never matched and
+            # the sweep silently never settled. (Plural ?tickers= also works but this shape is exact.)
+            resp = self.proxy.rest_get(f"/markets/{ticker}")
         except Exception as e:  # noqa: BLE001
             logger.warning("[RUN] market-result fetch failed for %s: %s", ticker, e)
             return None
@@ -1774,15 +1778,24 @@ class WindowService:
                 continue
             legs = entry.get("unsettled_legs") or []
             results: dict[str, str] = {}
-            settled = True
+            pending_leg: str | None = None
             for leg in legs:
                 tk = leg["ticker"] if isinstance(leg, dict) else leg[0]
                 res = self._fetch_market_result(tk)
                 if res not in ("yes", "no"):
-                    settled = False
+                    pending_leg = tk
                     break
                 results[tk] = res
-            if not settled:
+            if pending_leg is not None:
+                # A pending row we cannot yet settle (a leg unsettled/unavailable). Make the silent
+                # wait visible in the journal — compact, and at most once per window per wake since
+                # the sweep itself runs once per wake.
+                tickers = [leg["ticker"] if isinstance(leg, dict) else leg[0] for leg in legs]
+                self._journal(
+                    "settlement_backfill_pending",
+                    {"window": window, "tickers": tickers, "unsettled_leg": pending_leg,
+                     "settled_legs": sorted(results.keys())},
+                )
                 continue
             try:
                 payoff = settlement_payoff(legs, results)
