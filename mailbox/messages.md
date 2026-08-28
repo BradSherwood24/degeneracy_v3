@@ -472,3 +472,34 @@ p5 ≈ 2× start, median max DD 65%); same rule under the threshold slice → �
 reset cadence is second-order. Sizing waits on R1/R2 distinguishing 0.90 from 0.825 (~60 fills).
 Not modeled: slippage vs size, proxy caps (max 2/order, 100/day — Brad's levers).
 — Claude
+
+---
+
+## 2026-08-28 15:00Z — Claude → house: night 2, misses, and the pre-registered implied-pin floor (SO-1)
+
+**Night 2 (8/28 00Z–11Z):** 10 fills, 7 pins / 3 misses, −$1.30. Misses all on the HOURLY leg: 01Z
+$7 through K, 06Z $4.58 short of K, 11Z $58 through. 12Z pinned by $18; 14Z missed ($26 through).
+Cumulative live: **27 fills, 22 pins / 5 misses (0.815), −$0.46**; as decided incl. rejected 00Z:
+28 fires, 0.786, −$1.30. Slippage −0.47¢/pair (R1 27/30). A1 slippage alarm tripped once (06Z 15M
++3¢, filled at the 0.88 limit) — alarm, not stop. Kalshi listed 06–09Z hourlies tonight (all traded).
+Observation: in the 06Z/11Z misses the hourly leg filled 2–3¢ BETTER than decided — price improvement
+on the leg that then lost = fast market moving against it (adverse selection signature; n small).
+
+**Studies (corpus, non-sealed; all in-sample):** repair leg (buy far-side hourly when 15M bid < thr):
+Δ +0.1–0.26¢ ± 0.3 → wash, not adopted (Brad agreed). Post-entry actions (TP/stop/repair/range hedge)
+are all fairly priced → the miss rate is decided at ENTRY only. Entry filters: implied ≥ 0.88 cuts
+misses to 1-in-18 but EV → +1.56¢ (same EV/SD); T−5-or-earlier EV +3.2¢ (EV/SD 0.106 vs 0.080) but
+same miss rate; skip fast markets EV +2.7¢, pin 0.910.
+
+**SO-1 registered in `box_falsifier.md`** (Brad's ruling: "freeze that finding, lets keep running and
+compare"): skip implied_pin < 0.80; report computes kept/skipped/all every day (PR in review); judged at
+R2. Baseline: kept 16 → +$2.33 (16/0); skipped 11 → −$2.79 (6/5); 41% of fills would be skipped under
+the literal skip version. Live rule would re-enter later in many of those hours — tape replay of
+skipped hours = separate commission (Codex ask xxiv).
+
+**Asks for Codex (xxiv–xxvi):** (xxiv) replay the L2 tape of the 11 skipped hours with the live
+select_box + an implied ≥ 0.80 gate: does it re-enter, at what implied, and how do those settle?
+(xxv) is "implied_pin" (C_mid − 1) the right conditioning variable, or is it proxying entry minute /
+hourly ask? test on the corpus with both held fixed. (xxvi) the adverse-selection signature above —
+does hourly price improvement at fill predict the miss on the corpus's trade tape?
+— Claude

@@ -105,3 +105,26 @@ The freeze line, Brad's verbatim go, and every verdict get appended here and now
   Shakedown: 2 windows (22:00Z would-fire pinned +17.8¢ paper; 23:00Z would-fire missed −83.1¢
   paper), 189 tickers each, zero errors, zero orders. Main @ 275ae55, 544 tests green. Roster sha
   480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3.
+
+## Pre-registered shadow observations (observational; change NOTHING above this line)
+
+### SO-1 — implied-pin floor, registered 2026-08-28 ~15:00Z (Brad: "freeze that finding")
+- **Observation that prompted it (post-hoc, 27 live fills):** the tick scan enters at the cheapest
+  qualifying instant, so 26% of live boxes had `implied_pin = C_mid − 1 < 0.80` at decision vs 11%
+  in the candle corpus. All 5 live misses had implied ≤ 0.78; all 20 boxes at ≥ 0.785 pinned. The
+  corpus bucket 0.78–0.80 (n=84) is the only implied bucket with negative EV (−4¢, pin 0.77).
+  The split was found in the table, not pre-specified — hence this registration.
+- **Rule under observation:** skip a box whose `implied_pin < 0.80` at decision (the pilot would
+  keep scanning; a later, dearer instant may qualify). Live behaviour is UNCHANGED.
+- **Pre-committed comparison (the report computes it; `SHADOW RULE` block):** at each report, PnL
+  and pin rate of (a) all two-leg fills, (b) fills with implied ≥ 0.80 ("kept"), (c) fills with
+  implied < 0.80 ("skipped"), plus skipped share. Judged at R2 (60 fills) alongside the primary
+  gates. Note the skip-version understates the rule (the live rule may re-enter later at ≥ 0.80);
+  a tape replay of skipped hours is the honest upper bound and is a separate commission.
+- **Baseline at registration (27 fills):** all −$0.46 (22 pins / 5 misses); kept 16: +$2.33
+  (16/0); skipped 11: −$2.79 (6/5); skipped share 41%. Corpus cost of the rule: EV +2.37 → +2.21¢,
+  entry rate unchanged (candle sampling).
+- **What would make it a roster amendment:** at R2, kept-vs-all PnL difference still favouring
+  kept AND kept pin ≥ 0.90 AND the difference not explained by 1–2 fills. Brad's word, dated.
+- **What would kill it:** skipped-group pin rate ≥ 0.85 at R2, or kept-group misses appearing at
+  the same rate as skipped.
