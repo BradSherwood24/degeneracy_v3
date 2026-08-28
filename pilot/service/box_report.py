@@ -50,6 +50,15 @@ A5_WINDOW = 20                                   # rolling last-20 box fires
 A5_MAX_ONE_LEGGED_RATE = Decimal("0.10")         # alarm if one-legged/fires > 0.10
 S4_DAILY_LOSS_CAP = Decimal("3.00")              # daily loss cap on the ACCOUNT BALANCE
 
+# --- pre-registered shadow rule (observational only; NOT a falsifier, NOT a decision gate) ---
+# Pre-registered 2026-08-28 (Brad): the live tick scan enters at the cheapest qualifying instant;
+# 5 of the first 5 live misses had implied_pin <= 0.78 while all 20 boxes at >= 0.785 pinned
+# (post-hoc split; frozen here so the forward record judges it). The rule under observation: skip a
+# box whose implied_pin < 0.80 at decision. This report computes what the ledger would show if those
+# fills were removed. It changes nothing about live decisions.
+SHADOW_MIN_IMPLIED_PIN = Decimal("0.80")
+SHADOW_RULE_REGISTERED = "2026-08-28"
+
 # --- status literals ---
 STATUS_NOT_YET = "NOT YET"
 STATUS_HOLDING = "HOLDING"
@@ -612,6 +621,67 @@ def candle_staleness(windows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _shadow_group_stats(group: list[dict[str, Any]]) -> dict[str, Any]:
+    """Counts + settled-only PnL for one shadow group of two-leg windows. Settled = outcome in
+    {pinned, not_pinned}; realized_sum/mean/pin_rate are over the SETTLED subset only."""
+    pins = sum(1 for w in group if w["outcome"] == "pinned")
+    misses = sum(1 for w in group if w["outcome"] == "not_pinned")
+    unsettled = sum(1 for w in group if w["outcome"] == "unsettled")
+    n_settled = pins + misses
+    realized_sum = sum(
+        (w["realized"] for w in group
+         if w["outcome"] in ("pinned", "not_pinned") and w["realized"] is not None),
+        Decimal(0),
+    )
+    mean = (realized_sum / Decimal(n_settled)) if n_settled else None
+    pin_rate = (Decimal(pins) / Decimal(n_settled)) if n_settled else None
+    return {
+        "n": len(group),
+        "n_settled": n_settled,
+        "pins": pins,
+        "misses": misses,
+        "unsettled": unsettled,
+        "realized_sum": realized_sum,
+        "mean_realized_per_fill": mean,
+        "pin_rate": pin_rate,
+    }
+
+
+def shadow_implied_rule(windows: list[dict[str, Any]]) -> dict[str, Any]:
+    """PRE-REGISTERED SHADOW RULE (observational; see SHADOW_MIN_IMPLIED_PIN comment). Over the
+    TWO-LEG-filled windows only, split by implied_pin at decision into ``kept`` (>= 0.80),
+    ``skipped`` (< 0.80) and ``unknown`` (implied_pin missing/None), and report counts + settled-only
+    PnL for each plus ``all`` (every two-leg window). Purely a what-if on the ledger — it removes no
+    live fill and drives no decision."""
+    two_leg = [w for w in windows if w["fill_class"] == "both"]
+    kept: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
+    for w in two_leg:
+        ip = w["implied_pin"]
+        if ip is None:
+            unknown.append(w)
+        elif ip >= SHADOW_MIN_IMPLIED_PIN:
+            kept.append(w)
+        else:
+            skipped.append(w)
+    all_n = len(two_leg)
+    skipped_share = (Decimal(len(skipped)) / Decimal(all_n)) if all_n else None
+    skipped_windows = [
+        (w["close_time"], w["implied_pin"], w["outcome"], w["realized"]) for w in skipped
+    ]
+    return {
+        "min_implied_pin": SHADOW_MIN_IMPLIED_PIN,
+        "registered": SHADOW_RULE_REGISTERED,
+        "all": _shadow_group_stats(two_leg),
+        "kept": _shadow_group_stats(kept),
+        "skipped": _shadow_group_stats(skipped),
+        "unknown": _shadow_group_stats(unknown),
+        "skipped_share": skipped_share,
+        "skipped_windows": skipped_windows,
+    }
+
+
 def aggregate_block(windows: list[dict[str, Any]]) -> dict[str, Any]:
     """The full aggregate block for a set of fired windows (per-day or cumulative)."""
     fires = len(windows)
@@ -637,6 +707,7 @@ def aggregate_block(windows: list[dict[str, Any]]) -> dict[str, Any]:
         "A5": a5_one_legged(windows),
         "level_bumps": level_bumps(windows),
         "candle_staleness": candle_staleness(windows),
+        "shadow_implied_rule": shadow_implied_rule(windows),
     }
 
 
@@ -722,10 +793,13 @@ def _fc(d: Decimal | None, places: int = 2) -> str:
 def _render_window(w: dict[str, Any], lines: list[str]) -> None:
     tm = w["t_minus_s"]
     tm_s = f"T-{tm:.0f}s" if isinstance(tm, (int, float)) else "-"
+    ip = w["implied_pin"]
+    shadow_skip = (w["fill_class"] == "both" and ip is not None and ip < SHADOW_MIN_IMPLIED_PIN)
     lines.append(
         f"  {w['close_time']}  {tm_s}  side={w['side']:5}  "
         f"K={_f(w['K'],2)} A={_f(w['A'],2)} width={_f(w['width'],2)}  "
         f"[{w['fill_class']}]  outcome={w['outcome']}"
+        f"{' [shadow-skip]' if shadow_skip else ''}"
     )
     for lg in (w["hourly"], w["m15"]):
         bump = "  <<LEVEL BUMP" if lg["level_bump"] else ""
@@ -797,6 +871,31 @@ def _render_aggregate(agg: dict[str, Any], lines: list[str]) -> None:
         f"  CANDLE STALE : n_paid={cs['n_paid']} mean_paid_vs_mid={_fc(cs['mean_paid_vs_mid_cents'])}  "
         f"mean_decision_gap={_fc(cs['mean_decision_gap_cents'])}"
     )
+    _render_shadow_rule(agg["shadow_implied_rule"], lines)
+
+
+def _shadow_line(label: str, s: dict[str, Any]) -> str:
+    return (
+        f"      {label:8} n={s['n']:3}  pins/miss/unsettled={s['pins']}/{s['misses']}/{s['unsettled']}  "
+        f"PnL=${_f(s['realized_sum'],4)}  mean/settled=${_f(s['mean_realized_per_fill'],4)}  "
+        f"pin_rate={_f(s['pin_rate'],3)}"
+    )
+
+
+def _render_shadow_rule(sr: dict[str, Any], lines: list[str]) -> None:
+    lines.append(
+        "  SHADOW RULE (pre-registered 2026-08-28, observational): skip implied_pin < 0.80"
+    )
+    lines.append(_shadow_line("ALL", sr["all"]))
+    lines.append(_shadow_line("KEPT", sr["kept"]))
+    lines.append(_shadow_line("SKIPPED", sr["skipped"]))
+    share = sr["skipped_share"]
+    share_s = "-" if share is None else f"{_f(share * _CENT, 1)}%"
+    lines.append(f"      skipped share = {share_s} of fills")
+    for ct, ip, outcome, realized in sr["skipped_windows"]:
+        lines.append(
+            f"        skip: {ct}  implied={_f(ip,4)}  {outcome}  realized=${_f(realized,4)}"
+        )
 
 
 def _render_s4(s4: dict[str, Any], lines: list[str]) -> None:
