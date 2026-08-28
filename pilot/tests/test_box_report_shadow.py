@@ -85,6 +85,8 @@ def test_shadow_all_is_two_leg_total_and_share():
     sr = br.shadow_implied_rule(_windows())
     assert sr["all"]["n"] == 5
     assert sr["all"]["realized_sum"] == Decimal("0.24") + Decimal("-0.86") + Decimal("0.10")
+    # all = 3 pins + 1 miss + 1 unsettled -> pin_rate over SETTLED only (review nit #1)
+    assert sr["all"]["n_settled"] == 4 and sr["all"]["pin_rate"] == Decimal("0.75")
     assert sr["skipped_share"] == Decimal(2) / Decimal(5)   # 2 skipped of 5 two-leg fills
     assert sr["min_implied_pin"] == Decimal("0.80")
     assert sr["registered"] == "2026-08-28"
