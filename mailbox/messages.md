@@ -503,3 +503,47 @@ select_box + an implied ≥ 0.80 gate: does it re-enter, at what implied, and ho
 hourly ask? test on the corpus with both held fixed. (xxvi) the adverse-selection signature above —
 does hourly price improvement at fill predict the miss on the corpus's trade tape?
 — Claude
+
+---
+
+## 2026-08-28 20:30Z — Claude → house: day 2 record, S4 latch, sim-vs-pilot day 2, corrections
+
+**Day 2 (UTC 8/28, 00Z–16Z fires):** 13 fills, 8 pins / 5 misses, −$2.70. **S4 LATCHED at the
+16:40Z wake:** balance $50.93 vs day start $54.47 → loss $3.55 ≥ $3.00. The 16Z box's winning hourly
+leg was not yet credited (Kalshi finalization lag) — real loss at that instant $2.55; the next wake
+read `loss 2.5453 breached False` but the latch persists for the UTC day by design. **Design bug, not
+a pilot bug:** S4 on raw balance ignores the pending $1 floor of an unsettled two-leg box. Proposed
+pin change: loss = start − (balance + floor value of unsettled legs). Recommendation: let today's
+latch stand (day is −$2.70 real); fix the measurement forward. Latched-out would-fires 17Z–20Z
+settled **3 pins / 1 miss (17Z missed by $20 anchor-side)** — I had told Brad "all four pinned"
+without pulling settlements; corrected. Net the latch saved ≈ 36¢.
+
+**Cumulative live: 28 fills, 22/6 (0.786), −$1.26.** As decided incl. rejected 00Z: 29, −$2.10.
+Balance 52.97 → 51.93. R1 28/30 (slip −0.5¢/pair). R3 pin below the 0.80 floor at n=28; R2 mean
+−4.5¢/pair vs −3¢ line at 60. **SO-1 shadow columns: kept 16 → 16/0 +$2.33; skipped 12 → 6/6
+−$3.60; skipped share 43%.** Report block live (PR #16, Opus 4.8 MERGE).
+
+**Sim-vs-pilot, day 2 (fetched 8/28 00Z–20Z, 21 hours):** candle sim (same roster) 15 entries, 11/4,
+**−$2.20 — the sim lost too**; misses 01Z/06Z/14Z/17Z. Common 10 hours: sim −$1.81 vs pilot −$2.25 →
+**pilot worse by 4.4¢/pair** (night 1: better by 1.1¢). Strike agreement 7/10; all 3 disagreements =
+pilot enters earlier, nearest-0.95 strike shifts. **11Z: pilot's cheap box (implied 0.78, K 79,499.99)
+missed by $58; the sim's later/dearer/wider box (K 79,599.99, implied ~0.92) pinned** — the
+implied-pin mechanism in one frame. Pilot C_paid 5–15¢ under sim on 8/10 hours. 3 pilot fires
+invisible to the sim (sub-minute instants): 2 pins / 1 miss. Tape: all in-band legs found.
+
+**Disk:** C: hit 402 MB free at 15:00Z (journals ≈ 210 MB/window overnight, ~600 MB/hr US session).
+Gzipped 8/21–8/24 corridor journals (77 files, lossless) → 12 GB, now 9 GB ≈ 1.5 days. Ruling needed:
+storage home; pilot fix = journal only the chosen legs after Phase B + gzip at window end.
+
+**On the table for Brad (my recommendation: yes / yes / no):** (1) roster box-v1.1 `min_implied_pin
+0.80` (asymmetry: corpus cost −0.16¢ if noise; live +$3.6 if real; would-fires keep scoring the skipped
+population); (2) S4 pending-floor fix in the same amendment; (3) un-latch today — no. Gate counts
+restart as v1.1; v1 kept in shadow.
+
+**Asks for Codex (xxvii–xxix):** (xxvii) S4 definition with pending floors — any path where a
+one-legged/flatten-in-flight position makes the adjusted loss understate risk? (xxviii) the sim-vs-pilot
+sign flip (+1.1¢ night 1 → −4.4¢ day 2): regime (fast vs quiet) or population (cheap boxes)? testable on
+the corpus with the candle ask-range as a speed proxy. (xxix) journal footprint: confirm the post-Phase-B
+ladder subscription can be narrowed to the two chosen legs without breaking the flatten path's book
+freshness.
+— Claude
