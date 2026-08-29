@@ -105,6 +105,10 @@ The freeze line, Brad's verbatim go, and every verdict get appended here and now
   Shakedown: 2 windows (22:00Z would-fire pinned +17.8¢ paper; 23:00Z would-fire missed −83.1¢
   paper), 189 tickers each, zero errors, zero orders. Main @ 275ae55, 544 tests green. Roster sha
   480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3.
+- 2026-08-29 — AMENDED to box-v1.1 (implied-pin floor 0.80, S4 pending-settlement band). Brad
+  (verbatim): "Go ahead with it. Full review and agent build as before. Let me know when it's
+  ready." Roster sha cec4b1a29c5d46deac09fd7a46ec0e08b7603a1f6862758cdb60e97a477aa42c. Tests 604
+  green. Details in `## Amendment box-v1.1 — 2026-08-29` below.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
@@ -128,3 +132,79 @@ The freeze line, Brad's verbatim go, and every verdict get appended here and now
   kept AND kept pin ≥ 0.90 AND the difference not explained by 1–2 fills. Brad's word, dated.
 - **What would kill it:** skipped-group pin rate ≥ 0.85 at R2, or kept-group misses appearing at
   the same rate as skipped.
+
+## Amendment box-v1.1 — 2026-08-29 (Brad's go, verbatim)
+
+SO-1 crossed the "roster amendment" bar. Brad (verbatim, 2026-08-28 ~23:30Z): **"Go ahead with it.
+Full review and agent build as before. Let me know when it's ready."** This section records the
+amendment; nothing above the "change NOTHING above this line" marker changed except the appended
+Registration line.
+
+### Evidence (do not re-derive)
+
+Live, 28 two-leg fills (the armed campaign):
+
+| group          | fills | pins/miss | realized |
+|----------------|-------|-----------|----------|
+| implied ≥ 0.80 |   16  |   16 / 0  |  +$2.33  |
+| implied < 0.80 |   12  |    6 / 6  |  −$3.60  |
+
+Candle corpus (1,289-hour backtest, per-fill cents):
+
+| variant                         | fills | ¢/fill |
+|---------------------------------|-------|--------|
+| all fills (v1)                  | 1,024 | +2.37  |
+| literal skip-the-hour (≥ 0.80)  |   912 | +2.61  |
+| keep-scanning (re-enter ≥ 0.80) | 1,017 | +2.21  |
+
+Literal skip-the-hour is the better-supported variant and is what Brad approved.
+
+### Policy delta (roster `box-v1` → `box-v1.1`)
+
+- New pin **`min_implied_pin` = 0.80** in `pilot/policy/box_params.json`. A box whose
+  `implied_pin = C_mid − 1` (fee-free mids) is **below** the floor at the FIRST qualifying instant
+  is **SKIPPED for the hour** — literal skip-the-hour, **no orders** (a skip is a skip, even in
+  shakedown). Equality (implied == 0.80) FIRES.
+- The skip is journaled `box_skip_implied` with the full selection payload (side / K / A /
+  implied_pin / C_decision) plus `implied_pin` / `min_implied_pin` / `t_minus_s`, so the report
+  **counts** it live as a paper skip. NOTE: SETTLEMENT SCORING of a paper window requires a
+  settlement source for markets we did NOT hold (an un-traded skip has no ledger row and so no
+  backfill row) — a follow-up commission (a read-only, report-side resolver that fetches the settled
+  result for the selection's markets). Until then the SO-1 paper groups show COUNTS and `unsettled`;
+  the scoring plumbing (`payoff − C_decision`) is in place for the moment such a source exists.
+- **Rescan paper record:** after a skip, the FIRST later instant that re-qualifies (`implied ≥ 0.80`)
+  inside the entry window emits ONE paper `box_rescan_would_fire` — never an order. It RECORDS, on
+  live tape, that the skipped hour would have re-qualified (the literal-skip-vs-keep-scanning
+  question, SO-1's open caveat); its settlement PnL waits on the same paper-scoring source as skips.
+- New roster sha **`cec4b1a29c5d46deac09fd7a46ec0e08b7603a1f6862758cdb60e97a477aa42c`**
+  (old box-v1 sha `480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3` retained in code
+  as `BOX_V1_POLICY_SHA256` for the report's roster partition). The loader self-verifies the new sha
+  and requires `min_implied_pin` (fails closed if absent).
+
+### S4 measurement amendment (pending-settlement band)
+
+The 2026-08-28 **16:40Z** false latch: a box had PINNED but its 15M leg
+(`KXBTC15M-26AUG280800-00`, window 12:00Z) stayed unfinalized at Kalshi from 12:40Z to 16:40Z. The
+account balance — and the ledger, which books only the $1 floor until backfill — both read **$1
+worse than truth**, so raw loss 3.5453 > cap 3.00 latched S4. Real loss at that instant was $2.55 <
+cap: a **measurement error, not a strategy loss**.
+
+Fix (never latch on a number a pending settlement can still move): S4 now bounds the loss under
+EVERY resolution of the unfinalized legs. `pending_value` = optimistic $1 per unfinalized leg whose
+`close_time` is today. `loss_pessimistic = start − now`; `loss_optimistic = start − (now +
+pending_value)`. **latch** iff `loss_optimistic ≥ cap` (breached under every resolution); **clear**
+iff `loss_pessimistic < cap`; else **pending** — stand down THIS window (degrade to dry), journal
+`s4_pending_settlement`, write **no** day-guard latch; the next wake re-evaluates. The 16:40Z case
+(pessimistic 3.5453, optimistic 2.5453) is now `pending`, not a latch. Bundled LOW fix:
+`_day_totals` is recomputed AFTER the settlement-backfill sweep so `ledger_vs_balance_delta` no
+longer shows the backfill timing artifact. The S4 cap ($3.00) and every other pin are unchanged.
+
+### Gate restart
+
+- **R1–R4, A1, A5** count **box-v1.1** fills from the first v1.1 window. **box-v1** closes at its
+  final counts as a **LEGACY** line in the report (frozen; not counted in the live gates).
+- **SO-1** continues over BOTH rosters and now includes the v1.1 **paper skips** (the SKIPPED group
+  reports `n_real` = v1 fills with implied < 0.80, `n_paper` = v1.1 skipped windows — counted live;
+  their settlement PnL awaits the paper-scoring source noted above) and a paper **rescan** group.
+- Nothing else about the box changed: 1 contract per leg, `pair_cost_max` $1.99, the entry window,
+  the one-legged flatten, the S1/S3/S4/S5 pins, and the R1–R4/A5 thresholds all stand.

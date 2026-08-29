@@ -67,6 +67,15 @@ from service.signal import (
 # --- source identifier (journals / parity) ---
 WIDE_BOX = "wide-box"
 
+# --- box-specific action kinds (v1.1, 2026-08-29) — distinct from FIRE/WOULD_FIRE/STAND_DOWN so the
+# report/summary never counts them as fires/would-fires. Both are ORDER-FREE:
+#   BOX_SKIP               -> the implied-pin floor was breached at the first qualifying instant; the
+#                             hour is skipped (no orders). Journaled with the full selection as paper.
+#   BOX_RESCAN_WOULD_FIRE  -> after a skip, the FIRST later instant that re-qualifies (implied >= floor)
+#                             inside the entry window; a paper record only (never an order).
+BOX_SKIP = "BOX_SKIP"
+BOX_RESCAN_WOULD_FIRE = "BOX_RESCAN_WOULD_FIRE"
+
 # --- leg sides (Kalshi YES-perspective outcome we BUY on that leg) ---
 BUY_YES = "yes"
 BUY_NO = "no"
@@ -242,6 +251,15 @@ class BoxState:
     entered: bool = False
     fired_selection: BoxSelection | None = None
     standdown_emitted: bool = False
+    # v1.1 implied-pin floor (2026-08-29). ``skipped`` latches when the floor is breached at the first
+    # qualifying instant (the hour is skipped; ``entered`` is also set so the fire path is closed). After
+    # a skip the driver keeps folding books until the FIRST later re-qualifying instant emits ONE paper
+    # ``BOX_RESCAN_WOULD_FIRE`` (``rescan_emitted`` latches, ``rescan_selection`` records it). Both carry
+    # a BoxSelection but NEVER an order.
+    skipped: bool = False
+    skipped_selection: BoxSelection | None = None
+    rescan_emitted: bool = False
+    rescan_selection: BoxSelection | None = None
     # F5: the current selection view (BoxSelection | NoBox | None), computed ONCE per relevant book
     # fold in decide_box and reused by the driver's box_eval so select_box does not run twice per tick.
     # compare=False so it never perturbs golden-state equality; repr=False to keep reprs quiet.
@@ -319,11 +337,50 @@ def decide_box(
         else:
             return st, []
 
-    # 2) window already entered -> done (one pair per hour).
+    t_minus = st.T - now
+
+    # 2') RESCAN branch (v1.1): after a SKIP, keep folding books and, at the FIRST later instant whose
+    #     fresh selection re-qualifies (implied_pin >= floor) INSIDE the entry window, emit ONE paper
+    #     BOX_RESCAN_WOULD_FIRE (never an order); the window is then fully done. This runs BEFORE the
+    #     "already entered" gate because a skip also sets ``entered`` (the fire path is closed, but the
+    #     paper rescan is not). Cheap observability for the literal-skip vs keep-scanning question (R2).
+    if st.skipped and not st.rescan_emitted:
+        if not (params.entry_end_s <= t_minus <= params.entry_start_s):
+            return st, []  # before/after the entry window -> no rescan possible at this instant
+        rsel = st.view
+        if not isinstance(rsel, BoxSelection):
+            return st, []
+        if rsel.implied_pin < params.min_implied_pin:
+            return st, []  # still below the floor -> keep scanning
+        if not (
+            _leg_fresh(st, rsel.m15_ticker, now, params)
+            and _leg_fresh(st, rsel.hourly_ticker, now, params)
+        ):
+            return st, []
+        legs = (
+            LegOrder(rsel.hourly_ticker, rsel.hourly_side, params.contracts, rsel.hourly_limit),
+            LegOrder(rsel.m15_ticker, rsel.m15_side, params.contracts, rsel.m15_limit),
+        )
+        st = replace(st, rescan_emitted=True, rescan_selection=rsel)
+        return st, [
+            Action(
+                kind=BOX_RESCAN_WOULD_FIRE,
+                source=WIDE_BOX,
+                legs=legs,
+                count=params.contracts,
+                C=rsel.C,
+                ev=None,
+                t_minus_s=t_minus,
+                reason=(
+                    f"rescan re-qualified: implied_pin {rsel.implied_pin} >= floor "
+                    f"{params.min_implied_pin} (paper record; no order)"
+                ),
+            )
+        ]
+
+    # 2) window already entered (fired or skipped) -> the fire path is done (one pair per hour).
     if st.entered:
         return st, []
-
-    t_minus = st.T - now
 
     # 3) no orders inside the settle cutoff (emit StandDown once).
     if t_minus < params.no_orders_after_s_to_settle:
@@ -361,12 +418,32 @@ def decide_box(
     ):
         return st, []
 
-    # 7) fire (WOULD_FIRE in shakedown), then the window is DONE.
-    kind = WOULD_FIRE if st.shakedown else FIRE
+    # 7) FIRST qualifying, fresh instant. v1.1: apply the implied-pin floor here (literal skip-the-hour).
+    #    implied_pin < floor -> SKIP the whole hour (no orders; a skip is a skip even in shakedown).
+    #    implied_pin >= floor (equality included) -> fire (WOULD_FIRE in shakedown), then DONE.
     legs = (
         LegOrder(sel.hourly_ticker, sel.hourly_side, params.contracts, sel.hourly_limit),
         LegOrder(sel.m15_ticker, sel.m15_side, params.contracts, sel.m15_limit),
     )
+    if sel.implied_pin < params.min_implied_pin:
+        # entered=True closes the fire path; skipped=True opens the rescan scan above on later frames.
+        st = replace(st, entered=True, skipped=True, skipped_selection=sel)
+        return st, [
+            Action(
+                kind=BOX_SKIP,
+                source=WIDE_BOX,
+                legs=legs,                 # informational: the legs the fire WOULD have sent; no order
+                count=params.contracts,
+                C=sel.C,
+                ev=None,
+                t_minus_s=t_minus,
+                reason=(
+                    f"implied-pin floor: implied_pin {sel.implied_pin} < floor "
+                    f"{params.min_implied_pin} -> SKIP the hour (no orders)"
+                ),
+            )
+        ]
+    kind = WOULD_FIRE if st.shakedown else FIRE
     st = replace(st, entered=True, fired_selection=sel)
     return st, [
         Action(
@@ -395,9 +472,13 @@ DEFAULT_BOX_POLICY_PATH = os.path.join(_POLICY_DIR, "box_params.json")
 
 # Canonical sha of the frozen box roster shipped in policy/box_params.json. A plain
 # load_box_policy() self-verifies the shipped file against this and refuses any drift.
-# Re-pinned in phase box-2 when ``pair_cost_max`` (the S1_box booked-cost ceiling) was added to
-# the roster; the box roster is not yet ceremonially frozen (a box falsifier comes later).
-FROZEN_BOX_POLICY_SHA256 = "480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3"
+# Re-pinned 2026-08-29 for the box-v1.1 amendment (min_implied_pin 0.80 = the implied-pin floor;
+# roster_name box-v1 -> box-v1.1). Brad's go (verbatim): "Go ahead with it. Full review and agent
+# build as before. Let me know when it's ready." Prior re-pin was phase box-2 (pair_cost_max add).
+FROZEN_BOX_POLICY_SHA256 = "cec4b1a29c5d46deac09fd7a46ec0e08b7603a1f6862758cdb60e97a477aa42c"
+# The prior (box-v1) roster sha, kept so box_report can PARTITION rosters (box-v1 fires close as a
+# legacy line; box-v1.1 fires drive the live gates). Never load against this — v1 is retired.
+BOX_V1_POLICY_SHA256 = "480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3"
 
 
 class BoxPolicyShaMismatch(Exception):
@@ -423,6 +504,10 @@ class BoxParams:
     # S1_box booked-cost ceiling (both legs, fees in). A filled box pair whose cost exceeds this is a
     # guaranteed loss against the $2 pinned ceiling -> S1_box trips (halts the day). Pinned in the roster.
     pair_cost_max: Decimal
+    # v1.1 implied-pin floor (2026-08-29). A box whose implied_pin (= C_mid - 1, fee-free mids) is
+    # BELOW this at the first qualifying instant is SKIPPED for the hour (literal skip; no orders).
+    # Required in the roster (the loader fails closed if absent).
+    min_implied_pin: Decimal
     sha256: str
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
@@ -466,6 +551,8 @@ def load_box_policy(
         no_orders_after_s_to_settle=int(raw["no_orders_after_s_to_settle"]),
         contracts=int(raw["contracts"]),
         pair_cost_max=Decimal(str(raw["pair_cost_max"])),
+        # required key: a roster without it fails closed (KeyError) — never default the floor.
+        min_implied_pin=Decimal(str(raw["min_implied_pin"])),
         sha256=sha,
         raw=raw,
     )

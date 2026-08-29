@@ -328,8 +328,25 @@ def _box_svc(tmp_path, *, mode="armed", window_driver=None, post_fn=None, wake=N
     )
 
 
-def _fire_below(recorder, *, ts=None, hourly=("0.94", "0.92"), populate_books=None):
-    """Drive the recorder's box driver to fire a BELOW-case box on K=64000 (15M NO + hourly YES)."""
+def _fire_below(recorder, *, ts=None, hourly=("0.94", "0.94"), populate_books=None):
+    """Drive the recorder's box driver to fire a BELOW-case box on K=64000 (15M NO + hourly YES).
+
+    v1.1: the quotes are tuned so implied_pin lands EXACTLY on the 0.80 floor (h_mid 0.94 + m15 NO
+    mid 0.86 - 1 = 0.80), which FIRES (equality included). The observed asks are unchanged from v1
+    (hourly ask 0.94, 15M NO ask 0.86) so every downstream limit/cost/fill assertion is identical;
+    only the mids moved up (hourly bid 0.92->0.94, 15M yes 0.20->0.14) to clear the floor. The
+    below-floor SKIP path is exercised by ``_skip_below`` (implied 0.76)."""
+    ts = ts if ts is not None else (T - 300)
+    if populate_books:
+        for tk, tp in populate_books.items():
+            recorder.books[tk] = _FakeBook(tp)
+    recorder.driver.on_book_update(HOURLY_TICKER, top(yes_ask=hourly[0], yes_bid=hourly[1]), ts)
+    recorder.driver.on_book_update(M15_TICKER, top(yes_ask="0.14", yes_bid="0.14"), ts)
+
+
+def _skip_below(recorder, *, ts=None, hourly=("0.94", "0.92"), populate_books=None):
+    """Drive a BELOW-case box whose implied_pin (0.76) is below the 0.80 floor -> v1.1 BOX_SKIP (no
+    orders). Same K=64000 selection the fire would have chosen; only the mids are lower."""
     ts = ts if ts is not None else (T - 300)
     if populate_books:
         for tk, tp in populate_books.items():
@@ -938,8 +955,8 @@ def _event_list():
         BookUpdate(HOURLY_TICKER, top(yes_ask="0.995", yes_bid="0.99"), T - 600),
         BookUpdate(M15_TICKER, top(yes_ask="0.20", yes_bid="0.14"), T - 600),  # hourly out of range
         ClockTick(T - 550),
-        BookUpdate("KXBTCD-63500", top(yes_ask="0.94", yes_bid="0.92"), T - 540),  # K=63500 qualifies
-        BookUpdate(M15_TICKER, top(yes_ask="0.20", yes_bid="0.14"), T - 540),      # fires here
+        BookUpdate("KXBTCD-63500", top(yes_ask="0.94", yes_bid="0.94"), T - 540),  # K=63500 qualifies
+        BookUpdate(M15_TICKER, top(yes_ask="0.14", yes_bid="0.14"), T - 540),      # implied 0.80 -> fires
         ClockTick(T - 500),
     ]
 
@@ -969,3 +986,227 @@ def test_box_decision_is_golden_deterministic():
     assert len(fires) == 1
     assert a.state.fired_selection.strike_K == Decimal("63500")
     assert a.state.entered == b.state.entered is True
+
+
+# ===========================================================================
+# v1.1 implied-pin floor: BOX_SKIP wiring + rescan journaling + S4 pending band
+# ===========================================================================
+def _box_summary_row(ledger_path, close_time):
+    for r in load_entries(ledger_path):
+        if r.get("strategy") == "box" and r.get("close_time") == close_time \
+                and not r.get("backfill_of"):
+            return r
+    return None
+
+
+def test_box_skip_journals_and_places_no_orders(tmp_path):
+    """A below-floor box (implied 0.76) SKIPS: box_skip_implied is journaled with the selection
+    payload + implied/floor, ZERO orders reach the executor, no ledger row is opened, and the summary
+    carries box_skipped=True (and is neither a fire nor a would-fire)."""
+    post = FakePost(entry_fills={})  # will assert nothing is sent
+
+    def driver(recorder, deadline):
+        _skip_below(recorder)
+
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    svc = _box_svc(tmp_path, mode="armed", window_driver=driver, post_fn=post, ledger_path=ledger_path)
+    plan = svc.prepare()
+    assert plan.armed is True
+    svc.execute(plan)
+    # zero orders, no ledger position opened
+    assert post.calls == []
+    assert svc.ledger_state is None
+    # the skip journal record: same selection payload shape as box_would_fire + implied/floor
+    recs = [r for r in svc.journal.records() if r["kind"] == "box_skip_implied"]
+    assert len(recs) == 1
+    obj = recs[0]["obj"]
+    assert "selection" in obj and obj["selection"]["hourly_ticker"] == HOURLY_TICKER
+    assert Decimal(str(obj["implied_pin"])) < Decimal("0.80")
+    assert Decimal(str(obj["min_implied_pin"])) == Decimal("0.80")
+    assert obj["t_minus_s"] is not None
+    # the summary: box_skipped True, and NOT counted as a fire/would-fire/signal
+    row = _box_summary_row(ledger_path, CLOSE)
+    assert row is not None
+    assert row["box_skipped"] is True and row["box_rescan"] is False
+    assert row["fires"] == 0 and row["would_fires"] == 0 and row["signals"] == 0
+    assert row["fired_source"] is None and row["orders_attempted"] == 0
+
+
+def test_box_skip_then_rescan_journaled_at_driver():
+    """Driver-level: a skip followed by a later re-qualifying instant journals box_skip_implied then a
+    single box_rescan_would_fire (paper)."""
+    from service.journal import Journal
+    j = Journal()
+    st = BoxState.new(close_time=CLOSE, anchor_A=A, m15_ticker=M15_TICKER,
+                      strikes={HOURLY_TICKER: Decimal("64000")}, shakedown=True, T=T)
+    drv = BoxSignalDriver(BOX_PARAMS, st, j, clock=lambda: 0.0)
+    # skip at T-300 (implied 0.76): hourly 0.94/0.92 + 15M 0.20/0.14
+    drv.on_book_update(HOURLY_TICKER, top(yes_ask="0.94", yes_bid="0.92"), T - 300)
+    drv.on_book_update(M15_TICKER, top(yes_ask="0.20", yes_bid="0.14"), T - 300)
+    # rescan at T-240 (implied 0.80): hourly 0.94/0.94 + 15M 0.14/0.14
+    drv.on_book_update(HOURLY_TICKER, top(yes_ask="0.94", yes_bid="0.94"), T - 240)
+    drv.on_book_update(M15_TICKER, top(yes_ask="0.14", yes_bid="0.14"), T - 240)
+    kinds = [r["kind"] for r in j.records()
+             if r["kind"] in ("box_skip_implied", "box_rescan_would_fire")]
+    assert kinds == ["box_skip_implied", "box_rescan_would_fire"]
+    rescan = next(r for r in j.records() if r["kind"] == "box_rescan_would_fire")
+    assert "selection" in rescan["obj"]
+    assert Decimal(str(rescan["obj"]["implied_pin"])) >= Decimal("0.80")
+
+
+def test_settlement_sweep_returns_pending_picture(tmp_path):
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    append_entry({
+        "close_time": "2026-08-21T20:00:00Z", "strategy": "box", "fires": 1,
+        "fired_source": WIDE_BOX, "realized_delta": "-0.82", "realized_unsettled": True,
+        "floor_booked": "1.00",
+        "unsettled_legs": [{"ticker": HOURLY_TICKER, "side": "yes", "count": 1},
+                           {"ticker": M15_TICKER, "side": "no", "count": 1}],
+    }, ledger_path)
+    # hourly settles 'no', 15M not finalized -> the row stays unsettled and enters the pending picture
+    results = {HOURLY_TICKER: "no", M15_TICKER: None}
+    svc = _box_svc(tmp_path, mode="shakedown", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, market_result_getter=(lambda tk: results.get(tk)))
+    pending = svc._settlement_backfill_sweep()
+    assert "2026-08-21T20:00:00Z" in pending
+    row = pending["2026-08-21T20:00:00Z"]
+    assert row["close_time"] == "2026-08-21T20:00:00Z"
+    legs = {lg[0]: lg for lg in row["legs"]}
+    assert legs[HOURLY_TICKER][3] == "no"          # finalized
+    assert legs[M15_TICKER][3] is None             # not finalized
+    from service.stops import s4_pending_value
+    assert s4_pending_value(pending, "2026-08-21") == Decimal("1.00")
+
+
+def _write_guard(tmp_path, day, start):
+    import json as _json
+    p = os.path.join(tmp_path, f"stops_{day}.json")
+    with open(p, "w", encoding="utf-8") as f:
+        _json.dump({"utc_day": day, "balance_start_dollars": start, "latched": []}, f)
+    return p
+
+
+def test_s4_pending_settlement_stands_down_without_latch(tmp_path):
+    """The 16:40Z bug: the pessimistic loss breaches but a pending settlement (+$1) would clear it ->
+    stand down THIS window, journal s4_pending_settlement, write NO day-guard latch."""
+    from service.stops import read_day_guard
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    append_entry({
+        "close_time": "2026-08-21T20:00:00Z", "strategy": "box", "fires": 1,
+        "fired_source": WIDE_BOX, "realized_delta": "-3.55", "realized_unsettled": True,
+        "floor_booked": "1.00",
+        "unsettled_legs": [{"ticker": HOURLY_TICKER, "side": "yes", "count": 1},
+                           {"ticker": M15_TICKER, "side": "no", "count": 1}],
+    }, ledger_path)
+    _write_guard(tmp_path, "2026-08-21", "54.47")   # start; now 50.92 -> loss 3.55; pending 1 -> 2.55
+    results = {HOURLY_TICKER: "no", M15_TICKER: None}
+    svc = _box_svc(tmp_path, mode="armed", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, balance=5092,   # $50.92
+                   market_result_getter=(lambda tk: results.get(tk)))
+    plan = svc.prepare()
+    assert plan.armed is False and plan.degraded is True
+    recs = svc.journal.records()
+    assert any(r["kind"] == "s4_pending_settlement" for r in recs)
+    assert not any(r["kind"] == "s4_balance_latch" for r in recs)
+    chk = next(r["obj"] for r in recs if r["kind"] == "s4_balance_check")
+    assert chk["decision"] == "pending"
+    assert Decimal(chk["loss_pessimistic"]) == Decimal("3.55")
+    assert Decimal(chk["loss_optimistic"]) == Decimal("2.55")
+    assert Decimal(chk["pending_value_dollars"]) == Decimal("1.00")
+    guard = read_day_guard(svc._day_guard_path, "2026-08-21")
+    assert all(x.get("kind") != "S4" for x in guard.latched)
+
+
+def test_s4_latch_when_no_pending_credit(tmp_path):
+    """No pending settlement can move the number (pending_value 0) and loss >= cap -> latch as before."""
+    from service.stops import read_day_guard
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    _write_guard(tmp_path, "2026-08-21", "54.47")   # start; now 50.92 -> loss 3.55 >= cap; no pending
+    svc = _box_svc(tmp_path, mode="armed", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, balance=5092)
+    plan = svc.prepare()
+    assert plan.armed is False
+    recs = svc.journal.records()
+    assert any(r["kind"] == "s4_balance_latch" for r in recs)
+    chk = next(r["obj"] for r in recs if r["kind"] == "s4_balance_check")
+    assert chk["decision"] == "latch"
+    guard = read_day_guard(svc._day_guard_path, "2026-08-21")
+    assert any(x.get("kind") == "S4" for x in guard.latched)
+
+
+def test_day_totals_recomputed_after_backfill_sweep(tmp_path):
+    """B4: a today row that settles PINNED during the sweep credits +$1; _day_totals is recomputed
+    AFTER the sweep so s4_balance_check.ledger_realized_today reflects it (no timing artifact)."""
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    append_entry({
+        "close_time": "2026-08-21T20:00:00Z", "strategy": "box", "fires": 1,
+        "fired_source": WIDE_BOX, "realized_delta": "-0.82", "realized_unsettled": True,
+        "floor_booked": "1.00",
+        "unsettled_legs": [{"ticker": HOURLY_TICKER, "side": "yes", "count": 1},
+                           {"ticker": M15_TICKER, "side": "no", "count": 1}],
+    }, ledger_path)
+    _write_guard(tmp_path, "2026-08-21", "50.00")   # start == now (no loss) -> S4 clear
+    results = {HOURLY_TICKER: "yes", M15_TICKER: "no"}   # pinned -> +$1 backfill
+    svc = _box_svc(tmp_path, mode="armed", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, balance=5000,   # $50.00 == start -> no S4 breach
+                   market_result_getter=(lambda tk: results.get(tk)))
+    plan = svc.prepare()
+    # _day_totals recomputed post-sweep: -0.82 (floor) + 1.00 (pinned backfill) = +0.18
+    assert svc._day_totals[0] == Decimal("0.18")
+    chk = next(r["obj"] for r in svc.journal.records() if r["kind"] == "s4_balance_check")
+    assert Decimal(chk["ledger_realized_today"]) == Decimal("0.18")
+
+
+def test_box_report_shas_mirror_service_box():
+    """box_report mirrors the roster shas locally (pure data module) — they MUST equal service.box."""
+    from service import box_report as br
+    assert br.CURRENT_BOX_POLICY_SHA256 == box_mod.FROZEN_BOX_POLICY_SHA256
+    assert br.BOX_V1_POLICY_SHA256 == box_mod.BOX_V1_POLICY_SHA256
+
+
+def test_amended_box_falsifier_still_arms():
+    """A7: the amended box_falsifier.md still passes arming_check (STATUS: FROZEN untouched)."""
+    from service.run_window import DEFAULT_BOX_FALSIFIER_PATH
+    dec = arming_check(DEFAULT_BOX_FALSIFIER_PATH, GOOD_HEALTH, True,
+                       strategy="box", expected_strategy="box")
+    assert dec.armed is True, dec.reasons
+
+
+def test_sweep_pending_picture_queries_every_leg_no_break(tmp_path):
+    """Review finding 1: the sweep must query EVERY leg, not break on the first laggard. Here the
+    UNFINALIZED 15M leg is FIRST in iteration order and the hourly leg AFTER it is settled; the
+    pending picture must mark only the 15M leg None (pending_value $1). With the old break-on-first
+    behaviour the hourly leg would read None too (pending_value $2) and understate the loss, turning a
+    certain >= cap loss into a false 'pending' that arms next wake."""
+    from service.stops import read_day_guard, s4_pending_value
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    # unsettled_legs ordered so the LAGGARD (15M) is iterated first, the settled leg (hourly) second.
+    append_entry({
+        "close_time": "2026-08-21T20:00:00Z", "strategy": "box", "fires": 1,
+        "fired_source": WIDE_BOX, "realized_delta": "-4.00", "realized_unsettled": True,
+        "floor_booked": "1.00",
+        "unsettled_legs": [{"ticker": M15_TICKER, "side": "no", "count": 1},
+                           {"ticker": HOURLY_TICKER, "side": "yes", "count": 1}],
+    }, ledger_path)
+    results = {M15_TICKER: None, HOURLY_TICKER: "no"}   # 15M unfinalized, hourly settled
+    svc = _box_svc(tmp_path, mode="shakedown", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, market_result_getter=(lambda tk: results.get(tk)))
+    pending = svc._settlement_backfill_sweep()
+    legs = {lg[0]: lg for lg in pending["2026-08-21T20:00:00Z"]["legs"]}
+    assert legs[M15_TICKER][3] is None            # the only unfinalized leg
+    assert legs[HOURLY_TICKER][3] == "no"         # queried despite following the laggard
+    assert s4_pending_value(pending, "2026-08-21") == Decimal("1.00")   # NOT $2
+
+    # end-to-end: start 54.47 / now 50.47 -> loss 4.00; optimistic 4.00 - 1.00 = 3.00 >= cap -> LATCH.
+    _write_guard(tmp_path, "2026-08-21", "54.47")
+    svc2 = _box_svc(tmp_path, mode="armed", window_driver=(lambda r, d: None),
+                    ledger_path=ledger_path, balance=5047,   # $50.47
+                    market_result_getter=(lambda tk: results.get(tk)))
+    plan = svc2.prepare()
+    chk = next(r["obj"] for r in svc2.journal.records() if r["kind"] == "s4_balance_check")
+    assert Decimal(chk["pending_value_dollars"]) == Decimal("1.00")
+    assert Decimal(chk["loss_optimistic"]) == Decimal("3.00")
+    assert chk["decision"] == "latch"
+    assert plan.armed is False
+    guard = read_day_guard(svc2._day_guard_path, "2026-08-21")
+    assert any(x.get("kind") == "S4" for x in guard.latched)

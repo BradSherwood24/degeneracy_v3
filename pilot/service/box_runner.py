@@ -21,6 +21,8 @@ from collections.abc import Callable
 
 from service.book import TopOfBook
 from service.box import (
+    BOX_RESCAN_WOULD_FIRE,
+    BOX_SKIP,
     FIRE,
     STAND_DOWN,
     WOULD_FIRE,
@@ -44,6 +46,11 @@ _BOX_ACTION_KIND_TO_JOURNAL = {
     WOULD_FIRE: "box_would_fire",
     FIRE: "box_fire",
     STAND_DOWN: "box_stand_down",
+    # v1.1 (2026-08-29): both order-free. box_skip_implied carries the SAME ``selection`` payload
+    # shape as box_would_fire (so the report's would-fire normaliser reads it) plus implied_pin /
+    # min_implied_pin / t_minus_s; box_rescan_would_fire is the paper re-qualify record.
+    BOX_SKIP: "box_skip_implied",
+    BOX_RESCAN_WOULD_FIRE: "box_rescan_would_fire",
 }
 
 
@@ -128,12 +135,27 @@ class BoxSignalDriver:
         self._maybe_journal_eval(event.server_ts)
         for a in actions:
             self.actions.append(a)
-            sel = self.state.fired_selection if a.kind in (FIRE, WOULD_FIRE) else None
+            # each decision action carries its own selection view from state: fires from
+            # fired_selection, the v1.1 skip from skipped_selection, the paper rescan from
+            # rescan_selection (STAND_DOWN carries none).
+            if a.kind in (FIRE, WOULD_FIRE):
+                sel = self.state.fired_selection
+            elif a.kind == BOX_SKIP:
+                sel = self.state.skipped_selection
+            elif a.kind == BOX_RESCAN_WOULD_FIRE:
+                sel = self.state.rescan_selection
+            else:
+                sel = None
             hourly_top = self.state.tops.get(sel.hourly_ticker) if sel is not None else None
             m15_top = self.state.tops.get(self.state.m15_ticker) if sel is not None else None
+            payload = _action_payload(a, sel, hourly_top, m15_top)
+            if a.kind in (BOX_SKIP, BOX_RESCAN_WOULD_FIRE) and sel is not None:
+                # extra structured fields (t_minus_s is already in the payload from the action).
+                payload["implied_pin"] = sel.implied_pin
+                payload["min_implied_pin"] = self.params.min_implied_pin
             self.journal.append(
                 _BOX_ACTION_KIND_TO_JOURNAL.get(a.kind, "box_action"),
-                _action_payload(a, sel, hourly_top, m15_top),
+                payload,
                 self.clock(),
             )
             if self._on_action is not None:

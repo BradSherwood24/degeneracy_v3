@@ -237,3 +237,95 @@ def test_apply_stop_latches_and_is_idempotent():
     s = apply_stop(StopState(), S1_ARITH, "r1")
     s = apply_stop(s, S1_ARITH, "r2")  # same stop again
     assert s.tripped == (S1_ARITH,) and len(s.notifications) == 2
+
+
+# ---------------------------------------------------------------------------
+# S4 pending-settlement band (2026-08-29) — s4_pending_value + s4_balance_decision
+# ---------------------------------------------------------------------------
+from service.stops import S4Decision, s4_balance_decision, s4_pending_value  # noqa: E402
+
+
+def _pending(window, close_time, legs):
+    """A one-window pending picture (as _settlement_backfill_sweep returns)."""
+    return {window: {"close_time": close_time, "legs": legs}}
+
+
+def test_s4_pending_value_counts_only_none_legs_of_the_day():
+    # window on 2026-08-28: hourly settled 'no' (0), 15M not finalized (None -> $1). value = $1.
+    pend = _pending(
+        "2026-08-28T12:00:00Z", "2026-08-28T12:00:00Z",
+        [("KXBTCD-x", "yes", 1, "no"), ("KXBTC15M-x", "no", 1, None)],
+    )
+    assert s4_pending_value(pend, "2026-08-28") == Decimal("1.00")
+    # two unfinalized legs -> $2 (optimistic: every unfinalized leg pays)
+    pend2 = _pending(
+        "2026-08-28T12:00:00Z", "2026-08-28T12:00:00Z",
+        [("KXBTCD-x", "yes", 1, None), ("KXBTC15M-x", "no", 1, None)],
+    )
+    assert s4_pending_value(pend2, "2026-08-28") == Decimal("2.00")
+    # all legs finalized -> $0
+    pend3 = _pending(
+        "2026-08-28T12:00:00Z", "2026-08-28T12:00:00Z",
+        [("KXBTCD-x", "yes", 1, "yes"), ("KXBTC15M-x", "no", 1, "no")],
+    )
+    assert s4_pending_value(pend3, "2026-08-28") == Decimal("0")
+
+
+def test_s4_pending_value_prior_day_rows_contribute_zero():
+    # a pending row from a PRIOR utc day contributes 0 to today's optimistic bound (safe direction).
+    pend = _pending(
+        "2026-08-27T23:00:00Z", "2026-08-27T23:00:00Z",
+        [("KXBTC15M-x", "no", 1, None)],
+    )
+    assert s4_pending_value(pend, "2026-08-28") == Decimal("0")
+    assert s4_pending_value(pend, "2026-08-27") == Decimal("1.00")
+
+
+def test_s4_pending_value_count_gt_one():
+    pend = _pending(
+        "2026-08-28T12:00:00Z", "2026-08-28T12:00:00Z",
+        [("KXBTC15M-x", "no", 3, None)],
+    )
+    assert s4_pending_value(pend, "2026-08-28") == Decimal("3.00")
+
+
+CAP = Decimal("3.00")
+
+
+def test_s4_decision_pending_is_the_1640z_case():
+    # start 54.4745, now 50.9292, pending 1.00 -> pessimistic 3.5453, optimistic 2.5453 -> PENDING.
+    d = s4_balance_decision(Decimal("54.4745"), Decimal("50.9292"), Decimal("1.00"), CAP)
+    assert d.kind == "pending"
+    assert d.loss_pessimistic == Decimal("3.5453")
+    assert d.loss_optimistic == Decimal("2.5453")
+
+
+def test_s4_decision_latch_when_no_pending_credit():
+    # same balances, pending 0 -> optimistic == pessimistic 3.5453 >= cap -> LATCH.
+    d = s4_balance_decision(Decimal("54.4745"), Decimal("50.9292"), Decimal("0"), CAP)
+    assert d.kind == "latch"
+    assert d.loss_optimistic == Decimal("3.5453")
+
+
+def test_s4_decision_clear_under_cap():
+    # now 51.9292, pending 0 -> loss 2.5453 < cap -> CLEAR.
+    d = s4_balance_decision(Decimal("54.4745"), Decimal("51.9292"), Decimal("0"), CAP)
+    assert d.kind == "clear"
+    assert d.loss_pessimistic == Decimal("2.5453")
+
+
+def test_s4_decision_latch_even_after_pending_credit():
+    # now 49.50, pending 1.00 -> optimistic 54.4745 - 50.50 = 3.9745 >= cap -> LATCH.
+    d = s4_balance_decision(Decimal("54.4745"), Decimal("49.50"), Decimal("1.00"), CAP)
+    assert d.kind == "latch"
+    assert d.loss_optimistic == Decimal("3.9745")
+    assert d.loss_pessimistic == Decimal("4.9745")
+
+
+def test_s4_decision_boundary_equality_latches():
+    # optimistic exactly == cap latches (>= cap).
+    d = s4_balance_decision(Decimal("53.00"), Decimal("50.00"), Decimal("0"), CAP)
+    assert d.kind == "latch" and d.loss_optimistic == Decimal("3.00")
+    # pessimistic exactly == cap but optimistic below -> pending (not clear: clear needs < cap).
+    d2 = s4_balance_decision(Decimal("53.00"), Decimal("50.00"), Decimal("0.50"), CAP)
+    assert d2.kind == "pending"

@@ -29,6 +29,7 @@ import pytest
 from service._simlaw import fee
 from service.book import TopOfBook
 from service.box import (
+    BOX_SKIP,
     BUY_NO,
     BUY_YES,
     FIRE,
@@ -387,10 +388,19 @@ def test_golden_decide_box_reproduces_scan_on_winning_snapshot():
         st, a = decide_box_or_import(st, BookUpdate(h["m15_ticker"], m15_top, ts))
         acts_all += a
 
-        fire = [x for x in acts_all if x.kind == FIRE]
-        assert len(fire) == 1, f"{h['m15_ticker']}: expected 1 FIRE, got {len(fire)}"
-        act = fire[0]
-        sel = st.fired_selection
+        # v1.1: the scan (select_box, no floor) still picks the box; decide_box then FIRES it if
+        # implied_pin >= the 0.80 floor, else SKIPS the hour (BOX_SKIP). Exactly one such action, and
+        # its kind is decided purely by the winning box's implied_pin.
+        decided = [x for x in acts_all if x.kind in (FIRE, BOX_SKIP)]
+        assert len(decided) == 1, (
+            f"{h['m15_ticker']}: expected 1 FIRE/BOX_SKIP, got {len(decided)}"
+        )
+        act = decided[0]
+        sel = st.fired_selection if act.kind == FIRE else st.skipped_selection
+        if sel.implied_pin >= PARAMS.min_implied_pin:
+            assert act.kind == FIRE, f"{h['m15_ticker']}: implied {sel.implied_pin} >= floor but not FIRE"
+        else:
+            assert act.kind == BOX_SKIP, f"{h['m15_ticker']}: implied {sel.implied_pin} < floor but not SKIP"
         assert (sel.strike_K, sel.hourly_side, sel.C) == (K, side, C)
         assert act.C == C
         # limits = ask + margin, capped at 0.99

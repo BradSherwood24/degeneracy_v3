@@ -1,6 +1,6 @@
 # BOX_ARMING.md — the mechanical runbook for arming the wide box
 
-Scope: how to take the box (`strategy=box`, roster `box-v1`) from a clean tree to live single-pair
+Scope: how to take the box (`strategy=box`, roster `box-v1.1`) from a clean tree to live single-pair
 taker firing, and how to stand it down or repair a jammed guard. The authority for WHAT is being
 judged is `pilot/ceremony/box_falsifier.md`; this file is only the sequence of hands-on steps that
 its checklist implies. House law is unchanged: `python` only, all Kalshi access through the proxy at
@@ -34,8 +34,8 @@ frozen) and journals `degrade_to_dry` with the reasons. You cannot arm past a fa
 6. **Freeze the falsifier.** On Brad's verbatim go, change the STATUS line of
    `pilot/ceremony/box_falsifier.md` from `STATUS: DRAFT` to exactly `STATUS: FROZEN`, and append the
    go + roster sha under Registration. **Only Brad authorises the freeze**; an agent never flips it.
-   Confirm the roster sha in the file matches the pinned constant
-   `480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3`
+   Confirm the roster sha in the file matches the pinned constant (box-v1.1, 2026-08-29)
+   `cec4b1a29c5d46deac09fd7a46ec0e08b7603a1f6862758cdb60e97a477aa42c`
    (`python -c "import json,hashlib;o=json.load(open('pilot/policy/box_params.json'));print(hashlib.sha256(json.dumps(o,sort_keys=True,separators=(',',':')).encode()).hexdigest())"`).
 7. **Arm.** Brad sets `pilot/ops/mode.txt` → `armed`. The next `:40` process reads mode.txt +
    strategy.txt fresh, loads the box roster, runs S5, and (if every gate passes) fires the single pair

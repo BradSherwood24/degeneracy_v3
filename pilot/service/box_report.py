@@ -59,6 +59,16 @@ S4_DAILY_LOSS_CAP = Decimal("3.00")              # daily loss cap on the ACCOUNT
 SHADOW_MIN_IMPLIED_PIN = Decimal("0.80")
 SHADOW_RULE_REGISTERED = "2026-08-28"
 
+# --- roster partition (box-v1.1 amendment, 2026-08-29) ---
+# Every window summary row carries policy_sha / roster. The primary gates (R1-R4, A1, A5) and the
+# headline count ONLY the CURRENT roster; box-v1 fires close as a frozen LEGACY line. These MUST equal
+# service.box.FROZEN_BOX_POLICY_SHA256 / BOX_V1_POLICY_SHA256 (mirrored here to keep this report a pure
+# data module with no decision-layer import — see the wiring test that asserts the equality).
+CURRENT_BOX_POLICY_SHA256 = "cec4b1a29c5d46deac09fd7a46ec0e08b7603a1f6862758cdb60e97a477aa42c"
+BOX_V1_POLICY_SHA256 = "480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3"
+CURRENT_ROSTER = "box-v1.1"
+LEGACY_ROSTER = "box-v1"  # windows with no policy_sha/roster tag are treated as box-v1 (legacy)
+
 # --- status literals ---
 STATUS_NOT_YET = "NOT YET"
 STATUS_HOLDING = "HOLDING"
@@ -300,6 +310,28 @@ def _outcome(fill_class: str, backfill_row: dict[str, Any] | None,
     return "n/a"
 
 
+def _roster_of(ledger_row: dict[str, Any] | None) -> tuple[str, str | None]:
+    """(roster_name, policy_sha) for a window from its summary/fire ledger row. A row without the tag
+    is treated as box-v1 (the legacy roster shipped before the tag existed)."""
+    if not ledger_row:
+        return LEGACY_ROSTER, None
+    sha = ledger_row.get("policy_sha")
+    roster = ledger_row.get("roster")
+    if roster:
+        return str(roster), (str(sha) if sha is not None else None)
+    if sha == CURRENT_BOX_POLICY_SHA256:
+        return CURRENT_ROSTER, str(sha)
+    if sha == BOX_V1_POLICY_SHA256:
+        return LEGACY_ROSTER, str(sha)
+    return LEGACY_ROSTER, (str(sha) if sha is not None else None)
+
+
+def _is_current_roster(w: dict[str, Any]) -> bool:
+    """True iff the window belongs to the CURRENT roster (box-v1.1). The primary gates and headline
+    count only these; every other window closes as a legacy line."""
+    return w.get("policy_sha") == CURRENT_BOX_POLICY_SHA256 or w.get("roster") == CURRENT_ROSTER
+
+
 def build_window(fire_obj: dict[str, Any], close_time: str,
                  ledger_row: dict[str, Any] | None,
                  backfill_row: dict[str, Any] | None,
@@ -364,9 +396,13 @@ def build_window(fire_obj: dict[str, Any], close_time: str,
     )
     staleness_decision_gap = ((c_decision - c_mid) * _CENT) if (c_decision is not None and c_mid is not None) else None
 
+    roster, policy_sha = _roster_of(ledger_row)
     return {
         "close_time": close_time,
         "t_minus_s": fire_obj.get("t_minus_s"),
+        "roster": roster,
+        "policy_sha": policy_sha,
+        "paper": False,
         "side": _side_from_selection(selection),
         "K": K,
         "A": A,
@@ -387,6 +423,56 @@ def build_window(fire_obj: dict[str, Any], close_time: str,
         "staleness_paid_vs_mid_cents": staleness_paid_vs_mid,
         "staleness_decision_gap_cents": staleness_decision_gap,
         "has_ledger": ledger_row is not None,
+    }
+
+
+def build_paper_window(obj: dict[str, Any], close_time: str,
+                       backfill_row: dict[str, Any] | None, *, kind: str) -> dict[str, Any]:
+    """A PAPER box window from a ``box_skip_implied`` / ``box_rescan_would_fire`` journal record (v1.1).
+    No order was placed, so there is no fill/ledger row: the window is counted live with the full
+    selection (side / K / A / implied_pin / C_decision).
+
+    SETTLEMENT SCORING of a paper window requires a settlement source for markets we did NOT hold — the
+    settlement sweep only settles rows WE traded, so an un-traded skip has no backfill row. Until a
+    follow-up commission supplies one (a read-only, report-side resolver that fetches the settled
+    result for the selection's markets), a paper window normally reads ``unsettled`` and contributes 0
+    to the settled PnL; the SO-1 paper groups show COUNTS and ``unsettled`` only. This function DOES
+    score a paper window when a settlement-backfill row happens to be keyed on its close_time (payoff $2
+    pinned / $1 not -> ``paper realized = payoff - C_decision``, C_decision the fee-inclusive pair cost),
+    so the plumbing is ready the moment such a source exists. ``kind`` in {"skip", "rescan"}."""
+    selection = obj.get("selection", {}) or {}
+    implied_pin = _dec(selection.get("implied_pin"))
+    if implied_pin is None:
+        implied_pin = _dec(obj.get("implied_pin"))  # skip/rescan records also carry it top-level
+    c_decision = _dec(selection.get("C"))
+    K = _dec(selection.get("strike_K"))
+    A = _dec(selection.get("anchor_A"))
+    outcome = "unsettled"
+    realized: Decimal | None = None
+    realized_settled = False
+    if backfill_row is not None:
+        payoff = _dec(backfill_row.get("settlement_payoff"))
+        if payoff is not None and c_decision is not None:
+            realized = payoff - c_decision            # (2 if pinned else 1) - C_decision (fees in C)
+            outcome = "pinned" if payoff >= _TWO else "not_pinned"
+            realized_settled = True
+    return {
+        "close_time": close_time,
+        "t_minus_s": obj.get("t_minus_s"),
+        "roster": CURRENT_ROSTER,
+        "policy_sha": CURRENT_BOX_POLICY_SHA256,
+        "paper": True,
+        "kind": kind,                                 # "skip" | "rescan"
+        "fill_class": "none",                         # never a fill (no order)
+        "side": _side_from_selection(selection),
+        "K": K,
+        "A": A,
+        "width": abs(K - A) if (K is not None and A is not None) else None,
+        "C_decision": c_decision,
+        "implied_pin": implied_pin,
+        "outcome": outcome,
+        "realized": realized,
+        "realized_settled": realized_settled,
     }
 
 
@@ -647,15 +733,27 @@ def _shadow_group_stats(group: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def shadow_implied_rule(windows: list[dict[str, Any]]) -> dict[str, Any]:
-    """PRE-REGISTERED SHADOW RULE (observational; see SHADOW_MIN_IMPLIED_PIN comment). Over the
-    TWO-LEG-filled windows only, split by implied_pin at decision into ``kept`` (>= 0.80),
-    ``skipped`` (< 0.80) and ``unknown`` (implied_pin missing/None), and report counts + settled-only
-    PnL for each plus ``all`` (every two-leg window). Purely a what-if on the ledger — it removes no
-    live fill and drives no decision."""
+def shadow_implied_rule(windows: list[dict[str, Any]], *,
+                        paper_skips: list[dict[str, Any]] | None = None,
+                        rescans: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """PRE-REGISTERED SHADOW RULE / SO-1 (observational; see SHADOW_MIN_IMPLIED_PIN comment). Spans
+    BOTH rosters and now includes paper skips:
+
+      * ``kept``    = TWO-LEG fills with implied_pin >= 0.80 (either roster).
+      * ``skipped`` = TWO-LEG fills with implied_pin < 0.80 (v1 REAL fills that a box-v1.1 would skip)
+                      PLUS the v1.1 ``box_skip_implied`` windows scored on settlement as PAPER. The
+                      paper/real split is reported as ``n_real`` / ``n_paper``.
+      * ``rescan``  = the v1.1 ``box_rescan_would_fire`` PAPER records (a skipped hour that re-qualified
+                      at a later instant), for the literal-skip vs keep-scanning question.
+      * ``unknown`` = two-leg fills with implied_pin missing.
+      * ``all``     = every two-leg fill.
+
+    Purely a what-if — it removes no live fill and drives no decision."""
+    paper_skips = paper_skips or []
+    rescans = rescans or []
     two_leg = [w for w in windows if w["fill_class"] == "both"]
     kept: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
+    skipped_real: list[dict[str, Any]] = []
     unknown: list[dict[str, Any]] = []
     for w in two_leg:
         ip = w["implied_pin"]
@@ -664,26 +762,65 @@ def shadow_implied_rule(windows: list[dict[str, Any]]) -> dict[str, Any]:
         elif ip >= SHADOW_MIN_IMPLIED_PIN:
             kept.append(w)
         else:
-            skipped.append(w)
+            skipped_real.append(w)
+    skipped_all = skipped_real + paper_skips
     all_n = len(two_leg)
-    skipped_share = (Decimal(len(skipped)) / Decimal(all_n)) if all_n else None
+    denom = all_n + len(paper_skips)  # the full box population (fills + paper skips)
+    skipped_share = (Decimal(len(skipped_all)) / Decimal(denom)) if denom else None
     skipped_windows = [
-        (w["close_time"], w["implied_pin"], w["outcome"], w["realized"]) for w in skipped
+        (w["close_time"], w["implied_pin"], w["outcome"], w["realized"]) for w in skipped_all
     ]
+    skipped_stats = _shadow_group_stats(skipped_all)
+    skipped_stats["n_real"] = len(skipped_real)
+    skipped_stats["n_paper"] = len(paper_skips)
     return {
         "min_implied_pin": SHADOW_MIN_IMPLIED_PIN,
         "registered": SHADOW_RULE_REGISTERED,
         "all": _shadow_group_stats(two_leg),
         "kept": _shadow_group_stats(kept),
-        "skipped": _shadow_group_stats(skipped),
+        "skipped": skipped_stats,
+        "rescan": _shadow_group_stats(rescans),
         "unknown": _shadow_group_stats(unknown),
         "skipped_share": skipped_share,
         "skipped_windows": skipped_windows,
     }
 
 
-def aggregate_block(windows: list[dict[str, Any]]) -> dict[str, Any]:
-    """The full aggregate block for a set of fired windows (per-day or cumulative)."""
+def legacy_roster_summary(windows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The frozen LEGACY (box-v1) line: final n (two-leg fills) / pins / misses / realized over the
+    non-current-roster fired windows. Computed, never hardcoded."""
+    two_leg = [w for w in windows if w["fill_class"] == "both"]
+    settled = [w for w in two_leg if w["outcome"] in ("pinned", "not_pinned")]
+    pins = sum(1 for w in settled if w["outcome"] == "pinned")
+    misses = sum(1 for w in settled if w["outcome"] == "not_pinned")
+    realized_sum = sum(
+        (w["realized"] for w in two_leg
+         if w["realized"] is not None and w["realized_settled"]),
+        Decimal(0),
+    )
+    rosters = sorted({str(w.get("roster") or LEGACY_ROSTER) for w in windows})
+    return {
+        "roster": rosters[0] if len(rosters) == 1 else LEGACY_ROSTER,
+        "rosters": rosters,
+        "fires": len(windows),
+        "n_two_leg": len(two_leg),
+        "n_settled": len(settled),
+        "pins": pins,
+        "misses": misses,
+        "realized_sum": realized_sum,
+    }
+
+
+def aggregate_block(windows: list[dict[str, Any]], *,
+                    shadow_windows: list[dict[str, Any]] | None = None,
+                    paper_skips: list[dict[str, Any]] | None = None,
+                    rescans: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The full aggregate block for a set of fired windows (per-day or cumulative).
+
+    ``windows`` drives the primary gates R1-R4 / A1 / A5 and the headline — the caller passes the
+    CURRENT-roster fires so legacy box-v1 windows never move a live gate. ``shadow_windows`` (default
+    ``windows``) is the SO-1 population, which spans BOTH rosters; ``paper_skips`` / ``rescans`` are the
+    v1.1 paper records folded into the SO-1 block."""
     fires = len(windows)
     two_leg = sum(1 for w in windows if w["fill_class"] == "both")
     one_legged = sum(1 for w in windows if w["fill_class"] == "one-legged")
@@ -707,7 +844,10 @@ def aggregate_block(windows: list[dict[str, Any]]) -> dict[str, Any]:
         "A5": a5_one_legged(windows),
         "level_bumps": level_bumps(windows),
         "candle_staleness": candle_staleness(windows),
-        "shadow_implied_rule": shadow_implied_rule(windows),
+        "shadow_implied_rule": shadow_implied_rule(
+            shadow_windows if shadow_windows is not None else windows,
+            paper_skips=paper_skips, rescans=rescans,
+        ),
     }
 
 
@@ -795,11 +935,14 @@ def _render_window(w: dict[str, Any], lines: list[str]) -> None:
     tm_s = f"T-{tm:.0f}s" if isinstance(tm, (int, float)) else "-"
     ip = w["implied_pin"]
     shadow_skip = (w["fill_class"] == "both" and ip is not None and ip < SHADOW_MIN_IMPLIED_PIN)
+    # a legacy (box-v1) fire still renders in the display list but is excluded from the live gates —
+    # tag it so a reader never mistakes it for a current-roster fire the headline counted.
+    legacy_tag = "" if _is_current_roster(w) else f" [legacy {w.get('roster') or LEGACY_ROSTER}]"
     lines.append(
         f"  {w['close_time']}  {tm_s}  side={w['side']:5}  "
         f"K={_f(w['K'],2)} A={_f(w['A'],2)} width={_f(w['width'],2)}  "
         f"[{w['fill_class']}]  outcome={w['outcome']}"
-        f"{' [shadow-skip]' if shadow_skip else ''}"
+        f"{' [shadow-skip]' if shadow_skip else ''}{legacy_tag}"
     )
     for lg in (w["hourly"], w["m15"]):
         bump = "  <<LEVEL BUMP" if lg["level_bump"] else ""
@@ -885,17 +1028,35 @@ def _shadow_line(label: str, s: dict[str, Any]) -> str:
 def _render_shadow_rule(sr: dict[str, Any], lines: list[str]) -> None:
     lines.append(
         "  SHADOW RULE (pre-registered 2026-08-28, observational): skip implied_pin < 0.80"
+        "  [SO-1; spans box-v1 + box-v1.1; skipped includes v1.1 paper skips]"
     )
     lines.append(_shadow_line("ALL", sr["all"]))
     lines.append(_shadow_line("KEPT", sr["kept"]))
-    lines.append(_shadow_line("SKIPPED", sr["skipped"]))
+    skipped = sr["skipped"]
+    lines.append(
+        _shadow_line("SKIPPED", skipped)
+        + f"  [real={skipped.get('n_real', 0)} paper={skipped.get('n_paper', 0)}]"
+    )
+    if "rescan" in sr:
+        lines.append(_shadow_line("RESCAN", sr["rescan"]) + "  [paper]")
     share = sr["skipped_share"]
     share_s = "-" if share is None else f"{_f(share * _CENT, 1)}%"
-    lines.append(f"      skipped share = {share_s} of fills")
+    lines.append(f"      skipped share = {share_s} of the box population (fills + paper skips)")
     for ct, ip, outcome, realized in sr["skipped_windows"]:
         lines.append(
             f"        skip: {ct}  implied={_f(ip,4)}  {outcome}  realized=${_f(realized,4)}"
         )
+
+
+def _render_legacy(lr: dict[str, Any] | None, lines: list[str]) -> None:
+    """The frozen LEGACY box-v1 line (final counts; excluded from the live gates above)."""
+    if not lr:
+        return
+    lines.append(
+        f"  LEGACY {lr['roster']:8}: fires={lr['fires']} two_leg={lr['n_two_leg']} "
+        f"pins/miss={lr['pins']}/{lr['misses']} (settled={lr['n_settled']})  "
+        f"realized=${_f(lr['realized_sum'],4)}  [closed; not counted in the live gates]"
+    )
 
 
 def _render_s4(s4: dict[str, Any], lines: list[str]) -> None:
@@ -946,9 +1107,30 @@ def render_text(report: dict[str, Any]) -> str:
                 )
         else:
             lines.append("SHADOW - WOULD-FIRE (0): none")
+        skips = d.get("skipped_implied") or []
+        if skips:
+            lines.append("")
+            lines.append(f"SKIPPED - IMPLIED-PIN FLOOR (box-v1.1, paper) ({len(skips)}):")
+            for w in skips:
+                lines.append(
+                    f"  {w['close_time']}  [skipped-implied]  side={w['side']:5}  "
+                    f"K={_f(w['K'],2)} A={_f(w['A'],2)} width={_f(w['width'],2)}  "
+                    f"C={_f(w['C_decision'],4)} implied_pin={_f(w['implied_pin'],4)} "
+                    f"outcome={w['outcome']} realized=${_f(w['realized'],4)}"
+                )
+        rescans = d.get("rescans") or []
+        if rescans:
+            lines.append(f"RESCAN - WOULD RE-QUALIFY (box-v1.1, paper) ({len(rescans)}):")
+            for w in rescans:
+                lines.append(
+                    f"  {w['close_time']}  side={w['side']:5}  K={_f(w['K'],2)} A={_f(w['A'],2)}  "
+                    f"C={_f(w['C_decision'],4)} implied_pin={_f(w['implied_pin'],4)} "
+                    f"outcome={w['outcome']} realized=${_f(w['realized'],4)}"
+                )
         lines.append("")
         lines.append("DAY AGGREGATES:")
         _render_aggregate(d["aggregates"], lines)
+        _render_legacy(d.get("legacy_rosters"), lines)
         _render_s4(d["s4"], lines)
     cum = report.get("cumulative")
     if cum is not None:
@@ -957,6 +1139,7 @@ def render_text(report: dict[str, Any]) -> str:
         lines.append("CUMULATIVE (all box fires across the journal set)")
         lines.append("=" * 78)
         _render_aggregate(cum["aggregates"], lines)
+        _render_legacy(cum.get("legacy_rosters"), lines)
         s4s = cum.get("s4_days", [])
         latched_days = [s["day"] for s in s4s if s["any_stop_latched"]]
         corrupt_days = [s["day"] for s in s4s if s.get("corrupt")]
@@ -983,11 +1166,20 @@ def build_report(
 
     ``journals`` is [(close_time_or_fallback, records)]; ``guards`` maps a UTC day to its parsed
     day-guard dict. The CUMULATIVE block always spans ALL fires (even with ``only_day`` set); only the
-    per-day ``days`` map is filtered to ``only_day``."""
+    per-day ``days`` map is filtered to ``only_day``.
+
+    Roster partition (box-v1.1): each day's ``fires`` is the DISPLAY list — EVERY fire of the day
+    (current box-v1.1 + legacy box-v1), each carrying a ``roster`` field and rendered with a
+    ``[legacy …]`` tag when not current. The ``aggregates`` block is the GATE POPULATION — computed
+    over the CURRENT-roster fires only (R1-R4/A1/A5 + headline), so a legacy fire in the display list
+    never moves a live gate; box-v1 closes as the ``legacy_rosters`` summary. The SO-1 shadow block
+    inside ``aggregates`` spans BOTH rosters and folds in the v1.1 paper skips/rescans."""
     fire_rows, backfill_rows = index_ledger(ledger_entries)
 
     all_fired: list[dict[str, Any]] = []
     all_would: list[dict[str, Any]] = []
+    all_paper_skips: list[dict[str, Any]] = []
+    all_rescans: list[dict[str, Any]] = []
     s4_records_by_day: dict[str, list[dict[str, Any]]] = {}
 
     for close_time, records in journals:
@@ -1004,29 +1196,59 @@ def build_report(
             )
         for obj in _records_of_kind(records, "box_would_fire"):
             all_would.append(build_window(obj, str(ct), None, None, []))
+        # v1.1 paper records (order-free): scored on settlement via a backfill row keyed on close_time
+        # when one exists (usually absent for an un-traded skip -> reads unsettled).
+        for obj in _records_of_kind(records, "box_skip_implied"):
+            all_paper_skips.append(
+                build_paper_window(obj, str(ct), backfill_rows.get(str(ct)), kind="skip")
+            )
+        for obj in _records_of_kind(records, "box_rescan_would_fire"):
+            all_rescans.append(
+                build_paper_window(obj, str(ct), backfill_rows.get(str(ct)), kind="rescan")
+            )
 
     def _day_of(w: dict[str, Any]) -> str:
         return str(w["close_time"])[:10]
 
+    # Roster partition: the primary gates and headline count ONLY the current roster; box-v1 fires
+    # close as a legacy line but stay in the SO-1 shadow population.
+    current_fired = [w for w in all_fired if _is_current_roster(w)]
+    legacy_fired = [w for w in all_fired if not _is_current_roster(w)]
+
     days_present = sorted({_day_of(w) for w in all_fired} | {_day_of(w) for w in all_would}
+                          | {_day_of(w) for w in all_paper_skips} | {_day_of(w) for w in all_rescans}
                           | set(s4_records_by_day) | set(guards))
     if only_day is not None:
         days_present = [d for d in days_present if d == only_day]
 
     days: dict[str, Any] = {}
     for day in days_present:
-        day_fires = [w for w in all_fired if _day_of(w) == day]
+        day_fired_all = [w for w in all_fired if _day_of(w) == day]
+        day_current = [w for w in current_fired if _day_of(w) == day]
+        day_legacy = [w for w in legacy_fired if _day_of(w) == day]
         day_would = [w for w in all_would if _day_of(w) == day]
+        day_skips = [w for w in all_paper_skips if _day_of(w) == day]
+        day_rescans = [w for w in all_rescans if _day_of(w) == day]
         days[day] = {
             "date": day,
-            "fires": day_fires,
+            "fires": day_fired_all,          # every fire (rendered); gates below count current only
             "would_fires": day_would,
-            "aggregates": aggregate_block(day_fires),
+            "skipped_implied": day_skips,    # v1.1 paper skips
+            "rescans": day_rescans,          # v1.1 paper rescans
+            "aggregates": aggregate_block(
+                day_current, shadow_windows=day_fired_all,
+                paper_skips=day_skips, rescans=day_rescans,
+            ),
+            "legacy_rosters": legacy_roster_summary(day_legacy) if day_legacy else None,
             "s4": compute_s4(day, guards.get(day), s4_records_by_day.get(day, [])),
         }
 
     cumulative = {
-        "aggregates": aggregate_block(all_fired),
+        "aggregates": aggregate_block(
+            current_fired, shadow_windows=all_fired,
+            paper_skips=all_paper_skips, rescans=all_rescans,
+        ),
+        "legacy_rosters": legacy_roster_summary(legacy_fired) if legacy_fired else None,
         "s4_days": [
             compute_s4(day, guards.get(day), s4_records_by_day.get(day, []))
             for day in sorted(set(s4_records_by_day) | set(guards))
@@ -1054,6 +1276,8 @@ DEFAULT_OUT_DIR = os.path.join(_PILOT, "reports")
 REPORT_KINDS = (
     "window_start", "window_meta",
     "box_fire", "box_would_fire", "box_flatten",
+    # v1.1 paper records (implied-pin floor)
+    "box_skip_implied", "box_rescan_would_fire",
     "s4_balance_check",
 )
 
