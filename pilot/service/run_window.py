@@ -1844,8 +1844,14 @@ class WindowService:
                 tk = leg["ticker"] if isinstance(leg, dict) else leg[0]
                 res = self._fetch_market_result(tk)
                 if res not in ("yes", "no"):
-                    pending_leg = tk
-                    break
+                    # Do NOT break: query EVERY leg so ``results`` holds each genuinely settled leg and
+                    # a leg reads None in the pending picture iff it is truly unfinalized. Breaking on
+                    # the first laggard would mark all legs AFTER it None even when settled, so
+                    # s4_pending_value would credit an optimistic $1 to a settled leg and UNDERSTATE the
+                    # loss (a certain >= cap loss could then read ``pending`` instead of ``latch``).
+                    # ``pending_leg`` keeps the FIRST unfinalized leg for the journal (unchanged).
+                    pending_leg = pending_leg or tk
+                    continue
                 results[tk] = res
             if pending_leg is not None:
                 # A pending row we cannot yet settle (a leg unsettled/unavailable). Make the silent

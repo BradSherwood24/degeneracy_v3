@@ -1170,3 +1170,43 @@ def test_amended_box_falsifier_still_arms():
     dec = arming_check(DEFAULT_BOX_FALSIFIER_PATH, GOOD_HEALTH, True,
                        strategy="box", expected_strategy="box")
     assert dec.armed is True, dec.reasons
+
+
+def test_sweep_pending_picture_queries_every_leg_no_break(tmp_path):
+    """Review finding 1: the sweep must query EVERY leg, not break on the first laggard. Here the
+    UNFINALIZED 15M leg is FIRST in iteration order and the hourly leg AFTER it is settled; the
+    pending picture must mark only the 15M leg None (pending_value $1). With the old break-on-first
+    behaviour the hourly leg would read None too (pending_value $2) and understate the loss, turning a
+    certain >= cap loss into a false 'pending' that arms next wake."""
+    from service.stops import read_day_guard, s4_pending_value
+    ledger_path = os.path.join(tmp_path, "ledger", "pilot_ledger.jsonl")
+    # unsettled_legs ordered so the LAGGARD (15M) is iterated first, the settled leg (hourly) second.
+    append_entry({
+        "close_time": "2026-08-21T20:00:00Z", "strategy": "box", "fires": 1,
+        "fired_source": WIDE_BOX, "realized_delta": "-4.00", "realized_unsettled": True,
+        "floor_booked": "1.00",
+        "unsettled_legs": [{"ticker": M15_TICKER, "side": "no", "count": 1},
+                           {"ticker": HOURLY_TICKER, "side": "yes", "count": 1}],
+    }, ledger_path)
+    results = {M15_TICKER: None, HOURLY_TICKER: "no"}   # 15M unfinalized, hourly settled
+    svc = _box_svc(tmp_path, mode="shakedown", window_driver=(lambda r, d: None),
+                   ledger_path=ledger_path, market_result_getter=(lambda tk: results.get(tk)))
+    pending = svc._settlement_backfill_sweep()
+    legs = {lg[0]: lg for lg in pending["2026-08-21T20:00:00Z"]["legs"]}
+    assert legs[M15_TICKER][3] is None            # the only unfinalized leg
+    assert legs[HOURLY_TICKER][3] == "no"         # queried despite following the laggard
+    assert s4_pending_value(pending, "2026-08-21") == Decimal("1.00")   # NOT $2
+
+    # end-to-end: start 54.47 / now 50.47 -> loss 4.00; optimistic 4.00 - 1.00 = 3.00 >= cap -> LATCH.
+    _write_guard(tmp_path, "2026-08-21", "54.47")
+    svc2 = _box_svc(tmp_path, mode="armed", window_driver=(lambda r, d: None),
+                    ledger_path=ledger_path, balance=5047,   # $50.47
+                    market_result_getter=(lambda tk: results.get(tk)))
+    plan = svc2.prepare()
+    chk = next(r["obj"] for r in svc2.journal.records() if r["kind"] == "s4_balance_check")
+    assert Decimal(chk["pending_value_dollars"]) == Decimal("1.00")
+    assert Decimal(chk["loss_optimistic"]) == Decimal("3.00")
+    assert chk["decision"] == "latch"
+    assert plan.armed is False
+    guard = read_day_guard(svc2._day_guard_path, "2026-08-21")
+    assert any(x.get("kind") == "S4" for x in guard.latched)

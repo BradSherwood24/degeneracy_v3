@@ -135,3 +135,29 @@ test asserts the new roster/sha/floor. Added `_skip_below` helper (implied 0.76)
 - No Kalshi/proxy calls; no reads of `.env`/`*.pem`/`sim/out/sealed_eval`. Tests use injected fakes.
 - contracts=1, pair_cost_max $1.99, S4 cap $3.00, and every other falsifier pin unchanged.
 - Main working tree never edited/run/checked out. Worktree only.
+
+## Review fixes (Opus 4.8 verdict: MERGE WITH NITS; finding 1 fix-before-merge)
+
+1. **FIX (finding 1, S4 understatement).** `_settlement_backfill_sweep` no longer `break`s on the
+   first non-yes/no leg — it queries EVERY leg (`pending_leg = pending_leg or tk; continue`), so
+   `results` holds each genuinely settled leg and a leg is None in the pending picture iff truly
+   unfinalized. Prior behaviour marked the break leg AND every leg after it None, crediting an
+   optimistic $1 to already-settled legs and understating `loss_optimistic` → a certain ≥cap loss
+   could read `pending` instead of `latch` and arm next wake. Journaling semantics unchanged
+   (`unsettled_leg` = first laggard; `settled_legs` now correctly lists all settled legs).
+   New test `test_sweep_pending_picture_queries_every_leg_no_break`: laggard (15M) first in
+   iteration order, settled leg (hourly) after it, start−now $4.00 / cap $3.00 → pending_value
+   **1.00** (not 2.00) → `loss_optimistic` 3.00 → **latch** (old code: 2.00 → false pending). Asserts
+   both the picture and the end-to-end day-guard S4 latch.
+2. **NIT (finding 2, wording).** Softened the "scored on settlement as paper" / "measures … directly
+   on live tape" claims in `box_falsifier.md`'s Amendment (policy-delta + rescan + gate-restart
+   bullets) and in `build_paper_window`'s docstring: paper skips/rescans are COUNTED live; settlement
+   scoring of paper windows needs a settlement source for un-held markets (a follow-up read-only,
+   report-side resolver commission), and until then the SO-1 paper groups show counts and
+   `unsettled`. `box_params.json` deliberately NOT edited (would change the pinned sha / Registration).
+3. **NIT (finding 3, display vs gate population).** Each fire dict already carries `roster` /
+   `policy_sha`; added a `[legacy <roster>]` tag in the per-window text render for non-current-roster
+   fires, and documented in `build_report`'s docstring that `fires` is the DISPLAY list (all rosters,
+   tagged) while `aggregates` is the GATE POPULATION (current roster only).
+
+Full suite after fixes: **605 passed** (604 + the finding-1 regression test).

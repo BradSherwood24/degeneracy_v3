@@ -165,11 +165,17 @@ Literal skip-the-hour is the better-supported variant and is what Brad approved.
   `implied_pin = C_mid − 1` (fee-free mids) is **below** the floor at the FIRST qualifying instant
   is **SKIPPED for the hour** — literal skip-the-hour, **no orders** (a skip is a skip, even in
   shakedown). Equality (implied == 0.80) FIRES.
-- The skip is journaled `box_skip_implied` with the full selection payload (so the report scores it
-  on settlement as **paper**) plus `implied_pin` / `min_implied_pin` / `t_minus_s`.
+- The skip is journaled `box_skip_implied` with the full selection payload (side / K / A /
+  implied_pin / C_decision) plus `implied_pin` / `min_implied_pin` / `t_minus_s`, so the report
+  **counts** it live as a paper skip. NOTE: SETTLEMENT SCORING of a paper window requires a
+  settlement source for markets we did NOT hold (an un-traded skip has no ledger row and so no
+  backfill row) — a follow-up commission (a read-only, report-side resolver that fetches the settled
+  result for the selection's markets). Until then the SO-1 paper groups show COUNTS and `unsettled`;
+  the scoring plumbing (`payoff − C_decision`) is in place for the moment such a source exists.
 - **Rescan paper record:** after a skip, the FIRST later instant that re-qualifies (`implied ≥ 0.80`)
-  inside the entry window emits ONE paper `box_rescan_would_fire` — never an order. This measures the
-  literal-skip-vs-keep-scanning question directly on live tape (SO-1's open caveat).
+  inside the entry window emits ONE paper `box_rescan_would_fire` — never an order. It RECORDS, on
+  live tape, that the skipped hour would have re-qualified (the literal-skip-vs-keep-scanning
+  question, SO-1's open caveat); its settlement PnL waits on the same paper-scoring source as skips.
 - New roster sha **`cec4b1a29c5d46deac09fd7a46ec0e08b7603a1f6862758cdb60e97a477aa42c`**
   (old box-v1 sha `480d46347c6d5e5b136d34df1555516cf1b3d3899b41611a2f0dafb786305eb3` retained in code
   as `BOX_V1_POLICY_SHA256` for the report's roster partition). The loader self-verifies the new sha
@@ -198,7 +204,7 @@ longer shows the backfill timing artifact. The S4 cap ($3.00) and every other pi
 - **R1–R4, A1, A5** count **box-v1.1** fills from the first v1.1 window. **box-v1** closes at its
   final counts as a **LEGACY** line in the report (frozen; not counted in the live gates).
 - **SO-1** continues over BOTH rosters and now includes the v1.1 **paper skips** (the SKIPPED group
-  reports `n_real` = v1 fills with implied < 0.80, `n_paper` = v1.1 skipped windows scored on
-  settlement) and a paper **rescan** group.
+  reports `n_real` = v1 fills with implied < 0.80, `n_paper` = v1.1 skipped windows — counted live;
+  their settlement PnL awaits the paper-scoring source noted above) and a paper **rescan** group.
 - Nothing else about the box changed: 1 contract per leg, `pair_cost_max` $1.99, the entry window,
   the one-legged flatten, the S1/S3/S4/S5 pins, and the R1–R4/A5 thresholds all stand.

@@ -429,13 +429,17 @@ def build_window(fire_obj: dict[str, Any], close_time: str,
 def build_paper_window(obj: dict[str, Any], close_time: str,
                        backfill_row: dict[str, Any] | None, *, kind: str) -> dict[str, Any]:
     """A PAPER box window from a ``box_skip_implied`` / ``box_rescan_would_fire`` journal record (v1.1).
-    No order was placed, so there is no fill/ledger row: it is scored on SETTLEMENT as paper using the
-    SAME convention a fire uses — a settlement-backfill row keyed on the close_time gives the payoff
-    ($2 pinned / $1 not), and ``paper realized = payoff - C_decision`` (C_decision is the fee-inclusive
-    pair cost from the selection). Absent a backfill (the usual case for an un-traded skip, since the
-    settlement sweep only settles rows WE hold) the window reads ``unsettled`` and contributes 0 to the
-    settled PnL — its value in the forward record is the count and, once/if settlement data exists, the
-    paper PnL. ``kind`` in {"skip", "rescan"}."""
+    No order was placed, so there is no fill/ledger row: the window is counted live with the full
+    selection (side / K / A / implied_pin / C_decision).
+
+    SETTLEMENT SCORING of a paper window requires a settlement source for markets we did NOT hold — the
+    settlement sweep only settles rows WE traded, so an un-traded skip has no backfill row. Until a
+    follow-up commission supplies one (a read-only, report-side resolver that fetches the settled
+    result for the selection's markets), a paper window normally reads ``unsettled`` and contributes 0
+    to the settled PnL; the SO-1 paper groups show COUNTS and ``unsettled`` only. This function DOES
+    score a paper window when a settlement-backfill row happens to be keyed on its close_time (payoff $2
+    pinned / $1 not -> ``paper realized = payoff - C_decision``, C_decision the fee-inclusive pair cost),
+    so the plumbing is ready the moment such a source exists. ``kind`` in {"skip", "rescan"}."""
     selection = obj.get("selection", {}) or {}
     implied_pin = _dec(selection.get("implied_pin"))
     if implied_pin is None:
@@ -931,11 +935,14 @@ def _render_window(w: dict[str, Any], lines: list[str]) -> None:
     tm_s = f"T-{tm:.0f}s" if isinstance(tm, (int, float)) else "-"
     ip = w["implied_pin"]
     shadow_skip = (w["fill_class"] == "both" and ip is not None and ip < SHADOW_MIN_IMPLIED_PIN)
+    # a legacy (box-v1) fire still renders in the display list but is excluded from the live gates —
+    # tag it so a reader never mistakes it for a current-roster fire the headline counted.
+    legacy_tag = "" if _is_current_roster(w) else f" [legacy {w.get('roster') or LEGACY_ROSTER}]"
     lines.append(
         f"  {w['close_time']}  {tm_s}  side={w['side']:5}  "
         f"K={_f(w['K'],2)} A={_f(w['A'],2)} width={_f(w['width'],2)}  "
         f"[{w['fill_class']}]  outcome={w['outcome']}"
-        f"{' [shadow-skip]' if shadow_skip else ''}"
+        f"{' [shadow-skip]' if shadow_skip else ''}{legacy_tag}"
     )
     for lg in (w["hourly"], w["m15"]):
         bump = "  <<LEVEL BUMP" if lg["level_bump"] else ""
@@ -1159,7 +1166,14 @@ def build_report(
 
     ``journals`` is [(close_time_or_fallback, records)]; ``guards`` maps a UTC day to its parsed
     day-guard dict. The CUMULATIVE block always spans ALL fires (even with ``only_day`` set); only the
-    per-day ``days`` map is filtered to ``only_day``."""
+    per-day ``days`` map is filtered to ``only_day``.
+
+    Roster partition (box-v1.1): each day's ``fires`` is the DISPLAY list — EVERY fire of the day
+    (current box-v1.1 + legacy box-v1), each carrying a ``roster`` field and rendered with a
+    ``[legacy …]`` tag when not current. The ``aggregates`` block is the GATE POPULATION — computed
+    over the CURRENT-roster fires only (R1-R4/A1/A5 + headline), so a legacy fire in the display list
+    never moves a live gate; box-v1 closes as the ``legacy_rosters`` summary. The SO-1 shadow block
+    inside ``aggregates`` spans BOTH rosters and folds in the v1.1 paper skips/rescans."""
     fire_rows, backfill_rows = index_ledger(ledger_entries)
 
     all_fired: list[dict[str, Any]] = []
