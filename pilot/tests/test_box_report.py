@@ -87,6 +87,8 @@ def ledger_box_row(close_time, *, hourly_fill="0.93", m15_fill="0.90",
         "realized_delta": realized_delta, "realized_unsettled": realized_unsettled,
         "floor_booked": floor_booked, "unsettled_legs": [], "slippage_abs_per_side": [],
         "s1_violation": False, "alarms": [], "stops": [],
+        # v1.1: fire rows carry the roster tag so the report counts them in the CURRENT-roster gates.
+        "policy_sha": br.CURRENT_BOX_POLICY_SHA256, "roster": br.CURRENT_ROSTER,
     }
 
 
@@ -731,3 +733,146 @@ def test_s4_corrupt_guard_in_cumulative(tmp_path):
     rep = br.build_report([], [], guards)
     text = br.render_text(rep)
     assert "GUARD CORRUPT: 2026-08-26" in text
+
+
+# ===========================================================================
+# v1.1: roster partition + SO-1 paper skips / rescans
+# ===========================================================================
+def _legacy_ledger_box_row(close_time, **kw):
+    """A box-v1 (legacy) fire ledger row: same as ledger_box_row but tagged the retired roster."""
+    row = ledger_box_row(close_time, **kw)
+    row["roster"] = br.LEGACY_ROSTER
+    row["policy_sha"] = br.BOX_V1_POLICY_SHA256
+    return row
+
+
+def skip_journal(close_time, selection=None, implied_pin="0.75"):
+    """A box_skip_implied journal (v1.1 paper skip) with the box_would_fire selection payload shape."""
+    sel = selection or _selection(implied_pin=implied_pin)
+    return [
+        _rec("window_start", {"close_time": close_time, "pairs": 1}, idx=0),
+        _rec("box_skip_implied", {"kind": "BOX_SKIP", "source": br.WIDE_BOX, "count": 1,
+                                  "C": sel["C"], "t_minus_s": 300.0, "reason": "below floor",
+                                  "legs": [], "selection": sel,
+                                  "implied_pin": sel["implied_pin"], "min_implied_pin": "0.80"}, idx=1),
+    ]
+
+
+def rescan_journal(close_time, selection=None, implied_pin="0.83"):
+    sel = selection or _selection(implied_pin=implied_pin)
+    return [
+        _rec("window_start", {"close_time": close_time, "pairs": 1}, idx=0),
+        _rec("box_rescan_would_fire", {"kind": "BOX_RESCAN_WOULD_FIRE", "source": br.WIDE_BOX,
+                                       "count": 1, "C": sel["C"], "t_minus_s": 240.0,
+                                       "reason": "re-qualified", "legs": [], "selection": sel,
+                                       "implied_pin": sel["implied_pin"], "min_implied_pin": "0.80"},
+             idx=1),
+    ]
+
+
+def test_roster_partition_excludes_legacy_from_gates():
+    cur = "2026-08-29T05:00:00Z"
+    leg = "2026-08-29T06:00:00Z"
+    journals = [("a", fire_journal(cur)), ("b", fire_journal(leg))]
+    ledger = [
+        ledger_box_row(cur, realized_delta="-0.86"),
+        backfill_row(cur, settlement_payoff="2.00", realized_delta="1.00"),
+        _legacy_ledger_box_row(leg, realized_delta="-0.86"),
+        backfill_row(leg, settlement_payoff="1.00", realized_delta="0.00"),
+    ]
+    rep = br.build_report(journals, ledger, {})
+    agg = rep["cumulative"]["aggregates"]
+    # only the CURRENT-roster fire counts in the headline / gates
+    assert agg["fires"] == 1 and agg["two_leg_fills"] == 1
+    assert agg["R2"]["n_fills"] == 1
+    assert agg["R3"]["n_fills"] == 1
+    # the legacy box-v1 fire closes as a legacy line (computed, not hardcoded)
+    lr = rep["cumulative"]["legacy_rosters"]
+    assert lr is not None
+    assert lr["roster"] == "box-v1"
+    assert lr["fires"] == 1 and lr["n_two_leg"] == 1
+    assert lr["pins"] == 0 and lr["misses"] == 1              # legacy settled not_pinned
+    assert lr["realized_sum"] == Decimal("-0.86")
+
+
+def test_so1_spans_both_rosters_and_paper_skips():
+    kept = "2026-08-29T05:00:00Z"        # current, implied 0.88 -> KEPT
+    real_skip = "2026-08-29T06:00:00Z"   # legacy v1 fill, implied 0.75 -> REAL skip
+    paper_skip = "2026-08-29T07:00:00Z"  # v1.1 paper skip, implied 0.75, settled via backfill
+    journals = [
+        ("a", fire_journal(kept, selection=_selection(implied_pin="0.88"))),
+        ("b", fire_journal(real_skip, selection=_selection(implied_pin="0.75"))),
+        ("c", skip_journal(paper_skip, implied_pin="0.75")),
+    ]
+    ledger = [
+        ledger_box_row(kept, realized_delta="-0.86"),
+        backfill_row(kept, settlement_payoff="2.00", realized_delta="1.00"),
+        _legacy_ledger_box_row(real_skip, realized_delta="-0.86"),
+        backfill_row(real_skip, settlement_payoff="1.00", realized_delta="0.00"),
+        # a settlement for the paper-skip window -> the paper skip is scored on settlement
+        backfill_row(paper_skip, settlement_payoff="1.00", realized_delta="0.00"),
+    ]
+    sr = br.build_report(journals, ledger, {})["cumulative"]["aggregates"]["shadow_implied_rule"]
+    assert sr["kept"]["n"] == 1
+    skipped = sr["skipped"]
+    assert skipped["n"] == 2                       # 1 real + 1 paper
+    assert skipped["n_real"] == 1 and skipped["n_paper"] == 1
+    # both settled not_pinned ($1 payoff) -> both counted in the settled PnL
+    assert skipped["n_settled"] == 2 and skipped["misses"] == 2
+    # paper realized = payoff($1) - C_decision($1.86) = -$0.86 (same as the real skip)
+    assert skipped["realized_sum"] == Decimal("-0.86") + Decimal("-0.86")
+
+
+def test_so1_paper_skip_unsettled_when_no_backfill():
+    ct = "2026-08-29T07:00:00Z"
+    journals = [("c", skip_journal(ct, implied_pin="0.75"))]
+    # no backfill row for the skip -> unscored (unsettled), contributes 0 to PnL
+    sr = br.build_report(journals, [], {})["cumulative"]["aggregates"]["shadow_implied_rule"]
+    assert sr["skipped"]["n"] == 1 and sr["skipped"]["n_paper"] == 1
+    assert sr["skipped"]["n_settled"] == 0 and sr["skipped"]["unsettled"] == 1
+    assert sr["skipped"]["realized_sum"] == Decimal("0")
+
+
+def test_so1_rescan_group_paper():
+    ct = "2026-08-29T07:00:00Z"
+    journals = [("c", rescan_journal(ct, implied_pin="0.83"))]
+    ledger = [backfill_row(ct, settlement_payoff="2.00", realized_delta="1.00")]
+    sr = br.build_report(journals, ledger, {})["cumulative"]["aggregates"]["shadow_implied_rule"]
+    assert "rescan" in sr
+    assert sr["rescan"]["n"] == 1
+    # scored on settlement: payoff $2 - C_decision $1.86 = +$0.14
+    assert sr["rescan"]["pins"] == 1
+    assert sr["rescan"]["realized_sum"] == Decimal("0.14")
+
+
+def test_render_skipped_implied_tag_and_legacy_line():
+    cur = "2026-08-29T05:00:00Z"
+    leg = "2026-08-29T06:00:00Z"
+    paper_skip = "2026-08-29T07:00:00Z"
+    journals = [
+        ("a", fire_journal(cur, selection=_selection(implied_pin="0.88"))),
+        ("b", fire_journal(leg, selection=_selection(implied_pin="0.75"))),
+        ("c", skip_journal(paper_skip, implied_pin="0.75")),
+    ]
+    ledger = [
+        ledger_box_row(cur, realized_delta="-0.86"),
+        backfill_row(cur, settlement_payoff="2.00", realized_delta="1.00"),
+        _legacy_ledger_box_row(leg, realized_delta="-0.86"),
+        backfill_row(leg, settlement_payoff="1.00", realized_delta="0.00"),
+    ]
+    text = br.render_text(br.build_report(journals, ledger, {}))
+    assert "SKIPPED - IMPLIED-PIN FLOOR (box-v1.1, paper)" in text
+    assert "[skipped-implied]" in text
+    assert "LEGACY box-v1" in text
+    assert "real=" in text and "paper=" in text     # the SKIPPED split renders
+
+
+def test_paper_skip_and_rescan_jsonify():
+    ct = "2026-08-29T07:00:00Z"
+    journals = [("c", skip_journal(ct)), ("d", rescan_journal("2026-08-29T08:00:00Z"))]
+    rep = br.build_report(journals, [], {})
+    js = br._jsonify(rep)   # must not raise; Decimals -> strings
+    day = js["days"]["2026-08-29"]
+    assert len(day["skipped_implied"]) == 1
+    assert day["skipped_implied"][0]["paper"] is True
+    assert len(day["rescans"]) == 1

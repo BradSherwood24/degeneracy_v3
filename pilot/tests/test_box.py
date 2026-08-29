@@ -14,6 +14,9 @@ import pytest
 from service._simlaw import close_epoch, fee
 from service.book import TopOfBook
 from service.box import (
+    BOX_RESCAN_WOULD_FIRE,
+    BOX_SKIP,
+    BOX_V1_POLICY_SHA256,
     BUY_NO,
     BUY_YES,
     FIRE,
@@ -243,7 +246,8 @@ def test_margin_does_not_affect_filters():
 def test_legorders_use_limits_not_observed_asks():
     st = _state()
     now = T - 300
-    st, acts = _drive(st, now, hourly=("0.94", "0.92"))
+    # hourly (0.94, 0.94) -> h_mid 0.94; with the 15M NO mid 0.86 implied_pin = 0.80 == floor -> FIRE.
+    st, acts = _drive(st, now, hourly=("0.94", "0.94"))
     assert [a.kind for a in acts] == [FIRE]
     limits = {leg.ticker: leg.limit_price for leg in acts[0].legs}
     assert limits["H-T64000"] == Decimal("0.97")   # 0.94 + 0.03
@@ -284,9 +288,13 @@ def _state(shakedown=False):
 def _drive(st, now, *, hourly=("0.97", "0.95")):
     """Seed both legs fresh at ``now`` (below case) then tick, collecting all actions. The fire,
     when it happens, lands on the second BookUpdate (both legs present); the trailing ClockTick
-    then returns nothing because the window has latched."""
+    then returns nothing because the window has latched.
+
+    v1.1: the 15M quote is (0.14, 0.14) so the 15M NO mid is 0.86 and, with the default hourly mid
+    0.96, implied_pin = 0.82 clears the 0.80 floor and the box FIRES (the 15M NO ask stays 0.86 = 1 -
+    yes_bid, so limit/cost assertions are unchanged from v1)."""
     acts = []
-    st, a = decide_box(PARAMS, st, BookUpdate("M15", top(yes_ask="0.20", yes_bid="0.14"), now)); acts += a
+    st, a = decide_box(PARAMS, st, BookUpdate("M15", top(yes_ask="0.14", yes_bid="0.14"), now)); acts += a
     st, a = decide_box(PARAMS, st, BookUpdate("H-T64000", top(yes_ask=hourly[0], yes_bid=hourly[1]), now)); acts += a
     st, a = decide_box(PARAMS, st, ClockTick(now)); acts += a
     return st, acts
@@ -353,12 +361,12 @@ def test_strike_can_switch_between_instants_before_fire():
         strikes={"H-T64000": Decimal("64000"), "H-T63500": Decimal("63500")},
     )
     # instant 1 (T-600): only 64000 present but ask 0.995 > max -> no fire
-    st, _ = decide_box(PARAMS, st, BookUpdate("M15", top(yes_ask="0.20", yes_bid="0.14"), T - 600))
+    st, _ = decide_box(PARAMS, st, BookUpdate("M15", top(yes_ask="0.14", yes_bid="0.14"), T - 600))
     st, _ = decide_box(PARAMS, st, BookUpdate("H-T64000", top(yes_ask="0.995", yes_bid="0.99"), T - 600))
     st, acts = decide_box(PARAMS, st, ClockTick(T - 600))
     assert acts == [] and not st.entered
-    # instant 2 (T-540): 63500 now present, mid 0.96 in-range -> fires on 63500
-    st, _ = decide_box(PARAMS, st, BookUpdate("M15", top(yes_ask="0.20", yes_bid="0.14"), T - 540))
+    # instant 2 (T-540): 63500 now present, mid 0.96 in-range, implied 0.82 >= floor -> fires on 63500
+    st, _ = decide_box(PARAMS, st, BookUpdate("M15", top(yes_ask="0.14", yes_bid="0.14"), T - 540))
     acts2 = []
     st, a = decide_box(PARAMS, st, BookUpdate("H-T63500", top(yes_ask="0.97", yes_bid="0.95"), T - 540)); acts2 += a
     st, a = decide_box(PARAMS, st, BookUpdate("H-T64000", top(yes_ask="0.995", yes_bid="0.99"), T - 540)); acts2 += a
@@ -422,7 +430,7 @@ def test_unrelated_ticker_ignored():
 def test_default_load_self_verifies():
     p = load_box_policy()
     assert p.sha256 == FROZEN_BOX_POLICY_SHA256
-    assert p.roster_name == "box-v1"
+    assert p.roster_name == "box-v1.1"
     assert p.target_mid == Decimal("0.95")
     assert p.hourly_ask_min == Decimal("0.90")
     assert p.hourly_ask_max == Decimal("0.99")
@@ -433,6 +441,8 @@ def test_default_load_self_verifies():
     assert p.freshness_max_leg_age_s == 1.0
     assert p.no_orders_after_s_to_settle == 1 and p.contracts == 1
     assert p.pair_cost_max == Decimal("1.99")
+    # v1.1 implied-pin floor (2026-08-29)
+    assert p.min_implied_pin == Decimal("0.80")
 
 
 def test_canonical_sha_key_order_invariant():
@@ -458,3 +468,127 @@ def test_tampered_file_refuses_but_loads_without_check(tmp_path):
     loaded = load_box_policy(str(p), expected_sha=None)
     assert loaded.target_mid == Decimal("0.90")
     assert loaded.sha256 != FROZEN_BOX_POLICY_SHA256
+
+
+# ===========================================================================
+# v1.1 implied-pin floor: BOX_SKIP / BOX_RESCAN_WOULD_FIRE (2026-08-29)
+# ===========================================================================
+# Quote helpers: below-case boxes whose implied_pin sits either side of the 0.80 floor.
+#   fire quotes : hourly (0.97,0.95) h_mid 0.96 + 15M (0.14,0.14) NO mid 0.86 -> implied 0.82 (>=0.80)
+#   skip quotes : hourly (0.97,0.95) h_mid 0.96 + 15M (0.20,0.14) NO mid 0.83 -> implied 0.79 (<0.80)
+_FIRE_M15 = ("0.14", "0.14")
+_SKIP_M15 = ("0.20", "0.14")
+
+
+def _seed_and_tick(st, now, *, m15, hourly=("0.97", "0.95")):
+    acts = []
+    st, a = decide_box(PARAMS, st, BookUpdate("M15", top(yes_ask=m15[0], yes_bid=m15[1]), now)); acts += a
+    st, a = decide_box(PARAMS, st, BookUpdate("H-T64000", top(yes_ask=hourly[0], yes_bid=hourly[1]), now)); acts += a
+    st, a = decide_box(PARAMS, st, ClockTick(now)); acts += a
+    return st, acts
+
+
+def test_implied_below_floor_skips_the_hour():
+    st = _state()
+    st, acts = _seed_and_tick(st, T - 300, m15=_SKIP_M15)
+    assert [a.kind for a in acts] == [BOX_SKIP]
+    a = acts[0]
+    assert a.source == WIDE_BOX and a.count == 1
+    assert len(a.legs) == 2                       # the legs the fire WOULD have sent (informational)
+    assert st.entered and st.skipped and st.skipped_selection is not None
+    assert st.skipped_selection.implied_pin < PARAMS.min_implied_pin
+    assert st.fired_selection is None             # no fire
+
+
+def test_skip_then_no_fire_later_in_window():
+    st = _state()
+    st, acts = _seed_and_tick(st, T - 300, m15=_SKIP_M15)
+    assert [a.kind for a in acts] == [BOX_SKIP]
+    # a later STILL-below instant does not fire and does not rescan
+    st, acts2 = _seed_and_tick(st, T - 200, m15=_SKIP_M15)
+    assert acts2 == []
+    assert not st.rescan_emitted
+
+
+def test_implied_equal_floor_fires():
+    # hourly (0.94,0.94) h_mid 0.94 + 15M NO mid 0.86 -> implied EXACTLY 0.80 -> FIRE (equality).
+    st = _state()
+    st, acts = _seed_and_tick(st, T - 300, m15=_FIRE_M15, hourly=("0.94", "0.94"))
+    assert [a.kind for a in acts] == [FIRE]
+    assert st.fired_selection.implied_pin == PARAMS.min_implied_pin
+
+
+def test_implied_above_floor_fires():
+    st = _state()
+    st, acts = _seed_and_tick(st, T - 300, m15=_FIRE_M15)          # implied 0.82 > 0.80
+    assert [a.kind for a in acts] == [FIRE]
+    assert st.fired_selection.implied_pin > PARAMS.min_implied_pin
+    assert not st.skipped
+
+
+def test_skip_then_rescan_paper_record_once():
+    st = _state()
+    st, acts = _seed_and_tick(st, T - 300, m15=_SKIP_M15)          # skip
+    assert [a.kind for a in acts] == [BOX_SKIP]
+    # a later instant re-qualifies (implied 0.82 >= floor) -> ONE paper rescan record
+    st, acts2 = _seed_and_tick(st, T - 240, m15=_FIRE_M15)
+    assert [a.kind for a in acts2] == [BOX_RESCAN_WOULD_FIRE]
+    assert st.rescan_emitted and st.rescan_selection is not None
+    assert st.rescan_selection.implied_pin >= PARAMS.min_implied_pin
+    # a yet-later qualifying instant does NOT re-emit (one rescan per window)
+    st, acts3 = _seed_and_tick(st, T - 180, m15=_FIRE_M15)
+    assert acts3 == []
+
+
+def test_no_rescan_if_nothing_later_qualifies():
+    st = _state()
+    st, _ = _seed_and_tick(st, T - 300, m15=_SKIP_M15)             # skip
+    # every later instant stays below the floor -> no rescan action ever
+    for tm in (240, 180, 120):
+        st, acts = _seed_and_tick(st, T - tm, m15=_SKIP_M15)
+        assert acts == []
+    assert not st.rescan_emitted
+
+
+def test_rescan_requires_freshness_and_window():
+    st = _state()
+    st, _ = _seed_and_tick(st, T - 300, m15=_SKIP_M15)             # skip
+    # a re-qualifying selection AFTER the entry window (t-59 < entry_end 60) does NOT rescan
+    st, acts = _seed_and_tick(st, T - 59, m15=_FIRE_M15)
+    assert acts == []
+    assert not st.rescan_emitted
+
+
+def test_shakedown_skip_is_a_skip_not_a_would_fire():
+    st = _state(shakedown=True)
+    st, acts = _seed_and_tick(st, T - 300, m15=_SKIP_M15)
+    assert [a.kind for a in acts] == [BOX_SKIP]                    # a skip is a skip, even in shakedown
+    assert st.skipped and st.fired_selection is None
+
+
+# ---------------------------------------------------------------------------
+# v1.1 loader: min_implied_pin required (fail closed), new sha pins, old sha kept + refused
+# ---------------------------------------------------------------------------
+def test_loader_new_sha_and_min_implied_pin():
+    p = load_box_policy()
+    assert p.sha256 == FROZEN_BOX_POLICY_SHA256
+    assert FROZEN_BOX_POLICY_SHA256 != BOX_V1_POLICY_SHA256
+    assert p.min_implied_pin == Decimal("0.80")
+
+
+def test_loader_old_v1_sha_refused():
+    # the shipped file no longer canonicalises to the v1 sha -> loading against it fails closed.
+    with pytest.raises(BoxPolicyShaMismatch):
+        load_box_policy(expected_sha=BOX_V1_POLICY_SHA256)
+
+
+def test_loader_missing_min_implied_pin_fails_closed(tmp_path):
+    from service.box import DEFAULT_BOX_POLICY_PATH
+    obj = json.load(open(DEFAULT_BOX_POLICY_PATH, encoding="utf-8"))
+    del obj["min_implied_pin"]
+    p = tmp_path / "no_floor.json"
+    p.write_text(json.dumps(obj), encoding="utf-8")
+    # the required key is absent -> the loader raises (never defaults the floor). Loaded without the
+    # sha check so we reach the field read rather than the sha guard.
+    with pytest.raises(KeyError):
+        load_box_policy(str(p), expected_sha=None)

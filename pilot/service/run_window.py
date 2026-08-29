@@ -57,6 +57,8 @@ from typing import Any
 
 from service.book import TopOfBook
 from service.box import (
+    BOX_RESCAN_WOULD_FIRE,
+    BOX_SKIP,
     WIDE_BOX,
     BoxPolicyShaMismatch,
     BoxState,
@@ -803,6 +805,10 @@ class WindowService:
                     )
 
         # (c) reconcile-first
+        # B3: the pending-settlement picture the sweep computes, consumed by the S4 wake block below.
+        # Initialized empty so a reconcile-first failure (caught) leaves the S4 block a safe {} (no
+        # pending legs -> the pessimistic == optimistic loss, i.e. today's balance behaviour).
+        settlement_pending: dict[str, dict[str, Any]] = {}
         try:
             observed = self._read_positions()
             inherited = {t: n for t, n in observed.items() if self._ours(t) and n != 0}
@@ -815,7 +821,12 @@ class WindowService:
             # realized_unsettled, fetch each held ticker's settled result via the proxy /markets
             # (read-only) and run the existing backfill. Idempotent, fail-closed (an unsettled/absent
             # result just waits for a later wake); never breaks startup.
-            self._settlement_backfill_sweep()
+            settlement_pending = self._settlement_backfill_sweep()
+            # B4 (LOW fix): the sweep may have appended a backfill row for TODAY (crediting the pinned
+            # +$1 that was booked at the $1 floor). Recompute _day_totals AFTER the sweep so the S4
+            # record's ledger_realized_today / ledger_vs_balance_delta reflect the just-backfilled
+            # credit instead of the pre-sweep snapshot (the backfill timing artifact).
+            self._day_totals = self._ledger_day_totals()
             if inherited:
                 # BUG-3 (S4 balance): positions are open at wake, so the balance is NOT clean cash
                 # and the loss compare would be meaningless -> record a skip rather than compare
@@ -858,7 +869,8 @@ class WindowService:
                 ensure_balance_start,
                 parse_balance,
                 record_latched_stop,
-                s4_balance_breached,
+                s4_balance_decision,
+                s4_pending_value,
             )
 
             stop_cfg = StopConfig()
@@ -917,9 +929,22 @@ class WindowService:
                         start, first_wake = ensure_balance_start(
                             self._day_guard_path, self._utc_day, br.dollars, self.clock()
                         )
-                        breached, loss_dollars = s4_balance_breached(
-                            start, br.dollars, stop_cfg.daily_loss_cap_dollars
-                        )
+                        # B2/B3: the pending-settlement band. pending_value is the OPTIMISTIC credit
+                        # still owed by today's unfinalized legs ($1/leg); the decision latches only if
+                        # the cap is breached even under that best case, and stands down (no latch)
+                        # while the breach depends on an unfinalized leg (the 16:40Z measurement bug).
+                        pending_value = s4_pending_value(settlement_pending, self._utc_day)
+                        cap = stop_cfg.daily_loss_cap_dollars
+                        s4d = s4_balance_decision(start, br.dollars, pending_value, cap)
+                        loss_dollars = s4d.loss_pessimistic  # start - now (secondary reporting figure)
+                        breached = s4d.kind == "latch"
+                        pending_legs = [
+                            {"window": w, "ticker": lg[0], "count": lg[2]}
+                            for w, row in (settlement_pending or {}).items()
+                            for lg in row.get("legs", []) or []
+                            if (len(lg) <= 3 or lg[3] is None)
+                            and str(row.get("close_time", ""))[:10] == self._utc_day
+                        ]
                         # Secondary: the repaired ledger realized today + the venue-vs-ledger delta.
                         ledger_realized_today = self._day_totals[0]
                         balance_pnl = -loss_dollars  # balance_now - balance_start
@@ -932,29 +957,57 @@ class WindowService:
                                 "portfolio_value": br.portfolio_value,
                                 "first_wake": first_wake,
                                 "loss_dollars": str(loss_dollars),
-                                "cap_dollars": str(stop_cfg.daily_loss_cap_dollars),
+                                "cap_dollars": str(cap),
                                 "breached": breached,
+                                "pending_value_dollars": str(pending_value),
+                                "pending_legs": pending_legs,
+                                "loss_pessimistic": str(s4d.loss_pessimistic),
+                                "loss_optimistic": str(s4d.loss_optimistic),
+                                "decision": s4d.kind,
                                 "ledger_realized_today": str(ledger_realized_today),
                                 "ledger_vs_balance_delta": str(ledger_realized_today - balance_pnl),
                             },
                         )
-                        if breached:
+                        if s4d.kind == "latch":
                             record_latched_stop(
                                 self._day_guard_path, self._utc_day, "S4",
-                                f"S4 balance: loss {loss_dollars} >= cap "
-                                f"{stop_cfg.daily_loss_cap_dollars} (start ${start} -> now "
-                                f"${br.dollars})",
+                                f"S4 balance: loss {s4d.loss_pessimistic} (optimistic "
+                                f"{s4d.loss_optimistic}) >= cap {cap} even after pending credit "
+                                f"${pending_value} (start ${start} -> now ${br.dollars})",
                                 self.close_time, self.clock(),
                             )
                             self._journal(
                                 "s4_balance_latch",
-                                {"loss_dollars": str(loss_dollars),
-                                 "cap_dollars": str(stop_cfg.daily_loss_cap_dollars),
-                                 "note": "S4 balance cap breached -> latched for the day"},
+                                {"loss_pessimistic": str(s4d.loss_pessimistic),
+                                 "loss_optimistic": str(s4d.loss_optimistic),
+                                 "pending_value_dollars": str(pending_value),
+                                 "cap_dollars": str(cap),
+                                 "note": "S4 cap breached under EVERY resolution of pending "
+                                         "settlements -> latched for the day"},
                             )
                             _degrade(
-                                f"S4 balance day-lock: loss {loss_dollars} >= "
-                                f"{stop_cfg.daily_loss_cap_dollars}"
+                                f"S4 balance day-lock: loss {s4d.loss_pessimistic} >= {cap} "
+                                f"(optimistic {s4d.loss_optimistic} also >= {cap})"
+                            )
+                        elif s4d.kind == "pending":
+                            # The breach depends on a leg the venue has not finalized. Stand down THIS
+                            # window (degrade to dry) but do NOT latch and do NOT write the day guard —
+                            # the next wake re-evaluates once the settlement lands (or does not).
+                            self._journal(
+                                "s4_pending_settlement",
+                                {"loss_pessimistic": str(s4d.loss_pessimistic),
+                                 "loss_optimistic": str(s4d.loss_optimistic),
+                                 "pending_value_dollars": str(pending_value),
+                                 "pending_legs": pending_legs,
+                                 "cap_dollars": str(cap),
+                                 "note": "S4 loss is between the pessimistic and optimistic bounds; a "
+                                         "pending settlement can still move it -> stand down this "
+                                         "window, no latch, re-evaluate next wake"},
+                            )
+                            _degrade(
+                                f"S4 pending settlement: loss between {s4d.loss_optimistic} and "
+                                f"{s4d.loss_pessimistic} vs cap {cap} (pending ${pending_value}) -> "
+                                f"stand down this window, no latch"
                             )
 
         # (d) wake discovery
@@ -1758,17 +1811,25 @@ class WindowService:
             return None
         return _parse_market_result(resp, ticker)
 
-    def _settlement_backfill_sweep(self) -> None:
+    def _settlement_backfill_sweep(self) -> dict[str, dict[str, Any]]:
         """At reconcile-first, backfill any prior ledger row still marked realized_unsettled once its
         held tickers have settled. Idempotent (skips already-backfilled windows) and fail-closed (an
-        absent/unsettled result just waits for a later wake). Never raises out of startup."""
+        absent/unsettled result just waits for a later wake). Never raises out of startup.
+
+        Returns the PENDING PICTURE it already computes — ``{window: {"legs": [(ticker, side, count,
+        result_or_None), ...], "close_time": ...}}`` — for every row still ``realized_unsettled`` after
+        the sweep (results fetched via ``_fetch_market_result``; None = not yet finalized). The S4 wake
+        block uses it to bound the balance under EVERY resolution of the unfinalized legs (B2/B3) so a
+        pending settlement can never move the number a latch is decided on (the 2026-08-28 16:40Z bug).
+        Journaling is unchanged."""
         from service.ledger import settlement_payoff
 
+        pending_picture: dict[str, dict[str, Any]] = {}
         try:
             entries = load_entries(self.ledger_path)
         except Exception as e:  # noqa: BLE001
             logger.warning("[RUN] settlement-backfill: ledger read failed: %s", e)
-            return
+            return pending_picture
         pending: dict[str, dict[str, Any]] = {}
         for e in entries:
             if e.get("realized_unsettled") and e.get("unsettled_legs"):
@@ -1796,6 +1857,22 @@ class WindowService:
                     {"window": window, "tickers": tickers, "unsettled_leg": pending_leg,
                      "settled_legs": sorted(results.keys())},
                 )
+                # Record the pending picture: each leg with its fetched result (None = not finalized,
+                # e.g. the leg that stopped the sweep and any leg after it). s4_pending_value counts
+                # only the None legs (optimistic $1/leg), so a settled 'no' leg contributes nothing.
+                def _leg_field(leg: Any, i: int) -> Any:
+                    return leg[i] if isinstance(leg, (list, tuple)) else None
+                picture_legs: list[tuple[Any, Any, Any, str | None]] = []
+                for leg in legs:
+                    if isinstance(leg, dict):
+                        tk = leg.get("ticker"); side = leg.get("side"); cnt = leg.get("count")
+                    else:
+                        tk = _leg_field(leg, 0); side = _leg_field(leg, 1); cnt = _leg_field(leg, 2)
+                    picture_legs.append((tk, side, cnt, results.get(str(tk))))
+                pending_picture[str(window)] = {
+                    "close_time": str(entry.get("close_time", window)),
+                    "legs": picture_legs,
+                }
                 continue
             try:
                 payoff = settlement_payoff(legs, results)
@@ -1814,6 +1891,7 @@ class WindowService:
                 {"window": window, "results": results, "settlement_payoff": str(payoff),
                  "floor_netted": bf.get("floor_netted"), "realized_delta": bf.get("realized_delta")},
             )
+        return pending_picture
 
     def _build_recorder(self, plan: Plan) -> WindowRecorder:
         wake, policy, state = plan.wake, plan.policy, plan.state
@@ -2336,6 +2414,11 @@ class WindowService:
         would_fires = sum(1 for a in actions if a.kind == WOULD_FIRE)
         fires = sum(1 for a in actions if a.kind == FIRE)
         fired_source = WIDE_BOX if fires > 0 else None
+        # v1.1 implied-pin floor: a skip / paper rescan is neither a fire nor a would-fire (distinct
+        # action kinds), so it never counts in fires/would_fires/signals. Surface the flags for the
+        # report so a skipped hour is not mistaken for a no-signal hour.
+        box_skipped = any(a.kind == BOX_SKIP for a in actions)
+        box_rescan = any(a.kind == BOX_RESCAN_WOULD_FIRE for a in actions)
 
         fills: list[dict[str, Any]] = []
         filled = False
@@ -2413,6 +2496,8 @@ class WindowService:
             "signals": would_fires + fires,
             "would_fires": would_fires,
             "fires": fires,
+            "box_skipped": box_skipped,
+            "box_rescan": box_rescan,
             "fired_source": fired_source,
             "orders_attempted": orders_attempted,
             "fills": fills,

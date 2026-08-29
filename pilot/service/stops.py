@@ -596,6 +596,77 @@ def s4_balance_breached(
 
 
 # ---------------------------------------------------------------------------
+# S4 pending-settlement band (2026-08-29): never LATCH on a number a pending settlement can still
+# move. The 2026-08-28 16:40Z incident: a box had PINNED but its 15M leg stayed unfinalized at
+# Kalshi; the account balance (and the ledger, which books only the $1 floor until backfill) both
+# read $1 worse than truth, so the raw loss 3.5453 > cap 3.00 latched S4 — a MEASUREMENT error, not a
+# strategy loss (real loss at that instant $2.55 < cap). The band latches only if the cap is breached
+# under EVERY resolution of the unfinalized legs, and stands down (no latch) while the breach depends
+# on one.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class S4Decision:
+    """The S4 balance verdict with the pending-settlement band. ``kind`` in {clear, pending, latch}.
+    ``loss_pessimistic`` = start - now (no pending credit); ``loss_optimistic`` = start - (now +
+    pending_value) (every unfinalized leg pays its $1)."""
+
+    kind: str  # "clear" | "pending" | "latch"
+    loss_pessimistic: Decimal
+    loss_optimistic: Decimal
+
+
+def s4_pending_value(pending: dict, utc_day: str) -> Decimal:
+    """The OPTIMISTIC upper bound on credit still owed by pending settlements, in dollars: Σ over
+    pending rows whose ``close_time`` falls in ``utc_day`` of ``count × $1.00`` for each leg whose
+    fetched result is None (not yet finalized -> assume it PAYS). ``pending`` is the picture returned
+    by ``_settlement_backfill_sweep``: ``{window: {"legs": [(ticker, side, count, result_or_None), …],
+    "close_time": …}}``.
+
+    Rows from a PRIOR UTC day contribute 0. Such a row's late credit inflates today's balance the
+    moment it finalizes (its floor was booked on that prior day, not today), so folding it into
+    today's optimistic bound would double-count in the UNSAFE direction; excluding it is conservative
+    for a stop (it can only make the loss look larger, never smaller). Pre-existing behaviour — left
+    as-is and flagged here."""
+    total = Decimal(0)
+    for _window, row in (pending or {}).items():
+        if str((row or {}).get("close_time", ""))[:10] != utc_day:
+            continue  # prior-day rows contribute 0 (comment above)
+        for leg in (row or {}).get("legs", []) or []:
+            # leg = (ticker, side, count, result_or_None)
+            result = leg[3] if len(leg) > 3 else None
+            if result is not None:
+                continue  # already finalized -> no pending credit from this leg
+            count = leg[2] if len(leg) > 2 else 1
+            try:
+                total += Decimal(str(count)) * Decimal("1.00")
+            except (InvalidOperation, TypeError):
+                total += Decimal("1.00")  # unparseable count -> assume 1 (optimistic, safe direction)
+    return total
+
+
+def s4_balance_decision(
+    balance_start: Decimal, balance_now: Decimal, pending_value: Decimal, cap_dollars: Decimal
+) -> S4Decision:
+    """S4 with the pending-settlement band. Wraps ``s4_balance_breached`` for the pessimistic bound.
+
+      loss_pessimistic = start - now                          (no pending credit)
+      loss_optimistic  = start - (now + pending_value)        (every unfinalized leg pays)
+      latch   iff loss_optimistic >= cap   (breached under EVERY resolution of the pending settlements)
+      clear   iff loss_pessimistic <  cap  (not breached under any)
+      pending otherwise                    (the breach depends on an unfinalized leg -> stand down)
+    """
+    _breached, loss_pessimistic = s4_balance_breached(balance_start, balance_now, cap_dollars)
+    loss_optimistic = balance_loss_dollars(balance_start, balance_now + pending_value)
+    if loss_optimistic >= cap_dollars:
+        kind = "latch"
+    elif loss_pessimistic < cap_dollars:
+        kind = "clear"
+    else:
+        kind = "pending"
+    return S4Decision(kind=kind, loss_pessimistic=loss_pessimistic, loss_optimistic=loss_optimistic)
+
+
+# ---------------------------------------------------------------------------
 # Controller — the thin shell: pure state + Executor freeze + flatten dispatch + journal
 # ---------------------------------------------------------------------------
 class StopController:
