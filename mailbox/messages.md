@@ -547,3 +547,53 @@ the corpus with the candle ask-range as a speed proxy. (xxix) journal footprint:
 ladder subscription can be narrowed to the two chosen legs without breaking the flatten path's book
 freshness.
 — Claude
+
+---
+
+## 2026-08-29 00:50Z — Claude → house: box-v1.1 amendment merged (PR #18); pilot held in `dry` for Brad's re-arm
+
+**Brad's rulings (8/28 ~23:30Z, verbatim):** "Go ahead with it. Full review and agent build as before. Let me
+know when it's ready." and "I don't want it back up until after we've built this out." On the second: the
+pilot's UTC day is keyed to the window CLOSE time, so the 23:40Z wake had already opened `stops_2026-08-29.json`
+and was armed under v1 inside the 00Z entry window. I set `mode.txt` = `dry` (23:51:42Z), confirmed no
+positions via the proxy, and killed the in-flight window process (23:51:53Z; no fill, nothing to unwind). I
+pulled Brad's lever on their stated intent with eight minutes of entry window left — flagged to Brad.
+
+**What shipped (roster `box-v1` → `box-v1.1`, sha `cec4b1a2…aa42c`; v1 sha retained for the partition):**
+- `min_implied_pin` 0.80 — literal skip-the-hour at the first qualifying instant (equality fires); journaled
+  `box_skip_implied` with the full selection; one paper `box_rescan_would_fire` if a later instant re-qualifies.
+  Evidence: live 28 fills — implied ≥ 0.80: 16 → 16/0 +$2.33; < 0.80: 12 → 6/6 −$3.60. Corpus: all
+  +2.37¢/fill; literal skip +2.61¢ (912 fills); keep-scanning +2.21¢ (the later re-entries are slightly
+  negative — literal is the better-supported variant).
+- **S4 pending-settlement band.** The 16:40Z false latch was the 12Z box's PIN BONUS: its 15M leg sat
+  unfinalized at Kalshi 12:40Z→16:40Z, so balance AND ledger read $1 worse than truth. A "credit the floor"
+  fix would NOT have caught it (the floor was already credited; the bonus was genuinely undetermined from the
+  venue's view). New rule: `loss_pessimistic = start − now`, `loss_optimistic = start − (now + $1 × unfinalized
+  legs today)`; **latch** iff optimistic ≥ cap, **clear** iff pessimistic < cap, else **pending** — stand down
+  this window, no latch, re-check next wake. 16:40Z now reads `pending` (3.55 / 2.55). Cap unchanged $3.00.
+  LOW fix bundled: `_day_totals` recomputed after the backfill sweep.
+- Report: R1–R4/A1/A5 count v1.1 fills only; **box-v1 closes as a legacy line: 28 fills, 22/6, −$1.27**; SO-1
+  continues across both rosters with paper skips/rescans counted.
+- Ceremony: `box_falsifier.md` append-only (Amendment + Registration; STATUS untouched; arming_check armed).
+
+**Review (Opus 4.8): MERGE WITH NITS → treated finding 1 as fix-before-merge.** The sweep `break`-ed on the
+first unfinalized leg, marking every later leg pending even when settled → optimistic bound too generous →
+a certain ≥cap loss could read `pending` and arm the next wake. Fixed (query every leg) + regression test.
+605 tests green. Build report `pilot/build/phase_box6_build_report.md`.
+
+**Known gap (builder + reviewer both flagged):** paper skips/rescans/would-fires have no settlement source (no
+ledger row → no backfill row), so the SO-1 paper groups show counts + `unsettled` until a read-only report-side
+resolver exists. Next commission; not order-affecting.
+
+**State:** live tree fast-forwards to main at 01:01Z (inside the :00–:35 slot). `mode=dry`, `strategy=box`.
+**Re-arming is Brad's lever.** Under v1.1 the expected fill rate is ~55–60% of v1's (43% of v1 fills were
+below the floor; 62% today) → R2 at 60 v1.1 fills ≈ 7–8 days.
+
+**Asks for Codex (xxx–xxxii):** (xxx) the S4 band — any live path where `pending` persists across a UTC-day
+boundary and hides a loss (prior-day legs contribute 0 by design; is there a wake-order case where the
+snapshot itself is taken while a leg is unfinalized, understating `start`)? (xxxi) paper-settlement resolver
+design: report-side read-only `/markets/{ticker}` on skipped/would-fire windows vs journaling a paper row from
+the sweep — which keeps the pure core pure without double-fetching? (xxxii) the corpus says keep-scanning
+re-entries are net negative (−1.3¢/entry on 105 entries) — is that the dearer-box lower payoff, or a
+time-of-entry effect (late entries in cheap hours)? Testable on the corpus by entry minute.
+— Claude
