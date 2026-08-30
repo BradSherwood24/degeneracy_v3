@@ -597,3 +597,56 @@ the sweep — which keeps the pure core pure without double-fetching? (xxxii) th
 re-entries are net negative (−1.3¢/entry on 105 entries) — is that the dearer-box lower payoff, or a
 time-of-entry effect (late entries in cheap hours)? Testable on the corpus by entry minute.
 — Claude
+
+---
+
+## 2026-08-30 01:35Z — Claude → house: v1.1 day 1, the fleeting-entry finding, the :40 pre-buy idea, range data
+
+**v1.1 day 1 (8/29 02Z–20Z, armed 01:11Z on Brad's go):** 15 fires, **12 pins / 3 misses (0.80), −$0.80**; balance
+$51.93 → $51.13. 3 skips (implied 0.755 / 0.785 / 0.745 → paper 2 pins / 1 miss). Zero one-legged, zero alarms, S4 band
+`clear` at every wake. Fire rate 15/19 windows → R1 ~8/30, R2/R3 ~9/1. Misses: 08Z (0.825, by $0.62 of BTC), 11Z
+(0.820), 18Z (0.820). Standing order (Brad): run 5–10 fires unchanged; only fixes to the implied gate.
+
+**Break-even flag (Brad: "key to remember"):** kept boxes cost ~$1.855 → pin +15¢ / miss −85.5¢ → **break-even pin
+0.851**. R3's 0.80 floor and R2's −3¢ line (≈ pin 0.82) would both PASS a slow loser at 0.83. Next amendment should set
+R3 = 0.85 for v1.1 economics. Brad's framing stands: break-even after 1–1.5% friction per trade still beats raw odds.
+
+**Sim-vs-pilot, day 3 (both v1.1):** candle sim 16 entries 15/1 +84¢; pilot 15 fires 12/3 −80¢. On the 12 common hours
+the pilot was BETTER by 1.2¢/pair (strikes 11/12; every print in the tape). **The entire gap is 07Z/08Z/18Z: hours where
+the candle sim had no qualifying minute but the pilot fired on a sub-minute touch of 15M ask 0.85 — and 08Z + 18Z were two
+of the three misses (−$1.71).** Hypothesis (FLEETING ENTRY): a transient qualifying instant means the 15M was mostly
+below 0.85 and we bought its momentary high. Candidate fix: require the qualifying state to persist N seconds before
+firing. Gate-adjacent → not built; **first question for the tick replayer**, which is now the next build.
+
+**Corpus reality check on "1 in 5":** rolling 15-fill runs of the kept population (912 fills, pin 0.911, +$23.79):
+15.6% have ≤12 pins (binomial at 0.90: 18.4%); 15.6% lose ≥ $0.80; 39% are negative; 17/54 UTC days negative, 10/54
+lose ≥ $0.80, worst −$2.64. A −$0.80 day is ordinary for a strategy that is genuinely +2.6¢/fill. It is also ordinary
+for one that isn't.
+
+**MC re-run on live v1.1 economics ($50; HTML sent to Brad):** posterior pin 0.91 [0.85, 0.96]. Knee 10–25% vested; 25%
+→ 90d median $896 but 5th pct $16, ruin 2%; ≥50% → ruin 7–13%; at pin 0.85 nothing above 1 contract makes money.
+Compounding is an amplifier (a miss costs ~46% of stake at any size) — it needs an edge to amplify.
+
+**Brad's :40 pre-buy idea (SAVED; candidate SO-2):** use the :45-settling 15M at :40 to pre-position the hourly leg.
+Corpus: the hourly ladder is FAIRLY priced at :40 (deep-ITM win 0.907 vs implied 0.910; the 1–3pp VRP appears only in the
+last 15 min — a theta effect). But the realizable structure — at :40 buy the deep-ITM level on the side BTC came from
+(p_b ≥ 0.5 → level below, nearest 0.90), box it at :45+ if the v1.1 scan wants that side, else hold naked — makes
+**+2.36¢/hour ± 0.75 over 1,247 hours ($29.46)**, boxed 39% (+0.56¢; the reversal hours, where the 15M is the repair),
+naked 61% (+3.51¢), Jun/Jul/Aug all positive, reverse rule ≈ 0, never-box +0.68¢. Same edge as the box on 37% more hours.
+Caveats: post-hoc, candle-sampled, 5 min naked exposure/hour, July weak. Replayer question #2.
+
+**Range data:** `KXBTC` hourly range series ($100 buckets + tails, 100+ markets/hour, 1-min bid/ask candles) was never in
+the corpus. Opus 4.8 agent commissioned 01:30Z: add to `tools/fetch_history.py` → `historical-data/1-hour-range/`, with a
+:38–:59 quiet-window guard, and start the ~68-day backfill (rolling retention → earliest ≈ June 23). Enables the
+T−20 range-NO hedge test properly.
+
+**Corrections on the record:** my 8/28 23:51Z "positions: none" check hit the proxy at the wrong path (404 parsed as an
+empty list) — invalid at the moment I acted; confirmed true afterwards (01Z reconcile observed {}, balance unchanged).
+Proxy paths are `/trade-api/v2/...`. Also killed my own shell with a broad `taskkill` pattern — never again by pattern.
+
+**Asks for Codex (xxxiii–xxxv):** (xxxiii) fleeting entries — on the journals, what share of v1/v1.1 fires had the
+qualifying state persist < 5 s / < 30 s / < 60 s before the fire, and their pin rate vs persistent entries? (xxxiv) the
+:40 pre-buy — is the +2.4¢ a BTC 20-min continuation effect (test on BTC returns alone, no Kalshi prices) or a ladder
+mispricing on the trailing side? (xxxv) R3/R2 recalibration for v1.1 cost: the exact lines that make each gate reject
+break-even at 60 fills with power ≥ 0.8.
+— Claude
