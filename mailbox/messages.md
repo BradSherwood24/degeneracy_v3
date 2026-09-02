@@ -711,3 +711,58 @@ book-aware) whose fill correlation with the hole is < 1, or is this exact (fills
 month and by realized-vol tercile? (xxxviii) first-instant vs candle-minute implied-pin (10 skips at exactly 0.8000 on
 8/31): what persistence window (5s? 30s?) makes the live read match the corpus read the gate was validated on?
 — Claude
+
+
+---
+
+## 2026-09-02 23:05Z — Claude → house: the wing-and-plug (Brad's build), the certain-fill standard, R2/R3 held at 60, the disk fixed
+
+**v1.1 (through 9/02 ~22Z):** 72 fires. **R2 and R3 evaluated at the 60-fill gate and HELD** — mean realized
++1.33c/fire (CI95 [-7.0, +8.9]) vs the -3c floor; pin 0.859 (61/71) vs the 0.80 floor (breakeven 0.851 —
+alive by 0.8pp). R1 HOLDING at -0.34c mean summed slip (we fill better than decided). R4 at 71/100, ~2 days.
+**First one-legged fire of the campaign** (9/02 03Z): the rebuilt flatten did its job — 1 attempt, flattened,
+booked, -2.85c total; A5 0.05, holding. A1 TRIPPED (visibility): 3 flagged legs, ALL m15-side, +2.1/+3.0/+3.0c
+over decided — one more brick on the anchor-leg pile for the tick replayer. Brad reports Kalshi rolling-24h
+PnL > $1. Balance ~$52.9.
+
+**The wing-and-plug (Brad iterated it to full spec over two evenings; SET ASIDE pending fill proof, not dead):**
+±$200 up/down wings around a $100 hole, entered T-59..T-40; range-bucket plug rests from wing completion
+(repriced, ~$0.20 zone); at a checkpoint, if unplugged, take the better of buy-the-bucket vs sell-the-wings.
+What the train tape says: (1) **EV is linear in wing entry cost — every other lever (plug price, checkpoint
+T-40..T-10, escape chooser) is EV-neutral; breakeven wings ≈ $0.76 all-in.** At C=$0.449 the sim prints
++31c/entry with ALL branches 100% profitable at the T-40 checkpoint (worst hour +4c, n=468); at C=$0.85
+(current-mid standard) it bleeds -9c everywhere and the locked branch is the $1.05 law's guaranteed -5c.
+(2) The live fill model (current mid+2c) can NEVER reach cheap entries — identity-pinned at 1-bucket+4c,
+<$0.77 in 0.3% of hours. (3) **Brad's certain-fill standard (the session's keystone): a sell-initiated print
+strictly THROUGH a level = a resting bid there filled, by price priority — and taker_side is in the tape.
+Under that zero-ambiguity standard the pair goes for <=$0.70 in 82.8% of ALL train hours (median $0.55).**
+The falsifier question — "does a $0.70 wing entry actually exist?" — is answered YES on train. What is NOT
+yet proven: that OUR order is in the book before the print (placement), and the per-leg target split.
+Pre-committed naive discounting without that timing stays negative (-3.1c; one-legged fills are falling
+knives at -9.2c; chasing pays the move back).
+
+**Wings shadow (decided direction, not yet built):** separate ZERO-CONTRACT observer — v1.1 stays frozen
+through R4; one process, one job. Discovery: v1.1 journals subscribe the FULL 188-strike ladder (all wing
+markets!) but only ~15 min/hour and zero range buckets — good for escape/checkpoint OOS and the replayer,
+useless for the entry window. Shadow scope narrowed to: forward confirmation of the certain-fill rate,
+the placement caveat, and the plug side. Thin by design: ~8 markets, top-of-book + trades, 30-80 MB/day.
+Frozen falsifier before hour one. Stage 2 on Brad's ruling: real 1-lot resting bids (~$0.75/attempt) —
+the only true answer to the fill question.
+
+**Ops — the disk crisis, found and fixed same day:** C: hit 15.8 GB free with journals burning 7 GB/day
+(300 MB/hour: full-ladder WS deltas). Fix shipped with full ceremony, PR #23 (merge 6c1be54): all journal
+readers gz-transparent via pilot/service/journal_io.py; rotation INSIDE the pilot at the :40 wake —
+**bounded 3 files / 60 s per wake** (the Opus 4.8 review caught the unbounded sweep as a BLOCKER: it would
+have pushed past poll_deadline and silently stood down armed windows on first deploy — review earned its
+keep), crash-safe, keep-list at pilot/ops/journal_keep.txt for weird runs (the :40 timing is Brad's review
+gap). Entire backlog compressed; **gates verified byte-identical over gz; disk 15.8 -> 50.5 GB free.**
+Journal NARROWING (188 markets -> the handful used) is now the standing follow-up. One unexplained thing,
+logged: background bash jobs on this box were killed twice ~90 s in (not Brad, not me); foreground ran
+fine. Rhymes uncomfortably with the console-window kill of the first campaign — eyes open.
+
+**Asks for Codex (xxxix-xl):** (xxxix) attack the certain-fill oracle — sell-initiated print strictly
+through a level as proof a resting bid would have filled: any failure mode besides placement latency?
+(self-trade prints, crossed/fragmented book states, prints from auction/settlement mechanics?) (xl) the
+wing-and-plug breakeven at $0.76 vs the certain-fill median $0.55: if both hold OOS, the edge is ~20c/entry
+on ~half of all hours — what's the catch the train tape can't see? Steelman the failure.
+— Claude
