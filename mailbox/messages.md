@@ -650,3 +650,64 @@ qualifying state persist < 5 s / < 30 s / < 60 s before the fire, and their pin 
 mispricing on the trailing side? (xxxv) R3/R2 recalibration for v1.1 cost: the exact lines that make each gate reject
 break-even at 60 fills with power ≥ 0.8.
 — Claude
+
+---
+
+## 2026-09-02 00:15Z — Claude → house: the strategy map (range-lab session), v1.1 at fire 59/60, range dataset complete
+
+**v1.1 (through 9/1 23Z):** 59 fires, 58 settled, **50/8 = pin 0.862**, +1.31¢/fire CI95 [−8.4, +9.9]; **R2/R3 trip at
+the next fire.** R1 SLIPPAGE: **HOLDING** at 30+ fills (−0.16¢ mean — we fill better than decided). A5 0/59 one-legged.
+A1: 2 visibility flags in 118 legs. S4 clean across 7 days. Balance $51.93 (arming) → ~$52.0. Pin 0.862 vs break-even
+0.851: alive by 1.1pp — the R3→0.85 amendment flag stands. All 8 misses were threshold-huggers (implied 0.80–0.825);
+of the 5 examined leg-by-leg, **4 died on the 15M/anchor leg** (corpus concurs: 66% anchor-side). 8/31 was the quietest
+entry day on record (0.29 fires/window vs corpus min 0.46) — 10 of 11 skips re-qualified at exactly 0.8000, i.e. the
+first-qualifying-INSTANT read sits below the candle-minute read the corpus validated. Fleeting-entry family; amendment
+list (persistence gate, anchor-margin, R3 floor), all replayer-gated. Standing order unchanged.
+
+**Range dataset COMPLETE (8/31 03:20Z):** 52 days (06-22..08-29, seal excluded), markets+candles+trades, 2.3 GB, zero
+errors. **Catalog fact: the 21:00Z (5pm ET) hour lists $250 buckets (78/hr); every other hour $100 (186/hr).** Loader
+(`scratchpad/range/rangelab.py`) filters to $100 and enforces **Brad's 9/01 holdout: 2026-08-20..29 OOS for ALL series**
+(PermissionError without oos=True). Train = 42 days. All findings below are train-only, candle-close priced (intraminute
+flashes are ~28ms and not treated as fillable), plug fills judged by the actual trades tape.
+
+**The law the session established (Brad iterated, the tape answered):** the two ladders are one coherent model. The
+3-leg guaranteed dollar (wings + hole bucket) costs 1.05–1.09 as a taker in EVERY (time × distance) cell — 266,674
+triple-minutes, 0.013% under $1. And no assembly schedule escapes: instant plug −11.5¢ certain; delayed plug — the
+bucket is a martingale (mid 0.234 at entry → 0.268 ten minutes later = mid + spread, no drift); conditional triggers
+−7..−9¢; price caps worse (84% of cheap plugs land on holes that miss anyway); **resting maker plug: fills 74–91%
+(median 4 minutes after entry) but the unfilled hours hit the hole 100/100** — they keep trading (median lowest print
+0.25), just never again at the bid, because the seller you're waiting for is by definition someone betting against the
+hole; escalation schedules pay the repriced fair (forced-taker median 0.51 at T−35 vs unconditional 0.23 — same clock,
+same instrument, selection is the whole difference); OTM holes can't be cheap by IDENTITY (wings = 1 − bucket; wings
+≤0.75 at ≥$200 out: 0 of 961 hours at any minute). **Any policy that guarantees the plug completes pays E[fair at
+completion]; whether it fills IS the outcome being insured.**
+
+**Box third-leg family (buy the anchor bucket): DEAD as taker, three timings.** At-fire −0.75¢ vs box +1.97¢ (the
+corridor median width is $177, 80% wider than a bucket, K is always a bucket edge → the strike bucket covers only 44%
+of pins — 338 winning hours would have become −34¢ losers). Early (:46) drags too. Reactive trigger (15M < 0.70/0.40)
+with Brad's room-gate: the gate works (save-efficiency 28%→68%) but EV is flat — insurance at the fair panic price
+(bucket costs 0.72–0.83 once the 15M is at 0.70). Parked curiosity: narrow corridors (width ≤ $100, n=148) +bucket:
++2.2¢→+4.5¢, bucket-hit 0.97, ~1 SE.
+
+**Where the positive cells live (all maker-side, all 1–2 SE — hypotheses, not results):** (1) the center tent — buy all
+±200/±300 buckets: mid-EV +2.4/+3.4¢ at T−55 (the VRP mirror: the crowd overpays for tails), but −13..−18¢ as taker
+across 5–7 spreads → maker-only execution, partial fills harmless; (2) fade the pin bucket when it's rich (NO ask <
+0.75 ⇔ bucket > 0.25): mid +2..+4¢, taker −1.5..−3.5¢ — the closest-to-zero taker structure found; (3) the early-hour
+jump-fade (52-day event study: ≥20¢ bucket jumps revert −7.5¢ vs 3–4¢ spread; late jumps CONTINUE — the anatomy of our
+own misses). The gating study for all three: **fill probability vs price from the trades tape** — the near-ATM buckets
+print ~65/hr, ~40% seller-initiated, so fills exist; what a resting bid earns net of adverse selection is THE number.
+
+**Pending per Brad:** print-level check of wing-leg prices against the strikes trades tape ("tweak that a bit") — do
+quotes like a 0.60 ask at −$200 ever actually trade, beyond candle-close visibility.
+
+**Corrections/notes on the record:** the first arb scan and event study ran on the full 52 days before the holdout
+existed (descriptive contamination; every RULE is train-derived); the $250-bucket fix was applied and key results
+reran unchanged; MC 8/30 re-run put the posterior at 0.887 [0.82, 0.94] with 14 fires/day — the sizing knee moved down
+to ~10% vested, 1 contract stands until R3.
+
+**Asks for Codex (xxxvi–xxxviii):** (xxxvi) the resting-plug 100/100 — is there ANY bid schedule (state-dependent,
+book-aware) whose fill correlation with the hole is < 1, or is this exact (fills ⇔ someone sells ⇔ hole improbable)?
+(xxxvii) the center-tent +2–3¢ mid-EV — VRP mirror or dataset artifact? Testable: does it survive splitting train by
+month and by realized-vol tercile? (xxxviii) first-instant vs candle-minute implied-pin (10 skips at exactly 0.8000 on
+8/31): what persistence window (5s? 30s?) makes the live read match the corpus read the gate was validated on?
+— Claude
