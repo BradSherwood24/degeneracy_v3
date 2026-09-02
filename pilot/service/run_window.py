@@ -1302,10 +1302,16 @@ class WindowService:
         Skips ``summary.jsonl``, the CURRENT window's journal (which the write path still emits raw),
         any name listed in ``ops/journal_keep.txt``, and anything with mtime younger than 30 min.
         The current window's journal does not yet exist on disk at the wake, but it is excluded by
-        name anyway (defensive). ANY exception — from the sweep or from journaling its result — is
-        caught and logged here so a rotation failure can NEVER affect the window run."""
+        name anyway (defensive). Work is BOUNDED per wake (at most DEFAULT_MAX_FILES files / a wall-
+        clock budget) so a large backlog can never push execute() past the anchor poll deadline —
+        the remainder drains over subsequent wakes. ANY exception — from the sweep or from journaling
+        its result — is caught and logged here so a rotation failure can NEVER affect the window run."""
         try:
-            from service.journal_io import rotate_closed_journals
+            from service.journal_io import (
+                DEFAULT_MAX_FILES,
+                DEFAULT_MAX_SECONDS,
+                rotate_closed_journals,
+            )
 
             current = _safe_close(self.close_time) + ".jsonl"
             keep_path = os.path.join(self._ops_dir, "journal_keep.txt")
@@ -1314,11 +1320,14 @@ class WindowService:
                 exclude_basenames={current},
                 keep_path=keep_path,
                 now=self.clock(),
+                max_files=DEFAULT_MAX_FILES,       # bound the pre-execute critical path
+                max_seconds=DEFAULT_MAX_SECONDS,
             )
-            if summary["rotated"] or summary["errors"]:
+            if summary["rotated"] or summary["errors"] or summary.get("deferred"):
                 logger.info(
-                    "[RUN] journal rotation: %d compressed, %d bytes saved, %d error(s)",
+                    "[RUN] journal rotation: %d compressed, %d bytes saved, %d error(s), %d deferred",
                     summary["count"], summary["bytes_saved"], len(summary["errors"]),
+                    summary.get("deferred", 0),
                 )
                 self._journal("journal_rotation", summary)
         except Exception as e:  # noqa: BLE001 - rotation must never affect the window run

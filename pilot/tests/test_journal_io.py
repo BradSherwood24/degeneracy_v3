@@ -252,3 +252,71 @@ def test_rotation_is_idempotent(tmp_path):
     second = rotate_closed_journals(d, exclude_basenames=set(), now=_FUTURE)
     assert second["count"] == 0            # nothing left to compress (glob *.jsonl skips *.jsonl.gz)
     assert second["rotated"] == []
+
+
+# ---------------------------------------------------------------------------
+# rotation is BOUNDED per call (finding 1) — count cap + wall-clock budget
+# ---------------------------------------------------------------------------
+def test_rotation_bounded_by_max_files(tmp_path):
+    d = str(tmp_path)
+    names = [f"2026082{i}T040000Z.jsonl" for i in range(5)]  # 5 eligible closed journals
+    for n in names:
+        _write_lines(os.path.join(d, n), ["{}"])
+
+    summary = rotate_closed_journals(d, exclude_basenames=set(), now=_FUTURE, max_files=2)
+
+    assert summary["count"] == 2                       # only the bounded subset compressed
+    assert summary["deferred"] == 3
+    assert summary["stopped_early"] is True
+    assert summary["rotated"] == names[:2]             # deterministic sorted order
+    # the deferred three remain raw for the next wake
+    for n in names[2:]:
+        assert os.path.exists(os.path.join(d, n))
+        assert not os.path.exists(os.path.join(d, n + ".gz"))
+
+
+def test_rotation_bounded_by_wall_clock_budget(tmp_path):
+    d = str(tmp_path)
+    for i in range(5):
+        _write_lines(os.path.join(d, f"2026082{i}T040000Z.jsonl"), ["{}"])
+
+    # fake monotonic: call 1 = started (0), call 2 (first file) = 0 -> under budget, calls 3+ = 100
+    # -> over the 60 s budget, so exactly one file is started and the rest are deferred.
+    state = {"n": 0}
+
+    def fake_mono():
+        state["n"] += 1
+        return 0.0 if state["n"] <= 2 else 100.0
+
+    summary = rotate_closed_journals(
+        d, exclude_basenames=set(), now=_FUTURE, max_files=10, max_seconds=60.0, monotonic=fake_mono,
+    )
+    assert summary["count"] == 1
+    assert summary["deferred"] == 4
+    assert summary["stopped_early"] is True
+
+
+# ---------------------------------------------------------------------------
+# leftover raw whose .gz already exists (finding 4) — do NOT re-gzip; retry raw delete
+# ---------------------------------------------------------------------------
+def test_rotation_skips_and_clears_when_gz_already_exists(tmp_path):
+    d = str(tmp_path)
+    raw = os.path.join(d, "20260826T040000Z.jsonl")
+    gz = raw + ".gz"
+    _write_lines(raw, ["{}"])           # leftover raw (a prior wake's remove was blocked by a lock)
+    _write_gz_lines(gz, ["{}"])         # its .gz already exists
+
+    summary = rotate_closed_journals(d, exclude_basenames=set(), now=_FUTURE)
+
+    assert "20260826T040000Z.jsonl" not in summary["rotated"]   # NOT re-compressed
+    assert summary["count"] == 0
+    assert not os.path.exists(raw)                              # best-effort raw delete retried
+    assert os.path.exists(gz)                                   # the .gz is preserved
+
+
+# ---------------------------------------------------------------------------
+# compresslevel is the fast level 6 (finding 2)
+# ---------------------------------------------------------------------------
+def test_gzip_compresslevel_is_six():
+    from service import journal_io as ji
+    assert ji.GZIP_COMPRESSLEVEL == 6
