@@ -1,0 +1,5 @@
+# journal_keep.txt — one raw journal FILENAME per line that the :40-wake rotation
+# must NOT compress (e.g. a window under active offline diagnosis). Blank lines and
+# lines starting with '#' are ignored. Match the exact basename, e.g.:
+#   20260826T050000Z.jsonl
+# A missing/empty file means "keep nothing raw" — every eligible closed journal is gzipped.

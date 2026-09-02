@@ -118,7 +118,7 @@ def _parse_window(path: str):
     t_ready_ms = None
     last_scalars = None
 
-    is_sanity = os.path.basename(path).replace(".jsonl", "") == SANITY_WINDOW
+    is_sanity = _window_name(path) == SANITY_WINDOW
     sanity_540 = []        # (ts, size_hundredths) whenever depth at H yes-bid 540 mils changes
     last_540 = None
 
@@ -525,7 +525,7 @@ def _outcomes_for_config(pol, ask_timeline):
 
 def process_window(path: str) -> dict:
     hdr, events, ask_timeline, t_ready_ms, recon, sanity = _parse_window(path)
-    name = os.path.basename(path).replace(".jsonl", "")
+    name = _window_name(path)
     out = {
         "window": name, "path": path,
         "close_time": hdr.close_time, "close_epoch": hdr.close_epoch,
@@ -797,10 +797,27 @@ def write_per_window_csv(results, path):
                                                  rec["ask_B_tA"], rec["ask_B_target"], rec["ask_B_sz"]])
 
 
+def _window_name(path):
+    """Journal path -> window stem, handling BOTH ``.jsonl`` and rotated ``.jsonl.gz``."""
+    base = os.path.basename(path)
+    if base.endswith(".jsonl.gz"):
+        return base[: -len(".jsonl.gz")]
+    if base.endswith(".jsonl"):
+        return base[: -len(".jsonl")]
+    return base
+
+
 def _find_journals(journal_dir):
     import glob
-    files = sorted(glob.glob(os.path.join(journal_dir, "2026*.jsonl")))
-    return files
+    # gz-aware discovery: the pilot's :40 wake compresses closed journals to ``*.jsonl.gz``. Without
+    # this, a post-rotation run would silently see only the handful of not-yet-rotated raw windows.
+    # Dedup by stem, preferring the raw ``.jsonl`` when both exist (a not-yet-cleaned rotation artifact).
+    chosen = {}
+    for path in glob.glob(os.path.join(journal_dir, "2026*.jsonl.gz")):
+        chosen.setdefault(_window_name(path), path)
+    for path in glob.glob(os.path.join(journal_dir, "2026*.jsonl")):
+        chosen[_window_name(path)] = path
+    return [chosen[k] for k in sorted(chosen)]
 
 
 def main(argv=None):
@@ -815,7 +832,7 @@ def main(argv=None):
     files = _find_journals(args.journals)
     if args.only:
         want = set(args.only.split(","))
-        files = [f for f in files if os.path.basename(f).replace(".jsonl", "") in want]
+        files = [f for f in files if _window_name(f) in want]
     if args.limit:
         files = files[:args.limit]
 

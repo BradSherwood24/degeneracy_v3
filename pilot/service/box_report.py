@@ -1297,10 +1297,12 @@ def load_journal_file(path: str, keep_kinds: tuple[str, ...] = REPORT_KINDS) -> 
     top-level one — an ``obj`` that embeds ``"kind": "kalshi_ws"`` (or a keep-marker) in a nested field
     is never confused for the record's kind, in either direction. A truncated final line (or any
     unparseable line) is skipped, not raised."""
+    from service.journal_io import open_journal  # gz-transparent (raw .jsonl or .jsonl.gz)
+
     keep = set(keep_kinds)
     tok = _KIND_TOKEN
     out: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open_journal(path) as f:
         for ln in f:
             i = ln.find(tok)
             if i == -1:
@@ -1322,7 +1324,12 @@ def load_journal_file(path: str, keep_kinds: tuple[str, ...] = REPORT_KINDS) -> 
 def _close_from_filename(path: str) -> str | None:
     """Inverse of run_window._safe_close for a fallback close_time: 20260826T050000Z -> ...ISO."""
     base = os.path.basename(path)
-    stem = base[:-6] if base.endswith(".jsonl") else base
+    if base.endswith(".jsonl.gz"):
+        stem = base[: -len(".jsonl.gz")]
+    elif base.endswith(".jsonl"):
+        stem = base[: -len(".jsonl")]
+    else:
+        stem = base
     if len(stem) == 16 and stem[8] == "T" and stem.endswith("Z"):
         y, mo, d = stem[0:4], stem[4:6], stem[6:8]
         h, mi, s = stem[9:11], stem[11:13], stem[13:15]
@@ -1331,10 +1338,10 @@ def _close_from_filename(path: str) -> str | None:
 
 
 def load_journals(journal_dir: str) -> list[tuple[str, list[dict[str, Any]]]]:
+    from service.journal_io import journal_paths  # discovers *.jsonl AND *.jsonl.gz (dedup, prefer raw)
+
     out: list[tuple[str, list[dict[str, Any]]]] = []
-    for path in sorted(glob.glob(os.path.join(journal_dir, "*.jsonl"))):
-        if os.path.basename(path).startswith("summary"):
-            continue
+    for path in journal_paths(journal_dir):
         try:
             records = load_journal_file(path)
         except Exception:  # noqa: BLE001 - one bad journal must not sink the report

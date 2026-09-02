@@ -16,15 +16,28 @@ If neither yields both tickers, the window is SKIPPED (reason recorded).
 from __future__ import annotations
 
 import datetime as _dt
+import gzip
 import json
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import IO, Iterator, Optional
+
+
+def _open_journal(path: str) -> IO[str]:
+    """Open a journal for text reading, transparently handling gzip.
+
+    The pilot's :40 wake compresses closed journals to ``<name>.jsonl.gz`` (crash-full disk repair,
+    2026-09-02), so the replayer — which reads only ``pilot/journals/`` — must read both. ``.gz`` ->
+    ``gzip.open(..., "rt")``; else plain text open. Kept local so this ``sim`` package stays
+    self-contained (no import into the ``pilot`` package)."""
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
 
 
 def iter_ws(path: str) -> Iterator[dict]:
     """Yield the ``obj`` of each ``kalshi_ws`` record, augmented with ``_idx`` and
     ``_local_ts`` from the envelope. Streams line-by-line (journals are ~130 MB)."""
-    with open(path, "r", encoding="utf-8") as fh:
+    with _open_journal(path) as fh:
         for line in fh:
             if '"kalshi_ws"' not in line:
                 continue
@@ -78,7 +91,7 @@ def read_window_header(path: str) -> WindowHeader:
     the whole file so a late ``fire`` is not missed (fire can appear well into the tape)."""
     hdr = WindowHeader(path=path)
     q_high = q_low = None
-    with open(path, "r", encoding="utf-8") as fh:
+    with _open_journal(path) as fh:
         for line in fh:
             if '"kalshi_ws"' in line:
                 # Fast reject the overwhelming majority of lines without JSON-parsing them.

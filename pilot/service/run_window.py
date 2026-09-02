@@ -1290,7 +1290,52 @@ class WindowService:
             plan = self.prepare()
         except Exception:  # noqa: BLE001 - finding 5: a startup-step crash must still leave a trace
             return self._finalize_startup_failure(traceback.format_exc())
+        # Disk repair (Brad, 2026-09-02): at the wake, AFTER prepare() has done all reconcile/inherit
+        # reads, gzip closed journals from prior hours to reclaim disk. Best-effort and fully
+        # isolated — never allowed to affect the window run.
+        self._rotate_closed_journals()
         return self.execute(plan)
+
+    def _rotate_closed_journals(self) -> None:
+        """Compress closed raw journals in ``self.journal_dir`` to ``.jsonl.gz`` (disk-full repair).
+
+        Skips ``summary.jsonl``, the CURRENT window's journal (which the write path still emits raw),
+        any name listed in ``ops/journal_keep.txt``, and anything with mtime younger than 30 min.
+        The current window's journal does not yet exist on disk at the wake, but it is excluded by
+        name anyway (defensive). Work is BOUNDED per wake (at most DEFAULT_MAX_FILES files / a wall-
+        clock budget) so a large backlog can never push execute() past the anchor poll deadline —
+        the remainder drains over subsequent wakes. ANY exception — from the sweep or from journaling
+        its result — is caught and logged here so a rotation failure can NEVER affect the window run."""
+        try:
+            from service.journal_io import (
+                DEFAULT_MAX_FILES,
+                DEFAULT_MAX_SECONDS,
+                rotate_closed_journals,
+            )
+
+            current = _safe_close(self.close_time) + ".jsonl"
+            keep_path = os.path.join(self._ops_dir, "journal_keep.txt")
+            summary = rotate_closed_journals(
+                self.journal_dir,
+                exclude_basenames={current},
+                keep_path=keep_path,
+                now=self.clock(),
+                max_files=DEFAULT_MAX_FILES,       # bound the pre-execute critical path
+                max_seconds=DEFAULT_MAX_SECONDS,
+            )
+            if summary["rotated"] or summary["errors"] or summary.get("deferred"):
+                logger.info(
+                    "[RUN] journal rotation: %d compressed, %d bytes saved, %d error(s), %d deferred",
+                    summary["count"], summary["bytes_saved"], len(summary["errors"]),
+                    summary.get("deferred", 0),
+                )
+                self._journal("journal_rotation", summary)
+        except Exception as e:  # noqa: BLE001 - rotation must never affect the window run
+            logger.warning("[RUN] journal rotation failed (ignored): %s", e)
+            try:
+                self._journal("journal_rotation_error", {"error": repr(e)})
+            except Exception:  # noqa: BLE001
+                pass
 
     def _finalize_startup_failure(self, tb: str) -> int:
         """Finding 5: a startup step in prepare() crashed BEFORE a Plan existed. execute()'s finally
