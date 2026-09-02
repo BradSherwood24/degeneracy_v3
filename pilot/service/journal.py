@@ -88,8 +88,10 @@ def load_journal(path: str) -> Journal:
     re-derives the index from position so a hand-edited or concatenated file still yields a
     contiguous 0..n-1 sequence.
     """
+    from service.journal_io import open_journal  # gz-transparent (raw .jsonl or .jsonl.gz)
+
     j = Journal()
-    with open(path, "r", encoding="utf-8") as f:
+    with open_journal(path) as f:
         for line in f:
             line = line.strip()
             if not line:

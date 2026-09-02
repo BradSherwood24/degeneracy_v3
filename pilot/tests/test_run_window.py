@@ -1209,3 +1209,50 @@ def test_unregister_script_dryrun_is_well_formed():
     else:
         with open(script, "r", encoding="utf-8") as f:
             assert "Unregister-ScheduledTask" in f.read()
+
+
+# ---------------------------------------------------------------------------
+# :40-wake journal rotation wiring (Change B) — WindowService._rotate_closed_journals
+# ---------------------------------------------------------------------------
+def test_rotate_closed_journals_wiring(tmp_path):
+    """The WindowService rotation step compresses old closed journals, excludes the current
+    window + summary, honors the ops/journal_keep.txt keep-list, journals a record, and never
+    raises. Uses os.utime so mtimes are old relative to the fixture's fixed clock."""
+    import gzip as _gzip
+
+    svc = _svc(tmp_path, "shakedown")
+    jd = svc.journal_dir
+    os.makedirs(jd, exist_ok=True)
+    old_ts = _FIXED_NOW - 3600.0  # 1h before the fixed wake clock -> eligible
+
+    prior = os.path.join(jd, "20260821T210000Z.jsonl")          # a closed prior window -> rotate
+    current = os.path.join(jd, "20260821T220000Z.jsonl")        # THIS window (CLOSE) -> excluded
+    summary = os.path.join(jd, "summary.jsonl")                  # summary -> excluded
+    keptname = "20260821T200000Z.jsonl"
+    kept = os.path.join(jd, keptname)                            # keep-listed -> excluded
+    for p, lines in ((prior, ['{"idx": 0, "kind": "box_fire", "obj": {"a": 1}}']),
+                     (current, ['{"idx": 0, "kind": "window_start", "obj": {}}']),
+                     (summary, ['{"s": 1}']),
+                     (kept, ['{"idx": 0, "kind": "x", "obj": {}}'])):
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.utime(p, (old_ts, old_ts))
+
+    # keep-list lives under the service's ops dir (derived from the mode.txt path -> tmp).
+    os.makedirs(svc._ops_dir, exist_ok=True)
+    with open(os.path.join(svc._ops_dir, "journal_keep.txt"), "w", encoding="utf-8") as f:
+        f.write(keptname + "\n")
+
+    svc._rotate_closed_journals()  # must never raise
+
+    # prior window compressed + raw removed; reads back to the original line
+    assert not os.path.exists(prior)
+    assert os.path.exists(prior + ".gz")
+    with _gzip.open(prior + ".gz", "rt", encoding="utf-8") as f:
+        assert f.read().strip() == '{"idx": 0, "kind": "box_fire", "obj": {"a": 1}}'
+    # exclusions all stay raw
+    assert os.path.exists(current) and not os.path.exists(current + ".gz")
+    assert os.path.exists(summary) and not os.path.exists(summary + ".gz")
+    assert os.path.exists(kept) and not os.path.exists(kept + ".gz")
+    # a rotation record was journaled
+    assert "journal_rotation" in _kinds(svc.journal)
