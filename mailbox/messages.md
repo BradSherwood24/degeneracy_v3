@@ -887,3 +887,42 @@ re-fetch before the 68-day clock erases June; (4) one 1-lot resting order live s
 "stale candle" vs "naive flow" with the ms Δ data; (xliv) is there a principled E (the sweep-depth distribution suggests a
 fat tail beyond 25c) or is E=25/30 just where fees stop mattering?
 — Claude
+
+
+---
+
+## 2026-09-05 16:20Z — Claude → house: daytime addendum before the box goes offline
+
+**Brad's read of the overnight:** "Returns all seem within the scope of reality. A 1 fire per day at +20 cents would be an
+amazing victory." Orders: record the hourly range WS feed; check V2 for maker-fill fee data; prepare the machine for shutdown
+(offline a few hours this afternoon; RAM not fixable yet).
+
+**MAKER FEE = 0 (from V2).** `degeneracy_v2/scratch/api_fills.json` + `pr34_fills.json`: 15 maker fills (is_taker false) on
+KXBTC15M in July 2026, every one `fee_cost 0.000000`; the 47 taker fills in the same files match 0.07·p·(1−p) to the
+hundredth of a cent (0.0074 at 0.88). Assume 0 for the crypto family (KXBTCD, KXBTC); confirm on the first live resting
+fill. Every maker-leg study drops its fee line (+0.8c on the spot pump-fader's bucket-NO leg).
+
+**RANGE-BUCKET RECORDER MERGED — PR #27 (966ce13), live tree pulled 16:12Z in-window, clean.** `python -m service.record_range`
+from pilot/ — a SEPARATE zero-order process (Opus 4.8 built; Opus 4.8 review: MERGE WITH NITS). Discovers every KXBTC bucket
+co-settling at the hour (all widths), subscribes orderbook_delta + trade through the proxy-signed WS (no key material),
+streams frames write-through to `pilot/journals_range/<close>.jsonl` in the pilot record shape (extractor-compatible),
+gzips at close. 632 tests green; 75 s live smoke: 188 buckets, 4,739 frames, lag 0.49 s, 34 MB RSS flat. ws_client gained an
+optional `channels` param with the default pinned unchanged by test; run_window/box/policy untouched. Nits logged in the PR
+(proxy-down at discovery raises without a summary row; hard kill may leave one torn trailing line; a launch seconds before
+:00 targets the imminent close). **Task Scheduler registration is Brad's lever — NOT registered as of this entry**; command
+in `pilot/ops/RANGE_RECORDER.md` (PowerShell form with -MultipleInstances Parallel recommended: the 10 s grace overlaps :00).
+Once running, the spot pump-fader's PESSIMISTIC fill arm (real bucket depth) becomes testable — the last gap in its falsifier.
+
+**Spot pump-fader, order by order (as briefed to Brad):** each minute T-15..T-5 pick the spot bucket (highest yes-mid); price
+the wings as taker W = ask(YES@Sd) + ask(NO@Su) + fees; rest ONE bucket-NO bid at the largest n with n <= 2 − E − W (maker
+fee 0), capped 1c inside the NO ask — i.e. offer bucket-YES ~E above the touch; cancel/replace each minute; on fill (a buyer
+sweeps through 1−n; WS fill channel ~30 ms) immediately take YES@Sd and NO@Su at the displayed asks; the position pays $2 at
+every settlement; hold. One fill per hour. Risks bounded: informed sweep → complete anyway at worse asks (train −0.6..−4.7c,
+3 of 49); one wing misses → retry ask+1c, naked bucket-NO worth ~0.5–0.8 for seconds; queue → 1–5 lots safe (median 85 lots
+through the level in the fill minute), >10 unproven. Expected 0.7–1.2 fills/day at +20–25c.
+
+**Shutdown state (16:20Z):** no research processes running; fetcher finished (range + hourly + 15M for 8/30–9/04 on disk,
+holdout intact); no scheduled tasks created by Claude; live tree 966ce13 clean; worktree clean; memory current
+(kalshi-fee-exact, pilot-journals-ms-data, pump-fader-finding, pilot-armed-state, journal-rotation/OOM). v1.1 remains
+armed under its standing order; the outage will simply skip windows.
+— Claude
