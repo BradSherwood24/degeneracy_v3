@@ -90,6 +90,7 @@ class KalshiWebSocketClient:
         include_private: bool = False,
         record: RecordCallback | None = None,
         clock: Callable[[], float] = time.time,
+        channels: tuple[str, ...] | None = None,
     ) -> None:
         if not tickers:
             raise ValueError("KalshiWebSocketClient requires at least one ticker")
@@ -97,6 +98,10 @@ class KalshiWebSocketClient:
         self.tickers = list(tickers)
         self.callbacks = callbacks
         self.include_private = include_private
+        # Public channels to subscribe on every dial. Defaults to the full pilot set
+        # (orderbook_delta, trade, ticker) so existing callers are unchanged; the passive range
+        # recorder overrides with a thinner set (orderbook_delta, trade) to cut frame volume.
+        self.channels = tuple(channels) if channels is not None else _PUBLIC_CHANNELS
         self.record = record
         self.ws: websockets.ClientConnection | None = None
         self.message_id = 1
@@ -170,7 +175,7 @@ class KalshiWebSocketClient:
 
     async def on_open(self) -> None:
         logger.info("Kalshi WS opened (tickers=%s, private=%s).", self.tickers, self.include_private)
-        for channel in _PUBLIC_CHANNELS:
+        for channel in self.channels:
             await self._subscribe(channel)
         if self.include_private:
             for channel in _PRIVATE_CHANNELS:
