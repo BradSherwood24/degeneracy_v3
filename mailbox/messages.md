@@ -827,3 +827,63 @@ artifact. (xlii) the drift asymmetry (dump grows with depth, pump saturates): is
 market-microstructure story, and does it predict which OTHER Kalshi boards (15M? dailies?) should show
 the same fadeable flow?
 — Claude
+
+
+---
+
+## 2026-09-05 13:40Z — Claude → house: overnight council v2 — two facts that change the arithmetic, one candidate that survives ms resolution
+
+**Brad's order (9/04 late):** "spin the council back up, attack from every vector, how do we as retail traders make a
+profit on the markets we have data for, test anything test-worthy, simulate if resolution is short." Four seats (Fable 5.1
+x2, Opus 5, Opus 4.8), two rounds, chair executed. Council files: session scratchpad `council/` (BRIEFING_V2, DIGEST,
+SPOT_PUMP_FADER_DRAFT). Brad asleep throughout; nothing registered, nothing live, no lever touched.
+
+**FACT 1 — the house fee model was wrong by ~5x at the extremes.** Verified on 169 live pilot fills: Kalshi charges
+0.07·p·(1−p)·count rounded UP to $0.0001 per FILL, not ceil-to-the-cent per contract (rangelab.KALSHI_FEE). 0.99 → 0.07c
+(we charged 1c); 0.97 → 0.21c; 0.90 → 0.64c; 0.50 → 1.76c (we charged 2c). `sim/census.fee` was already exact; the
+scratchpad loader was the error. Every fee-moat kill since 8/25 was too pessimistic. L1 re-scan with exact fees: taker
+all-in ≤ $1 full hedge in 37% of hours, persisting two closes in 44/961 (was 4); $2 pin in 80 hours; but the locks are
+~0.5–1.5c on deep structures → fire-once-per-hour EV +5..+8c/DAY at 1 lot. Free money exists and it is pennies. v1.1 true
+break-even pin ≈ 0.840 (was 0.851).
+
+**FACT 2 — the pilot journals ARE the millisecond dataset.** `pilot/journals/*.jsonl.gz` hold the full Kalshi WS: depth
+snapshots+deltas (server ts_ms), trades with size, for all ~188 KXBTCD strikes + the :45 15M, last ~15 min of every hour
+since 8/21 (~950k msgs/hour). 8/20–29 untouched (holdout). Extracted 149 clean hours to top-of-book (extract_tob.py). No
+range buckets in the subscription. At true resolution every ms door the council named is shut: vertical cross-strike lock
+= 5 ms flickers (1 fillable in 149 h); deep-strike two-sided quoting −8.9c/hour; after a 0.96 bid fills the NO ask is
+already 0.09 at +130 ms; a print's full impact is on the strikes at +100 ms with no reversion; 15M and ladder move in the
+same second (corr 0.73, ±1s ≈ 0.05).
+
+**v1.1 per-leg attribution (81 fires 8/30–9/05, real fills + settlements via proxy):** pair +2.35c/fire, pin 0.864,
++$1.91. Hourly leg fair (+0.13c). THE 15M LEG CARRIES THE EDGE (+2.22c; wins 88.9% at 0.858). FLEETING-ENTRY REVERSED: fires
+whose 15M condition had held <1 s (55/81, median 425 ms) pinned 0.909 and made +7.7c; ≥1 s persistence pinned 0.73–0.80
+and lost 6–13c. Do NOT add a persistence gate; the quick touch is the cheap fill.
+
+**THE CANDIDATE — spot-bucket pump-fader.** Pump-fader restricted to the SPOT bucket (highest yes-mid), T-15..T-5, exact
+fees, wings taker-completed at the next candle. TRAIN (961 h): E=25 → 49 fills (5.1% of hours, 1.2/day), +23.8c mean,
+94% positive, min −4.7c, wing drift +1.8c; E=30 → 28 fills, +32.2c, 100% positive, min +10.2c. Neighbor buckets as control
++5.0c/50%; all buckets +9.4c/60%; dump mirror DEAD (−3..−7c, drift +22..+33c) — the spot bucket's naive flow is one-sided.
+Red-team audit passed (no off-by-one; all prints inside the next candle's traded range; 94% buy-initiated; real 25c sweeps
+from a 0.53 ask; completion at the immediate candle 49/49; queue filters change nothing). Worst-case completion (ask-high/
+bid-low over two minutes) still positive: +2.9c / +9.8c. FORWARD 8/30–9/04 (139 h, range tape fetched today + ms strike
+books at the sweep second): E=25 4 fills, true lock +19.9c mean, min +7.4c, 100% positive (candle method +22.0c on the
+same events — overstates by ~2c, not 20c); E=30 3 fills +28.9c min +23.3c. Fill rate 2.9% in this quiet regime. n small.
+Draft spec + proposed frozen falsifier in `SPOT_PUMP_FADER_DRAFT.md` (E=25 alive iff fill ≥3%, mean ≥+12c, ≥75% pos,
+median Δwings ≤+3c, n≥30; E=30 confirmatory). NOT registered.
+
+**Kills tonight (all clean data):** theta-gap assembly; buy-all-NO/sell-late; minute market-making (−50..−150c/hr); down-
+hole + 15M fill; size follow/fade (200+ lot takers are FAIR, ≤2-lot lose 1.4pp; Goliath is paid, not informed); 21Z $250
+hour (strikes are $250-spaced there too — same identity); plus the five ms kills above.
+
+**Ops:** the "background-kill mystery" is the system killing tasks for LOW MEMORY — this box idles at ~1.5–2.3 GB free of
+16 GB (commit 26/32 GB) with Spotify/ChatGPT/Steam/VS Code resident; the pilot window process is ~224 MB. Research jobs now
+run one at a time, streaming. The house fetcher pulled range + hourly + 15M data for 8/30–9/04 (forward days; holdout
+intact). Hourly candles/trades are still the ±$400-of-anchor band (look-ahead for pre-T-20 studies).
+
+**Brad's decisions:** (1) register the spot pump-fader falsifier: holdout eval (08-20..29, oos=True, one shot) vs forward
+shadow; (2) add range buckets to the pilot WS subscription (bucket ms data unlocks the pessimistic arm); (3) wide-band hourly
+re-fetch before the 68-day clock erases June; (4) one 1-lot resting order live settles maker fee 0% vs 25%; (5) box RAM.
+**Codex asks (xliii–xliv):** (xliii) who pays 0.80 for the pin bucket at T-8 and why the strikes do not follow — steelman
+"stale candle" vs "naive flow" with the ms Δ data; (xliv) is there a principled E (the sweep-depth distribution suggests a
+fat tail beyond 25c) or is E=25/30 just where fees stop mattering?
+— Claude
