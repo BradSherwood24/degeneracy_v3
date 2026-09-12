@@ -926,3 +926,32 @@ holdout intact); no scheduled tasks created by Claude; live tree 966ce13 clean; 
 (kalshi-fee-exact, pilot-journals-ms-data, pump-fader-finding, pilot-armed-state, journal-rotation/OOM). v1.1 remains
 armed under its standing order; the outage will simply skip windows.
 — Claude
+
+
+---
+
+## 2026-09-12 19:00Z — Claude → house: box back after a week dark; v1.1 task disabled on Brad's order; queue for after the compact
+
+**Timeline.** Box shut down 9/05 ~20:xxZ (the 20:00Z window journal `20260905T200000Z.jsonl` is raw/interrupted) and came
+back 9/12 ~18:48Z. Brad: "I know I said a few hours off, but I really needed that vacation." Task Scheduler ran the
+missed pilot instance at boot (14:48 local, exit 0xC000013A = interrupted); it could not have traded — the signing proxy
+did not survive the reboot (`DegeneracyProxy` task is One-Time-Only, last run 8/26; nothing listening on :8642).
+
+**v1.1 status: TASK DISABLED 18:58Z** (`schtasks /change /tn DegeneracyV3Pilot /disable`) on Brad's explicit order
+("go ahead and do either of those"). `pilot/ops/mode.txt` left `armed` (untouched). Re-enable = `/enable`. No window
+process running. Last settled work: 81 post-holdout fires, +$1.91, pin 0.864 (9/05 attribution). R4 (100 fills) not
+reached. NOTE for the record: v1.1 does NOT skip the 21Z hour — it adapts expected_step (250 on 9/01–9/03, 500 on 9/04)
+and fired there on 9/01 and 9/02; whether it should trade a $250/$500 ladder is an open ruling.
+
+**Range-bucket recorder:** merged (PR #27) but NOT registered; needs the proxy up first. Brad: hold on both proxy and
+recorder for now.
+
+**Queue after the compact (Brad's order of business):**
+1. Proxy restart + range-recorder registration (Brad's levers; recorder command in pilot/ops/RANGE_RECORDER.md).
+2. Spot-bucket pump-fader: ruling on the frozen falsifier (draft in session scratchpad council/SPOT_PUMP_FADER_DRAFT.md;
+   E=25 alive iff fill ≥3%/hr-share, mean lock ≥+12c, ≥75% pos, median Δwings ≤+3c, n≥30; E=30 confirmatory) — holdout
+   one-shot vs forward shadow; the pessimistic-fill arm needs the recorder's bucket books.
+3. Wide-band hourly re-fetch: the 68-day retention clock has now erased June (≈ back to 7/06); July is next.
+4. v1.1: rule on 21Z ($250/$500 ladders) and on re-arming at all vs. retiring in favour of the pump-fader shadow.
+5. Box RAM (1.5–2.3 GB free idle) — research jobs one at a time until fixed.
+— Claude
