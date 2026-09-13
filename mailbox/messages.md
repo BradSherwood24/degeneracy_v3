@@ -955,3 +955,38 @@ recorder for now.
 4. v1.1: rule on 21Z ($250/$500 ladders) and on re-arming at all vs. retiring in favour of the pump-fader shadow.
 5. Box RAM (1.5–2.3 GB free idle) — research jobs one at a time until fixed.
 — Claude
+
+---
+
+## 2026-09-13 15:20Z — Claude → house: v1.1 final tally = break-even; drift was staleness, not flutter; CONTINUOUS-REQUOTE pump-fader; box RAM fixed
+
+**v1.1 final (post-holdout 8/30–9/05, journal `settlement_backfill` attribution, no proxy needed):** 88 fires (1 unresolved 23Z $250 fire
+9/02), pin 0.852, +0.78c/fire (SE 3.8c), total +$0.68. Hourly leg +0.06c (0.975 / 97.7%), 15M leg +0.72c (0.859 / 87.5%). Saturday added
+7 fires with 2 misses (07Z −89c, 12Z −83c) → −63c. Balance cross-check 8/30→9/05: day-guard start 51.34 → 52.63 (+$1.29) vs attribution
++$1.31. Whole armed campaign from 8/27 ≈ −$1.00. Brad: "exactly as expected." Break-even pin 0.840–0.851 → v1.1 is fair, not edge.
+No sim of the dark week 9/05–9/12 is possible until the proxy is up (nothing on disk past 9/04).
+
+**Brad's question — can we lower E for more fires?** Train sweep (1,101 h, stale minute quote): $/day flat E=15..25 (+26..+29c),
+collapses below 15 (E=12: 6.4/day, +3.0c, 57% pos, min −18c). Brad: "sub-second to 1.5 s flutters — can they really be that extreme?"
+**Drift decomposition on the ms strike books (forward 8/30–9/04, 139 h):** A = arm-minute staleness (before the sweep) = +4.5..+6.9c
+mean at E=10..25 (p90 +17.6c); B = sweep instant (print−1s → +1.5s) = +0.6..+1.7c mean, MEDIAN 0. Median fill lands 36–42 s after
+arming. The loss at low E was our once-a-minute bid sitting against wings up to 60 s stale — not flutter. Brad's instinct was right.
+
+**CONTINUOUS REQUOTE (n re-solved vs live W(t), fill = yes print > 1−n(t), completion +1.5 s, one/hour):**
+E=8: 25 fills 4.3/day +7.6c min −3.5 96% pos +33c/day | **E=10: 21 fills 3.6/day +9.3c p10 +5.8 min −1.4 95% pos +34c/day, positive on
+all 6 days** | E=12: 15 fills 2.6/day +10.8c min +0.6 100% pos +28c/day | E=15: 1.9/day +14.3c 100% | E≥20: 0.5/day (requoting removes
+the "lucky stale" fills). Stale E=25 on the same hours: 0.7/day +19.9c = +14c/day. Multi (re-arm after completion) adds ≤2 fills.
+Caveats: 6 forward days only (train has no ms strike books; holdout 8/20–29 untouched); requote cadence ≤1 s assumed (B is the honest
+residual); bucket cap from minute candle (never bound); WING DEPTH (lots at the ask at completion) not yet checked — next.
+Scripts: scratchpad journals/pf_ms_drift.py, pf_ms_requote.py; addendum in council/SPOT_PUMP_FADER_DRAFT.md. ms top-of-book (164 h,
+8/30–9/05) re-extracted after a Temp wipe and PERSISTED at `historical-data/tob/` (gitignored).
+**Recommendation:** register the falsifier on the REQUOTE variant at E=10 or 12; the shadow must cancel/replace on every wing tick.
+
+**Box RAM (Brad's order):** Fast Startup off; MySQL80 → Manual; Dell TechHub/SupportAssist/Digital Delivery/ClientMgmt + Killer
+Analytics/Provider → Disabled; Steam autostart removed; Copilot/Game Assist killed. After a real reboot: used 12.0 → 8.3 GB, nonpaged pool
+1,448 → 878 MB (the "driver anomaly" was mostly Dell/Killer), vendor stack 1.75 GB → 150 MB. ~7.5 GB free idle.
+
+**Queue (unchanged order):** 1. proxy up (Brad) → 2. register range recorder → 3. pilot to dry mode (keeps the strike books flowing;
+the wings need them) → 4. build the requoting zero-order shadow + wing-depth check → 5. wide-band hourly re-fetch (retention clock)
+→ 6. rule on v1.1 retire/21Z. Pilot task still DISABLED; mode.txt still `armed`.
+— Claude
