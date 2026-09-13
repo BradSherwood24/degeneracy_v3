@@ -93,13 +93,22 @@ below are for the FIRST ARMED WINDOW to confirm and for the Phase-4 `[pin]` list
   errs toward HALTING (safe), and the "minus floor" is a deliberate, documented choice, so I left it — but the
   real-balance S4 arguably wants the FULL owed payoff (`min(#legs,2)`). **Phase-4 decision** (kept #6's
   unambiguous unsafe overstatement fixed either way).
-* **Requote-overlap double-fill (residual, by design).** `core._requote` replace keeps the old rest
-  fillable while placing the new (requote2 semantics), so both can momentarily rest. If BOTH fill, the core
-  books the first and DROPS the second (`_apply_fill` gated on `rest_fill is None`) → a naked second
-  bucket-NO (bounded ≤ $1 at 1 contract). Inherent to the model; watch the first armed window.
 * **Reconcile-first keys on non-zero size only.** `reconcile_positions_clean` refuses if any KXBTC* position
   size ≠ 0. Confirm the venue zeroes a SETTLED position by the next :40 (else a slow settlement blocks arming
-  — fail-closed, safe, but could stand the pilot down).
+  — fail-closed, safe, but could stand the pilot down). Added to the first-armed-window list.
+
+## RESOLVED BY RULING (R-OVERLAP, coordinator 2026-09-13) — applied on this branch
+
+* **Requote-overlap double-fill.** The replace is now STRICTLY SEQUENTIAL: `core._requote` emits CANCEL_REST,
+  waits for OrderCancelled (a fill there → TAKE_WINGS, never PLACE), then PLACE_REST at the freshly re-solved
+  n on a later tick — exactly like the bucket-change path. `rest_live` is kept populated (not eagerly cleared)
+  so a fill during the cancel books at the RESTING price, not the drifted `desired_n`; `awaiting_replace` +
+  the cancel-in-flight hold suppress any PLACE while the cancel is outstanding. Never two live rests; never a
+  fillable old rest beside a new one in flight. The ~200-400 ms of no quote per replace (~30 s/hour) is
+  accepted. Core law docstring + `PLAN_V32.md` "Requote policy" updated. Tests: rewrote
+  `test_requote_above_tol_and_debounce_replaces` and `test_requote_debounce_blocks_until_elapsed`
+  (sequential); added `test_replace_no_live_fill_on_trade_while_cancel_in_flight` and
+  `test_fill_during_replace_cancel_takes_wings_not_place`.
 
 ## FIRST ARMED WINDOW MUST CONFIRM
 
@@ -111,7 +120,9 @@ below are for the FIRST ARMED WINDOW to confirm and for the Phase-4 `[pin]` list
    `fill_frame.json`; the NO-space paid price = 1 − yes) — the `exec_price_mismatch` alarm stays quiet.
 5. `/health` exposes `orders_enabled`, `caps.max_contracts_per_order`, `caps.ticker_prefixes`,
    `orders_remaining_today` in the shapes `v32_caps_agree` reads; positions/balance shapes match reconcile/S4.
-6. No requote-overlap double-fill; no unknown-POST stand-down under normal latency.
+6. No requote-overlap double-fill (now sequential by R-OVERLAP); no unknown-POST stand-down under normal latency.
+7. Reconcile-first sees ZERO size for the previous hour's SETTLED positions by :40 (a settled KXBTC* position
+   reports position 0 / is absent, so a fresh window is not blocked from arming by a stale settled row).
 
 ## PHASE 4 `[pin]` LIST (every threshold hard-coded)
 
@@ -127,4 +138,4 @@ below are for the FIRST ARMED WINDOW to confirm and for the Phase-4 `[pin]` list
 
 ## SUITE
 
-`cd pilot && python -m pytest -q` → **765 passed in ~26s** (759 baseline + 6 net new).
+`cd pilot && python -m pytest -q` → **767 passed in ~26s** (759 baseline + 6 review fixes + 2 R-OVERLAP tests).

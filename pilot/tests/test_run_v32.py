@@ -206,7 +206,8 @@ def test_connect_gate_epoch():
 # ===========================================================================
 def _replace_to_new_order(drv, p, now):
     """Place one rest, keep both strikes fresh across the debounce window (no |dn| replace), then move
-    a wing so the core does a TRUE requote2 replace (cancel old kept-live + place new in one decide).
+    a wing so the core does a SEQUENTIAL replace (R-OVERLAP): the moving-wing tick emits CANCEL only
+    (the FrozenExecutor synth-confirms it in the same pump), and the NEXT tick places the new rest.
     Returns (first_coid, second_coid)."""
     # Deep wings (W ~ 1.33) so the BUDGET binds n (not the bucket cap); then moving a wing shifts n.
     _feed_quote(drv, "0.70", "0.60", now)
@@ -217,7 +218,10 @@ def _replace_to_new_order(drv, p, now):
         _feed_quote(drv, "0.70", "0.60", t)
     assert drv.state.rest_live.client_order_id == first, "no premature replace while |dn| < tol"
     t += 0.5
-    _feed_quote(drv, "0.76", "0.60", t)  # yes_ask up -> n down by >= tol, debounce elapsed -> replace
+    _feed_quote(drv, "0.76", "0.60", t)   # yes_ask up -> n down >= tol, debounce elapsed -> CANCEL only
+    assert drv.state.rest_live is None and drv.state.awaiting_replace  # sequential: old cancelled, no new yet
+    t += 0.5
+    _feed_quote(drv, "0.76", "0.60", t)   # after the cancel confirms -> PLACE the new rest
     second = drv.state.rest_live.client_order_id
     return first, second
 

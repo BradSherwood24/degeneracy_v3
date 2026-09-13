@@ -43,6 +43,7 @@ from service.v32 import (
     BookUpdate,
     Fill,
     OrderAck,
+    OrderCancelled,
     Trade,
     V32State,
     classify_ticker,
@@ -264,6 +265,10 @@ def _run_core(fix, E: Decimal, tol: Decimal, deb_ms: int):
             if a.kind == ActionKind.PLACE_REST:
                 ack_oid[0] += 1
                 push(ev.server_ts + _LAT_MS / 1000.0, 0, "ack", (a.client_order_id, f"OID{ack_oid[0]}"))
+            if a.kind == ActionKind.CANCEL_REST:
+                # SEQUENTIAL replace (R-OVERLAP): confirm the cancel after one RTT so the core can then
+                # place the new quote. filled 0 (no fill during this cancel in the fixture).
+                push(ev.server_ts + _LAT_MS / 1000.0, 0, "cancelled", (a.order_id,))
             if a.kind == ActionKind.TAKE_WINGS:
                 take[0] = a
 
@@ -275,6 +280,9 @@ def _run_core(fix, E: Decimal, tol: Decimal, deb_ms: int):
         elif kind == "ack":
             coid, oid = payload
             feed(OrderAck(coid, oid, ts))
+        elif kind == "cancelled":
+            (oid,) = payload
+            feed(OrderCancelled(oid, ts, Decimal(0)))
         elif kind == "trade":
             tk, pc, side, cnt = payload
             feed(Trade(tk, _D(pc), side, Decimal(cnt), ts))
