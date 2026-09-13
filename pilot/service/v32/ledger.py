@@ -198,13 +198,25 @@ def v32_set_floor_dollars(num_legs_held: int, count: int = 1) -> Decimal:
     return Decimal(max(0, int(num_legs_held) - 1)) * Decimal(str(count))
 
 
-def v32_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> Decimal:
-    """The OPTIMISTIC upper bound on settlement credit still owed today by un-backfilled unsettled
-    windows: Σ over rows (realized_unsettled, this UTC day, no backfill yet) of (best-case $2 payoff −
-    the conservative floor already booked). A complete pin (floor $2) owes $0; a one-legged set (floor
-    $1) owes up to $1. Feeds the banded S4 so a pending settlement never moves the latch number."""
+def v32_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> tuple[Decimal, Decimal]:
+    """The (pessimistic, optimistic) BAND on settlement credit still owed today by un-backfilled
+    unsettled windows (S4 floor-netting RULING, Phase 4 — coordinator 2026-09-13). Σ over rows
+    (realized_unsettled, this UTC day, no backfill yet), per set by the legs held to settlement:
+
+      * complete 3-leg pin -> guaranteed floor $2.00, upside $0.00 -> (2.00, 2.00)  (pays $2 everywhere)
+      * any 2-leg subset   -> guaranteed floor $1.00, upside $1.00 -> (1.00, 2.00)  ($1 floor, $2 best)
+      * a lone leg          -> guaranteed floor $0.00, upside $1.00 -> (0.00, 1.00)  (directional 0..1)
+
+    ``pessimistic`` = Σ guaranteed floor (``v32_set_floor_dollars``) — the credit that arrives under
+    EVERY resolution of the unfinalized legs; ``optimistic`` = Σ best-case payoff ``min(#legs, 2)`` =
+    floor + upside. The banded S4 nets the guaranteed floor into BOTH bounds (an unsettled-but-
+    guaranteed complete pin's cash dip is credited back, never spuriously latching a day loss), while
+    the upside is credited only into the optimistic bound (a lone leg's optimistic $1 can still resolve
+    to $0, and a 2-leg subset's $2 to $1). Feeds ``v32_s4_decision`` so a pending settlement can only
+    move the latch number within this band, never past what a resolution can actually deliver."""
     done: set[str] = {str(r.get("backfill_of")) for r in rows if r.get("backfill_of")}
-    total = Decimal(0)
+    pessimistic = Decimal(0)
+    optimistic = Decimal(0)
     for r in rows:
         if not r.get("realized_unsettled"):
             continue
@@ -213,16 +225,10 @@ def v32_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> Decimal:
         if str(r.get("close_time")) in done:
             continue
         legs = r.get("unsettled_legs") or r.get("held_legs") or []
-        floor = v32_set_floor_dollars(len(legs))
-        # optimistic MAX payoff = min(#legs, 2): a lone bucket-NO pays at most $1 (NOT $2), any two
-        # legs at most $2, the complete pin exactly $2. Using a flat $2 here overstated the credit for
-        # a lone-leg set by $1 -> the banded S4 would credit money that can never arrive and could fail
-        # to latch a real day loss. credit = best-case payoff still owed beyond the floor already booked.
-        best = Decimal(min(len(legs), 2))
-        credit = best - floor
-        if credit > 0:
-            total += credit
-    return total
+        n_legs = len(legs)
+        pessimistic += v32_set_floor_dollars(n_legs)   # guaranteed floor: 3->2, 2->1, 1->0, 0->0
+        optimistic += Decimal(min(n_legs, 2))          # best-case payoff: 3->2, 2->2, 1->1, 0->0
+    return pessimistic, optimistic
 
 
 def build_v32_backfill_row(

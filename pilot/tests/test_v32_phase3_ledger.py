@@ -96,21 +96,47 @@ def test_one_legged_set_backfill_corrects_by_result():
     assert row["realized_delta"] == "1"   # $2 settlement nets the $1 floor -> +$1 correction
 
 
-def test_pending_credit_optimistic_bound():
-    rows = [
-        {"close_time": CLOSE, "realized_unsettled": True, "unsettled_legs": COMPLETE_LEGS},  # floor 2 -> 0
-        {"close_time": CLOSE[:11] + "19:00:00Z", "realized_unsettled": True,
-         "unsettled_legs": COMPLETE_LEGS[:2]},  # 2 legs -> floor 1 -> credit +1
-    ]
-    assert v32_pending_credit(rows, "2026-09-13") == Decimal(1)
+# --- S4 floor-netting RULING (Phase 4): v32_pending_credit now returns a (pessimistic, optimistic)
+#     BAND — guaranteed floor into both bounds, upside into optimistic only. -------------------------
+
+def test_pending_credit_band_complete_pin():
+    # a complete 3-leg pin pays $2 at EVERY settlement -> both bounds credit $2, upside $0.
+    rows = [{"close_time": CLOSE, "realized_unsettled": True, "unsettled_legs": COMPLETE_LEGS}]
+    pess, opt = v32_pending_credit(rows, "2026-09-13")
+    assert pess == Decimal(2) and opt == Decimal(2)
 
 
-def test_pending_credit_lone_leg_bounded_at_one_not_two():
-    # A lone bucket-NO pays AT MOST $1, so its optimistic pending credit is $1, not $2. (An overstated
-    # $2 would credit the banded S4 with money that can never arrive and could mask a real day loss.)
+def test_pending_credit_band_two_leg_subset():
+    # any 2-leg subset: guaranteed floor $1, best-case payoff $2 -> (1, 2), upside $1.
+    rows = [{"close_time": CLOSE, "realized_unsettled": True, "unsettled_legs": COMPLETE_LEGS[:2]}]
+    pess, opt = v32_pending_credit(rows, "2026-09-13")
+    assert pess == Decimal(1) and opt == Decimal(2)
+
+
+def test_pending_credit_band_lone_leg():
+    # A lone bucket-NO is directional: guaranteed floor $0, best-case payoff $1 -> (0, 1). The
+    # optimistic $1 can still resolve to $0, so it is credited ONLY into the optimistic bound.
     rows = [{"close_time": CLOSE, "realized_unsettled": True,
-             "unsettled_legs": [{"ticker": B, "side": "no", "count": 1}]}]  # floor 0, max payoff 1
-    assert v32_pending_credit(rows, "2026-09-13") == Decimal(1)
+             "unsettled_legs": [{"ticker": B, "side": "no", "count": 1}]}]
+    pess, opt = v32_pending_credit(rows, "2026-09-13")
+    assert pess == Decimal(0) and opt == Decimal(1)
+
+
+def test_pending_credit_band_sums_across_sets_and_skips_backfilled_and_prior_day():
+    rows = [
+        {"close_time": CLOSE, "realized_unsettled": True, "unsettled_legs": COMPLETE_LEGS},   # (2,2)
+        {"close_time": CLOSE[:11] + "19:00:00Z", "realized_unsettled": True,
+         "unsettled_legs": COMPLETE_LEGS[:2]},                                                # (1,2)
+        # a prior-day unsettled row contributes 0 to today's band
+        {"close_time": "2026-09-12T20:00:00Z", "realized_unsettled": True,
+         "unsettled_legs": COMPLETE_LEGS},
+        # an already-backfilled window contributes 0 (skipped by backfill_of)
+        {"close_time": CLOSE[:11] + "18:00:00Z", "realized_unsettled": True,
+         "unsettled_legs": COMPLETE_LEGS},
+        {"backfill_of": CLOSE[:11] + "18:00:00Z"},
+    ]
+    pess, opt = v32_pending_credit(rows, "2026-09-13")
+    assert pess == Decimal(3) and opt == Decimal(4)
 
 
 def test_ledger_row_carries_money_math_slots():

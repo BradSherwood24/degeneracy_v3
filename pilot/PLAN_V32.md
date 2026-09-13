@@ -175,3 +175,31 @@ Exchange write rate ~0.15/s, far under Kalshi limits. Full grid in scratchpad `j
 
 ## Open questions for Brad (asked 2026-09-13)
 See the mailbox entry for 2026-09-13 (V3.2 build start). Defaults if unanswered are marked in each phase.
+
+## Status 2026-09-13
+
+Phases 1-4 built on Opus 4.8, disclosed branches, reviewed.
+
+* **Phase 1** (pure core) -- MERGED (PR #31).
+* **Phase 2** (process spine, dry mode, task) -- MERGED (PR #32).
+* **Phase 3** (maker execution + money math + stops) -- MERGED (PR #33); review
+  `build/v32_phase3_review.md` (765 -> 767 tests, three wire bugs fixed, R-OVERLAP sequential replace).
+* **Phase 4** (ceremony + report) -- BUILT on `v32/phase4-ceremony`, pending Brad's review + merge.
+  Deliverables: `ceremony/v32_falsifier.md` (STATUS: DRAFT -- Brad alone freezes), `ops/V32_ARMING.md`,
+  the S4 floor-netting RULING (banded `v32_pending_credit`), the falsifier scoreboard in
+  `service/v32/report.py`, and `service/v32/falsifier_pins.py` (the `[pin]` constants, doc/code
+  agreement test). Suite 787 passed.
+
+Params sha (roster `DegeneracyV3_2`): `c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92`
+(E=0.10, tol=0.02, deb_ms=5000).
+
+**What remains before a live arm** (all Brad's levers, none an agent may do):
+1. Proxy `.env`: `ORDER_TICKER_PREFIXES` includes `KXBTC`; `DAILY_ORDER_BUDGET` >= 4000; restart proxy;
+   `/health` shows `orders_enabled: true` + caps + `orders_remaining_today` >= 200.
+2. >= 2 dry windows with `would_place_rest` + shadow records, no discovery errors.
+3. Clean live tree on `main` (Phase 4 merged); `pytest -q` green.
+4. Brad freezes `ceremony/v32_falsifier.md` (STATUS: FROZEN) on his verbatim go + Registration line.
+5. Brad writes `armed` to `ops/v32_mode.txt`; Brad registers/confirms the `DegeneracyV3_2` task.
+
+The falsifier's verdict gate (n >= 30 completed sets): mean lock >= +4.0c, % positive >= 80%, fill rate
+>= 2.0 sets/day, execution gap <= 3.0c, one-legged <= 2 of 30 -- any miss = KILL, no re-spec.

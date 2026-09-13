@@ -14,6 +14,7 @@ from service.v32.stops import (
     V32_MAX_CONTRACTS_PER_ORDER,
     V32_MIN_ORDER_BUDGET_AT_ARM,
     V32_S1_LEGGED_LATCH_THRESHOLD,
+    V32_S4_DAY_LOSS_CAP_DOLLARS,
     count_legged,
     decide_v32_arming,
     reconcile_positions_clean,
@@ -22,6 +23,7 @@ from service.v32.stops import (
     v32_caps_agree,
     v32_day_guard_path,
     v32_latched_stop_kind,
+    v32_s4_decision,
 )
 
 FROZEN = "STATUS: FROZEN\n"
@@ -164,6 +166,54 @@ def test_decide_arming_arms_when_everything_passes(tmp_path):
         day_guard=_clean_guard(), s4=S4Decision("clear", Decimal(0), Decimal(0)),
     )
     assert out.armed and out.effective_mode == "armed" and out.degrade_reason is None
+
+
+# ---------------------------------------------------------------------------
+# S4 floor-netting RULING (Phase 4): v32_s4_decision consumes the (pess, opt) credit band and nets the
+# guaranteed floor into BOTH bounds; only the upside separates them.
+# ---------------------------------------------------------------------------
+def test_s4_band_clears_when_guaranteed_floor_covers_the_dip():
+    # two complete pins unsettled: $4 cash dip, but each pays $2 at EVERY settlement (band (4, 4)).
+    # Netting the guaranteed floor into the pessimistic bound rescues it: loss_pess = 100-(96+4)=0.
+    d = v32_s4_decision(Decimal("100.00"), Decimal("96.00"), (Decimal(4), Decimal(4)))
+    assert d.kind == "clear"
+    assert d.loss_pessimistic == Decimal("0.00") and d.loss_optimistic == Decimal("0.00")
+
+
+def test_s4_band_latches_when_breached_even_after_best_case_credit():
+    # one complete pin unsettled (band (2, 2)); cash down $5.50. Even crediting the guaranteed $2,
+    # loss_opt = 100-(94.50+2) = 3.50 >= cap 3.00 -> a REAL day loss -> latch.
+    assert V32_S4_DAY_LOSS_CAP_DOLLARS == Decimal("3.00")
+    d = v32_s4_decision(Decimal("100.00"), Decimal("94.50"), (Decimal(2), Decimal(2)))
+    assert d.kind == "latch" and d.loss_optimistic == Decimal("3.50")
+
+
+def test_s4_band_pending_when_breach_turns_on_the_upside():
+    # one 2-leg subset unsettled (band (1, 2)); cash down $4. The breach depends on the unsettled
+    # upside: loss_pess = 100-(96+1)=3.00 (not < cap) and loss_opt = 100-(96+2)=2.00 (< cap) -> pending.
+    d = v32_s4_decision(Decimal("100.00"), Decimal("96.00"), (Decimal(1), Decimal(2)))
+    assert d.kind == "pending"
+    assert d.loss_pessimistic == Decimal("3.00") and d.loss_optimistic == Decimal("2.00")
+
+
+def test_s4_band_lone_leg_upside_not_credited_to_pessimistic():
+    # a lone leg band is (0, 1): the guaranteed floor is $0, so a lone-leg dip is NOT rescued.
+    # cash down $3.20; loss_pess = start-(now+0) = 3.20 >= cap and loss_opt = start-(now+1) = 2.20 < cap
+    # -> pending (the $1 upside can still resolve to $0, so it never clears the pessimistic bound).
+    d = v32_s4_decision(Decimal("100.00"), Decimal("96.80"), (Decimal(0), Decimal(1)))
+    assert d.kind == "pending"
+    assert d.loss_pessimistic == Decimal("3.20") and d.loss_optimistic == Decimal("2.20")
+
+
+def test_decide_arming_stands_down_on_s4_pending_without_latch(tmp_path):
+    # RULING: a pending S4 stands the window down (degrade to dry) but writes NO day-guard latch.
+    out = decide_v32_arming(
+        resolved_mode="armed", falsifier_path=_falsifier(tmp_path), health=_health(),
+        positions={"market_positions": []}, params_verified=True, contracts=1,
+        day_guard=_clean_guard(), s4=S4Decision("pending", Decimal("3.0"), Decimal("2.0")),
+    )
+    assert not out.armed and out.effective_mode == "dry"
+    assert any("S4" in r and "pending" in r for r in out.reasons)
 
 
 def test_decide_arming_degrades_on_s4_latch(tmp_path):
