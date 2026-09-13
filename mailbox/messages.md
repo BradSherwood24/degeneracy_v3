@@ -990,3 +990,39 @@ Analytics/Provider → Disabled; Steam autostart removed; Copilot/Game Assist ki
 the wings need them) → 4. build the requoting zero-order shadow + wing-depth check → 5. wide-band hourly re-fetch (retention clock)
 → 6. rule on v1.1 retire/21Z. Pilot task still DISABLED; mode.txt still `armed`.
 — Claude
+
+## 2026-09-13 ~18:30Z — Claude → house: V3.2 build started (continuous-requote pump-fader pilot); Phase 1 core merged; Brad's pre-arm levers
+
+Brad, 2026-09-13 (verbatim): "Build a new pilot, call it V3.2 (keep versioning consistent with degeneracy V3, but V3.2 as opposed to V1.1
+for the last pilot). Same building techniques, Opus 4.8 agents. Lets give it a live order switch as well. Well do a couple dry runs just to
+check functionality. Go a ahead with the build." Earlier: "Im almost tempted to do a low E value with allow orders on ... Collect as much data
+as possible. The shadow gives us little insight in what orders might actually fill at." Proxy restarted 15:30Z with orders ENABLED (Brad: leave it).
+
+Findings that shaped the spec (scratchpad journals/pf_ms_depth.py, pf_ms_requote2.py; forward 8/30-9/04, 139 h):
+- Wing depth at completion: thinner wing median 409 lots, p10 26, min 19 -> size never binds at 1-2 contracts.
+- Naive requote-every-tick = ~600 replaces/hour (strike books tick ~37/s). Lagging-quote model (replace iff |dn|>=TOL and >=DEB since last,
+  live +200 ms): E=10 TOL=2c DEB=5 s -> 21 fills, 3.6/day, +9.2c mean, min +3.4c, 100% positive, +33.5c/day, ~77 replaces/h (10-min window),
+  ~1,900 creates/day. The edge is insensitive to the gate; the drift that mattered was 60-s arm-minute staleness.
+
+V3.2 shape (pilot/PLAN_V32.md; survey pilot/build/v32_survey.md): separate process service.run_v32 + task DegeneracyV3_2 at :40; levers
+ops/v32_mode.txt (shakedown|dry|armed, fail closed; armed needs ceremony/v32_falsifier.md STATUS: FROZEN) + policy/v32_params.json (sha-pinned:
+E=0.10, tol=0.02, deb_ms=5000, 1 contract, wing_margin 0.02, lock_floor -0.10). Subscribes hourly strikes (KXBTCD) + range buckets (KXBTC),
+journals every frame (supersedes v1.1 dry recorder + range recorder once hourly). Rest bucket-NO post_only GTC with expiration T-5; on fill take
+both wings IOC ask+2c as one batch, UNCONDITIONALLY (ruling 9/13: lock_floor gates only the retry of a single missed leg, since any two legs
+= $1 floor); hold to settlement; one set/hour. Shadow (ideal rule, E in {8,10,12}) runs in every mode.
+
+Phase 1 (PR #31, merged): pure core service/v32 (params/events/actions/core), golden test on the real 2026-09-04T20Z hour reproducing the
+sim's fill to the cent; Opus 4.8 review APPROVE WITH FIXES — 4 defects fixed (suspect books priced into W; stale-then-silent feed left a rest
+live; cancel-race fill booked at the wrong price; duplicate wing fill double-counted sets) + 3 rulings applied; 677 tests pass. Phase 2/3 MUST
+list at the top of pilot/build/v32_phase1_review.md (F-1 retained cancel context / status-confirmed cancels is the big one).
+
+Brad's levers before ARMING (none needed for dry runs): degeneracy-proxy/.env ORDER_TICKER_PREFIXES add `KXBTC`; DAILY_ORDER_BUDGET 100 -> ~4,000
+(every requote = cancel + budgeted create); freeze v32_falsifier.md; v32_mode.txt -> armed; register the task. Brad 9/13: "we'll hold on the
+test run until i can make those" -> clarified: dry mode needs no .env change.
+
+Open questions to Brad (asked 9/13, defaults in force): leg-miss = retry to T-1 s under lock_floor then hold (not flatten); register the range
+recorder now for continuity (Claude leans yes); Claude merges Opus-reviewed V3.2 PRs under the 8/26 authority; code slug stays `v32`
+(module names cannot carry a dot; task name DegeneracyV3_2).
+
+Queue: Phase 2 spine/dry/task -> first dry run -> Phase 3 executor/ledger/stops -> Phase 4 ceremony -> Brad's levers -> arm at 1 contract, E=10.
+v1.1 stays DISABLED (mode.txt still `armed`; retire-vs-re-arm ruling pending). Dark-week replay + wide-band re-fetch still queued.

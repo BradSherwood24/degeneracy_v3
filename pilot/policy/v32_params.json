@@ -1,0 +1,17 @@
+{
+  "E": "0.10",
+  "tol": "0.02",
+  "deb_ms": 5000,
+  "quote_start_s": 900,
+  "quote_end_s": 300,
+  "contracts": 1,
+  "wing_margin": "0.02",
+  "lock_floor": "-0.10",
+  "no_orders_after_s_to_settle": 1,
+  "freshness_max_age_s": 1.0,
+  "max_sets_per_hour": 1,
+  "n_min": "0.05",
+  "replace_rate_alarm_per_min": 60,
+  "bucket_width": 100,
+  "shadow_Es": ["0.08", "0.10", "0.12"]
+}
