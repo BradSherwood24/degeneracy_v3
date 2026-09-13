@@ -15,14 +15,15 @@ silently book phantom or live money.
 
 Actions:
   * PLACE_REST  — single create: bucket-NO buy at n, ``post_only`` true, ``good_till_canceled`` with an
-    ``expiration_ts`` at the quote end (a crashed process leaves nothing resting past the window),
+    ``expiration_time`` at the quote end (a crashed process leaves nothing resting past the window),
     routed by ``exchange_index``. A successful create -> OrderAck (the rest is now live); an immediate
     fill on a post_only order is impossible but ``fill_count > 0`` is routed as a Fill anyway. A
     rejection (post_only cross, cap, budget, transport) -> journal ``rest_rejected`` + OrderCancelled
     (filled 0) so the core re-solves; three CONSECUTIVE rejections latch a stand-down for the hour.
-  * CANCEL_REST — DELETE the order, then CONFIRM via an order-status GET (bounded poll) and emit
-    OrderCancelled with ``filled_count_before_cancel`` READ FROM THE STATUS (never assumed 0 — the
-    fill/cancel race). The RestRecord is RETAINED (F-1) so a late fill on its coid is attributable.
+  * CANCEL_REST — DELETE the order; the cancel response's ``reduced_by`` (contracts pulled off the
+    book) makes the race decidable (filled = placed - reduced_by), cross-checked with an order-status
+    GET (take the MAX so a fill is never under-counted). ``filled_count_before_cancel`` is NEVER
+    assumed 0. The RestRecord is RETAINED (F-1) so a late fill on its coid is attributable.
   * TAKE_WINGS / RETRY_WING — batch create (2 legs) or single (1-leg retry), IOC taker at the leg's
     limit (ask + margin), count = the filled rest count, routed per leg. The batch response is
     synchronous fill truth: a filled leg -> Fill(count>0, exec price); an unfilled leg -> Fill(count 0)
@@ -72,19 +73,31 @@ DEFAULT_STP = "taker_at_cross"
 # DELETE under /portfolio/events/orders to the orders host, uncapped/unbudgeted.
 CANCEL_PATH_TMPL = "/portfolio/events/orders/{order_id}"
 # Order-status + open-orders READS are GETs (routed to the market-data host by the proxy).
-ORDER_STATUS_PATH_TMPL = "/portfolio/orders/{order_id}"   # UNVERIFIED-LIVE (GetOrder; v2 rest has list only)
-OPEN_ORDERS_PATH = "/portfolio/orders"                    # ?status=resting (prod-proven get_orders shape)
+ORDER_STATUS_PATH_TMPL = "/portfolio/orders/{order_id}"   # VERIFIED docs.kalshi.com/api-reference/orders/get-order
+OPEN_ORDERS_PATH = "/portfolio/orders"                    # ?status=resting (VERIFIED get-orders; ticker/order_id/client_order_id)
 
 CANCEL_CONFIRM_POLLS = 3
 CANCEL_CONFIRM_INTERVAL_S = 0.2
 CONSECUTIVE_REJECT_STANDDOWN = 3
 
 _KXBTC_PREFIX = "KXBTC"  # covers both range (KXBTC-) and strikes (KXBTCD-) via startswith
+_V32_COID_PREFIX = "v32-"  # our client_order_id prefix (core._mint_coid); scopes the startup sweep
 
 
 def _cents(price: Decimal) -> int:
     """Whole-cent integer of a dollar price (translate's direction mapping keys on cents)."""
     return int((Decimal(price) * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def _dec_or_none(v: Any) -> Decimal | None:
+    """Parse a fixed-point/dollar value to Decimal, or None (unparseable/absent)."""
+    if v is None or v == "":
+        return None
+    try:
+        d = Decimal(str(v))
+    except Exception:  # noqa: BLE001
+        return None
+    return d if d.is_finite() else None
 
 
 def _wire_price_no(n: Decimal) -> str:
@@ -122,12 +135,16 @@ class OrderStatus:
     available: bool
 
 
-# UNVERIFIED-LIVE: the exact order-status field names are not in degeneracy_v2/kalshi/rest.py (it lists
-# orders, never GETs one). We read the documented V2 order shape defensively — the first armed window
-# is watched to confirm these.
 def parse_order_status(body: dict[str, Any], order_id: str) -> OrderStatus:
-    """Parse a GetOrder body ({"order": {...}} or a bare order) into an OrderStatus. ``filled_count``
-    prefers an explicit ``fill_count``; else maker+taker fill counts; else place_count - remaining."""
+    """Parse a GetOrder body ({"order": {...}} or a bare order) into an OrderStatus.
+
+    VERIFIED (docs.kalshi.com/api-reference/orders/get-order, 2026-09-13): the order object carries
+    ``fill_count_fp`` / ``remaining_count_fp`` / ``initial_count_fp`` (fixed-point strings) and
+    ``status`` — NOT ``fill_count`` / ``remaining_count`` / ``place_count`` / ``maker_fill_count`` /
+    ``taker_fill_count``. ``filled_count`` prefers ``fill_count_fp``; else ``initial - remaining``.
+    The legacy names are kept only as a defensive fallback (older venue builds / test doubles). The
+    earlier build read ONLY the legacy names, so a live status always parsed filled=0 — silently
+    defeating both the cancel-race truth and the belt-and-braces poll."""
     if not isinstance(body, dict):
         return OrderStatus(order_id, None, 0, None, available=False)
     order = body.get("order") if isinstance(body.get("order"), dict) else body
@@ -143,17 +160,23 @@ def parse_order_status(body: dict[str, Any], order_id: str) -> OrderStatus:
             return None
 
     status = order.get("status")
-    remaining = _i(order.get("remaining_count"))
-    filled = _i(order.get("fill_count"))
+    # documented (fixed-point) fields first, legacy names as a fallback.
+    remaining = _i(order.get("remaining_count_fp"))
+    if remaining is None:
+        remaining = _i(order.get("remaining_count"))
+    initial = _i(order.get("initial_count_fp"))
+    if initial is None:
+        initial = _i(order.get("place_count"))
+    filled = _i(order.get("fill_count_fp"))
+    if filled is None:
+        filled = _i(order.get("fill_count"))
     if filled is None:
         mk = _i(order.get("maker_fill_count")) or 0
         tk = _i(order.get("taker_fill_count")) or 0
         if mk or tk:
             filled = mk + tk
-    if filled is None:
-        place = _i(order.get("place_count"))
-        if place is not None and remaining is not None:
-            filled = max(0, place - remaining)
+    if filled is None and initial is not None and remaining is not None:
+        filled = max(0, initial - remaining)
     if filled is None:
         filled = 0
     return OrderStatus(order_id=order.get("order_id") or order_id, status=status,
@@ -192,6 +215,7 @@ class LiveExecutor:
         self.stand_down_reason: str | None = None
         # money-math capture for the ledger (appended, read by run_v32._finalize).
         self.fills: list[dict[str, Any]] = []          # rest + wing fills (price, fee, ts, path)
+        self.booked_rest_oids: set[str] = set()        # de-dup rest-fill money-math across cancel/ws/poll
         self.rests_placed = 0
         self.rests_rejected = 0
         self.wing_batches = 0
@@ -259,8 +283,17 @@ class LiveExecutor:
         self.rests_placed += 1
         self._bump("rest_post")
         if not resp.ok:
+            # A POST is NEVER retried (a lost response on a server-side success would duplicate). A
+            # transport timeout (status None) or a 5xx leaves the outcome UNKNOWN: the order may be
+            # live on the book. Treating that as a clean rejection and re-placing would DOUBLE-ENTER,
+            # and a fill on the phantom would arrive on a coid we never recorded (dropped as foreign =
+            # an unhedged naked bucket-NO). So on an unknown outcome we (a) RECORD the coid so a later
+            # fill is attributable and gets hedged via the late-fill path, and (b) latch a stand-down
+            # so no second rest is placed this hour (the per-order expiration_time bounds the leak).
+            unknown = resp.status_code is None or resp.status_code >= 500
             return self._reject_place(coid, ticker, now, {"status": resp.status_code,
-                                                          "body": resp.body, "error": resp.error})
+                                                          "body": resp.body, "error": resp.error},
+                                      unknown=unknown, n=action.price)
         parsed = parse_single_response(resp.body, side=BUY_NO)
         if parsed.error or parsed.order_id is None:
             return self._reject_place(coid, ticker, now,
@@ -285,20 +318,37 @@ class LiveExecutor:
                                side="no", server_ts=now))
         return events
 
-    def _reject_place(self, coid: str, ticker: str, now: float, detail: dict) -> list[Any]:
+    def _reject_place(self, coid: str, ticker: str, now: float, detail: dict, *,
+                      unknown: bool = False, n: Decimal | None = None) -> list[Any]:
         self.rests_rejected += 1
         self._consecutive_rejects += 1
         self._bump("rest_rejected")
         self.journal.append("rest_rejected", {"client_order_id": coid, "ticker": ticker,
-                                              "consecutive": self._consecutive_rejects, **detail},
+                                              "consecutive": self._consecutive_rejects,
+                                              "unknown_outcome": bool(unknown), **detail},
                             self.clock())
-        rec = self.rest_book.get(coid)
-        if rec is not None:
-            rec.status = "rejected"
-        if self._consecutive_rejects >= CONSECUTIVE_REJECT_STANDDOWN and self.stand_down_reason is None:
-            self.stand_down_reason = "rest_rejected_x%d" % self._consecutive_rejects
-            self._record_alarm("rest_rejected_standdown",
-                               {"consecutive": self._consecutive_rejects})
+        if unknown:
+            # The order MAY be live (timeout / 5xx). Record the coid (order_id unknown) so a fill on it
+            # is attributable and hedged via the late-fill path, not dropped as foreign; and latch a
+            # stand-down so no second rest stacks on top of a possibly-live one.
+            self.rest_book[coid] = RestRecord(
+                client_order_id=coid, order_id=None,
+                price=n if n is not None else Decimal(0), count=1, ticker=ticker,
+                bucket_Sd=self._bucket_sd(ticker), placed_ts=now, status="unknown",
+            )
+            if self.stand_down_reason is None:
+                self.stand_down_reason = "post_unknown_outcome"
+                self._record_alarm("post_unknown_outcome",
+                                   {"client_order_id": coid, "ticker": ticker, **detail})
+        else:
+            rec = self.rest_book.get(coid)
+            if rec is not None:
+                rec.status = "rejected"
+            if (self._consecutive_rejects >= CONSECUTIVE_REJECT_STANDDOWN
+                    and self.stand_down_reason is None):
+                self.stand_down_reason = "rest_rejected_x%d" % self._consecutive_rejects
+                self._record_alarm("rest_rejected_standdown",
+                                   {"consecutive": self._consecutive_rejects})
         # Feed the core an OrderCancelled(filled 0) so it clears the pending slot and re-solves. The
         # placed order never became live (order_id None) -> match the pending's None order_id.
         return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
@@ -320,12 +370,14 @@ class LiveExecutor:
         body = to_v2_order(legacy)
         body["price"] = _wire_price_no(n)  # full 4-dp precision (translate rounds to whole cents)
         # expiration at the quote end so a crashed process leaves nothing resting past the window.
-        # UNVERIFIED-LIVE: documented V2 field is `expiration_ts` (int Unix seconds); the translate
-        # passthrough key is `expiration_time` — we set the documented field directly.
+        # VERIFIED (docs.kalshi.com/api-reference/orders/create-order-v2, 2026-09-13): the field is
+        # `expiration_time` (int Unix SECONDS), valid only with time_in_force=good_till_canceled. The
+        # earlier build set `expiration_ts` (a non-existent field the venue would ignore), which would
+        # have defeated crash-safety by leaving the rest with no auto-expiry.
         exp = action.expiration_epoch
         if exp is None:
             exp = self.close_epoch - self.quote_end_s
-        body["expiration_ts"] = int(exp)  # UNVERIFIED-LIVE
+        body["expiration_time"] = int(exp)  # docs.kalshi.com CreateOrderV2Request (int Unix seconds)
         return body
 
     # ---- CANCEL_REST ----
@@ -343,13 +395,30 @@ class LiveExecutor:
         self.journal.append("cancel_rest", {"order_id": oid, "client_order_id": coid}, self.clock())
         wr = self.writer.rest_delete(CANCEL_PATH_TMPL.format(order_id=oid))
         self._bump("cancel_delete")
-        # Confirm via order-status (the truth for the fill/cancel race). Never assume filled 0.
-        filled = self._confirm_cancel_filled(oid, now)
         rec = self.attribute(coid=coid, order_id=oid)
+        # The DELETE response is AUTHORITATIVE for the race: docs.kalshi.com cancel-order-v2 returns
+        # ``reduced_by`` = "the remaining count at time of cancellation" (contracts pulled off the book),
+        # so filled_before_cancel = placed_count - reduced_by. Cross-check with the order-status GET and
+        # take the MAX so a fill is NEVER under-counted (an under-count would leave a filled bucket-NO
+        # unhedged). A 404 (order already terminal) leaves reduced_by absent -> rely on the status GET.
+        filled_delete: int | None = None
+        rb = _dec_or_none(wr.body.get("reduced_by")) if isinstance(wr.body, dict) else None
+        if rb is not None and rec is not None:
+            filled_delete = max(0, int(rec.count) - int(rb))
+        filled_status = self._confirm_cancel_filled(oid, now)
+        filled = max(filled_delete or 0, filled_status)
         if rec is not None:
-            rec.status = "cancelled"  # RETAINED for late-fill attribution (F-1)
+            rec.status = "filled" if filled > 0 else "cancelled"  # RETAINED for late-fill attr (F-1)
+            if filled > 0 and rec.order_id is not None and rec.order_id not in self.booked_rest_oids:
+                # book the race fill into money-math (maker fee 0). De-duped by order_id so a later WS
+                # echo of the same fill (driver._record_fill) does NOT double-count the rest leg.
+                self.booked_rest_oids.add(rec.order_id)
+                self.fills.append({"leg": "rest", "side": "no", "ticker": rec.ticker,
+                                   "price": rec.price, "exec_price": None, "fee": Decimal(0),
+                                   "count": int(filled), "bucket_Sd": rec.bucket_Sd,
+                                   "path": "cancel_race", "client_order_id": rec.client_order_id})
         self.journal.append("cancel_confirmed",
-                            {"order_id": oid, "delete_status": wr.status_code,
+                            {"order_id": oid, "delete_status": wr.status_code, "reduced_by": str(rb),
                              "filled_before_cancel": filled}, self.clock())
         return [OrderCancelled(order_id=oid, server_ts=now,
                                filled_count_before_cancel=Decimal(filled))]
@@ -489,7 +558,7 @@ def cancel_stale_open_orders(writer: ProxyWriter, journal: Any,
                              clock: Callable[[], float] = time.time) -> dict[str, Any]:
     """On an armed ``prepare()``: GET our resting orders and DELETE any in KXBTC* so a prior crashed
     process leaves nothing live. Fail-closed and never raises out of startup: an unreadable list just
-    means we cancel nothing (and the per-order ``expiration_ts`` still bounds a leaked rest)."""
+    means we cancel nothing (and the per-order ``expiration_time`` still bounds a leaked rest)."""
     result = {"found": 0, "cancelled": 0, "errors": 0}
     try:
         body = writer.rest_get(OPEN_ORDERS_PATH, {"status": "resting"})
@@ -505,6 +574,14 @@ def cancel_stale_open_orders(writer: ProxyWriter, journal: Any,
         ticker = str(o.get("ticker") or o.get("market_ticker") or "")
         oid = o.get("order_id")
         if not ticker.startswith(_KXBTC_PREFIX) or not oid:
+            continue
+        # Cross-pilot safety (the account is shared): NEVER cancel an order that carries a foreign
+        # client_order_id (e.g. a re-armed v1.1 box order). A missing coid is still cancelled (a
+        # crashed-process leftover with no attribution is ours to clear). Our coids are "v32-...".
+        coid = o.get("client_order_id")
+        if coid and not str(coid).startswith(_V32_COID_PREFIX):
+            journal.append("startup_skip_foreign_order",
+                           {"ticker": ticker, "order_id": oid, "client_order_id": coid}, clock())
             continue
         result["found"] += 1
         wr = writer.rest_delete(CANCEL_PATH_TMPL.format(order_id=oid))

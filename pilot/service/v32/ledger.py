@@ -214,7 +214,12 @@ def v32_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> Decimal:
             continue
         legs = r.get("unsettled_legs") or r.get("held_legs") or []
         floor = v32_set_floor_dollars(len(legs))
-        credit = Decimal(2) - floor
+        # optimistic MAX payoff = min(#legs, 2): a lone bucket-NO pays at most $1 (NOT $2), any two
+        # legs at most $2, the complete pin exactly $2. Using a flat $2 here overstated the credit for
+        # a lone-leg set by $1 -> the banded S4 would credit money that can never arrive and could fail
+        # to latch a real day loss. credit = best-case payoff still owed beyond the floor already booked.
+        best = Decimal(min(len(legs), 2))
+        credit = best - floor
         if credit > 0:
             total += credit
     return total

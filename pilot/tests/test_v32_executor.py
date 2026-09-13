@@ -1,6 +1,6 @@
 """V3.2 armed maker executor (Phase 3). FAKES ONLY — no network, no proxy dialed, no key/holdout read.
 
-Covers: the place/cancel/take wire bodies (post_only + GTC + expiration_ts; IOC wings; NO-space price)
+Covers: the place/cancel/take wire bodies (post_only + GTC + expiration_time; IOC wings; NO-space price)
 against the real create-response fixture; the rejection paths + 3-consecutive stand-down; the
 cancel-race (filled_count read from the order status, never assumed 0); IOC no-fill -> retry; the
 FrozenExecutor armed guard (P3-1); the exec-price mismatch alarm (P3-4) and fill de-dup (ws + poll)
@@ -106,7 +106,8 @@ def test_place_rest_wire_body_post_only_gtc_expiration():
     assert path == SINGLE_CREATE_PATH
     assert body["post_only"] is True
     assert body["time_in_force"] == "good_till_canceled"
-    assert body["expiration_ts"] == CTS - 300           # quote end (T-5)
+    assert body["expiration_time"] == CTS - 300         # quote end (T-5); VERIFIED CreateOrderV2 field
+    assert "expiration_ts" not in body                   # the non-existent field must NOT be sent
     assert body["side"] == "ask"                          # buy NO == sell YES == ask
     assert body["price"] == "0.5500"                      # NO at 0.45 == YES ask at 1-0.45
     assert body["client_order_id"] == "c1"
@@ -177,7 +178,7 @@ def test_cancel_confirms_filled_count_from_status_not_assumed_zero():
     assert len(events) == 1 and isinstance(events[0], OrderCancelled)
     assert events[0].filled_count_before_cancel == Decimal(1)   # READ from status, not assumed 0
     assert w.deletes == [CANCEL_PATH_TMPL.format(order_id=oid)]
-    assert ex.rest_book["c1"].status == "cancelled"             # RETAINED (F-1)
+    assert ex.rest_book["c1"].status == "filled"               # RETAINED (F-1); the race fill happened
 
 
 def test_cancel_clean_status_zero_filled():
@@ -195,18 +196,67 @@ def test_cancel_clean_status_zero_filled():
 
 
 def test_parse_order_status_derivations():
-    # explicit fill_count
+    # DOCUMENTED fixed-point fields (docs.kalshi.com get-order): fill_count_fp
+    s = parse_order_status({"order": {"order_id": "o", "status": "executed", "fill_count_fp": "1.00",
+                                      "remaining_count_fp": "0.00", "initial_count_fp": "1.00"}}, "o")
+    assert s.filled_count == 1 and s.available and s.remaining_count == 0
+    # initial - remaining (fp) fallback when no explicit fill count
+    s = parse_order_status({"order": {"initial_count_fp": "1.00", "remaining_count_fp": "0.00"}}, "o")
+    assert s.filled_count == 1
+    # legacy explicit fill_count still honored (defensive fallback / test doubles)
     s = parse_order_status({"order": {"order_id": "o", "status": "resting", "fill_count": "1.00",
                                       "remaining_count": "0.00"}}, "o")
     assert s.filled_count == 1 and s.available
-    # maker+taker fallback
-    s = parse_order_status({"order": {"maker_fill_count": "1", "taker_fill_count": "0"}}, "o")
-    assert s.filled_count == 1
-    # place - remaining fallback
+    # legacy place - remaining fallback
     s = parse_order_status({"order": {"place_count": "1", "remaining_count": "0"}}, "o")
     assert s.filled_count == 1
     # unreadable -> unavailable, filled 0
     assert parse_order_status("nope", "o").available is False
+
+
+def test_cancel_race_reduced_by_from_delete_response_is_authoritative():
+    # The DELETE response's reduced_by (remaining pulled off the book) decides the race even when the
+    # order-status GET is unavailable (a 404 on an already-terminal order): filled = placed - reduced_by.
+    w = FakeWriter()
+    ex = _exec(w)
+    ex.on_action(_place_action(coid="c1"), V32State.new(CLOSE, CTS, BUCKET_MAP, load_v32_params()),
+                 CTS - 600)
+    oid = ex.rest_book["c1"].order_id
+    w.delete_queue.append(WriteResponse(200, {"order_id": oid, "reduced_by": "0.00"}, True))  # nothing
+    # order-status GET returns nothing (unavailable) -> reduced_by carries the race
+    cancel = V32Action(kind=ActionKind.CANCEL_REST, order_id=oid, client_order_id="c1")
+    events = ex.on_action(cancel, V32State.new(CLOSE, CTS, BUCKET_MAP, load_v32_params()), CTS - 590)
+    assert events[0].filled_count_before_cancel == Decimal(1)   # placed 1 - reduced_by 0 = 1 filled
+    # the race fill is booked into money-math exactly once (maker fee 0), de-duped by order_id
+    rest_fills = [f for f in ex.fills if f.get("leg") == "rest"]
+    assert len(rest_fills) == 1 and rest_fills[0]["path"] == "cancel_race"
+
+
+def test_post_unknown_outcome_records_coid_and_stands_down():
+    # A transport timeout (status None) leaves the order outcome UNKNOWN: it may be live. The coid must
+    # be recorded (so a phantom fill is hedged, not dropped) and a stand-down latched (no second rest).
+    w = FakeWriter()
+    j = FakeJournal()
+    ex = _exec(w, j)
+    w.post_queue.append(WriteResponse(None, {}, False, "post_exception:Timeout"))
+    st = V32State.new(CLOSE, CTS, BUCKET_MAP, load_v32_params())
+    from service.v32.events import OrderCancelled
+    events = ex.on_action(_place_action(coid="cu"), st, CTS - 600)
+    assert isinstance(events[0], OrderCancelled) and events[0].filled_count_before_cancel == 0
+    assert "cu" in ex.rest_book and ex.rest_book["cu"].status == "unknown"
+    assert ex.rest_book["cu"].order_id is None and ex.rest_book["cu"].price == Decimal("0.45")
+    assert ex.stand_down_reason == "post_unknown_outcome"
+    # the recorded coid makes a later phantom fill attributable (not foreign)
+    assert ex.attribute(coid="cu") is not None
+
+
+def test_post_5xx_is_treated_as_unknown_not_clean_reject():
+    w = FakeWriter()
+    ex = _exec(w)
+    w.post_queue.append(WriteResponse(503, {"error": "upstream"}, False, "http_503"))
+    ex.on_action(_place_action(coid="c5"), V32State.new(CLOSE, CTS, BUCKET_MAP, load_v32_params()),
+                 CTS - 600)
+    assert ex.rest_book["c5"].status == "unknown" and ex.stand_down_reason == "post_unknown_outcome"
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +360,24 @@ def test_startup_cancel_only_kxbtc_orders():
     assert res["found"] == 2 and res["cancelled"] == 2
     assert set(w.deletes) == {CANCEL_PATH_TMPL.format(order_id="o1"),
                               CANCEL_PATH_TMPL.format(order_id="o2")}
+
+
+def test_startup_cancel_skips_foreign_coid_but_clears_our_and_coidless():
+    # Cross-pilot safety: never cancel a KXBTC* order carrying a FOREIGN coid (a re-armed v1.1 box
+    # order shares the account); cancel our v32- orders and any coid-less crash leftover.
+    w = FakeWriter()
+    j = FakeJournal()
+    w.get_map["/portfolio/orders"] = {"orders": [
+        {"ticker": "KXBTCD-26SEP1316-T68199.99", "order_id": "v1", "client_order_id": "box-abc"},
+        {"ticker": "KXBTC-26SEP1316-B68200", "order_id": "v2", "client_order_id": "v32-x-1"},
+        {"ticker": "KXBTC-26SEP1316-B68300", "order_id": "v3"},  # no coid -> ours to clear
+    ]}
+    res = cancel_stale_open_orders(w, j, clock=lambda: 0.0)
+    assert res["found"] == 2 and res["cancelled"] == 2
+    assert set(w.deletes) == {CANCEL_PATH_TMPL.format(order_id="v2"),
+                              CANCEL_PATH_TMPL.format(order_id="v3")}
+    assert "v1" not in "".join(w.deletes)
+    assert "startup_skip_foreign_order" in j.kinds()
 
 
 # ---------------------------------------------------------------------------

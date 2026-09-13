@@ -97,7 +97,11 @@ def v32_caps_agree(health: Any, contracts: int) -> tuple[bool, str]:
     if not isinstance(prefixes, (list, tuple)):
         return False, "proxy ticker_prefixes missing"
     for probe in (V32_RANGE_TICKER_PROBE, V32_STRIKE_TICKER_PROBE):
-        if not any(probe.startswith(str(p)) or str(probe).startswith(str(p)) for p in prefixes):
+        # mirror the proxy's own gate (a real ticker T is allowed iff T.startswith(prefix)); a ticker
+        # of this series starts with ``probe``, so it is covered iff some configured prefix is itself a
+        # prefix of ``probe``. (The prior code OR'd a clause identical to the first — dead code — which
+        # only ever fail-closed; this is the exact, non-redundant condition.)
+        if not any(probe.startswith(str(p)) for p in prefixes):
             return False, f"proxy prefixes do not cover a {probe!r} ticker: {list(prefixes)}"
     try:
         remaining = int(health.get("orders_remaining_today"))

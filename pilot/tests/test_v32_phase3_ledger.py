@@ -105,6 +105,14 @@ def test_pending_credit_optimistic_bound():
     assert v32_pending_credit(rows, "2026-09-13") == Decimal(1)
 
 
+def test_pending_credit_lone_leg_bounded_at_one_not_two():
+    # A lone bucket-NO pays AT MOST $1, so its optimistic pending credit is $1, not $2. (An overstated
+    # $2 would credit the banded S4 with money that can never arrive and could mask a real day loss.)
+    rows = [{"close_time": CLOSE, "realized_unsettled": True,
+             "unsettled_legs": [{"ticker": B, "side": "no", "count": 1}]}]  # floor 0, max payoff 1
+    assert v32_pending_credit(rows, "2026-09-13") == Decimal(1)
+
+
 def test_ledger_row_carries_money_math_slots():
     row = build_v32_ledger_row(
         close_time=CLOSE, resolved_mode="armed", effective_mode="armed", degrade=None,

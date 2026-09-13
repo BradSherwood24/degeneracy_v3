@@ -805,6 +805,13 @@ class V32Driver:
         fills = getattr(self.executor, "fills", None)
         if fills is None:
             return
+        # de-dup the REST leg across the cancel-race / WS / poll paths so money-math never
+        # double-counts one fill (the cancel path may have already booked it by order_id).
+        booked = getattr(self.executor, "booked_rest_oids", None)
+        if booked is not None and rec.order_id is not None:
+            if rec.order_id in booked:
+                return
+            booked.add(rec.order_id)
         fills.append({"leg": "rest", "side": "no", "ticker": rec.ticker, "price": rec.price,
                       "exec_price": exec_price, "fee": exec_fee, "count": int(count),
                       "bucket_Sd": rec.bucket_Sd, "path": path,

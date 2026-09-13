@@ -573,9 +573,15 @@ def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, l
         return st, actions
     t_to_close = st.close_epoch - now
     if t_to_close < params.no_orders_after_s_to_settle:
-        # cutoff: any still-unfilled leg is a bounded one-legged set; stop trying.
-        if st.wing_taken and any(l.status != "filled" for l in st.wing_legs):
-            st = replace(st, one_legged=True)
+        # cutoff: a rest filled but the $2 pin never completed -> a bounded, unhedged set. Flag it
+        # one_legged (drives S1_LEGGED). This covers BOTH the wings-taken-but-a-leg-missed case AND
+        # the wings-NEVER-taken case (strike feed dead from fill to deadline = a lone bucket-NO), which
+        # the earlier ``st.wing_taken and ...`` guard silently missed — leaving the worst unhedged case
+        # unflagged and uncounted toward the day latch.
+        if st.rest_fill is not None and st.wings_needed:
+            incomplete = (not st.wing_legs) or any(l.status != "filled" for l in st.wing_legs)
+            if incomplete:
+                st = replace(st, one_legged=True)
         return st, actions
 
     prices = _wing_prices(st, now, params)

@@ -566,6 +566,25 @@ def test_duplicate_wing_fill_does_not_double_count_sets_done():
     assert st.sets_done == 1
 
 
+def test_lone_bucket_no_never_hedged_latches_one_legged_at_cutoff():
+    # ADVERSARIAL (review): a rest fills but the strike feed is DEAD from the fill to the settle cutoff,
+    # so the wings are NEVER taken -> a lone, unhedged bucket-NO. This MUST latch one_legged (drives
+    # S1_LEGGED). The earlier cutoff guard required wing_taken=True and silently missed this worst case.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    # the fill arrives 100 s later; the strike books (last ts now) are stale -> no wings taken.
+    st, acts = _feed(p, st, Fill(st.rest_live.order_id, coid, Decimal(1), Decimal("0.45"), "no",
+                                 now + 100.0))
+    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]  # wings could not be taken
+    assert st.rest_fill is not None and not st.wing_taken and st.wings_needed
+    assert not st.one_legged  # not yet at the cutoff
+    # advance to the settle cutoff (t_to_close < no_orders_after_s_to_settle=1): must flag one_legged.
+    st, _ = _feed(p, st, ClockTick(server_ts=T - 0.5))
+    assert st.one_legged is True
+
+
 def test_suspect_strike_book_is_not_priced():
     # REGRESSION (review Fix A): a suspect strike book (malformed delta / seq-gap) must not be
     # used to compute W or to place a rest.
