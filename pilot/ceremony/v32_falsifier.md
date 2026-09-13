@@ -119,7 +119,7 @@ Any TWO of the three legs are a $1 floor (bucket-NO + a wing pays >= $1 everywhe
 leg is bounded, not naked. On a rest fill the INITIAL both-wings take is UNCONDITIONAL. If a wing leg
 is missed, retry the missing leg every tick until the T-1 s cutoff (`no_orders_after_s_to_settle` = 1),
 subject to the retry lock floor: never pay for the last leg if it would push the set's lock below
-`lock_floor` - 0.10 = [pin] -0.10 (retry at better prices only); else hold the two-leg $1-floor
+`lock_floor` = [pin] -0.10 (retry at better prices only); else hold the two-leg $1-floor
 position to settlement and flag `one_legged`. A lone bucket-NO never hedged is flagged `one_legged` at
 the cutoff too (so S1_LEGGED counts it).
 

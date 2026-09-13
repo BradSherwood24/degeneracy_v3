@@ -103,6 +103,35 @@ def test_scoreboard_kill_on_too_many_one_legged():
     assert sb["verdict"].startswith("KILL") and "one-legged" in sb["verdict"]
 
 
+def test_scoreboard_kill_on_low_fill_rate():
+    # 30 completed sets but spread thin: 2/day on 5 days + 1/day on 20 days = 25 armed days -> 30/25 =
+    # 1.2/day < the 2.0 pin. Locks/gap/legged all fine, so the ONLY miss is the fill-rate gate.
+    rows: list[dict] = []
+    d = 1
+    for _ in range(5):          # 5 days x 2 sets = 10
+        rows += [_set_row(d, 16, "0.09", "0.10"), _set_row(d, 17, "0.09", "0.10")]
+        d += 1
+    for _ in range(20):         # 20 days x 1 set = 20  (total 30 over 25 days)
+        rows.append(_set_row(d, 16, "0.09", "0.10"))
+        d += 1
+    sb = build_falsifier_scoreboard(rows)
+    assert sb["n"] == 30 and sb["n_days"] == 25
+    assert sb["fill_rate_per_day"] == Decimal(30) / Decimal(25)   # 1.2/day < 2.0
+    assert sb["verdict"].startswith("KILL") and "fill rate" in sb["verdict"]
+
+
+def test_scoreboard_kill_on_low_pct_positive():
+    # 23 sets at +10c and 7 at -1c: mean = (230-7)/30 = +7.43c (>= +4.0c) but %positive = 23/30 =
+    # 76.7% < 80 -> the ONLY miss is the %positive gate (mean lock still clears its bar).
+    rows = [_set_row(d, h, "0.10", "0.10") for d in range(1, 9) for h in (16, 17, 18)][:23]
+    rows += [_set_row(9, h, "-0.01", "0.00") for h in range(7)]   # 7 negative-lock completed sets
+    sb = build_falsifier_scoreboard(rows)
+    assert sb["n"] == 30
+    assert sb["mean_lock_c"] >= V32_FALSIFIER_MIN_MEAN_LOCK_CENTS   # mean still clears +4.0c
+    assert sb["pct_positive"] == Decimal(23) * 100 / Decimal(30)    # 76.66..% < 80
+    assert sb["verdict"].startswith("KILL") and "%positive" in sb["verdict"]
+
+
 def test_scoreboard_p99_data_age_per_connection():
     rows = [_set_row(1, 16, "0.09", "0.10", slag=0.2, blag=0.4),
             _set_row(1, 17, "0.09", "0.10", slag=0.9, blag=1.5)]
