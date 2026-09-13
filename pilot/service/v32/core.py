@@ -107,7 +107,14 @@ def wing_cost(yes_ask_sd: Decimal, no_ask_su: Decimal) -> Decimal:
 
 
 def lock_value(n: Decimal, w_paid: Decimal) -> Decimal:
-    """lock = 2 - (n + fee(n)) - W_paid per contract (maker fee 0 on the rest leg)."""
+    """lock = 2 - (n + fee(n)) - W_paid per contract.
+
+    NB the ``fee(n)`` here is a TAKER fee charged on the resting (maker) leg. On Kalshi crypto the
+    maker fee is 0 (see MEMORY kalshi-fee-exact), so the REALIZED lock is ~fee(n) (~1.7c at n=0.45)
+    HIGHER than this value. We keep the fee to stay bit-identical to the pinned sim (pf_ms_requote*)
+    whose reference locks (+10.36c / +12.38c) the golden test asserts; it is the conservative
+    (pessimistic) direction, so the live edge is understated, never overstated. See the Phase-1
+    review's money-math finding."""
     return _TWO - (n + fee(n)) - w_paid
 
 
@@ -290,6 +297,8 @@ def _compute_W(st: V32State, Sd: int, Su: int, now: float, params: V32Params) ->
     su_top = st.strike_tops.get(Su)
     if sd_top is None or su_top is None:
         return None
+    if sd_top.suspect or su_top.suspect:
+        return None  # a suspect (malformed-delta / seq-gap) book is untrustworthy: no quote
     if not _fresh(now, st.strike_ts.get(Sd), params.freshness_max_age_s):
         return None
     if not _fresh(now, st.strike_ts.get(Su), params.freshness_max_age_s):
@@ -363,6 +372,11 @@ def decide_v32(
         return st, actions
 
     if isinstance(event, ClockTick):
+        # Re-derive the quote context against the tick's clock so a SILENT feed (books stop
+        # arriving) is detected: a strike book that has gone stale relative to ``now`` makes W
+        # None, which the requote gate turns into CANCEL_REST + stand down. Without this, a
+        # stale-then-silent feed would leave a rest live until the next book frame (or expiry).
+        st = _recompute_context(params, st, now)
         st, sc = _shadow_complete(params, st, now)
         st, wa = _wing_step(params, st, now)
         st, qa = _requote(params, st, now)
@@ -442,12 +456,16 @@ def _apply_cancelled(
 ) -> tuple[V32State, list[V32Action]]:
     """OrderCancelled confirms a cancel. A partial fill before cancel is treated as a rest fill."""
     actions: list[V32Action] = []
-    # clear the matching order slot
+    # clear the matching order slot, remembering the order so a partial fill is booked at ITS
+    # price (not the current desired_n, which may have drifted since the order was placed).
     matched = False
+    matched_order: RestOrder | None = None
     if st.rest_live is not None and st.rest_live.order_id == event.order_id:
+        matched_order = st.rest_live
         st = replace(st, rest_live=None)
         matched = True
     elif st.rest_pending is not None and st.rest_pending.order_id == event.order_id:
+        matched_order = st.rest_pending
         st = replace(st, rest_pending=None)
         matched = True
     # A cancel confirm clears the in-flight flag whether or not the slot is still populated (on a
@@ -456,10 +474,16 @@ def _apply_cancelled(
     if matched or st.cancel_in_flight:
         st = replace(st, cancel_in_flight=False)
     if event.filled_count_before_cancel > _ZERO and st.rest_fill is None:
-        # a fill slipped in before the cancel landed -> book it and take wings
-        n = st.rest_live.price if st.rest_live is not None else (
-            st.desired_n if st.desired_n is not None else _ZERO
-        )
+        # a fill slipped in before the cancel landed -> book it at the CANCELLED order's price
+        # and take wings. (When the slot was eagerly cleared before the cancel confirm — a bucket
+        # change or a stand-down cancel — matched_order is None and we fall back to desired_n;
+        # see the Phase-1 review's retained-cancel-context finding.)
+        if matched_order is not None:
+            n = matched_order.price
+        elif st.desired_n is not None:
+            n = st.desired_n
+        else:
+            n = _ZERO
         st = replace(
             st,
             rest_fill=RestFill(price=n, count=int(event.filled_count_before_cancel), server_ts=now),
@@ -522,6 +546,8 @@ def _wing_prices(st: V32State, now: float, params: V32Params) -> tuple[Decimal, 
     su = st.strike_tops.get(st.spot_Su)
     if sd is None or su is None:
         return None
+    if sd.suspect or su.suspect:
+        return None  # never price a taker completion off a suspect (untrustworthy) book
     if not _fresh(now, st.strike_ts.get(st.spot_Sd), params.freshness_max_age_s):
         return None
     if not _fresh(now, st.strike_ts.get(st.spot_Su), params.freshness_max_age_s):
@@ -595,8 +621,11 @@ def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, l
 
 
 def _maybe_close_set(st: V32State) -> V32State:
-    """Both wings filled -> the set is complete: count it and clear the completion flags."""
-    if st.wing_legs and all(l.status == "filled" for l in st.wing_legs):
+    """Both wings filled -> the set is complete: count it and clear the completion flags.
+
+    Gated on ``wings_needed`` so a DUPLICATE fill event for an already-filled leg (same fill
+    reported twice by the channel + the status poll) does not increment ``sets_done`` again."""
+    if st.wings_needed and st.wing_legs and all(l.status == "filled" for l in st.wing_legs):
         return replace(
             st, sets_done=st.sets_done + 1, wings_needed=False, one_legged=False
         )

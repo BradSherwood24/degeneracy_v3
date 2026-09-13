@@ -480,6 +480,73 @@ def test_partial_fill_before_cancel_books_a_fill():
     assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
 
 
+def test_partial_fill_before_cancel_books_at_resting_price_not_desired_n():
+    # REGRESSION (review Fix C): a filled_count_before_cancel must book at the CANCELLED order's
+    # resting price, not the (possibly drifted) current desired_n.
+    p = _params(tol=Decimal("0.50"))  # high tol -> the desired-n move below does NOT requote
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)  # rest at n=0.45
+    oid = st.rest_live.order_id
+    # move the wing so desired_n drifts to 0.60 while the resting order stays at 0.45.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.1))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 0.1))
+    assert st.desired_n == Decimal("0.60") and st.rest_live.price == Decimal("0.45")
+    st, _ = _feed(p, st, OrderCancelled(oid, now + 0.2, filled_count_before_cancel=Decimal(1)))
+    assert st.rest_fill is not None
+    assert st.rest_fill.price == Decimal("0.45")  # the resting price, NOT desired_n 0.60
+
+
+def test_duplicate_wing_fill_does_not_double_count_sets_done():
+    # REGRESSION (review Fix D): a fill event reported twice (fill channel + status poll) for an
+    # already-filled leg must not increment sets_done a second time.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, Fill(st.rest_live.order_id, coid, Decimal(1), Decimal("0.45"), "no", now + 0.1))
+    yc = st.wing_legs[0].client_order_id
+    nc = st.wing_legs[1].client_order_id
+    st, _ = _feed(p, st, Fill("Y1", yc, Decimal(1), Decimal("0.76"), "yes", now + 0.2))
+    st, _ = _feed(p, st, Fill("N1", nc, Decimal(1), Decimal("0.64"), "no", now + 0.3))
+    assert st.sets_done == 1 and not st.wings_needed
+    # duplicate no-leg fill -> sets_done must stay 1.
+    st, _ = _feed(p, st, Fill("N1", nc, Decimal(1), Decimal("0.64"), "no", now + 0.4))
+    assert st.sets_done == 1
+
+
+def test_suspect_strike_book_is_not_priced():
+    # REGRESSION (review Fix A): a suspect strike book (malformed delta / seq-gap) must not be
+    # used to compute W or to place a rest.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, acts = _feed_all(p, st, [
+        BookUpdate(B_SD, _top("0.35", "0.36"), now),
+        BookUpdate(STK_SU, _top("0.36", "0.37"), now),
+        BookUpdate(STK_SD, _top("0.75", "0.76", suspect=True), now),  # suspect low wing
+    ])
+    assert st.W is None
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    sd = [a for a in acts if a.kind == ActionKind.STAND_DOWN]
+    assert sd and sd[-1].reason == "stale_or_missing_wing"
+
+
+def test_silent_feed_clocktick_cancels_stale_rest():
+    # REGRESSION (review Fix B): with a live rest, a ClockTick after the strike books have gone
+    # stale (no new book frames) must CANCEL the rest and stand down, not leave it live.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_live_rest(p, st, now)
+    assert st.rest_live is not None
+    st, acts = _feed(p, st, ClockTick(now + 2.0))  # strikes now 2s old > freshness 1s
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    sd = [a for a in acts if a.kind == ActionKind.STAND_DOWN]
+    assert sd and sd[-1].reason == "stale_or_missing_wing"
+    assert st.rest_live is None
+
+
 # ===========================================================================
 # Replace-rate alarm
 # ===========================================================================
