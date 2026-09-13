@@ -1,0 +1,1 @@
+{"idx": 390, "kind": "kalshi_ws", "local_ts": 1788255917.2492468, "obj": {"msg": {"delta_fp": "50.00", "market_id": "9940197b-2256-4e51-aedf-c96ae5ba055c", "market_ticker": "KXBTCD-26SEP0106-T77999.99", "price_dollars": "0.3800", "side": "no", "ts": "2026-09-01T09:45:17.151634Z", "ts_ms": 1788255917151}, "type": "orderbook_delta"}}

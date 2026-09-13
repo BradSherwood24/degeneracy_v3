@@ -12,6 +12,16 @@ functionality" step. One command, one window, then read the report.
    journal at close (a clean no-op).
 2. **Clean tree, tests green.** From `pilot/`: `python -m pytest -q` (expect all green).
 3. You are in `pilot/` and using `python` (never `python3`/`py` on this box).
+4. **Create the mode lever.** `ops/v32_mode.txt` is git-IGNORED (machine-local, exactly like the
+   box's `ops/mode.txt`) so your live flips never dirty the tree. It does NOT ship in the repo. If it
+   is absent, `run_v32` fails CLOSED to `shakedown` (the no-orders rung — verified in code:
+   `read_v32_mode_file` returns `""` on a missing file, which `resolve_v32_mode` maps to
+   `shakedown`). To run a dry window either pass `--mode dry` (below) or create the file:
+   ```
+   echo dry > ops\v32_mode.txt        # or: shakedown | armed  (armed degrades to dry in Phase 2)
+   ```
+   The scheduled task passes no `--mode`, so it reads this file at run time — flip it with no
+   re-registration. `--mode` on the command line always wins over the file.
 
 ## Run one dry window
 

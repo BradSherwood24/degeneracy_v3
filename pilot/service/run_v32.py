@@ -392,17 +392,30 @@ class FrozenExecutor:
 # The driver — wires decide_v32 onto the recorder pipeline
 # ===========================================================================
 def _trade_event(market: str, payload: dict, server_ts: float) -> Trade | None:
-    """Build a Phase-1 ``Trade`` (YES-space Decimal price) from a Kalshi trade frame, or None if the
-    frame lacks the fields the core needs (then the caller journals it, fail-closed)."""
+    """Build a Phase-1 ``Trade`` (YES-space Decimal DOLLARS) from a Kalshi trade frame, or None if the
+    frame lacks the fields the core needs (then the caller journals it, fail-closed).
+
+    Pinned to a real live WS ``trade`` frame (``tests/fixtures/v32/live_frames/trade_frame.json``):
+    the exchange sends DOLLAR strings ``yes_price_dollars`` / ``no_price_dollars`` (e.g. "0.5700"),
+    the taker side in ``taker_side``, and the size in ``count_fp`` ("10.00"). The earlier parser read
+    cents fields (``yes_price`` / ``count``) that the live frame does NOT carry, so every real trade
+    was dropped as ``v32_trade_unparsed`` and the shadow never filled. Cents fields are kept only as a
+    last-resort fallback for any legacy/synthetic frame that lacks the ``_dollars`` fields."""
     side = payload.get("taker_side")
     if side not in ("yes", "no"):
         return None
     yes_price: Decimal | None = None
-    yp = payload.get("yes_price")
+    ypd = payload.get("yes_price_dollars")
+    npd = payload.get("no_price_dollars")
+    yp = payload.get("yes_price")  # legacy/synthetic cents fallback
     npr = payload.get("no_price")
     pr = payload.get("price")
     try:
-        if yp is not None:
+        if ypd is not None:
+            yes_price = Decimal(str(ypd))
+        elif npd is not None:
+            yes_price = Decimal(1) - Decimal(str(npd))
+        elif yp is not None:
             yes_price = Decimal(str(yp)) / Decimal(100)
         elif npr is not None:
             yes_price = (Decimal(100) - Decimal(str(npr))) / Decimal(100)
@@ -413,11 +426,58 @@ def _trade_event(market: str, payload: dict, server_ts: float) -> Trade | None:
     if yes_price is None:
         return None
     try:
-        count = Decimal(str(payload.get("count", 0)))
+        raw_count = payload.get("count_fp", payload.get("count", 0))
+        count = Decimal(str(raw_count))
     except (TypeError, ValueError, ArithmeticError):
         count = Decimal(0)
     return Trade(market_ticker=market, yes_price=yes_price, taker_side=side, count=count,
                  server_ts=server_ts)
+
+
+def _fill_event(payload: dict) -> dict | None:
+    """Parse a Kalshi private ``fill`` WS frame into the fields V3.2 needs, or None if it carries no
+    ``client_order_id`` (unattributable). Pinned to a real live frame
+    (``tests/fixtures/v32/live_frames/fill_frame.json``).
+
+    THE YES-SPACE UNITS TRAP: a NO purchase reports ``side: "yes"`` with a ``yes_price_dollars`` that
+    is the YES leg's price; the NO-space price we actually PAID is ``1 - yes_price_dollars``. Key the
+    conversion off ``purchased_side`` / ``outcome_side`` (both "no" on a NO fill), NEVER off ``side``.
+    Carries ``count_fp``, ``order_id``, ``client_order_id``, ``is_taker`` and ``fee_cost`` so Phase 3
+    can reconcile the executed price + fee against the resting order's price."""
+    coid = payload.get("client_order_id")
+    if not coid:
+        return None
+    purchased = payload.get("purchased_side") or payload.get("outcome_side")
+    ypd = payload.get("yes_price_dollars")
+    yes_price: Decimal | None = None
+    price: Decimal | None = None  # NO-space price actually paid (1 - yes) on a NO fill
+    try:
+        if ypd is not None:
+            yes_price = Decimal(str(ypd))
+            price = (Decimal(1) - yes_price) if purchased == "no" else yes_price
+    except (TypeError, ValueError, ArithmeticError):
+        yes_price = None
+        price = None
+    try:
+        count = int(Decimal(str(payload.get("count_fp", payload.get("count", 0)))))
+    except (TypeError, ValueError, ArithmeticError):
+        count = 0
+    fee: Decimal | None = None
+    try:
+        if payload.get("fee_cost") is not None:
+            fee = Decimal(str(payload.get("fee_cost")))
+    except (TypeError, ValueError, ArithmeticError):
+        fee = None
+    return {
+        "client_order_id": coid,
+        "order_id": payload.get("order_id"),
+        "purchased_side": purchased,
+        "yes_price": yes_price,
+        "price": price,
+        "count": count,
+        "is_taker": bool(payload.get("is_taker", False)),
+        "fee_cost": fee,
+    }
 
 
 class V32Driver:
@@ -478,10 +538,12 @@ class V32Driver:
         FOREIGN fill (journaled + dropped, fail-closed). A currently-tracked coid feeds a normal
         ``Fill``; a RETAINED (replaced/cancelled) coid is a LATE fill -> journaled ``late_fill`` and
         booked via the additive ``book_late_rest_fill`` hook so it is never a silent unhedged leg."""
-        coid = payload.get("client_order_id")
-        oid = payload.get("order_id")
+        pf = _fill_event(payload) or {}
+        coid = pf.get("client_order_id") or payload.get("client_order_id")
+        oid = pf.get("order_id") or payload.get("order_id")
         rec = self.executor.attribute(coid=coid, order_id=oid)
         if rec is None:
+            # coid not in the RestBook -> a foreign fill (R1). Drop + journal, fail-closed.
             self.counts["foreign_fill_ignored"] += 1
             self.journal.append(
                 "foreign_fill_ignored",
@@ -490,10 +552,9 @@ class V32Driver:
             )
             return
         self._stamp(server_ts)
-        try:
-            count = int(Decimal(str(payload.get("count", rec.count))))
-        except (TypeError, ValueError, ArithmeticError):
-            count = rec.count
+        count = int(pf.get("count") or 0) or rec.count  # count_fp; fall back to the placed count
+        exec_price = pf.get("price")  # NO-space executed price (parsed from the frame; 1 - yes on NO)
+        exec_fee = pf.get("fee_cost")
         live = self.state.rest_live
         pend = self.state.rest_pending
         tracked = (live is not None and live.client_order_id == rec.client_order_id) or (
@@ -502,6 +563,16 @@ class V32Driver:
         self.executor.mark_filled(rec.client_order_id)
         if tracked:
             self.counts["rest_fill"] += 1
+            self.journal.append(
+                "rest_fill",
+                {"market": market, "client_order_id": rec.client_order_id, "order_id": rec.order_id,
+                 "rest_price": rec.price, "exec_price": exec_price, "exec_fee": exec_fee,
+                 "count": count},
+                self.clock(),
+            )
+            # The rest is a post_only maker bid -> it fills AT its resting price; book the lock off
+            # ``rec.price`` (the Phase-1 convention). ``exec_price``/``exec_fee`` are journaled above
+            # for Phase-3 reconciliation against the frame.
             self._pump([Fill(order_id=rec.order_id, client_order_id=rec.client_order_id,
                              count=Decimal(count), price=rec.price, side="no", server_ts=server_ts)])
             return
@@ -514,6 +585,8 @@ class V32Driver:
                 "client_order_id": rec.client_order_id,
                 "order_id": rec.order_id,
                 "price": rec.price,
+                "exec_price": exec_price,
+                "exec_fee": exec_fee,
                 "count": count,
                 "bucket_Sd": rec.bucket_Sd,
                 "status_before": rec.status,

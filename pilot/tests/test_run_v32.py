@@ -92,10 +92,26 @@ def test_mode_resolution_cli_wins_then_file_then_failclosed(tmp_path):
     assert R.resolve_v32_mode(None, mf) == "shakedown"     # unknown -> fail closed
 
 
-def test_shipped_mode_file_is_shakedown():
-    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ops", "v32_mode.txt")
-    with open(p) as f:
-        assert f.read().strip() == "shakedown"
+def test_mode_file_is_git_ignored_and_absent_fails_closed():
+    """v32_mode.txt is machine-local + git-ignored (R2), exactly like the box's mode.txt: Brad's flips
+    never dirty the tree, and it does NOT ship in the repo. It must be git-ignored, and an ABSENT file
+    must fail closed to shakedown. If a local copy exists it must be a valid mode."""
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    rel = "pilot/ops/v32_mode.txt"
+    # (a) it is git-ignored
+    r = subprocess.run(["git", "check-ignore", rel], cwd=repo, capture_output=True, text=True)
+    assert r.returncode == 0 and rel in r.stdout, "v32_mode.txt must be git-ignored (R2)"
+    # (b) it is NOT tracked in the index
+    r = subprocess.run(["git", "ls-files", rel], cwd=repo, capture_output=True, text=True)
+    assert r.stdout.strip() == "", "v32_mode.txt must not be tracked (R2)"
+    # (c) absent -> fail closed to shakedown (the no-orders rung)
+    assert R.resolve_v32_mode(None, os.path.join(repo, "pilot", "ops", "no_such_mode.txt")) == "shakedown"
+    # (d) if a local copy exists, it must be a recognized mode
+    p = os.path.join(repo, rel)
+    if os.path.exists(p):
+        with open(p) as f:
+            assert f.read().strip() in R.VALID_MODES_V32
 
 
 def test_armed_degrades_to_dry_phase2():
