@@ -178,10 +178,30 @@ def reconcile_positions_clean(positions: Any) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # S4 day-loss decision (banded, reusing the pilot primitive)
 # ---------------------------------------------------------------------------
-def v32_s4_decision(balance_start: Decimal, balance_now: Decimal, pending_value: Decimal):
-    """S4 with the pending-settlement band at the V3.2 cap. Returns the ``S4Decision``
+def v32_s4_decision(
+    balance_start: Decimal,
+    balance_now: Decimal,
+    pending_credit: tuple[Decimal, Decimal],
+):
+    """S4 with the pending-settlement band at the V3.2 cap, using the (pessimistic, optimistic) credit
+    band from ``v32_pending_credit`` (Phase-4 floor-netting RULING). The guaranteed floor is netted
+    into the account balance for BOTH bounds; only the upside separates them:
+
+        loss_pessimistic = start - (now + pess_credit)   (only the guaranteed floor arrives)
+        loss_optimistic  = start - (now + opt_credit)    (floor + upside arrive)
+        latch   iff loss_optimistic >= cap   (breached under EVERY resolution of the pending legs)
+        clear   iff loss_pessimistic <  cap  (not breached under any)
+        pending otherwise                    (the breach turns on an unfinalized leg -> stand down)
+
+    Reuses the pilot's ``s4_balance_decision`` by folding the guaranteed floor into ``balance_now`` and
+    passing only the upside (opt - pess) as its optimistic pending value; the returned
+    ``S4Decision.loss_{pessimistic,optimistic}`` then read on the full band. Returns the ``S4Decision``
     (kind clear|pending|latch)."""
-    return s4_balance_decision(balance_start, balance_now, pending_value, V32_S4_DAY_LOSS_CAP_DOLLARS)
+    pess_credit, opt_credit = pending_credit
+    upside = opt_credit - pess_credit
+    return s4_balance_decision(
+        balance_start, balance_now + pess_credit, upside, V32_S4_DAY_LOSS_CAP_DOLLARS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +276,15 @@ def decide_v32_arming(
     clean, detail = reconcile_positions_clean(positions)
     if not clean:
         reasons.append(f"reconcile-first: {detail}")
-    if s4 is not None and getattr(s4, "kind", None) == "latch":
-        reasons.append("S4 day-loss cap breached")
+    if s4 is not None:
+        s4_kind = getattr(s4, "kind", None)
+        if s4_kind == "latch":
+            # breached under EVERY resolution of the pending legs -> refuse to arm this window.
+            reasons.append("S4 day-loss cap breached")
+        elif s4_kind == "pending":
+            # the breach turns on an unfinalized leg -> stand down THIS window (degrade to dry),
+            # write NO day-guard latch; the next wake re-evaluates on the fresh balance (RULING).
+            reasons.append("S4 day-loss pending settlement (stand down, no latch)")
     if reasons:
         return V32ArmingOutcome(effective_mode="dry", armed=False,
                                 degrade_reason="degrade_to_dry", reasons=tuple(reasons))

@@ -15,6 +15,15 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from service.v32.falsifier_pins import (
+    V32_FALSIFIER_MAX_EXEC_GAP_CENTS,
+    V32_FALSIFIER_MAX_ONE_LEGGED,
+    V32_FALSIFIER_MIN_FILL_RATE_PER_DAY,
+    V32_FALSIFIER_MIN_MEAN_LOCK_CENTS,
+    V32_FALSIFIER_MIN_N,
+    V32_FALSIFIER_MIN_PCT_POSITIVE,
+    V32_FALSIFIER_SHADOW_GAP_E,
+)
 from service.v32.ledger import DEFAULT_V32_LEDGER_PATH, load_v32_rows
 
 
@@ -105,6 +114,7 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "e_keys": e_keys,
         "windows": windows,
+        "falsifier": build_falsifier_scoreboard(rows),
         "totals": {
             "windows": len(rows),
             "would_places": tot_would_places,
@@ -116,6 +126,159 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mean_lag_seconds": mean_lag,
         },
     }
+
+
+def _percentile(sorted_vals: list[Decimal], pct: Decimal) -> Decimal | None:
+    """Nearest-rank percentile of an already-sorted list (pct in [0,100]). None on empty."""
+    if not sorted_vals:
+        return None
+    n = len(sorted_vals)
+    # nearest-rank: rank = ceil(pct/100 * n), clamped to [1, n]
+    import math
+    rank = int(math.ceil(float(pct) / 100.0 * n))
+    rank = max(1, min(n, rank))
+    return sorted_vals[rank - 1]
+
+
+def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The pre-registered falsifier scoreboard, computed from the SAME [pin] constants the document
+    commits to (``service.v32.falsifier_pins``). Pure; the CLI renders it.
+
+    A *completed set* is an armed window whose ``realized_lock`` is present (both wings taken). A
+    *one-legged set* is an armed window flagged ``one_legged``. The verdict (``ALIVE-so-far`` / ``KILL``
+    / ``n<MIN_N pending``) is decided ONLY once ``n`` completed sets exist and applies every pinned
+    threshold; any miss at n >= MIN_N is a KILL (no re-spec on the same window)."""
+    e = V32_FALSIFIER_SHADOW_GAP_E
+    completed: list[dict[str, Any]] = []
+    legged = 0
+    fill_days: set[str] = set()
+    armed_days: set[str] = set()
+    live_locks_c: list[Decimal] = []          # realized lock in cents (completed sets)
+    shadow_locks_c: list[Decimal] = []        # shadow E=0.10 lock in cents (any window it filled)
+    gaps_c: list[Decimal] = []                # shadow E=0.10 - live lock in cents (both present)
+    replaces: list[Decimal] = []
+    strike_lags: list[Decimal] = []
+    bucket_lags: list[Decimal] = []
+    for r in rows:
+        if not r.get("armed"):
+            continue
+        day = str(r.get("close_time", ""))[:10]
+        armed_days.add(day)
+        rlock = _dec(r.get("realized_lock"))
+        is_fill = bool(r.get("realized_unsettled")) or rlock is not None or bool(r.get("one_legged"))
+        if is_fill:
+            fill_days.add(day)
+        if r.get("one_legged"):
+            legged += 1
+        rep = _dec(r.get("replaces"))
+        if rep is not None:
+            replaces.append(rep)
+        for bucket, lag_field in ((strike_lags, "strike_lag_seconds"),
+                                  (bucket_lags, "bucket_lag_seconds")):
+            lg = _dec(r.get(lag_field))
+            if lg is not None:
+                bucket.append(lg)
+        shadow = r.get("shadow") or {}
+        sub = shadow.get(e)
+        slock = _dec(sub.get("lock")) if (sub and sub.get("filled")) else None
+        if slock is not None:
+            shadow_locks_c.append(slock * 100)
+        if rlock is not None:
+            completed.append(r)
+            live_locks_c.append(rlock * 100)
+            if slock is not None:
+                gaps_c.append(slock * 100 - rlock * 100)
+
+    n = len(completed)
+    n_days = len(armed_days)
+    # fills_total = number of armed windows with a rest fill (completed + one-legged)
+    fills_total = sum(
+        1 for r in rows if r.get("armed") and (
+            bool(r.get("realized_unsettled")) or _dec(r.get("realized_lock")) is not None
+            or bool(r.get("one_legged")))
+    )
+    slocks = sorted(live_locks_c)
+    mean_lock = (sum(live_locks_c, Decimal(0)) / Decimal(n)) if n else None
+    median_lock = _percentile(slocks, Decimal(50)) if n else None
+    p10_lock = _percentile(slocks, Decimal(10)) if n else None
+    min_lock = slocks[0] if n else None
+    pos = sum(1 for x in live_locks_c if x > 0)
+    pct_positive = (Decimal(pos) * 100 / Decimal(n)) if n else None
+    fill_rate = (Decimal(fills_total) / Decimal(n_days)) if n_days else None
+    shadow_mean = ((sum(shadow_locks_c, Decimal(0)) / Decimal(len(shadow_locks_c)))
+                   if shadow_locks_c else None)
+    exec_gap = (sum(gaps_c, Decimal(0)) / Decimal(len(gaps_c))) if gaps_c else None
+    replaces_mean = (sum(replaces, Decimal(0)) / Decimal(len(replaces))) if replaces else None
+    strike_p99 = _percentile(sorted(strike_lags), Decimal(99)) if strike_lags else None
+    bucket_p99 = _percentile(sorted(bucket_lags), Decimal(99)) if bucket_lags else None
+
+    # --- verdict from the [pin] constants -------------------------------------------------------
+    if n < V32_FALSIFIER_MIN_N:
+        verdict = f"n<{V32_FALSIFIER_MIN_N} pending (n={n})"
+    else:
+        fails: list[str] = []
+        if mean_lock is None or mean_lock < V32_FALSIFIER_MIN_MEAN_LOCK_CENTS:
+            fails.append(f"mean lock {mean_lock}c < +{V32_FALSIFIER_MIN_MEAN_LOCK_CENTS}c")
+        if pct_positive is None or pct_positive < V32_FALSIFIER_MIN_PCT_POSITIVE:
+            fails.append(f"%positive {pct_positive} < {V32_FALSIFIER_MIN_PCT_POSITIVE}")
+        if fill_rate is None or fill_rate < V32_FALSIFIER_MIN_FILL_RATE_PER_DAY:
+            fails.append(f"fill rate {fill_rate}/day < {V32_FALSIFIER_MIN_FILL_RATE_PER_DAY}")
+        if exec_gap is None or exec_gap > V32_FALSIFIER_MAX_EXEC_GAP_CENTS:
+            fails.append(f"exec gap {exec_gap}c > {V32_FALSIFIER_MAX_EXEC_GAP_CENTS}c")
+        if legged > V32_FALSIFIER_MAX_ONE_LEGGED:
+            fails.append(f"one-legged {legged} > {V32_FALSIFIER_MAX_ONE_LEGGED}")
+        verdict = "ALIVE-so-far" if not fails else ("KILL: " + "; ".join(fails))
+
+    return {
+        "shadow_gap_E": e,
+        "n": n,
+        "fills_total": fills_total,
+        "one_legged": legged,
+        "n_days": n_days,
+        "mean_lock_c": mean_lock,
+        "median_lock_c": median_lock,
+        "p10_lock_c": p10_lock,
+        "min_lock_c": min_lock,
+        "pct_positive": pct_positive,
+        "fill_rate_per_day": fill_rate,
+        "shadow_mean_lock_c": shadow_mean,
+        "exec_gap_c": exec_gap,
+        "replaces_per_hour_mean": replaces_mean,
+        "strike_lag_p99_s": strike_p99,
+        "bucket_lag_p99_s": bucket_p99,
+        "verdict": verdict,
+    }
+
+
+def _c(v: Decimal | None, prec: int = 1) -> str:
+    return f"{v:+.{prec}f}c" if v is not None else "n/a"
+
+
+def _num(v: Decimal | None, prec: int, suffix: str = "") -> str:
+    return f"{v:.{prec}f}{suffix}" if v is not None else "n/a"
+
+
+def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
+    e = sb["shadow_gap_E"]
+    pct = sb["pct_positive"]
+    rate = sb["fill_rate_per_day"]
+    return [
+        "",
+        "FALSIFIER SCOREBOARD (DegeneracyV3_2, continuous-requote pump-fader, E=0.10) -- [pin] gates",
+        "-" * 78,
+        f"  completed sets n = {sb['n']}   (rest fills total = {sb['fills_total']}, one-legged = "
+        f"{sb['one_legged']})   armed days = {sb['n_days']}",
+        f"  realized lock: mean {_c(sb['mean_lock_c'])}  median {_c(sb['median_lock_c'])}  "
+        f"p10 {_c(sb['p10_lock_c'])}  min {_c(sb['min_lock_c'])}",
+        f"  %positive = {_num(pct, 1) if pct is not None else 'n/a'}   "
+        f"fill rate = {_num(rate, 2, '/day') if rate is not None else 'n/a'}",
+        f"  shadow E={e}: mean lock {_c(sb['shadow_mean_lock_c'])}   "
+        f"execution gap (shadow-live) {_c(sb['exec_gap_c'])}",
+        f"  replaces/hour mean = {_num(sb['replaces_per_hour_mean'], 1)}   "
+        f"data-age p99: strike {_num(sb['strike_lag_p99_s'], 2, 's')}  "
+        f"bucket {_num(sb['bucket_lag_p99_s'], 2, 's')}",
+        f"  VERDICT: {sb['verdict']}",
+    ]
 
 
 def _render(report: dict[str, Any]) -> str:
@@ -155,6 +318,8 @@ def _render(report: dict[str, Any]) -> str:
     mlag = t["mean_lag_seconds"]
     lines.append(f"  mean data-age (lag) = {float(mlag):.2f}s" if mlag is not None
                  else "  mean data-age (lag) = n/a")
+    if report.get("falsifier") is not None:
+        lines.extend(_render_scoreboard(report["falsifier"]))
     return "\n".join(lines)
 
 

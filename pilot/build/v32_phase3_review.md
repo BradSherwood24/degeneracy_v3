@@ -87,12 +87,22 @@ below are for the FIRST ARMED WINDOW to confirm and for the Phase-4 `[pin]` list
 
 ## NOT FIXED — flagged for a ruling / the first armed window
 
-* **S4 floor-netting (conservative, arguable).** For a COMPLETE or 2-leg unsettled pin, `v32_pending_credit`
-  still nets the guaranteed floor (`min(#legs,2) − floor`), so an unsettled but profitable pin's cash dip is
-  NOT credited back — biasing S4 toward a (spurious) stand-down if two pins are unsettled at once at :40. This
-  errs toward HALTING (safe), and the "minus floor" is a deliberate, documented choice, so I left it — but the
-  real-balance S4 arguably wants the FULL owed payoff (`min(#legs,2)`). **Phase-4 decision** (kept #6's
-  unambiguous unsafe overstatement fixed either way).
+* **S4 floor-netting (conservative, arguable). RESOLVED BY RULING (coordinator 2026-09-13, Phase 4).**
+  For a COMPLETE or 2-leg unsettled pin, `v32_pending_credit` used to net only the OPTIMISTIC upside
+  (`min(#legs,2) − floor`), so an unsettled-but-guaranteed pin's cash dip was NOT credited back into the
+  pessimistic bound — biasing S4 toward a spurious stand-down when two pins were unsettled at :40. RULING:
+  the pending credit is now BANDED like the pilot's `s4_pending_value`. For each unsettled set this UTC day,
+  optimistic = guaranteed floor + upside, pessimistic = guaranteed floor, where guaranteed floor = $2.00 for
+  a complete 3-leg pin / $1.00 for any 2-leg subset / $0.00 for a lone leg, and upside = $0 / $1.00 / $1.00.
+  `v32_pending_credit` now returns `(pessimistic, optimistic)`; `v32_s4_decision` nets the guaranteed floor
+  into BOTH bounds (folding it into `balance_now` and passing only the upside to `s4_balance_decision`), so
+  `loss_pessimistic = start − (now + pess)` and `loss_optimistic = start − (now + opt)`. **latch** iff
+  loss_optimistic ≥ cap; **clear** iff loss_pessimistic < cap; else **pending** → `decide_v32_arming` stands
+  the window down (degrade to dry) with NO day-guard latch (the next wake re-evaluates on the fresh balance).
+  #6's unambiguous lone-leg overstatement (a lone leg's max payoff is $1, not $2) stays fixed. Tests:
+  `test_pending_credit_band_{complete_pin,two_leg_subset,lone_leg,sums_across_sets_...}` and
+  `test_s4_band_{clears_when_guaranteed_floor_covers_the_dip,latches_when_breached...,pending_when_breach...,
+  lone_leg_upside_not_credited...}` + `test_decide_arming_stands_down_on_s4_pending_without_latch`.
 * **Reconcile-first keys on non-zero size only.** `reconcile_positions_clean` refuses if any KXBTC* position
   size ≠ 0. Confirm the venue zeroes a SETTLED position by the next :40 (else a slow settlement blocks arming
   — fail-closed, safe, but could stand the pilot down). Added to the first-armed-window list.
