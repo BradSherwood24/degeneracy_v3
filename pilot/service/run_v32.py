@@ -68,6 +68,7 @@ from typing import Any
 from service.book import BookMirror, TopOfBook
 from service.journal_io import _gzip_one_crash_safe
 from service.proxy_auth import ProxyAuth
+from service.proxy_writer import ProxyWriter
 from service.record_range import (
     RANGE_SERIES,
     StreamJournal,
@@ -99,7 +100,33 @@ from service.v32 import (
     parse_strike_ticker,
 )
 from service.v32.events import STRIKE_SERIES_PREFIX
-from service.v32.ledger import DEFAULT_V32_LEDGER_PATH, append_v32_ledger_row, build_v32_ledger_row
+from service.v32.executor import (
+    LiveExecutor,
+    cancel_stale_open_orders,
+)
+from service.v32.core import lock_value
+from service.v32.ledger import (
+    DEFAULT_V32_LEDGER_PATH,
+    append_v32_ledger_row,
+    build_v32_ledger_row,
+    load_v32_rows,
+    v32_pending_credit,
+    v32_set_floor_dollars,
+    v32_settlement_backfill_sweep,
+)
+from service._simlaw import fee as _fee
+from service.v32.stops import (
+    V32_S1_LEGGED_LATCH_THRESHOLD,
+    decide_v32_arming,
+    record_legged_occurrence,
+    v32_day_guard_path,
+    v32_s4_decision,
+)
+from service.stops import (
+    ensure_balance_start,
+    parse_balance,
+    read_day_guard,
+)
 from service.wake import (
     DEAD_STATUSES,
     MARKETS_PATH,
@@ -133,6 +160,7 @@ _PILOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_JOURNAL_DIR = os.path.join(_PILOT_DIR, "journals_v32")
 DEFAULT_LOG_DIR = os.path.join(_PILOT_DIR, "logs_v32")
 DEFAULT_MODE_PATH = os.path.join(_PILOT_DIR, "ops", "v32_mode.txt")
+DEFAULT_FALSIFIER_PATH = os.path.join(_PILOT_DIR, "ceremony", "v32_falsifier.md")
 
 
 # ===========================================================================
@@ -155,11 +183,10 @@ def resolve_v32_mode(cli_mode: str | None, mode_txt_path: str) -> str:
 
 
 def effective_mode_and_degrade(resolved_mode: str) -> tuple[str, str | None]:
-    """Phase-2 mode mapping (pure, testable). ``armed`` has NO order path in Phase 2 (the maker
-    executor is Phase 3), so it DEGRADES to dry with reason ``phase2_no_executor``. shakedown/dry pass
-    through unchanged. Returns ``(effective_mode, degrade_reason | None)``."""
-    if resolved_mode == "armed":
-        return "dry", "phase2_no_executor"
+    """Phase-3 mode passthrough (pure, testable). All three modes pass through unchanged here — the
+    armed->dry DEGRADE decision now lives in ``service.v32.stops.decide_v32_arming`` (S5 + reconcile +
+    day latch + S4), which runs in ``main`` with the live /health, positions and balance. shakedown/dry
+    never arm. Returns ``(effective_mode, degrade_reason | None)`` (degrade is always None here)."""
     return resolved_mode, None
 
 
@@ -276,6 +303,101 @@ def observed_bucket_width(bucket_map: dict[str, tuple[float, float]]) -> int | N
     return max(widths.items(), key=lambda kv: kv[1])[0]
 
 
+def bucket_width_of(floor: float, cap: float) -> int | None:
+    """The $ width of one bucket [floor, cap], or None if unmeasurable (round(cap - floor + 0.01))."""
+    try:
+        w = int(round(float(cap) - float(floor) + 0.01))
+    except (TypeError, ValueError):
+        return None
+    return w if w > 0 else None
+
+
+def filter_buckets_to_width(
+    bucket_map: dict[str, tuple[float, float]], width: int
+) -> tuple[dict[str, tuple[float, float]], list[str]]:
+    """P3-2: DROP every bucket whose width != ``width`` so a mixed-width hour cannot select a
+    wrong-width spot bucket and break the $2 pin (a strike could land INSIDE a 250-wide bucket). Returns
+    (kept_map, dropped_tickers). The caller stands down if the kept map is empty."""
+    kept: dict[str, tuple[float, float]] = {}
+    dropped: list[str] = []
+    for tk, (floor, cap) in bucket_map.items():
+        if bucket_width_of(floor, cap) == int(width):
+            kept[tk] = (floor, cap)
+        else:
+            dropped.append(tk)
+    return kept, dropped
+
+
+# ===========================================================================
+# Proxy read helpers (health / settlement) — all GET through the proxy
+# ===========================================================================
+def get_health(proxy_base: str, http_get: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """GET {base}/health (the proxy's own endpoint; not under /trade-api/v2). Fail-closed to {} on any
+    error so the arming check simply refuses. ``http_get`` is injected in tests."""
+    try:
+        if http_get is not None:
+            resp = http_get(proxy_base.rstrip("/") + "/health")
+        else:
+            import requests
+            resp = requests.get(proxy_base.rstrip("/") + "/health", timeout=5.0)
+        if getattr(resp, "status_code", None) != 200:
+            return {}
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[V32] /health read failed: %s", e)
+        return {}
+
+
+def fetch_market_result_v32(proxy: Any, ticker: str) -> str | None:
+    """The settled result ('yes'/'no') for ``ticker`` via /markets/{ticker} (exact-ticker match), or
+    None until settled/unavailable. Mirror of run_window._fetch_market_result (fail-closed to None)."""
+    try:
+        resp = proxy.rest_get(f"/markets/{ticker}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[V32] market-result fetch failed for %s: %s", ticker, e)
+        return None
+    if not isinstance(resp, dict):
+        return None
+    market = resp.get("market")
+    rec = market if isinstance(market, dict) and market.get("ticker") == ticker else None
+    if rec is None:
+        markets = resp.get("markets")
+        if isinstance(markets, list):
+            rec = next((m for m in markets if isinstance(m, dict) and m.get("ticker") == ticker), None)
+    if not isinstance(rec, dict):
+        return None
+    result = rec.get("result")
+    return result if result in ("yes", "no") else None
+
+
+# ===========================================================================
+# Executor selection — P3-1: the ONE place the executor kind is chosen
+# ===========================================================================
+def build_executor(
+    effective_mode: str,
+    *,
+    bucket_map: dict[str, tuple[float, float]],
+    exchange_index_by_ticker: dict[str, int | None],
+    journal: StreamJournal,
+    close_epoch_val: int,
+    params: V32Params,
+    writer: ProxyWriter | None,
+    clock: Callable[[], float] = time.time,
+) -> Any:
+    """Select the executor by ``effective_mode`` in EXACTLY ONE place (P3-1). ``armed`` -> the real
+    ``LiveExecutor`` (requires a ``ProxyWriter``); everything else -> the dry ``FrozenExecutor`` (which
+    refuses a real action kind). A LiveExecutor is NEVER constructed unless effective_mode is armed."""
+    if effective_mode == "armed":
+        if writer is None:
+            raise ValueError("armed executor requires a ProxyWriter (P3-1)")
+        return LiveExecutor(
+            writer, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
+            params.quote_end_s, clock=clock,
+        )
+    return FrozenExecutor(bucket_map)
+
+
 # ===========================================================================
 # Order-tracking layer + FrozenExecutor (F-1 retained cancel context)
 # ===========================================================================
@@ -322,9 +444,28 @@ class FrozenExecutor:
         fc = self.bucket_map.get(ticker)
         return int(round(float(fc[0]))) if fc is not None else None
 
+    # Real (order-emitting) action kinds. A FrozenExecutor must NEVER see one — it would synthesize a
+    # phantom ack/cancel/fill and book money that was never sent (Phase-2 review P3-1). The executor is
+    # selected by ``effective_mode`` in exactly one place (``build_executor``); a real kind reaching a
+    # FrozenExecutor is a mis-wire, so we fail loud rather than silently synth-fill.
+    _REAL_KINDS = (
+        ActionKind.PLACE_REST, ActionKind.CANCEL_REST,
+        ActionKind.TAKE_WINGS, ActionKind.RETRY_WING,
+    )
+
     def on_action(self, action, state: V32State, now: float) -> list[Any]:
-        """Handle one emitted action; return the synthetic exchange events to feed back into the core."""
+        """Handle one emitted action; return the synthetic exchange events to feed back into the core.
+
+        P3-1: refuses a REAL (non-WOULD_*) kind — the core must be in shakedown (WOULD_* twins only)
+        whenever a FrozenExecutor is selected, so a real kind here means the armed executor was not
+        wired. Raise so the mis-wire fails loud and the window stands down, never synth-fills live money.
+        """
         k = action.kind
+        if k in self._REAL_KINDS:
+            raise AssertionError(
+                f"FrozenExecutor received a REAL action kind {k}; a FrozenExecutor may only handle "
+                f"WOULD_* twins (the core must be shakedown=True). Armed windows use LiveExecutor (P3-1)."
+            )
         if k in (ActionKind.WOULD_PLACE_REST, ActionKind.PLACE_REST):
             coid = action.client_order_id or ""
             oid = f"dry-{coid}"
@@ -471,6 +612,7 @@ def _fill_event(payload: dict) -> dict | None:
     return {
         "client_order_id": coid,
         "order_id": payload.get("order_id"),
+        "trade_id": payload.get("trade_id"),   # for fill de-dup (WS channel + status poll)
         "purchased_side": purchased,
         "yes_price": yes_price,
         "price": price,
@@ -505,10 +647,20 @@ class V32Driver:
         self._last_wall: float | None = None
         self._last_eval_key: tuple | None = None
         self._last_eval_ts: float | None = None
+        # fill de-dup: a fill can surface on BOTH the private ``fill`` WS channel AND the 1 s
+        # order-status poll (belt and braces). Book each once, keyed by trade_id (WS) / order_id (poll).
+        self._seen_trade_ids: set[str] = set()
+        self._rest_fill_booked_oids: set[str] = set()
 
     # --- clock source for the ClockTick pump ---
     def _stamp(self, server_ts: float) -> None:
-        self._last_server_ts = server_ts
+        # P3-3: the two WS connections carry independent server clocks that interleave. Keep the
+        # freshness/tick clock MONOTONE (never let a later-arriving frame from the slower clock step
+        # ``server_now`` backwards) so a clock skew cannot make a fresh book look stale -> spurious
+        # CANCEL_REST + re-place churn (budget burn + A_REPLACE). A regressing frame is still FOLDED
+        # (its book is applied by the recorder); only the tick clock refuses to go back.
+        prev = self._last_server_ts
+        self._last_server_ts = server_ts if prev is None else max(prev, server_ts)
         self._last_wall = self.clock()
 
     def server_now(self) -> float | None:
@@ -541,6 +693,18 @@ class V32Driver:
         pf = _fill_event(payload) or {}
         coid = pf.get("client_order_id") or payload.get("client_order_id")
         oid = pf.get("order_id") or payload.get("order_id")
+        trade_id = pf.get("trade_id") or payload.get("trade_id")
+        # de-dup: a fill can arrive on the WS channel AND the status poll; book each trade once.
+        if trade_id is not None and trade_id in self._seen_trade_ids:
+            self.counts["fill_dup_ignored"] += 1
+            return
+        # a WS echo of a taker wing leg (already booked synchronously from the batch response) -> skip
+        # (not "foreign"): the wing coid is known to the executor.
+        if coid is not None and coid in getattr(self.executor, "wing_coids", set()):
+            if trade_id is not None:
+                self._seen_trade_ids.add(trade_id)
+            self.counts["wing_fill_ws_dup"] += 1
+            return
         rec = self.executor.attribute(coid=coid, order_id=oid)
         if rec is None:
             # coid not in the RestBook -> a foreign fill (R1). Drop + journal, fail-closed.
@@ -552,6 +716,8 @@ class V32Driver:
             )
             return
         self._stamp(server_ts)
+        if trade_id is not None:
+            self._seen_trade_ids.add(trade_id)
         count = int(pf.get("count") or 0) or rec.count  # count_fp; fall back to the placed count
         exec_price = pf.get("price")  # NO-space executed price (parsed from the frame; 1 - yes on NO)
         exec_fee = pf.get("fee_cost")
@@ -562,14 +728,18 @@ class V32Driver:
         )
         self.executor.mark_filled(rec.client_order_id)
         if tracked:
+            if rec.order_id is not None:
+                self._rest_fill_booked_oids.add(rec.order_id)
             self.counts["rest_fill"] += 1
+            self._check_exec_price(rec, exec_price)  # P3-4
             self.journal.append(
                 "rest_fill",
                 {"market": market, "client_order_id": rec.client_order_id, "order_id": rec.order_id,
                  "rest_price": rec.price, "exec_price": exec_price, "exec_fee": exec_fee,
-                 "count": count},
+                 "count": count, "path": "ws"},
                 self.clock(),
             )
+            self._record_fill(rec, exec_price, exec_fee, count, path="ws")
             # The rest is a post_only maker bid -> it fills AT its resting price; book the lock off
             # ``rec.price`` (the Phase-1 convention). ``exec_price``/``exec_fee`` are journaled above
             # for Phase-3 reconciliation against the frame.
@@ -577,7 +747,10 @@ class V32Driver:
                              count=Decimal(count), price=rec.price, side="no", server_ts=server_ts)])
             return
         # F-1 late fill on a no-longer-tracked (replaced / eagerly-cancelled) own order
+        if rec.order_id is not None:
+            self._rest_fill_booked_oids.add(rec.order_id)
         self.counts["late_fill"] += 1
+        self._check_exec_price(rec, exec_price)  # P3-4
         self.journal.append(
             "late_fill",
             {
@@ -590,12 +763,83 @@ class V32Driver:
                 "count": count,
                 "bucket_Sd": rec.bucket_Sd,
                 "status_before": rec.status,
+                "path": "ws",
             },
             self.clock(),
         )
+        self._record_fill(rec, exec_price, exec_fee, count, path="ws")
         self.state, actions = book_late_rest_fill(
             self.params, self.state, price=rec.price, count=count, server_ts=server_ts,
             bucket_Sd=rec.bucket_Sd,
+        )
+        synth: list[Any] = []
+        for a in actions:
+            self._journal_action(a, server_ts)
+            synth += self.executor.on_action(a, self.state, server_ts)
+        if synth:
+            self._pump(synth)
+
+    # --- P3-4 exec-price reconciliation + money-math capture ---
+    def _check_exec_price(self, rec, exec_price) -> None:
+        """P3-4: a post_only maker fills at its RESTING limit, so the frame's NO-space executed price
+        must equal ``rec.price``. A mismatch means our model of maker fills is wrong — record an alarm
+        and continue (the lock is still booked at the resting price, the conservative convention)."""
+        if exec_price is None:
+            return
+        try:
+            if abs(Decimal(str(exec_price)) - Decimal(str(rec.price))) > Decimal("0.0001"):
+                detail = {"client_order_id": rec.client_order_id, "order_id": rec.order_id,
+                          "rest_price": str(rec.price), "exec_price": str(exec_price)}
+                self.counts["exec_price_mismatch"] += 1
+                self.journal.append("alarm", {"alarm": "exec_price_mismatch", **detail}, self.clock())
+                mm = getattr(self.executor, "exec_price_mismatches", None)
+                if mm is not None:
+                    mm.append(detail)
+        except (ArithmeticError, ValueError, TypeError):
+            pass
+
+    def _record_fill(self, rec, exec_price, exec_fee, count: int, *, path: str) -> None:
+        """Append the REST fill to the executor's money-math capture (the ledger reads it at finalize).
+        Booked at the resting price ``rec.price`` (post_only maker); the frame's executed price/fee are
+        kept for reconciliation."""
+        fills = getattr(self.executor, "fills", None)
+        if fills is None:
+            return
+        # de-dup the REST leg across the cancel-race / WS / poll paths so money-math never
+        # double-counts one fill (the cancel path may have already booked it by order_id).
+        booked = getattr(self.executor, "booked_rest_oids", None)
+        if booked is not None and rec.order_id is not None:
+            if rec.order_id in booked:
+                return
+            booked.add(rec.order_id)
+        fills.append({"leg": "rest", "side": "no", "ticker": rec.ticker, "price": rec.price,
+                      "exec_price": exec_price, "fee": exec_fee, "count": int(count),
+                      "bucket_Sd": rec.bucket_Sd, "path": path,
+                      "client_order_id": rec.client_order_id})
+
+    def on_poll_fill(self, order_id: str, filled_count: int, server_ts: float) -> None:
+        """Book a REST fill discovered by the 1 s order-status poll (belt and braces). De-duped against
+        the WS channel by ``order_id`` so a fill seen on both paths is booked once."""
+        if filled_count <= 0 or order_id in self._rest_fill_booked_oids:
+            return
+        rec = self.executor.attribute(order_id=order_id)
+        if rec is None:
+            return
+        self._rest_fill_booked_oids.add(order_id)
+        self._stamp(server_ts)
+        self.executor.mark_filled(rec.client_order_id)
+        self.counts["rest_fill_poll"] += 1
+        self.journal.append(
+            "rest_fill", {"client_order_id": rec.client_order_id, "order_id": order_id,
+                          "rest_price": rec.price, "count": int(filled_count), "path": "poll"},
+            self.clock(),
+        )
+        self._record_fill(rec, None, None, int(filled_count), path="poll")
+        # feed the core (idempotent: rest_fill-is-None guard) so the wings complete.
+        self.state, actions = decide_v32(
+            self.params, self.state,
+            Fill(order_id=order_id, client_order_id=rec.client_order_id,
+                 count=Decimal(int(filled_count)), price=rec.price, side="no", server_ts=server_ts),
         )
         synth: list[Any] = []
         for a in actions:
@@ -618,7 +862,20 @@ class V32Driver:
             for a in actions:
                 self._journal_action(a, getattr(ev, "server_ts", self.clock()))
                 q.extend(self.executor.on_action(a, self.state, getattr(ev, "server_ts", self.clock())))
+            self._apply_executor_standdown(getattr(ev, "server_ts", self.clock()))
             self._maybe_eval(getattr(ev, "server_ts", None))
+
+    def _apply_executor_standdown(self, server_ts: float) -> None:
+        """The armed executor latches ``stand_down_reason`` after 3 consecutive rest rejections. Turn
+        that into the core's ``stood_down`` so ``_requote`` cancels + stops quoting for the hour (the
+        next book/clock tick honors it); idempotent once applied."""
+        reason = getattr(self.executor, "stand_down_reason", None)
+        if reason and not self.state.stood_down:
+            from dataclasses import replace as _replace
+            self.state = _replace(self.state, stood_down=True)
+            self.counts["executor_standdown"] += 1
+            self.journal.append("alarm", {"alarm": "executor_standdown", "reason": reason},
+                                self.clock())
 
     # --- journaling ---
     def _journal_action(self, a, server_ts: float) -> None:
@@ -818,6 +1075,33 @@ async def _clock_pump(
             driver.on_clock_tick(sn)
 
 
+ORDER_POLL_INTERVAL_S = 1.0
+
+
+async def _order_status_poll(
+    driver: V32Driver, executor: Any, clock: Callable[[], float], deadline: float,
+    sleep: Callable[[float], Awaitable[None]], interval: float = ORDER_POLL_INTERVAL_S,
+) -> None:
+    """Belt-and-braces: every ``interval`` s, GET the status of our live rest and book any fill the WS
+    ``fill`` channel missed (de-duped by order_id in ``driver.on_poll_fill``). Armed only. Never raises
+    out of the loop."""
+    while clock() < deadline:
+        await sleep(interval)
+        if clock() >= deadline:
+            break
+        rest = driver.state.rest_live
+        if rest is None or rest.order_id is None:
+            continue
+        try:
+            st = executor.order_status(rest.order_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[V32] order-status poll error: %s", e)
+            continue
+        if st.available and st.filled_count > 0:
+            driver.on_poll_fill(rest.order_id, int(st.filled_count),
+                                driver.server_now() or clock())
+
+
 async def run_v32_window(
     shared: V32Recorder,
     strike_conn: _ConnRecorder,
@@ -829,15 +1113,20 @@ async def run_v32_window(
     *,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     pump_interval: float = PUMP_INTERVAL_S,
+    order_poll: bool = False,
 ) -> None:
-    """Await the connect gate, then run both dial loops + the ClockTick pump concurrently on one loop
-    until the deadline. ``sleep`` is injected so tests drive the whole thing with a fake clock."""
+    """Await the connect gate, then run both dial loops + the ClockTick pump (and, when armed, the 1 s
+    order-status poll) concurrently on one loop until the deadline. ``sleep`` is injected so tests drive
+    the whole thing with a fake clock."""
     await _await_gate(gate_epoch, deadline, clock, sleep)
-    await asyncio.gather(
+    tasks = [
         run_recording(strike_conn, deadline=deadline, sleep=sleep),
         run_recording(bucket_conn, deadline=deadline, sleep=sleep),
         _clock_pump(driver, clock, deadline, sleep, pump_interval),
-    )
+    ]
+    if order_poll:
+        tasks.append(_order_status_poll(driver, driver.executor, clock, deadline, sleep))
+    await asyncio.gather(*tasks)
 
 
 # ===========================================================================
@@ -854,16 +1143,66 @@ def _gzip_journal(journal_path: str) -> dict:
                 "raw_bytes": None, "gz_bytes": None, "error": str(e)}
 
 
+def _compute_money_math(state: V32State, executor: Any) -> dict[str, Any]:
+    """Fold the completed window's fills into the ledger's money-math slots. Returns the kwargs for
+    ``build_v32_ledger_row`` (all empty/None when nothing filled — dry/shakedown windows). ``held_legs``
+    are the bucket-NO + each FILLED wing leg (side/ticker/count), marked ``realized_unsettled`` so the
+    settlement backfill sweep corrects the conservative floor booked here."""
+    fills = list(getattr(executor, "fills", []) or [])
+    if not fills or state.rest_fill is None:
+        return {"fills": fills}
+    rest_fills = [f for f in fills if f.get("leg") == "rest"]
+    wing_fills = [f for f in fills if f.get("leg") == "wing"]
+    held: list[dict[str, Any]] = []
+    bt = state.bucket_tickers.get(state.spot_Sd) if state.spot_Sd is not None else None
+    if bt:
+        held.append({"ticker": bt, "side": "no", "count": int(state.rest_fill.count)})
+    w_paid = Decimal(0)
+    all_wings_filled = bool(state.wing_legs) and all(lg.status == "filled" for lg in state.wing_legs)
+    for lg in state.wing_legs:
+        if lg.status == "filled":
+            held.append({"ticker": lg.ticker, "side": lg.side, "count": int(lg.count)})
+            if lg.fill_price is not None:
+                w_paid += lg.fill_price + _fee(lg.fill_price)
+    realized_lock = lock_value(state.rest_fill.price, w_paid) if all_wings_filled else None
+    # conservative realized at close = floor guaranteed by the held legs − cash actually paid.
+    cost = Decimal(0)
+    for f in fills:
+        try:
+            cost += Decimal(str(f.get("price", 0))) * Decimal(int(f.get("count", 0)))
+            if f.get("fee") is not None:
+                cost += Decimal(str(f.get("fee")))
+        except (ArithmeticError, ValueError, TypeError):
+            continue
+    floor = v32_set_floor_dollars(len(held))
+    realized_delta = floor - cost
+    return {
+        "fills": rest_fills,
+        "wing_fills": wing_fills,
+        "held_legs": held,
+        "realized_lock": realized_lock,
+        "one_legged": bool(state.one_legged),
+        "realized_unsettled": bool(held),
+        "realized_delta": realized_delta,
+        "rests_placed": int(getattr(executor, "rests_placed", 0)),
+        "rests_rejected": int(getattr(executor, "rests_rejected", 0)),
+        "wing_batches": int(getattr(executor, "wing_batches", 0)),
+        "exec_price_mismatches": list(getattr(executor, "exec_price_mismatches", []) or []),
+    }
+
+
 def _finalize(
     *, journal: StreamJournal, shared: V32Recorder, driver: V32Driver, close_iso: str,
     resolved_mode: str, effective_mode: str, degrade: str | None, params: V32Params,
     strike_disc: StrikeDiscovery, bucket_map: dict[str, tuple[float, float]],
     bucket_generations: int, journal_path: str, summary_path: str, ledger_path: str,
     strike_lag: float | None, bucket_lag: float | None, clock: Callable[[], float],
+    armed: bool = False, degrade_reason: str | None = None,
 ) -> dict:
     journal.close()
     gz = _gzip_journal(journal_path)
     final_path = os.path.abspath(gz.get("final_path") or journal_path)
+    money = _compute_money_math(driver.state, driver.executor)
     row = build_v32_ledger_row(
         close_time=close_iso,
         resolved_mode=resolved_mode,
@@ -884,6 +1223,9 @@ def _finalize(
         record_count=len(journal),
         stand_down_reason=None,
         now=clock(),
+        armed=armed,
+        degrade_reason=degrade_reason,
+        **money,
     )
     append_v32_ledger_row(row, ledger_path)
     summary = {
@@ -932,7 +1274,8 @@ def _stand_down(summary_path: str, ledger_path: str, close_iso: str, reason: str
 # ===========================================================================
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="V3.2 pump-fader window process (shakedown/dry; armed degrades to dry in Phase 2)."
+        description="V3.2 pump-fader window process (shakedown/dry/armed; armed degrades to dry unless "
+                    "S5 + reconcile-first + day-latch + S4 all pass)."
     )
     parser.add_argument("--close", default=None, help="Target close ISO (UTC). Default: next :00.")
     parser.add_argument("--mode", default=None, choices=list(VALID_MODES_V32),
@@ -941,6 +1284,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--ledger", default=DEFAULT_V32_LEDGER_PATH)
     parser.add_argument("--mode-file", default=DEFAULT_MODE_PATH)
+    parser.add_argument("--falsifier", default=DEFAULT_FALSIFIER_PATH,
+                        help="V3.2 falsifier (S5: must carry STATUS: FROZEN to arm).")
     parser.add_argument("--proxy-base", default=None, help="Override the proxy base URL.")
     parser.add_argument("--flush-every", type=int, default=200,
                         help="Flush the write-through journal to the OS every N frames (default 200).")
@@ -954,6 +1299,8 @@ def main(argv: list[str] | None = None) -> int:
 
     resolved_mode = resolve_v32_mode(args.mode, args.mode_file)
 
+    proxy_base_url = args.proxy_base or "http://127.0.0.1:8642"
+
     # Load + sha-verify the frozen policy; any drift -> clean stand-down (fail-closed, S5 discipline).
     try:
         params = load_v32_params()
@@ -962,16 +1309,31 @@ def main(argv: list[str] | None = None) -> int:
                            resolved_mode=resolved_mode, effective_mode="shakedown", degrade=None,
                            params_sha=None, clock=clock)
 
-    # Phase 2: armed has no order path -> degrade to dry with a journaled reason. shakedown/dry both
-    # run the FrozenExecutor (WOULD_* twins + synthesized acks), so state.shakedown is True for both.
-    effective_mode, degrade = effective_mode_and_degrade(resolved_mode)
-    shakedown = True  # Phase 2 never sends orders; armed is Phase 3
-    include_private = False  # private fill/positions only when actually armed (Phase 3)
+    # prepare(): settlement backfill for prior windows still realized_unsettled whose held tickers have
+    # settled (GET /markets/{ticker} exact match). Fail-closed / idempotent (never raises out of start).
+    try:
+        prior_rows = load_v32_rows(args.ledger)
+        backfills = v32_settlement_backfill_sweep(
+            prior_rows, lambda tk: fetch_market_result_v32(proxy, tk), clock()
+        )
+        for bf in backfills:
+            append_v32_ledger_row(bf, args.ledger)
+        if backfills:
+            logger.info("[V32] settlement backfill appended %d row(s)", len(backfills))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[V32] settlement backfill sweep failed: %s", e)
+
+    effective_mode = resolved_mode  # armed may DEGRADE below once /health + positions are read
+    degrade: str | None = None
+    degrade_reason: str | None = None
 
     # Discovery.
     strike_disc = discover_strike_ladder(proxy, close_iso, clock())
     range_disc = discover_range_markets(proxy, close_iso, clock())
     bucket_map = build_bucket_map(range_disc)
+    # P3-2: drop any bucket whose width != params.bucket_width so a mixed-width hour cannot select a
+    # wrong-width spot bucket and break the $2 pin.
+    bucket_map, dropped_width = filter_buckets_to_width(bucket_map, params.bucket_width)
 
     if not bucket_map:
         return _stand_down(summary_path, args.ledger, close_iso,
@@ -1018,14 +1380,74 @@ def main(argv: list[str] | None = None) -> int:
         },
         clock(),
     )
-    if degrade is not None:
-        journal.append("degrade_to_dry", {"reason": degrade, "from_mode": resolved_mode}, clock())
+    # --- arming resolution (S5 + reconcile-first + day latch + S4), the ONE arm-or-degrade gate ---
+    writer: ProxyWriter | None = None
+    if resolved_mode == "armed":
+        writer = ProxyWriter(proxy_auth=proxy, base_url=proxy_base_url)
+        health = get_health(proxy_base_url)
+        try:
+            positions = proxy.rest_get("/portfolio/positions")
+        except Exception as e:  # noqa: BLE001
+            positions = None
+            logger.warning("[V32] positions read failed: %s", e)
+        ops_dir = os.path.join(_PILOT_DIR, "ops")
+        utc_day = close_iso[:10]
+        guard_path = v32_day_guard_path(ops_dir, utc_day)
+        day_guard = read_day_guard(guard_path, utc_day)
+        s4 = None
+        try:
+            bal = parse_balance(proxy.rest_get("/portfolio/balance"))
+            if bal.ok and not day_guard.corrupt:
+                start, _first = ensure_balance_start(guard_path, utc_day, bal.dollars, clock())
+                if start is not None:
+                    pending = v32_pending_credit(load_v32_rows(args.ledger), utc_day)
+                    s4 = v32_s4_decision(start, bal.dollars, pending)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[V32] balance/S4 read failed: %s", e)
+        outcome = decide_v32_arming(
+            resolved_mode=resolved_mode, falsifier_path=args.falsifier, health=health,
+            positions=positions, params_verified=True, contracts=params.contracts,
+            day_guard=day_guard, s4=s4,
+        )
+        effective_mode = outcome.effective_mode
+        if not outcome.armed:
+            degrade = "degrade_to_dry"
+            degrade_reason = "; ".join(outcome.reasons)
+            journal.append("degrade_to_dry",
+                           {"reason": degrade_reason, "from_mode": resolved_mode,
+                            "reasons": list(outcome.reasons)}, clock())
+            logger.warning("[V32] ARMED refused -> dry: %s", degrade_reason)
+
+    armed = effective_mode == "armed"
+    shakedown = not armed              # dry/shakedown -> WOULD_* twins; armed -> real orders
+    include_private = armed            # private fill/market_positions channel only when armed
+    if dropped_width:
+        journal.append("buckets_dropped_off_width",
+                       {"count": len(dropped_width), "width": params.bucket_width}, clock())
 
     cts = close_epoch(close_iso)
     state = V32State.new(close_iso, cts, bucket_map, params, shakedown=shakedown)
-    executor = FrozenExecutor(bucket_map)
+
+    # exchange_index map (strikes + buckets) for the LiveExecutor's per-leg routing.
+    exch_map: dict[str, int | None] = dict(strike_disc.exchange_index_by_ticker)
+    for b in range_disc.buckets:
+        if getattr(b, "ticker", None):
+            exch_map[b.ticker] = coerce_exchange_index(getattr(b, "exchange_index", None))
+
+    # P3-1: the executor is selected by effective_mode in EXACTLY ONE place.
+    executor = build_executor(
+        effective_mode, bucket_map=bucket_map, exchange_index_by_ticker=exch_map,
+        journal=journal, close_epoch_val=cts, params=params, writer=writer, clock=clock,
+    )
     driver = V32Driver(params, state, journal, executor, clock=clock)
     shared = V32Recorder(journal, driver, clock=clock)
+
+    # Startup safety (armed): cancel any of OUR resting KXBTC* orders a prior crash left behind.
+    if armed and writer is not None:
+        try:
+            cancel_stale_open_orders(writer, journal, clock)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[V32] startup open-order cancel failed: %s", e)
 
     strike_ws = KalshiWebSocketClient(
         proxy_auth=proxy, tickers=list(strike_disc.tickers), callbacks=shared.callbacks(False),
@@ -1041,10 +1463,25 @@ def main(argv: list[str] | None = None) -> int:
     deadline = cts + GRACE_SECONDS
     gate = connect_gate_epoch(cts, params)
     try:
-        asyncio.run(run_v32_window(shared, strike_conn, bucket_conn, driver, clock, deadline, gate))
+        asyncio.run(run_v32_window(shared, strike_conn, bucket_conn, driver, clock, deadline, gate,
+                                   order_poll=armed))
     except KeyboardInterrupt:
         logger.warning("[V32] Ctrl+C — flushing streamed journal.")
     finally:
+        # S1_LEGGED: a completed set left one-legged below the floor at T-1 s. One occurrence stood the
+        # hour down (core); the DAY latches at the threshold (recorded in the SEPARATE v32 day guard).
+        if armed and driver.state.one_legged:
+            try:
+                ops_dir = os.path.join(_PILOT_DIR, "ops")
+                utc_day = close_iso[:10]
+                n = record_legged_occurrence(v32_day_guard_path(ops_dir, utc_day), utc_day,
+                                             close_iso, "set left one-legged below lock floor",
+                                             clock())
+                journal.append("s1_legged_occurrence",
+                               {"count": n, "latch_threshold": V32_S1_LEGGED_LATCH_THRESHOLD},
+                               clock())
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[V32] S1_LEGGED record failed: %s", e)
         summary = _finalize(
             journal=journal, shared=shared, driver=driver, close_iso=close_iso,
             resolved_mode=resolved_mode, effective_mode=effective_mode, degrade=degrade,
@@ -1052,7 +1489,7 @@ def main(argv: list[str] | None = None) -> int:
             bucket_generations=range_disc.generations, journal_path=journal_path,
             summary_path=summary_path, ledger_path=args.ledger,
             strike_lag=strike_ws.current_lag_seconds(), bucket_lag=bucket_ws.current_lag_seconds(),
-            clock=clock,
+            clock=clock, armed=armed, degrade_reason=degrade_reason,
         )
         logger.info("[V32] window done: %s", summary)
     return 0

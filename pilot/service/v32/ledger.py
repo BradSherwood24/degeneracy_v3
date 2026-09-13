@@ -100,11 +100,28 @@ def build_v32_ledger_row(
     stand_down_reason: str | None,
     now: float,
     params_sha: str | None = None,
+    # Phase-3 money-math slots (defaults preserve the Phase-2 row shape exactly).
+    armed: bool = False,
+    fills: list[Any] | None = None,
+    wing_fills: list[Any] | None = None,
+    held_legs: list[Any] | None = None,
+    realized_lock: Decimal | None = None,
+    one_legged: bool | None = None,
+    realized_unsettled: bool = False,
+    settlement: dict[str, Any] | None = None,
+    realized_delta: Decimal | None = None,
+    rests_placed: int = 0,
+    rests_rejected: int = 0,
+    wing_batches: int = 0,
+    exec_price_mismatches: list[Any] | None = None,
+    degrade_reason: str | None = None,
 ) -> dict[str, Any]:
-    """One window row. ``armed`` is always False in Phase 2 (armed degrades to dry); ``fills`` and
-    ``settlement`` are the Phase-3 slots (left empty). Discovery counts, would-be order counts,
-    replaces, shadow fills-per-E with locks, alarms, per-connection lag, and the stand-down reason are
-    all recorded so the report and the arming checklist read from one artifact."""
+    """One window row. In Phase 2 ``armed`` is always False; Phase 3 sets it True on an armed window
+    and fills the money-math slots (real ``fills``/``wing_fills``, the ``realized_lock`` per set, the
+    ``one_legged`` flag, ``held_legs`` for the settlement backfill, and ``exec_price_mismatches``).
+    Discovery counts, would-be/real order counts, replaces, shadow fills-per-E with locks, alarms,
+    per-connection lag, and the stand-down reason are all recorded so the report and the arming
+    checklist read from one artifact."""
     spot_Sd = getattr(state, "spot_Sd", None) if state is not None else None
     spot_Su = getattr(state, "spot_Su", None) if state is not None else None
     bucket_ticker = None
@@ -114,8 +131,9 @@ def build_v32_ledger_row(
         "close_time": close_time,
         "mode": resolved_mode,
         "effective_mode": effective_mode,
-        "armed": False,  # Phase 2: never armed (armed degrades to dry)
+        "armed": bool(armed),
         "degrade": degrade,
+        "degrade_reason": degrade_reason,
         "params_sha": params.sha256 if params is not None else params_sha,
         "stand_down": stand_down_reason is not None,
         "stand_down_reason": stand_down_reason,
@@ -149,10 +167,125 @@ def build_v32_ledger_row(
         "journal_path": journal_path,
         "record_count": record_count,
         "ws_counts": dict(ws_counts),
-        # Phase-3 slots (real fills + settlement) — intentionally empty in Phase 2
-        "fills": [],
-        "settlement": None,
-        "realized_delta": None,
+        # Phase-3 money math (empty in Phase 2 / dry: defaults preserve the old shape)
+        "fills": fills or [],
+        "wing_fills": wing_fills or [],
+        "held_legs": held_legs or [],
+        "realized_lock": (str(realized_lock) if realized_lock is not None else None),
+        "one_legged": one_legged,
+        "rests_placed": int(rests_placed),
+        "rests_rejected": int(rests_rejected),
+        "wing_batches": int(wing_batches),
+        "exec_price_mismatches": exec_price_mismatches or [],
+        # settlement backfill slots (the sweep appends its own backfill row)
+        "realized_unsettled": bool(realized_unsettled),
+        "unsettled_legs": (held_legs or []) if realized_unsettled else [],
+        "settlement": settlement,
+        "realized_delta": (str(realized_delta) if realized_delta is not None else None),
         "flushed_at": now,
     }
     return row
+
+
+# ---------------------------------------------------------------------------
+# Settlement backfill (Phase 3) — mirror pilot_ledger.build_backfill_entry
+# ---------------------------------------------------------------------------
+def v32_set_floor_dollars(num_legs_held: int, count: int = 1) -> Decimal:
+    """The GUARANTEED payoff floor of a V3.2 pin position held to settlement, per the fixed geometry
+    (bucket-NO(B) + YES@Sd + NO@Su, adjacent strikes bounding B): three legs pay $2 at EVERY
+    settlement; any two of the three pay >= $1; a lone leg is directional ($0 floor). So floor =
+    max(0, held - 1) dollars per contract. Booked conservatively at close; the backfill corrects it."""
+    return Decimal(max(0, int(num_legs_held) - 1)) * Decimal(str(count))
+
+
+def v32_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> Decimal:
+    """The OPTIMISTIC upper bound on settlement credit still owed today by un-backfilled unsettled
+    windows: Σ over rows (realized_unsettled, this UTC day, no backfill yet) of (best-case $2 payoff −
+    the conservative floor already booked). A complete pin (floor $2) owes $0; a one-legged set (floor
+    $1) owes up to $1. Feeds the banded S4 so a pending settlement never moves the latch number."""
+    done: set[str] = {str(r.get("backfill_of")) for r in rows if r.get("backfill_of")}
+    total = Decimal(0)
+    for r in rows:
+        if not r.get("realized_unsettled"):
+            continue
+        if str(r.get("close_time", ""))[:10] != utc_day:
+            continue
+        if str(r.get("close_time")) in done:
+            continue
+        legs = r.get("unsettled_legs") or r.get("held_legs") or []
+        floor = v32_set_floor_dollars(len(legs))
+        # optimistic MAX payoff = min(#legs, 2): a lone bucket-NO pays at most $1 (NOT $2), any two
+        # legs at most $2, the complete pin exactly $2. Using a flat $2 here overstated the credit for
+        # a lone-leg set by $1 -> the banded S4 would credit money that can never arrive and could fail
+        # to latch a real day loss. credit = best-case payoff still owed beyond the floor already booked.
+        best = Decimal(min(len(legs), 2))
+        credit = best - floor
+        if credit > 0:
+            total += credit
+    return total
+
+
+def build_v32_backfill_row(
+    window_entry: dict[str, Any], results: dict[str, str], payoff: Decimal,
+    floor_booked: Decimal, now: float,
+) -> dict[str, Any]:
+    """A ledger line recording a V3.2 settlement backfill (mirror of
+    ``pilot_ledger.build_backfill_entry``). ``realized_delta`` is the settlement ``payoff`` NET of the
+    conservative floor already booked at close, so a complete set (payoff $2, floor $2) corrects by $0
+    and a one-legged set corrects by its true settlement minus the $1 floor."""
+    realized = Decimal(str(payoff)) - Decimal(str(floor_booked))
+    return {
+        "close_time": window_entry.get("close_time"),
+        "mode": "backfill",
+        "backfill_of": window_entry.get("close_time"),
+        "armed": True,
+        "held_legs": window_entry.get("unsettled_legs") or window_entry.get("held_legs"),
+        "settlement_results": results,
+        "settlement_payoff": str(Decimal(str(payoff))),
+        "floor_netted": str(Decimal(str(floor_booked))),
+        "realized_delta": str(realized),
+        "realized_unsettled": False,
+        "flushed_at": now,
+    }
+
+
+def v32_settlement_backfill_sweep(
+    rows: list[dict[str, Any]],
+    fetch_result,
+    now: float,
+) -> list[dict[str, Any]]:
+    """Compute the backfill rows to append for every prior window still ``realized_unsettled`` whose
+    held tickers have all settled. Idempotent (skips a window that already has a ``backfill_of`` row);
+    fail-closed (a window with any unsettled/unavailable leg is left for a later wake — no row).
+
+    ``fetch_result(ticker) -> 'yes' | 'no' | None`` is injected (the proxy /markets read in prod, a
+    fake in tests). Uses ``service.ledger.settlement_payoff`` (which pays $1/contract where the held
+    leg's side matches the market result — so a complete pin yields exactly $2)."""
+    from service.ledger import settlement_payoff
+
+    done: set[str] = {str(r.get("backfill_of")) for r in rows if r.get("backfill_of")}
+    # most-recent unsettled row per window wins
+    pending: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if r.get("realized_unsettled") and (r.get("unsettled_legs") or r.get("held_legs")):
+            pending[str(r.get("close_time"))] = r
+    out: list[dict[str, Any]] = []
+    for window, entry in pending.items():
+        if window in done:
+            continue
+        legs = entry.get("unsettled_legs") or entry.get("held_legs") or []
+        results: dict[str, str] = {}
+        incomplete = False
+        for leg in legs:
+            tk = leg["ticker"] if isinstance(leg, dict) else leg[0]
+            res = fetch_result(tk)
+            if res not in ("yes", "no"):
+                incomplete = True
+                break
+            results[tk] = res
+        if incomplete:
+            continue  # wait for a later wake
+        payoff = settlement_payoff(legs, results)
+        floor = v32_set_floor_dollars(len(legs))
+        out.append(build_v32_backfill_row(entry, results, payoff, floor, now))
+    return out

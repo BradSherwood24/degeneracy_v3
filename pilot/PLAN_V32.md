@@ -83,6 +83,11 @@ single-flight / token budget (hostile to requoting), `WakeResult` (mandates a 15
 
 ## Requote policy
 
+**Replace = cancel -> confirm -> create; never two live rests** (R-OVERLAP ruling 2026-09-13): a replace is
+strictly sequential — emit CANCEL_REST, wait for OrderCancelled (a fill there means TAKE_WINGS, not PLACE),
+then PLACE_REST at the freshly re-solved n on the next tick. The ~200-400 ms of no quote per replace is
+accepted (~30 s/hour unquoted at ~77 replaces/hour). No fillable old rest is ever left beside a new one in flight.
+
 From `pf_ms_requote2.py` (lagging-quote model: replace only when |dn| >= TOL and >= DEB ms since the last replace;
 new quote live +200 ms; fill = print > 1 - n_resting; completion +1.5 s; one per hour; forward 139 h):
 

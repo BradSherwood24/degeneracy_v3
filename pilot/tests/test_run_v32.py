@@ -114,8 +114,10 @@ def test_mode_file_is_git_ignored_and_absent_fails_closed():
             assert f.read().strip() in R.VALID_MODES_V32
 
 
-def test_armed_degrades_to_dry_phase2():
-    assert R.effective_mode_and_degrade("armed") == ("dry", "phase2_no_executor")
+def test_effective_mode_passthrough_phase3():
+    # Phase 3: effective_mode_and_degrade is a passthrough; the armed->dry DEGRADE decision moved to
+    # service.v32.stops.decide_v32_arming (S5 + reconcile + day latch + S4), run in main with /health.
+    assert R.effective_mode_and_degrade("armed") == ("armed", None)
     assert R.effective_mode_and_degrade("dry") == ("dry", None)
     assert R.effective_mode_and_degrade("shakedown") == ("shakedown", None)
 
@@ -204,7 +206,8 @@ def test_connect_gate_epoch():
 # ===========================================================================
 def _replace_to_new_order(drv, p, now):
     """Place one rest, keep both strikes fresh across the debounce window (no |dn| replace), then move
-    a wing so the core does a TRUE requote2 replace (cancel old kept-live + place new in one decide).
+    a wing so the core does a SEQUENTIAL replace (R-OVERLAP): the moving-wing tick emits CANCEL only
+    (the FrozenExecutor synth-confirms it in the same pump), and the NEXT tick places the new rest.
     Returns (first_coid, second_coid)."""
     # Deep wings (W ~ 1.33) so the BUDGET binds n (not the bucket cap); then moving a wing shifts n.
     _feed_quote(drv, "0.70", "0.60", now)
@@ -215,7 +218,10 @@ def _replace_to_new_order(drv, p, now):
         _feed_quote(drv, "0.70", "0.60", t)
     assert drv.state.rest_live.client_order_id == first, "no premature replace while |dn| < tol"
     t += 0.5
-    _feed_quote(drv, "0.76", "0.60", t)  # yes_ask up -> n down by >= tol, debounce elapsed -> replace
+    _feed_quote(drv, "0.76", "0.60", t)   # yes_ask up -> n down >= tol, debounce elapsed -> CANCEL only
+    assert drv.state.rest_live is None and drv.state.awaiting_replace  # sequential: old cancelled, no new yet
+    t += 0.5
+    _feed_quote(drv, "0.76", "0.60", t)   # after the cancel confirms -> PLACE the new rest
     second = drv.state.rest_live.client_order_id
     return first, second
 

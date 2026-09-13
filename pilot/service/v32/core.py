@@ -19,6 +19,7 @@ T-``quote_start_s`` .. T-``quote_end_s`` (T-15..T-5):
   * Rest one bucket-NO bid (post-only; maker fee 0) at the largest whole-cent n with
         n + fee(n) <= 2 - E - W,   capped at no_ask(B) - 0.01 = (1 - yes_bid(B)) - 0.01  (never cross).
     Re-solve n on every strike/bucket book tick; REPLACE per the requote gate (tol / deb_ms).
+    Replace = cancel -> confirm -> create; never two live rests (R-OVERLAP ruling 2026-09-13).
   * Fill of the rest (Fill event, or OrderCancelled with filled_count_before_cancel > 0): immediately
     TAKE both wings (buy YES@Sd, buy NO@Su, taker, limit = ask + wing_margin) for the filled count,
     UNCONDITIONALLY (ruling F-2 — the fill happened, so we bound the position to the $2 pin). A
@@ -32,7 +33,9 @@ T-``quote_start_s`` .. T-``quote_end_s`` (T-15..T-5):
     actions — this IS the ideal fill rule running live, so a dry run yields the sim statistic.
 
 Windowing / plumbing: quote only inside the window; CANCEL (no new PLACE) at/after T-quote_end_s;
-never two live rests; hold while a PLACE is pending (awaiting ack); no orders inside
+never two live rests — a replace is STRICTLY SEQUENTIAL (cancel -> wait for OrderCancelled -> create at
+the freshly re-solved n on a later tick; a fill during the cancel -> TAKE_WINGS, not PLACE), exactly like
+the bucket-change path; hold while a PLACE is pending (awaiting ack); no orders inside
 no_orders_after_s_to_settle; a stale/missing strike book cancels the rest; replaces in a trailing
 60 s above replace_rate_alarm_per_min cancel the rest and stand the hour down; shakedown -> WOULD_*.
 
@@ -573,9 +576,15 @@ def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, l
         return st, actions
     t_to_close = st.close_epoch - now
     if t_to_close < params.no_orders_after_s_to_settle:
-        # cutoff: any still-unfilled leg is a bounded one-legged set; stop trying.
-        if st.wing_taken and any(l.status != "filled" for l in st.wing_legs):
-            st = replace(st, one_legged=True)
+        # cutoff: a rest filled but the $2 pin never completed -> a bounded, unhedged set. Flag it
+        # one_legged (drives S1_LEGGED). This covers BOTH the wings-taken-but-a-leg-missed case AND
+        # the wings-NEVER-taken case (strike feed dead from fill to deadline = a lone bucket-NO), which
+        # the earlier ``st.wing_taken and ...`` guard silently missed — leaving the worst unhedged case
+        # unflagged and uncounted toward the day latch.
+        if st.rest_fill is not None and st.wings_needed:
+            incomplete = (not st.wing_legs) or any(l.status != "filled" for l in st.wing_legs)
+            if incomplete:
+                st = replace(st, one_legged=True)
         return st, actions
 
     prices = _wing_prices(st, now, params)
@@ -793,11 +802,17 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
     dn = abs(st.desired_n - st.rest_live.price)  # type: ignore[operator]
     since_ms = (now - (st.last_replace_ts if st.last_replace_ts is not None else -1e18)) * 1000.0
     if dn >= params.tol and since_ms >= params.deb_ms and st.desired_n != st.rest_live.price:
-        # CANCEL the old (kept fillable until the new acks) + PLACE the new (requote2 semantics).
+        # SEQUENTIAL replace (R-OVERLAP ruling 2026-09-13): CANCEL the old, WAIT for OrderCancelled,
+        # and only THEN PLACE the new at the freshly re-solved n on a later tick — like the bucket-change
+        # path. NEVER two live rests, NEVER a fillable old rest beside a new one in flight. A fill during
+        # the cancel surfaces as OrderCancelled.filled_count_before_cancel > 0 (or a Fill event) ->
+        # TAKE_WINGS, not PLACE. rest_live is kept populated (not eagerly cleared) so such a fill books
+        # at the RESTING price, not the drifted desired_n; ``awaiting_replace`` + the cancel-in-flight
+        # hold above suppress any PLACE until OrderCancelled clears the slot. The ~200-400 ms of no quote
+        # per replace is accepted (~30 s/hour unquoted at ~77 replaces/hour).
         actions.append(_cancel_action(st, st.rest_live))
-        st = replace(st, cancel_in_flight=True)
-        st, pa = _emit_place(st, params, now)
-        return st, actions + pa
+        st = replace(st, cancel_in_flight=True, awaiting_replace=True)
+        return st, actions
     return st, actions
 
 

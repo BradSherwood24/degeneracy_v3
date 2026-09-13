@@ -290,15 +290,28 @@ def test_requote_below_tol_does_not_replace():
 
 
 def test_requote_above_tol_and_debounce_replaces():
+    # R-OVERLAP ruling: a replace is STRICTLY SEQUENTIAL — CANCEL the old, wait for OrderCancelled,
+    # then PLACE the new. Never CANCEL+PLACE in the same tick; never a new rest in flight beside the old.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
-    st, _ = _bring_up_live_rest(p, st, now)
-    # move the wing a lot -> desired n shifts >= tol -> CANCEL + PLACE (old stays live until ack).
+    st, coid = _bring_up_live_rest(p, st, now)
+    oid = st.rest_live.order_id
+    # move the wing a lot -> desired n shifts >= tol -> CANCEL only, no PLACE yet (keep Su fresh).
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
     kinds = [a.kind for a in acts]
-    assert ActionKind.CANCEL_REST in kinds and ActionKind.PLACE_REST in kinds
-    assert st.rest_live is not None            # old rest kept fillable until the new acks
+    assert ActionKind.CANCEL_REST in kinds and ActionKind.PLACE_REST not in kinds
+    assert st.rest_live is not None            # kept populated so a fill during cancel books at n
+    assert st.rest_pending is None             # NO new rest in flight
+    assert st.cancel_in_flight and st.awaiting_replace
+    # confirm the cancel (no fill), then a fresh book (both wings fresh) -> PLACE the new at re-solved n.
+    st, _ = _feed(p, st, OrderCancelled(oid, now + 1.2))
+    assert st.rest_live is None and not st.cancel_in_flight
+    acts = []
+    st, a = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.3)); acts += a
+    st, a = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1.3)); acts += a
+    assert [a for a in acts if a.kind == ActionKind.PLACE_REST]
     assert st.rest_pending is not None
 
 
@@ -306,14 +319,22 @@ def test_requote_debounce_blocks_until_elapsed():
     p = _params(tol=Decimal("0.01"), deb_ms=2000)
     st = _state(p)
     now = T - 600
-    st, _ = _bring_up_live_rest(p, st, now)
-    # same big move but only +0.5s since the place -> debounce blocks the replace.
+    st, _ = _bring_up_live_rest(p, st, now)   # place at `now`, last_replace_ts=now
+    # +0.5s: big move but debounce (2000ms) not elapsed -> no CANCEL, no PLACE. Keep both wings fresh.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.5))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 0.5))
-    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
-    # +2.1s -> debounce elapsed -> replace fires (refresh Su so its wing book stays fresh).
-    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 2.1))
-    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 2.1))
-    assert [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.CANCEL_REST)]
+    # +1.5s: refresh both wings (same prices) so neither goes stale; debounce STILL blocks (< 2.0s).
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.5))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1.5))
+    assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.CANCEL_REST)]
+    # +2.1s: debounce elapsed -> the SEQUENTIAL replace fires its CANCEL only (place follows on confirm).
+    acts = []
+    st, a = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 2.1)); acts += a
+    st, a = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 2.1)); acts += a
+    assert [x for x in acts if x.kind == ActionKind.CANCEL_REST]
+    assert not [x for x in acts if x.kind == ActionKind.PLACE_REST]
+    assert st.cancel_in_flight and st.awaiting_replace
 
 
 def test_requote_holds_while_place_pending():
@@ -350,6 +371,48 @@ def test_bucket_change_cancels_then_places_after_confirm():
     ])
     assert [a for a in acts if a.kind == ActionKind.PLACE_REST]
     assert st.rest_pending is not None and st.rest_pending.bucket_Sd == 79700
+
+
+def test_replace_no_live_fill_on_trade_while_cancel_in_flight():
+    # R-OVERLAP ruling: after CANCEL_REST is emitted (cancel_in_flight) but before OrderCancelled, a
+    # public Trade through the old rest's price must NOT book a live rest fill (the live fill truth comes
+    # ONLY from OrderCancelled/Fill events; a Trade only ever moves the SHADOW), and NO PLACE_REST fires
+    # while the cancel is in flight.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)   # rest at n=0.45 -> offer 0.55
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))  # -> sequential CANCEL
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert st.cancel_in_flight and st.rest_live is not None and st.rest_pending is None
+    # a YES print on the spot bucket ABOVE the old offer -> shadow only, never a live fill.
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.62"), "yes", Decimal(5), now + 1.05))
+    assert st.rest_fill is None                                   # no live fill from a Trade
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert st.cancel_in_flight                                    # still awaiting the cancel confirm
+
+
+def test_fill_during_replace_cancel_takes_wings_not_place():
+    # R-OVERLAP ruling: a Fill for the cancelling order (it filled during the cancel) -> TAKE_WINGS at
+    # the resting price, and NEVER a PLACE_REST (the one-set latch holds).
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)   # rest at n=0.45
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))     # keep Su fresh
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))  # -> sequential CANCEL
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert st.cancel_in_flight and st.rest_live is not None
+    # the old order fills during the cancel -> TAKE_WINGS (bounded pin), no PLACE.
+    st, acts = _feed(p, st, Fill(st.rest_live.order_id, coid, Decimal(1), Decimal("0.45"), "no",
+                                 now + 1.05))
+    assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert st.rest_fill is not None and st.rest_fill.price == Decimal("0.45")
+    assert not st.cancel_in_flight and st.rest_live is None and st.rest_pending is None
+    # a later book tick must NOT place a second rest (one set per hour latched at the fill).
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1.2))
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
 
 
 # ===========================================================================
@@ -566,6 +629,25 @@ def test_duplicate_wing_fill_does_not_double_count_sets_done():
     assert st.sets_done == 1
 
 
+def test_lone_bucket_no_never_hedged_latches_one_legged_at_cutoff():
+    # ADVERSARIAL (review): a rest fills but the strike feed is DEAD from the fill to the settle cutoff,
+    # so the wings are NEVER taken -> a lone, unhedged bucket-NO. This MUST latch one_legged (drives
+    # S1_LEGGED). The earlier cutoff guard required wing_taken=True and silently missed this worst case.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    # the fill arrives 100 s later; the strike books (last ts now) are stale -> no wings taken.
+    st, acts = _feed(p, st, Fill(st.rest_live.order_id, coid, Decimal(1), Decimal("0.45"), "no",
+                                 now + 100.0))
+    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]  # wings could not be taken
+    assert st.rest_fill is not None and not st.wing_taken and st.wings_needed
+    assert not st.one_legged  # not yet at the cutoff
+    # advance to the settle cutoff (t_to_close < no_orders_after_s_to_settle=1): must flag one_legged.
+    st, _ = _feed(p, st, ClockTick(server_ts=T - 0.5))
+    assert st.one_legged is True
+
+
 def test_suspect_strike_book_is_not_priced():
     # REGRESSION (review Fix A): a suspect strike book (malformed delta / seq-gap) must not be
     # used to compute W or to place a rest.
@@ -602,24 +684,21 @@ def test_silent_feed_clocktick_cancels_stale_rest():
 # Replace-rate alarm
 # ===========================================================================
 def test_replace_rate_alarm_trips_and_stands_down():
+    # The alarm counts places (replace_times) in a trailing 60 s; it is checked at the top of _requote
+    # and, when exceeded, cancels the rest and latches stood_down. With the SEQUENTIAL replace each
+    # replace is a separate cancel->confirm->place cycle, so seed a burst of recent places directly and
+    # verify the next in-window book tick trips the alarm and stands the hour down.
+    from dataclasses import replace as _dc
     p = _params(tol=Decimal("0.01"), deb_ms=0, replace_rate_alarm_per_min=3)
     st = _state(p)
     now = T - 600
-    st, coid = _bring_up_live_rest(p, st, now)  # 1 place so far
-    # drive several replaces in << 60s by moving the wing each tick, acking each so the next fires.
-    asks = ["0.70", "0.66", "0.62", "0.58", "0.54"]
-    tripped = False
-    for i, a in enumerate(asks):
-        tt = now + 0.01 * (i + 1)
-        st, acts = _feed(p, st, BookUpdate(STK_SD, _top(str(Decimal(a) - Decimal("0.01")), a), tt))
-        if [x for x in acts if x.kind == ActionKind.STAND_DOWN and x.reason == "replace_rate"]:
-            tripped = True
-            assert [x for x in acts if x.kind == ActionKind.CANCEL_REST]
-            break
-        place = [x for x in acts if x.kind == ActionKind.PLACE_REST]
-        if place:  # ack it so the hold-while-pending gate clears for the next replace
-            st, _ = _feed(p, st, OrderAck(place[-1].client_order_id, f"OID{i+2}", tt))
-    assert tripped and st.stood_down
+    st, coid = _bring_up_live_rest(p, st, now)  # 1 place, a live rest, replace_times={now}
+    # seed 4 recent places (> alarm threshold 3), all within the trailing 60 s.
+    st = _dc(st, replace_times=tuple(now + 0.001 * i for i in range(4)), replace_count=4)
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 0.02))
+    assert [x for x in acts if x.kind == ActionKind.STAND_DOWN and x.reason == "replace_rate"]
+    assert [x for x in acts if x.kind == ActionKind.CANCEL_REST]
+    assert st.stood_down
 
 
 # ===========================================================================
