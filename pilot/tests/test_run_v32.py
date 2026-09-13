@@ -114,8 +114,10 @@ def test_mode_file_is_git_ignored_and_absent_fails_closed():
             assert f.read().strip() in R.VALID_MODES_V32
 
 
-def test_armed_degrades_to_dry_phase2():
-    assert R.effective_mode_and_degrade("armed") == ("dry", "phase2_no_executor")
+def test_effective_mode_passthrough_phase3():
+    # Phase 3: effective_mode_and_degrade is a passthrough; the armed->dry DEGRADE decision moved to
+    # service.v32.stops.decide_v32_arming (S5 + reconcile + day latch + S4), run in main with /health.
+    assert R.effective_mode_and_degrade("armed") == ("armed", None)
     assert R.effective_mode_and_degrade("dry") == ("dry", None)
     assert R.effective_mode_and_degrade("shakedown") == ("shakedown", None)
 
