@@ -5,7 +5,9 @@ sim/out/
 # --- bulk data (way over GitHub limits; regenerable via tools/fetch_history.py) ---
 historical-data/
 pilot/journals/
+pilot/journals_v32/
 pilot/logs/
+pilot/logs_v32/
 
 # --- runtime state (machine-local, not source) ---
 pilot/ledger/

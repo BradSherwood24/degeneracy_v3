@@ -833,6 +833,52 @@ def _shadow_on_trade(
     return st, []
 
 
+# ---------------------------------------------------------------------------
+# F-1 additive hook: book a fill for an order the core no longer tracks
+# ---------------------------------------------------------------------------
+def book_late_rest_fill(
+    params: V32Params,
+    st: V32State,
+    *,
+    price: Decimal,
+    count: int,
+    server_ts: float,
+    bucket_Sd: int | None = None,
+) -> tuple[V32State, list[V32Action]]:
+    """ADDITIVE Phase-2 hook (Phase-1 review F-1 — retained cancel context).
+
+    Book a REST fill for one of OUR orders that the pure core no longer tracks — a coid the driver's
+    RestBook attributed to us (a just-replaced / eagerly-cancelled order that filled on the exchange
+    after the core cleared its slot). Without this, ``decide_v32``'s ``_apply_fill`` drops a fill whose
+    coid matches neither ``rest_live`` nor ``rest_pending`` (correct for a truly foreign order, wrong
+    for our own replaced one) — leaving an untracked, unhedged bucket-NO and defeating the one-set
+    latch. This books the RestFill at the RestBook's RETAINED price (never the drifted ``desired_n``),
+    latches the one-set rule, and takes the wings.
+
+    ``bucket_Sd`` (the retained order's bucket floor) forces the spot context to the FILLED bucket so
+    the wings price off that bucket's strikes even after the live spot moved on (the exact F-1 failure).
+    Idempotent: once any rest fill is booked (``rest_fill`` set), this is a no-op — a fill reported
+    twice (fill channel + status poll) never double-books. Emits no order-bearing action in shakedown
+    (the wing take downgrades to its WOULD_* twin like every other action)."""
+    if st.rest_fill is not None:
+        return st, []
+    spot_Sd = bucket_Sd if bucket_Sd is not None else st.spot_Sd
+    spot_Su = (spot_Sd + params.bucket_width) if spot_Sd is not None else st.spot_Su
+    st = replace(
+        st,
+        rest_fill=RestFill(price=price, count=int(count), server_ts=server_ts),
+        rest_live=None,
+        rest_pending=None,
+        cancel_in_flight=False,
+        wings_needed=True,
+        wing_taken=False,
+        spot_Sd=spot_Sd,
+        spot_Su=spot_Su,
+    )
+    st, wa = _wing_step(params, st, server_ts)
+    return st, wa
+
+
 def _shadow_complete(
     params: V32Params, st: V32State, now: float
 ) -> tuple[V32State, list[V32Action]]:
