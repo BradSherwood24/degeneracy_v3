@@ -1026,3 +1026,33 @@ recorder now for continuity (Claude leans yes); Claude merges Opus-reviewed V3.2
 
 Queue: Phase 2 spine/dry/task -> first dry run -> Phase 3 executor/ledger/stops -> Phase 4 ceremony -> Brad's levers -> arm at 1 contract, E=10.
 v1.1 stays DISABLED (mode.txt still `armed`; retire-vs-re-arm ruling pending). Dark-week replay + wide-band re-fetch still queued.
+
+## 2026-09-13 ~21:40Z — Claude → house: V3.2 BUILD COMPLETE (phases 1-4 merged); falsifier DRAFT awaits Brad; dry runs ready; Brad's levers
+
+Four Opus 4.8 build+review rounds in one afternoon, all merged to main after review: PR #31 core (264672c), #32 spine/dry (ae81a4c),
+#33 executor/stops/ledger (ea601e7), #34 ceremony/S4/scoreboard. Suite 632 -> 789 tests. Nothing armed; ops/v32_mode.txt absent = shakedown.
+
+What the reviews caught (all fixed, all pinned by tests): Phase 1 — suspect books priced into W; stale-then-silent feed left a rest live;
+cancel-race fill booked at the drifted price; duplicate wing fill double-counted. Phase 2 — the trade parser read cents fields the live WS
+never sends (every real trade dropped -> shadow dead); no fill parser (NO fills report YES-space); parsers now pinned to REAL 9/01 frames.
+Phase 3 (docs.kalshi.com verified) — rest expiration field was wrong (a crashed process would have left a GTC rest with no expiry);
+order-status fields wrong (every cancel-confirm/poll would have read 0 fills); cancel reply `reduced_by` ignored; POST timeout treated as
+a clean rejection (double entry / naked bucket-NO). Phase 4 — a doc/code pin phrasing mismatch; scoreboard kill branches under-tested.
+Rulings: initial both-wings take UNCONDITIONAL (lock_floor gates single-leg retries only); replace = cancel -> confirm -> create, never two
+live rests (~30 s/hour unquoted, golden hour unchanged); shadow is no-lag; v32_mode.txt git-ignored; S4 banded ($2/$1/$0 floors,
+pending -> stand down without latch).
+
+Falsifier DRAFT (pilot/ceremony/v32_falsifier.md; pins mirrored in service/v32/falsifier_pins.py, test-enforced): verdict at n >= 30 live
+completed sets — mean lock >= +4.0c, % positive >= 80%, >= 2.0 sets/day, execution gap (shadow E=0.10 - live) <= 3.0c, one-legged <= 2/30;
+any miss = KILL, no re-spec. R1-R4, promotion to 2 contracts at n >= 60 alive + >= 10 lots depth. Sim basis: 21 fills, +9.2c, 100% pos.
+
+FIRST ARMED WINDOW MUST CONFIRM (pilot/build/v32_phase3_review.md): expiration_time honored (rest gone at T-5); get-order fp fields present;
+cancel reply reduced_by; reconcile-first sees zero size for settled positions by :40; fill channel delivering; exec price == resting price.
+
+Brad's levers, in order (runbooks pilot/ops/V32_DRY_RUN.md then pilot/ops/V32_ARMING.md):
+ 1. Dry runs (no .env change): from the live tree pilot/  `python -m service.run_v32 --mode dry`  a few minutes before :45; report via
+    `python -m service.v32.report`. Two clean windows with would_place_rest + shadow records = checklist item.
+ 2. degeneracy-proxy/.env: ORDER_TICKER_PREFIXES add `KXBTC`; DAILY_ORDER_BUDGET >= 4000; restart proxy; /health caps.
+ 3. Rule on the pinned thresholds; freeze v32_falsifier.md (STATUS: FROZEN + Registration line, verbatim go).
+ 4. `armed` in pilot/ops/v32_mode.txt; register DegeneracyV3_2 (pilot/ops/register_v32_task.ps1).
+Open (Brad): range recorder now for continuity (Claude leans yes); v1.1 retire vs re-arm; dark-week replay + wide-band re-fetch queued.
