@@ -1,7 +1,7 @@
 {
   "E": "0.10",
   "tol": "0.02",
-  "deb_ms": 2000,
+  "deb_ms": 5000,
   "quote_start_s": 900,
   "quote_end_s": 300,
   "contracts": 1,

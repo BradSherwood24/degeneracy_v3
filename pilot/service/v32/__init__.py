@@ -37,6 +37,7 @@ from service.v32.events import (
 from service.v32.params import (
     FROZEN_V32_PARAMS_SHA256,
     V32Params,
+    V32ParamsInvalid,
     V32ParamsShaMismatch,
     canonical_sha256,
     load_v32_params,
@@ -58,6 +59,7 @@ __all__ = [
     "parse_strike_ticker",
     "FROZEN_V32_PARAMS_SHA256",
     "V32Params",
+    "V32ParamsInvalid",
     "V32ParamsShaMismatch",
     "canonical_sha256",
     "load_v32_params",

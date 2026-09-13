@@ -31,6 +31,7 @@ from service.v32 import (
     OrderCancelled,
     Trade,
     V32Params,
+    V32ParamsInvalid,
     V32ParamsShaMismatch,
     V32State,
     canonical_sha256,
@@ -115,7 +116,7 @@ def test_params_load_and_sha_pin(tmp_path):
     p = load_v32_params()
     assert p.E == Decimal("0.10")
     assert p.tol == Decimal("0.02")
-    assert p.deb_ms == 2000
+    assert p.deb_ms == 5000
     assert p.shadow_Es == (Decimal("0.08"), Decimal("0.10"), Decimal("0.12"))
     assert p.bucket_width == 100
     # the loaded file self-verifies against the pinned frozen sha
@@ -145,6 +146,17 @@ def test_params_missing_key_fails_closed(tmp_path):
 def test_canonical_sha_matches_box():
     sample = {"z": 1, "a": "0.10", "m": [1, "x"], "n": 1.0}
     assert canonical_sha256(sample) == box_canonical_sha256(sample)
+
+
+def test_params_E_not_in_shadow_Es_fails_closed(tmp_path):
+    # REGRESSION (ruling L-6): the live E must be one of the shadow_Es, else the shadow does not
+    # track the live policy. Fail closed at load.
+    raw = json.load(open(DEFAULT_V32_PARAMS_PATH, encoding="utf-8"))
+    raw["shadow_Es"] = ["0.08", "0.12"]  # drop 0.10 (== E) -> invalid
+    bad = tmp_path / "v32_params.json"
+    bad.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(V32ParamsInvalid):
+        load_v32_params(str(bad), expected_sha=None)
 
 
 # ===========================================================================
@@ -412,20 +424,59 @@ def test_fill_takes_wings_with_lock():
     assert st.rest_fill is not None and st.wing_taken
 
 
-def test_lock_floor_defers_wings_then_takes_on_improvement():
-    # a very high lock floor makes the initial take uneconomic -> defer; when the asks improve, take.
-    p = _params(lock_floor=Decimal("0.20"))
+def test_initial_take_is_unconditional_regardless_of_lock_floor():
+    # RULING F-2: the INITIAL both-wings take fires immediately on a fill, even when the lock is
+    # far below a (deliberately high) lock_floor. lock_floor does NOT gate the initial take.
+    p = _params(lock_floor=Decimal("0.20"))  # lock 0.1036 < 0.20
     st = _state(p)
     now = T - 600
     st, coid = _bring_up_live_rest(p, st, now)
     st, acts = _feed(p, st, Fill(st.rest_live.order_id, coid, Decimal(1), Decimal("0.45"), "no", now + 0.1))
-    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]  # lock 0.1036 < floor 0.20
-    assert st.wings_needed and not st.wing_taken
-    # asks improve so lock >= 0.20: cheaper wings (yes 0.70, no-side via su yes_bid 0.42 -> no_ask 0.58)
-    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.42", "0.43"), now + 0.2))
-    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.69", "0.70"), now + 0.2))
     tw = [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
-    assert tw and tw[0].lock >= Decimal("0.20")
+    assert tw and len(tw) == 1
+    assert tw[0].lock == Decimal("0.1036")  # take fired despite lock < floor
+    assert st.wing_taken
+
+
+def test_negative_lock_initial_take_still_fires():
+    # RULING F-2: even a negative-lock initial take fires (the fill already happened; assemble the
+    # pin to bound the position).
+    p = _params(tol=Decimal("0.50"))  # high tol so the expensive-wing book below does NOT requote
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)  # rest at n=0.45
+    # push both wings very expensive so the completion lock goes negative, without requoting.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.10", "0.11"), now + 0.1))  # no_ask(Su)=0.90
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.89", "0.90"), now + 0.1))  # yes_ask(Sd)=0.90
+    assert st.rest_live is not None and st.rest_live.price == Decimal("0.45")  # not requoted
+    st, acts = _feed(p, st, Fill(st.rest_live.order_id, coid, Decimal(1), Decimal("0.45"), "no", now + 0.15))
+    tw = [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
+    assert tw and tw[0].lock < Decimal(0)  # negative lock
+    assert st.wing_taken
+
+
+def test_retry_wing_gated_by_lock_floor_then_fires_on_improvement():
+    # RULING F-2: after the (unconditional) initial take, a single missing leg is RETRIED only while
+    # the projected set lock stays at/above lock_floor (the two held legs form the $1 floor).
+    p = _params(lock_floor=Decimal("-0.10"))
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    st, acts = _feed(p, st, Fill(st.rest_live.order_id, coid, Decimal(1), Decimal("0.45"), "no", now + 0.1))
+    assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS]  # initial take fired
+    yes_coid = st.wing_legs[0].client_order_id
+    no_coid = st.wing_legs[1].client_order_id
+    # NO leg fills at 0.64 (held); YES leg reports no-fill -> unfilled.
+    st, _ = _feed(p, st, Fill("N1", no_coid, Decimal(1), Decimal("0.64"), "no", now + 0.2))
+    st, _ = _feed(p, st, Fill(None, yes_coid, Decimal(0), Decimal("0.78"), "yes", now + 0.2))
+    assert st.wing_legs[1].status == "filled" and st.wing_legs[0].status == "unfilled"
+    # expensive YES ask (0.98) -> projected set lock < -0.10 -> retry DEFERRED.
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.97", "0.98"), now + 0.3))
+    assert not [a for a in acts if a.kind == ActionKind.RETRY_WING]
+    # YES ask improves to 0.90 -> projected lock >= -0.10 -> retry FIRES.
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.89", "0.90"), now + 0.4))
+    retry = [a for a in acts if a.kind == ActionKind.RETRY_WING]
+    assert retry and retry[0].legs[0].side == BUY_YES
 
 
 def test_one_set_per_hour_no_requote_after_fill():

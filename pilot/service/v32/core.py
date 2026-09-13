@@ -21,8 +21,10 @@ T-``quote_start_s`` .. T-``quote_end_s`` (T-15..T-5):
     Re-solve n on every strike/bucket book tick; REPLACE per the requote gate (tol / deb_ms).
   * Fill of the rest (Fill event, or OrderCancelled with filled_count_before_cancel > 0): immediately
     TAKE both wings (buy YES@Sd, buy NO@Su, taker, limit = ask + wing_margin) for the filled count,
-    but only if the resulting lock >= lock_floor; else retry when the ask improves. A position of all
-    three legs pays $2 at every settlement. lock = 2 - (n + fee(n)) - W_paid. One completed set/hour.
+    UNCONDITIONALLY (ruling F-2 — the fill happened, so we bound the position to the $2 pin). A
+    position of all three legs pays $2 at every settlement. lock = 2 - (n + fee(n)) - W_paid.
+    lock_floor gates ONLY the RETRY of a single missing leg after an IOC no-fill (the two held legs
+    are then a $1 floor, so a deferred retry is bounded, not naked). One completed set/hour.
   * Shadow (every E in shadow_Es, regardless of mode): re-solve n_shadow(E) each book tick with NO
     lag and NO requote gate; a spot-bucket YES trade strictly above 1 - n_shadow records a shadow
     fill (once per hour per E); shadow completion = wing asks at the trade tick (both strikes fresh)
@@ -560,7 +562,12 @@ def _wing_prices(st: V32State, now: float, params: V32Params) -> tuple[Decimal, 
 
 
 def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, list[V32Action]]:
-    """Take (or retry) the wings after a rest fill, honoring the lock floor and the settle cutoff."""
+    """Take (or retry) the wings after a rest fill.
+
+    The INITIAL both-wings take is UNCONDITIONAL (ruling F-2): once the bucket-NO fills we assemble
+    the $2 pin regardless of lock_floor. lock_floor gates ONLY the RETRY of a single missing leg
+    after an IOC no-fill — at which point the two already-held legs are a $1 floor, so we never
+    overpay for the last leg. Both branches honor the settle cutoff (no_orders_after_s_to_settle)."""
     actions: list[V32Action] = []
     if not st.wings_needed:
         return st, actions
@@ -577,12 +584,12 @@ def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, l
     ya, na = prices
 
     if not st.wing_taken:
-        # first take (or retry-as-full-take after a lock-floor deferral)
+        # UNCONDITIONAL initial take (ruling F-2): take BOTH wings at ask + wing_margin now,
+        # regardless of lock_floor. The fill already happened; completing the pin bounds the
+        # position to the $2 payoff. (lock is still computed for the journal/report.)
         n = st.rest_fill.price if st.rest_fill is not None else _ZERO
         w_paid = ya + fee(ya) + na + fee(na)
         lock = lock_value(n, w_paid)
-        if lock < params.lock_floor:
-            return st, actions  # defer; retry when the ask improves
         count = st.rest_fill.count if st.rest_fill is not None else params.contracts
         coid_y, st = _mint_coid(st)
         coid_n, st = _mint_coid(st)
@@ -602,7 +609,22 @@ def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, l
         )
         return st, actions
 
-    # already taken: retry any leg reported unfilled, at the fresh ask.
+    # already taken: retry any leg reported unfilled, at the fresh ask — but only while the
+    # projected set lock (filled legs at their fill price, unfilled legs at the current ask) stays
+    # at/above lock_floor (ruling F-2). The already-held leg(s) form the $1 floor, so a deferred
+    # retry is bounded, not naked; the retry fires as soon as the ask improves enough.
+    n = st.rest_fill.price if st.rest_fill is not None else _ZERO
+    projected_cost = _ZERO
+    for leg in st.wing_legs:
+        if leg.status == "filled" and leg.fill_price is not None:
+            projected_cost += leg.fill_price + fee(leg.fill_price)
+        else:
+            ask = ya if leg.side == BUY_YES else na
+            projected_cost += ask + fee(ask)
+    projected_lock = _TWO - (n + fee(n)) - projected_cost
+    if projected_lock < params.lock_floor:
+        return st, actions  # defer the retry; the held leg(s) bound the position
+
     legs_out = list(st.wing_legs)
     changed = False
     for i, leg in enumerate(st.wing_legs):

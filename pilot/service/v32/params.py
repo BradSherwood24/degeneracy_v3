@@ -29,11 +29,15 @@ DEFAULT_V32_PARAMS_PATH = os.path.join(
 
 # The canonical sha256 of the shipped policy/v32_params.json (sha of json.dumps(sort_keys=True,
 # separators=(",",":")).encode("utf-8")). Recompute + re-pin only when INTENTIONALLY re-freezing.
-FROZEN_V32_PARAMS_SHA256 = "69646917691ac1995b82f75bb0de2ca3796ee52b068ae283b1ee9df1455ceed1"
+FROZEN_V32_PARAMS_SHA256 = "c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92"
 
 
 class V32ParamsShaMismatch(Exception):
     """Raised when the loaded v32 policy's canonical sha != the expected sha (fail-closed)."""
+
+
+class V32ParamsInvalid(Exception):
+    """Raised when the loaded v32 policy violates a structural invariant (fail-closed)."""
 
 
 def canonical_sha256(obj: dict[str, Any]) -> str:
@@ -57,7 +61,9 @@ class V32Params:
       * ``quote_start_s``/``quote_end_s`` the quoting window T-900..T-300 (place only inside it).
       * ``contracts``    order size (1; proxy cap 2 stands).
       * ``wing_margin``  taker-completion limit margin over the observed ask.
-      * ``lock_floor``   never take a wing leg that would push the set's lock below this (retry later).
+      * ``lock_floor``   gates ONLY the RETRY of a single missing leg (ruling F-2): never pay for the
+                         last leg if it would push the set's lock below this. The INITIAL both-wings
+                         take is unconditional.
       * ``no_orders_after_s_to_settle`` hard order cutoff (T-1s): no PLACE/TAKE/RETRY after it.
       * ``freshness_max_age_s`` a STRIKE (wing) book older than this is stale -> cancel, do not place.
       * ``max_sets_per_hour`` stop quoting after this many completed sets (1).
@@ -104,8 +110,17 @@ def load_v32_params(
             f"v32 params sha mismatch for {path}: got {sha}, expected {expected_sha} "
             f"(refusing to load a policy whose canonical sha does not match)"
         )
+    E = Decimal(str(raw["E"]))
+    shadow_Es = tuple(Decimal(str(x)) for x in raw["shadow_Es"])
+    if E not in shadow_Es:
+        # Fail closed (ruling L-6): the live edge E must be one of the shadow ladder Es, else the
+        # in-process shadow does not track the live policy and dry mode reports the wrong statistic.
+        raise V32ParamsInvalid(
+            f"v32 policy at {path} is invalid: E={E} is not in shadow_Es={list(shadow_Es)} "
+            f"(the live edge must be one of the shadow Es so the shadow tracks the live policy)"
+        )
     return V32Params(
-        E=Decimal(str(raw["E"])),
+        E=E,
         tol=Decimal(str(raw["tol"])),
         deb_ms=int(raw["deb_ms"]),
         quote_start_s=int(raw["quote_start_s"]),
@@ -119,7 +134,7 @@ def load_v32_params(
         n_min=Decimal(str(raw["n_min"])),
         replace_rate_alarm_per_min=int(raw["replace_rate_alarm_per_min"]),
         bucket_width=int(raw["bucket_width"]),
-        shadow_Es=tuple(Decimal(str(x)) for x in raw["shadow_Es"]),
+        shadow_Es=shadow_Es,
         sha256=sha,
         raw=raw,
     )

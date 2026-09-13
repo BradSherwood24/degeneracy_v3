@@ -5,6 +5,34 @@ Reviewer: Opus 4.8 (Fable's delegated reviewer). Branch `v32/phase1-core`, PR #3
 Reviewed as an adversary because Phase 3 places REAL resting orders + taker completions with Brad's
 money. No network, no proxy, no holdout/seal read (the golden fixture is 2026-09-04, pre-extracted).
 
+## PHASE 2/3 MUST (carry-forward for the next builder)
+
+These are NOT fixed in Phase 1 (the pure core sends no orders). Close them before Phase 3 arming:
+
+* **F-1 — retained cancel context.** Retain a `coid/order_id -> (price, count, bucket_Sd)` map of
+  every order placed this hour so a `Fill` on a just-replaced / eagerly-cancelled order is booked
+  (right price + bucket) and latches the one-set rule; drive cancels through a status-confirmed path
+  so the fill arrives as `OrderCancelled.filled_count_before_cancel`. Without it a fill on an
+  untracked own-order is dropped -> untracked unhedged leg + possible double entry.
+* **L-1 — `solve_n` cap ceiling.** Floor the cap (or add `n <= cap` to the loop) so a non-whole-cent
+  cap can never yield an `n` that crosses the book / trips post_only.
+* **L-2 — out-of-order `server_ts`.** Feed a monotonic-ish clock, else a slightly-behind
+  cross-market frame makes a strike look stale -> spurious cancel/replace churn.
+* **L-3 — `no_ask == 1.0` wing.** `_wing_prices` accepts `na == 1` but caps the IOC limit at 0.99
+  (never fills) while `_compute_W` rejects `na == 1`; reconcile the boundary.
+* **L-4 — multi-lot partial.** At `contracts > 1` (size is pinned 1) a partial rest fill orphans the
+  remaining lots on the exchange, untracked; handle if the size ever rises.
+
+## RULINGS APPLIED (coordinator, on this review) — see the commit on `v32/phase1-core`
+
+* **F-2 RESOLVED** — the initial both-wings take is now UNCONDITIONAL; `lock_floor` gates only the
+  RETRY of a single missing leg. Core + docstrings + tests updated (see F-2 below, now historical).
+* **M-1 RESOLVED** — `deb_ms` set to 5000 in `policy/v32_params.json`; `FROZEN_V32_PARAMS_SHA256`
+  re-pinned to `c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92` (pre-freeze build
+  act). Golden test uses its own explicit tol/deb and stays green.
+* **L-6 RESOLVED** — `load_v32_params` now raises `V32ParamsInvalid` (fail-closed, clear message)
+  when `E` is not in `shadow_Es`; test added.
+
 ## VERDICT: APPROVE WITH FIXES
 
 Phase 1 is a well-built pure core: money is Decimal end to end, time comes only from event
