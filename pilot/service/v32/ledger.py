@@ -118,6 +118,19 @@ def build_v32_ledger_row(
     wing_batches: int = 0,
     exec_price_mismatches: list[Any] | None = None,
     degrade_reason: str | None = None,
+    # Last-quoted spot bucket + stand-down bookkeeping, captured WHILE quoting by the driver (see
+    # ``run_v32.V32Driver._capture_quote``). These win over the post-quote-end ``state`` so the row
+    # shows the bucket we actually rested on rather than the reset-at-close spot (which is nulled).
+    last_quoted_bucket_ticker: str | None = None,
+    last_quoted_Sd: int | None = None,
+    last_quoted_Su: int | None = None,
+    last_rest_price: Decimal | None = None,
+    last_desired_n: Decimal | None = None,
+    spot_buckets_quoted: list[int] | None = None,
+    quote_end_cancel: bool = False,
+    real_stand_downs: int | None = None,
+    last_stand_down_reason: str | None = None,
+    lag_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One window row. In Phase 2 ``armed`` is always False; Phase 3 sets it True on an armed window
     and fills the money-math slots (real ``fills``/``wing_fills``, the ``realized_lock`` per set, the
@@ -125,11 +138,22 @@ def build_v32_ledger_row(
     Discovery counts, would-be/real order counts, replaces, shadow fills-per-E with locks, alarms,
     per-connection lag, and the stand-down reason are all recorded so the report and the arming
     checklist read from one artifact."""
-    spot_Sd = getattr(state, "spot_Sd", None) if state is not None else None
-    spot_Su = getattr(state, "spot_Su", None) if state is not None else None
-    bucket_ticker = None
-    if state is not None and spot_Sd is not None:
-        bucket_ticker = getattr(state, "bucket_tickers", {}).get(spot_Sd)
+    spot_Sd_state = getattr(state, "spot_Sd", None) if state is not None else None
+    spot_Su_state = getattr(state, "spot_Su", None) if state is not None else None
+    bucket_ticker_state = None
+    if state is not None and spot_Sd_state is not None:
+        bucket_ticker_state = getattr(state, "bucket_tickers", {}).get(spot_Sd_state)
+    # Prefer the LAST QUOTED bucket (captured while quoting) over the reset-at-close state.
+    spot_Sd = last_quoted_Sd if last_quoted_Sd is not None else spot_Sd_state
+    spot_Su = last_quoted_Su if last_quoted_Su is not None else spot_Su_state
+    bucket_ticker = last_quoted_bucket_ticker or bucket_ticker_state
+    # Stand-downs = real alarm/staleness/no-spot events (driver excludes the T-5 quote-end cancel);
+    # legacy callers pass no ``real_stand_downs`` and fall back to the raw STAND_DOWN action count.
+    stand_downs = int(real_stand_downs) if real_stand_downs is not None \
+        else int(driver_counts.get("stand_down", 0))
+    # The row's stand_down_reason carries the full-standdown reason (the _stand_down path) or, absent
+    # that, the last REAL stand-down record seen while quoting.
+    row_stand_down_reason = stand_down_reason if stand_down_reason is not None else last_stand_down_reason
     row: dict[str, Any] = {
         "close_time": close_time,
         "mode": resolved_mode,
@@ -139,7 +163,7 @@ def build_v32_ledger_row(
         "degrade_reason": degrade_reason,
         "params_sha": params.sha256 if params is not None else params_sha,
         "stand_down": stand_down_reason is not None,
-        "stand_down_reason": stand_down_reason,
+        "stand_down_reason": row_stand_down_reason,
         # discovery
         "strike_count": strike_count,
         "strike_generations": strike_generations,
@@ -148,10 +172,14 @@ def build_v32_ledger_row(
         # recording-only co-settling 15M leg (list of tickers + frames tapped this window)
         "m15_tickers": list(m15_tickers or []),
         "m15_frames": int(m15_frames),
-        # spot bucket at window end
+        # last-quoted spot bucket (captured while quoting; falls back to end-of-window state)
         "spot_bucket_ticker": bucket_ticker,
         "Sd": spot_Sd,
         "Su": spot_Su,
+        "last_rest_price": (str(last_rest_price) if last_rest_price is not None else None),
+        "last_desired_n": (str(last_desired_n) if last_desired_n is not None else None),
+        "spot_buckets_quoted": list(spot_buckets_quoted or []),
+        "quote_end_cancel": bool(quote_end_cancel),
         # would-be order activity (Phase 2 sends none)
         "would_places": int(driver_counts.get("would_place_rest", 0)),
         "would_cancels": int(driver_counts.get("would_cancel_rest", 0)),
@@ -159,7 +187,7 @@ def build_v32_ledger_row(
         "would_retries": int(driver_counts.get("would_retry_wing", 0)),
         "replaces": getattr(state, "replace_count", 0) if state is not None else 0,
         "sets_done": getattr(state, "sets_done", 0) if state is not None else 0,
-        "stand_downs": int(driver_counts.get("stand_down", 0)),
+        "stand_downs": stand_downs,
         "late_fills": int(driver_counts.get("late_fill", 0)),
         # shadow (the ideal fill rule running live) — per E, with locks
         "shadow": _shadow_summary(state),
@@ -169,6 +197,9 @@ def build_v32_ledger_row(
         # per-connection lag (the two-connection topology's measured gauges)
         "strike_lag_seconds": strike_lag_seconds,
         "bucket_lag_seconds": bucket_lag_seconds,
+        # per-connection lag distribution {strikes,buckets: {mean,p99,last,n}} — the report reads the
+        # p99 here for the falsifier scoreboard's data-age line (mirror of the summary's lag_stats)
+        "lag_stats": lag_stats or {},
         # journal
         "journal_path": journal_path,
         "record_count": record_count,

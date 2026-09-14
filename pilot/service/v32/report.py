@@ -98,6 +98,8 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "close_time": r.get("close_time"),
                 "mode": r.get("effective_mode") or r.get("mode"),
                 "bucket": r.get("spot_bucket_ticker") or ("STAND DOWN" if r.get("stand_down") else "-"),
+                "Sd": r.get("Sd"),
+                "last_rest": r.get("last_rest_price"),
                 "replaces": r.get("replaces", 0),
                 "would_places": r.get("would_places", 0),
                 "late_fills": r.get("late_fills", 0),
@@ -139,6 +141,20 @@ def _percentile(sorted_vals: list[Decimal], pct: Decimal) -> Decimal | None:
     rank = int(math.ceil(float(pct) / 100.0 * n))
     rank = max(1, min(n, rank))
     return sorted_vals[rank - 1]
+
+
+def _lag_stats_p99(rows: list[dict[str, Any]], conn: str) -> Decimal | None:
+    """The MAX over windows of one connection's per-window ``lag_stats[conn]['p99']`` (the honest
+    worst-tail data-age across the reported windows). None when NO row carries a lag_stats p99 for
+    ``conn`` (legacy rows predating the field, or a run that never sampled)."""
+    vals: list[Decimal] = []
+    for r in rows:
+        sub = (r.get("lag_stats") or {}).get(conn)
+        if isinstance(sub, dict):
+            v = _dec(sub.get("p99"))
+            if v is not None:
+                vals.append(v)
+    return max(vals) if vals else None
 
 
 def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -212,6 +228,11 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     replaces_mean = (sum(replaces, Decimal(0)) / Decimal(len(replaces))) if replaces else None
     strike_p99 = _percentile(sorted(strike_lags), Decimal(99)) if strike_lags else None
     bucket_p99 = _percentile(sorted(bucket_lags), Decimal(99)) if bucket_lags else None
+    # data-age p99 from the per-window lag_stats (max across windows) — read over ALL rows (not just
+    # armed), since it is an operational health gauge; the scoreboard prefers these and falls back to
+    # the legacy per-row *_lag_seconds p99 (armed rows) only when no row carries lag_stats.
+    strike_stats_p99 = _lag_stats_p99(rows, "strikes")
+    bucket_stats_p99 = _lag_stats_p99(rows, "buckets")
 
     # --- verdict from the [pin] constants -------------------------------------------------------
     if n < V32_FALSIFIER_MIN_N:
@@ -247,6 +268,8 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "replaces_per_hour_mean": replaces_mean,
         "strike_lag_p99_s": strike_p99,
         "bucket_lag_p99_s": bucket_p99,
+        "strike_lag_stats_p99_s": strike_stats_p99,
+        "bucket_lag_stats_p99_s": bucket_stats_p99,
         "verdict": verdict,
     }
 
@@ -263,6 +286,14 @@ def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
     e = sb["shadow_gap_E"]
     pct = sb["pct_positive"]
     rate = sb["fill_rate_per_day"]
+    # data-age p99 = MAX of the per-window lag_stats p99 across windows (the honest worst tail);
+    # falls back to the legacy per-row mean-lag p99 only for rows predating the lag_stats field.
+    strike_age = sb.get("strike_lag_stats_p99_s")
+    if strike_age is None:
+        strike_age = sb.get("strike_lag_p99_s")
+    bucket_age = sb.get("bucket_lag_stats_p99_s")
+    if bucket_age is None:
+        bucket_age = sb.get("bucket_lag_p99_s")
     return [
         "",
         "FALSIFIER SCOREBOARD (DegeneracyV3_2, continuous-requote pump-fader, E=0.10) -- [pin] gates",
@@ -276,8 +307,8 @@ def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
         f"  shadow E={e}: mean lock {_c(sb['shadow_mean_lock_c'])}   "
         f"execution gap (shadow-live) {_c(sb['exec_gap_c'])}",
         f"  replaces/hour mean = {_num(sb['replaces_per_hour_mean'], 1)}   "
-        f"data-age p99: strike {_num(sb['strike_lag_p99_s'], 2, 's')}  "
-        f"bucket {_num(sb['bucket_lag_p99_s'], 2, 's')}",
+        f"data-age p99 (max/window): strike {_num(strike_age, 2, 's')}  "
+        f"bucket {_num(bucket_age, 2, 's')}",
         f"  VERDICT: {sb['verdict']}",
     ]
 
@@ -286,15 +317,20 @@ def _render(report: dict[str, Any]) -> str:
     e_keys = report["e_keys"]
     lines: list[str] = []
     header = ["close_time".ljust(22), "mode".ljust(9), "bucket".ljust(26),
-              "repl".rjust(5), "wPlc".rjust(5)]
+              "Sd".rjust(7), "lastRest".rjust(8), "repl".rjust(5), "wPlc".rjust(5)]
     for k in e_keys:
         header.append(("sh_E" + k).rjust(14))
     header += ["m15".rjust(6), "sLag".rjust(6), "bLag".rjust(6)]
     lines.append("  ".join(header))
     lines.append("-" * (len(lines[0])))
     for w in report["windows"]:
+        lr = w.get("last_rest")
+        lr_s = (f"{float(lr):.2f}" if lr not in (None, "") else "-")
         row = [str(w["close_time"]).ljust(22), str(w["mode"]).ljust(9),
-               str(w["bucket"]).ljust(26), str(w["replaces"]).rjust(5),
+               str(w["bucket"]).ljust(26),
+               (str(w.get("Sd")) if w.get("Sd") is not None else "-").rjust(7),
+               lr_s.rjust(8),
+               str(w["replaces"]).rjust(5),
                str(w["would_places"]).rjust(5)]
         for k in e_keys:
             row.append(str(w["shadow"].get(k, "-")).rjust(14))

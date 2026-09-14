@@ -710,6 +710,20 @@ class V32Driver:
         # order-status poll (belt and braces). Book each once, keyed by trade_id (WS) / order_id (poll).
         self._seen_trade_ids: set[str] = set()
         self._rest_fill_booked_oids: set[str] = set()
+        # Last-quoted spot bucket, captured WHILE quoting (each place/would-place), so the finalized
+        # ledger row + summary carry the bucket we actually rested on rather than the post-quote-end
+        # reset state (which nulls spot_Sd/Su at close). Plus stand-down bookkeeping: the T-5
+        # end-of-quoting cancel emits a STAND_DOWN("past_quote_end") that must NOT count as a
+        # stand-down (a stand-down means an alarm / staleness / no-spot event).
+        self._last_quoted_bucket_ticker: str | None = None
+        self._last_quoted_Sd: int | None = None
+        self._last_quoted_Su: int | None = None
+        self._last_rest_price: Decimal | None = None
+        self._last_desired_n: Decimal | None = None
+        self._spot_buckets_quoted: list[int] = []        # Sd ints, order of first appearance
+        self._last_stand_down_reason: str | None = None   # last REAL stand-down (not quote-end)
+        self._real_stand_downs: int = 0                   # alarms / staleness / no-spot only
+        self._quote_end_cancel: bool = False              # the T-5 end-of-quoting cancel fired
 
     # --- clock source for the ClockTick pump ---
     def _stamp(self, server_ts: float) -> None:
@@ -959,6 +973,7 @@ class V32Driver:
                 "price": a.price, "expiration_epoch": a.expiration_epoch,
                 "client_order_id": a.client_order_id,
             }
+            self._capture_quote(a)
         elif k in (ActionKind.WOULD_CANCEL_REST, ActionKind.CANCEL_REST):
             rk = "would_cancel_rest" if k == ActionKind.WOULD_CANCEL_REST else "cancel_rest"
             payload = {"order_id": a.order_id, "client_order_id": a.client_order_id}
@@ -979,11 +994,36 @@ class V32Driver:
         elif k == ActionKind.STAND_DOWN:
             rk = "stand_down"
             payload = {"reason": a.reason}
+            # The T-5 end-of-quoting cancel (reason "past_quote_end") is orderly window close, not a
+            # stand-down; record it distinctly and keep it out of the real stand-down tally.
+            if a.reason == "past_quote_end":
+                self._quote_end_cancel = True
+            else:
+                self._last_stand_down_reason = a.reason
+                self._real_stand_downs += 1
         else:
             rk = "v32_action"
             payload = {"kind": str(k)}
         self.counts[rk] += 1
         self.journal.append(rk, payload, self.clock())
+
+    def _capture_quote(self, a) -> None:
+        """Record the LAST bucket we quoted (rested on) WHILE quoting. Called on each place/would-place
+        so the finalized row + summary carry the bucket we actually rested on (its ticker, Sd, Su), the
+        last rest price and desired n, and every distinct spot bucket quoted in first-appearance order
+        — none of which survive on the post-quote-end state (spot_Sd is nulled at close)."""
+        st = self.state
+        if a.ticker:
+            self._last_quoted_bucket_ticker = a.ticker
+        if st.spot_Sd is not None:
+            self._last_quoted_Sd = st.spot_Sd
+            self._last_quoted_Su = st.spot_Su
+            if st.spot_Sd not in self._spot_buckets_quoted:
+                self._spot_buckets_quoted.append(st.spot_Sd)
+        if a.price is not None:
+            self._last_rest_price = a.price
+        if st.desired_n is not None:
+            self._last_desired_n = st.desired_n
 
     def _maybe_eval(self, server_ts: float | None) -> None:
         """Throttled observability heartbeat: emit ``v32_eval`` on a spot/quote change or every
@@ -1364,6 +1404,17 @@ def _finalize(
         m15_frames=shared.m15_frames,
         armed=armed,
         degrade_reason=degrade_reason,
+        # last-quoted spot bucket + stand-down bookkeeping (captured while quoting)
+        last_quoted_bucket_ticker=driver._last_quoted_bucket_ticker,
+        last_quoted_Sd=driver._last_quoted_Sd,
+        last_quoted_Su=driver._last_quoted_Su,
+        last_rest_price=driver._last_rest_price,
+        last_desired_n=driver._last_desired_n,
+        spot_buckets_quoted=list(driver._spot_buckets_quoted),
+        quote_end_cancel=driver._quote_end_cancel,
+        real_stand_downs=driver._real_stand_downs,
+        last_stand_down_reason=driver._last_stand_down_reason,
+        lag_stats=lag_stats,
         **money,
     )
     append_v32_ledger_row(row, ledger_path)
@@ -1381,6 +1432,18 @@ def _finalize(
         "would_places": driver.counts.get("would_place_rest", 0),
         "replaces": driver.state.replace_count,
         "sets_done": driver.state.sets_done,
+        # last-quoted spot bucket + rest, captured while quoting (mirror the ledger row)
+        "spot_bucket_ticker": driver._last_quoted_bucket_ticker,
+        "Sd": driver._last_quoted_Sd,
+        "Su": driver._last_quoted_Su,
+        "last_rest_price": (str(driver._last_rest_price)
+                            if driver._last_rest_price is not None else None),
+        "last_desired_n": (str(driver._last_desired_n)
+                           if driver._last_desired_n is not None else None),
+        "spot_buckets_quoted": list(driver._spot_buckets_quoted),
+        "quote_end_cancel": driver._quote_end_cancel,
+        "stand_downs": driver._real_stand_downs,
+        "stand_down_reason": driver._last_stand_down_reason,
         "m15_tickers": list(m15_tickers or []),
         "m15_frames": shared.m15_frames,
         "ws_counts": dict(shared.counts),
