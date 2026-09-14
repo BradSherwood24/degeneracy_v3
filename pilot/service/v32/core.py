@@ -280,11 +280,24 @@ def _valid_two_sided(top: TopOfBook | None) -> bool:
 
 
 def _fresh(now: float, last_ts: float | None, bound: float) -> bool:
-    """A strike (wing) book is fresh iff its age is known, non-negative, and within ``bound``."""
+    """A book is fresh iff its age is known and within ``[-bound, bound]``.
+
+    LAW (clock-interleave tolerance, 2026-09-14): the two WS connections (strikes KXBTCD vs buckets
+    KXBTC+15M) carry INDEPENDENT server clocks that interleave. A book folded from one connection can
+    be stamped with a ts up to a few tens of ms AHEAD of the evaluation clock ``now`` (which is driven
+    off the other connection's frame) -- a NEGATIVE age. That is clock skew, NOT staleness, so a book
+    up to ``bound`` ahead is fresh. Without this tolerance the age flips negative for a genuine book,
+    ``_compute_W``/``_wing_prices`` return None, and ``_requote`` cancels + re-places every ~1 ms
+    (the 2026-09-14T17:00:00Z live-dry flap: 61 place/cancel pairs in 5 s -> replace-rate alarm ->
+    the hour quoted nothing). The driver ALSO folds these onto a MONOTONE evaluation clock
+    (``run_v32.V32Driver.on_book_update``), so negative ages should not arise on the book path at all;
+    this bound is the belt-and-braces layer that also covers the private-order paths (Fill/Cancel),
+    whose ``now`` is the order channel's own ts and can trail the book clock. A book more than ``bound``
+    STALE (positive age > bound) is still stale -- genuine staleness detection is unchanged."""
     if last_ts is None:
         return False
     age = now - last_ts
-    return 0.0 <= age <= bound
+    return -bound <= age <= bound
 
 
 def _select_spot(st: V32State) -> int | None:
@@ -417,12 +430,17 @@ def _fold_book(st: V32State, event: BookUpdate) -> V32State:
     if cls is None:
         return st
     kind, floor = cls
+    # The RECORDED book age anchor is the FRAME'S OWN ts (``book_ts``), NOT the monotone evaluation
+    # clock (``server_ts``): a genuinely stalled feed must still age its book out even while the
+    # monotone clock advances off the other connection. Falls back to ``server_ts`` when ``book_ts``
+    # is absent (direct-constructed events: unit tests, the golden harness) — the pre-fix behavior.
+    book_ts = event.book_ts if event.book_ts is not None else event.server_ts
     if kind == "strike":
         strike_tops = dict(st.strike_tops)
         strike_ts = dict(st.strike_ts)
         strike_tickers = dict(st.strike_tickers)
         strike_tops[floor] = event.top
-        strike_ts[floor] = event.server_ts
+        strike_ts[floor] = book_ts
         strike_tickers[floor] = event.market_ticker
         return replace(st, strike_tops=strike_tops, strike_ts=strike_ts, strike_tickers=strike_tickers)
     else:
@@ -430,7 +448,7 @@ def _fold_book(st: V32State, event: BookUpdate) -> V32State:
         bucket_ts = dict(st.bucket_ts)
         bucket_tickers = dict(st.bucket_tickers)
         bucket_tops[floor] = event.top
-        bucket_ts[floor] = event.server_ts
+        bucket_ts[floor] = book_ts
         bucket_tickers[floor] = event.market_ticker
         return replace(st, bucket_tops=bucket_tops, bucket_ts=bucket_ts, bucket_tickers=bucket_tickers)
 

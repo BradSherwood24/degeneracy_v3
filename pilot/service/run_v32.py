@@ -57,11 +57,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import time
 from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
@@ -677,7 +678,15 @@ class V32Driver:
     record and routing every order-bearing action to the executor. Pure decision logic stays in the
     core, so the driver runs live and in replay identically. Time for the ClockTick pump is derived
     from the last observed server ts plus local elapsed (``server_now``) — never the machine clock as
-    a truth source (fail-closed: no server ts seen yet -> no tick driven)."""
+    a truth source (fail-closed: no server ts seen yet -> no tick driven).
+
+    CLOCK LAW (P3-3 + 2026-09-14 clock-flap fix): the two WS connections carry independent, interleaving
+    server clocks. The EVALUATION clock handed to the core as each event's ``server_ts`` (``now``) is the
+    MONOTONE ``_last_server_ts`` = max over every frame's ts on BOTH connections, so it is never behind
+    any book already folded from the other connection. A book's OWN raw frame ts still travels as
+    ``BookUpdate.book_ts`` and is what ``_fold_book`` records for that market, so genuine staleness
+    (a stalled feed) is still detected while the monotone clock advances off the live connection. This
+    kills the negative-age flap that emptied the first live-dry hour (close 2026-09-14T17:00:00Z)."""
 
     def __init__(
         self,
@@ -721,8 +730,17 @@ class V32Driver:
 
     # --- event entry points ---
     def on_book_update(self, market: str, top: TopOfBook, server_ts: float) -> None:
+        # P3-3 / clock-flap fix (2026-09-14): the EVALUATION clock (``now``) is the MONOTONE
+        # ``self._last_server_ts`` (= max(this frame's ts, every prior frame's ts across BOTH
+        # connections), never behind any folded book), while ``book_ts`` keeps this frame's OWN raw ts
+        # so a genuinely stalled feed still ages that market's book out. Before the fix ``now`` was the
+        # raw frame ts, so a frame from the slower connection made ``now`` regress below a book stamped
+        # by the faster one -> negative age -> "stale" -> W None -> cancel; the next (newer) frame ->
+        # place; ~1 ms flap (61 place/cancel pairs -> replace-rate alarm -> dead hour) in the first
+        # live-dry window (close 2026-09-14T17:00:00Z).
         self._stamp(server_ts)
-        self._pump([BookUpdate(market_ticker=market, top=top, server_ts=server_ts)])
+        eval_ts = self._last_server_ts  # monotone across connections
+        self._pump([BookUpdate(market_ticker=market, top=top, server_ts=eval_ts, book_ts=server_ts)])
 
     def on_trade(self, market: str, payload: dict, server_ts: float) -> None:
         ev = _trade_event(market, payload, server_ts)
@@ -730,6 +748,10 @@ class V32Driver:
             self.journal.append("v32_trade_unparsed", {"market": market}, self.clock())
             return
         self._stamp(server_ts)
+        # Same monotone evaluation clock as the book path: the shadow-on-trade freshness gate compares
+        # this ``server_ts`` against the spot bucket's book ts, so it must not regress below a book the
+        # other connection just stamped (a Trade carries no book to age, so it needs no ``book_ts``).
+        ev = replace(ev, server_ts=self._last_server_ts)
         self._pump([ev])
 
     def on_clock_tick(self, server_ts: float) -> None:
@@ -1125,17 +1147,63 @@ async def _await_gate(
         await sleep(remaining)
 
 
+class LagSampler:
+    """Samples each connection's ``current_lag_seconds()`` on the clock-pump tick and aggregates it.
+
+    WHY (2026-09-14 fix): ``KalshiWebSocketClient.force_close()`` sets ``last_delta_lag_seconds = None``
+    at window end, so reading ``current_lag_seconds()`` AT FINALIZE (after the connections have closed)
+    always yielded ``None`` — the ledger row and report showed ``strike/bucket_lag_seconds: null`` and
+    "mean data-age n/a" even though ~1.35 M frames streamed. Sampling on the live 0.5 s tick captures a
+    real distribution while the gauge is populated; the finalized row carries the MEAN (the per-window
+    representative the report already reduces to a cross-window p99), and the summary carries mean/p99/
+    last/n per connection. ``None`` readings (a dial before its first timestamped frame) are skipped."""
+
+    def __init__(self, conns: Mapping[str, KalshiWebSocketClient]) -> None:
+        self._conns = dict(conns)
+        self._samples: dict[str, list[float]] = {k: [] for k in self._conns}
+
+    def sample(self) -> None:
+        """Read every connection's current lag once; append the non-None readings."""
+        for key, ws in self._conns.items():
+            v = ws.current_lag_seconds()
+            if v is not None:
+                self._samples[key].append(float(v))
+
+    def summary(self, key: str) -> dict[str, float | int] | None:
+        """{mean, p99 (nearest-rank), last, n} for one connection, or None if never sampled."""
+        xs = self._samples.get(key) or []
+        if not xs:
+            return None
+        srt = sorted(xs)
+        n = len(srt)
+        rank = min(n - 1, max(0, math.ceil(0.99 * n) - 1))
+        return {"mean": sum(srt) / n, "p99": srt[rank], "last": xs[-1], "n": n}
+
+    def mean(self, key: str) -> float | None:
+        """The window mean lag for one connection (the ledger's per-window ``*_lag_seconds`` field)."""
+        summ = self.summary(key)
+        return summ["mean"] if summ is not None else None
+
+    def summaries(self) -> dict[str, dict[str, float | int] | None]:
+        return {key: self.summary(key) for key in self._conns}
+
+
 async def _clock_pump(
     driver: V32Driver, clock: Callable[[], float], deadline: float,
     sleep: Callable[[float], Awaitable[None]], interval: float = PUMP_INTERVAL_S,
+    lag_sampler: "LagSampler | None" = None,
 ) -> None:
     """Drive a ClockTick every ``interval`` seconds from the supervisor loop, using the driver's
     server-derived clock (last server ts + local elapsed). No tick before the first timestamped frame
-    (fail-closed). Advances the window cutoffs / staleness even when book frames stop arriving."""
+    (fail-closed). Advances the window cutoffs / staleness even when book frames stop arriving. Also
+    samples the per-connection data-age gauge each tick (``lag_sampler``) while the connections are
+    still live, so the finalized row carries a real lag even though force_close() nulls the gauge."""
     while clock() < deadline:
         await sleep(interval)
         if clock() >= deadline:
             break
+        if lag_sampler is not None:
+            lag_sampler.sample()
         sn = driver.server_now()
         if sn is not None:
             driver.on_clock_tick(sn)
@@ -1180,15 +1248,17 @@ async def run_v32_window(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     pump_interval: float = PUMP_INTERVAL_S,
     order_poll: bool = False,
+    lag_sampler: "LagSampler | None" = None,
 ) -> None:
     """Await the connect gate, then run both dial loops + the ClockTick pump (and, when armed, the 1 s
     order-status poll) concurrently on one loop until the deadline. ``sleep`` is injected so tests drive
-    the whole thing with a fake clock."""
+    the whole thing with a fake clock. ``lag_sampler`` (if given) records each connection's data-age on
+    every pump tick while the sockets are live."""
     await _await_gate(gate_epoch, deadline, clock, sleep)
     tasks = [
         run_recording(strike_conn, deadline=deadline, sleep=sleep),
         run_recording(bucket_conn, deadline=deadline, sleep=sleep),
-        _clock_pump(driver, clock, deadline, sleep, pump_interval),
+        _clock_pump(driver, clock, deadline, sleep, pump_interval, lag_sampler=lag_sampler),
     ]
     if order_poll:
         tasks.append(_order_status_poll(driver, driver.executor, clock, deadline, sleep))
@@ -1263,7 +1333,7 @@ def _finalize(
     strike_disc: StrikeDiscovery, bucket_map: dict[str, tuple[float, float]],
     bucket_generations: int, journal_path: str, summary_path: str, ledger_path: str,
     strike_lag: float | None, bucket_lag: float | None, clock: Callable[[], float],
-    m15_tickers: list[str] | None = None,
+    m15_tickers: list[str] | None = None, lag_stats: dict | None = None,
     armed: bool = False, degrade_reason: str | None = None,
 ) -> dict:
     journal.close()
@@ -1317,6 +1387,7 @@ def _finalize(
         "gzipped": bool(gz.get("gzipped")),
         "strike_lag_seconds": strike_lag,
         "bucket_lag_seconds": bucket_lag,
+        "lag_stats": lag_stats or {},
         "flushed_at": clock(),
     }
     _append_summary(summary_path, summary)
@@ -1558,9 +1629,10 @@ def main(argv: list[str] | None = None) -> int:
 
     deadline = cts + GRACE_SECONDS
     gate = connect_gate_epoch(cts, params)
+    lag_sampler = LagSampler({"strikes": strike_ws, "buckets": bucket_ws})
     try:
         asyncio.run(run_v32_window(shared, strike_conn, bucket_conn, driver, clock, deadline, gate,
-                                   order_poll=armed))
+                                   order_poll=armed, lag_sampler=lag_sampler))
     except KeyboardInterrupt:
         logger.warning("[V32] Ctrl+C — flushing streamed journal.")
     finally:
@@ -1584,7 +1656,8 @@ def main(argv: list[str] | None = None) -> int:
             params=params, strike_disc=strike_disc, bucket_map=bucket_map,
             bucket_generations=range_disc.generations, journal_path=journal_path,
             summary_path=summary_path, ledger_path=args.ledger,
-            strike_lag=strike_ws.current_lag_seconds(), bucket_lag=bucket_ws.current_lag_seconds(),
+            strike_lag=lag_sampler.mean("strikes"), bucket_lag=lag_sampler.mean("buckets"),
+            lag_stats=lag_sampler.summaries(),
             clock=clock, m15_tickers=list(m15_disc.tickers), armed=armed,
             degrade_reason=degrade_reason,
         )
