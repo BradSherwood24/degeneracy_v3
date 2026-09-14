@@ -41,12 +41,17 @@ def _doc() -> str:
         return f.read()
 
 
-def test_falsifier_is_draft_not_frozen():
+def test_falsifier_is_frozen_with_registration():
+    """Frozen 2026-09-14 on Brad's verbatim order (PR #41). The freeze line must be exact and the
+    Registration section must carry the go -- a FROZEN line without a registered go is a defect."""
     doc = _doc()
-    assert "STATUS: DRAFT" in doc
-    # a stray FROZEN line would arm the pilot -- guard against an accidental freeze in the draft.
-    assert not any(ln.strip() == "STATUS: FROZEN" for ln in doc.splitlines())
-    assert falsifier_is_frozen(_DOC) is False
+    lines = doc.splitlines()
+    assert lines[2].strip() == "STATUS: FROZEN"
+    assert "STATUS: DRAFT" not in doc
+    reg = doc.split("## Registration", 1)[1].split("## Pre-registered shadow observations", 1)[0]
+    assert "FROZEN on Brad's order" in reg and "go ahead and freeze it" in reg
+    assert "(empty -- awaiting Brad's freeze)" not in reg
+    assert falsifier_is_frozen(_DOC) is True
 
 
 def test_verdict_pins_match_doc():
