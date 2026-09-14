@@ -1103,3 +1103,38 @@ Disk: ~25 MB gz/hour ≈ 600 MB/day, 95% from the 15M market; option to thin it 
 Brad's levers now (pilot/ops/V32_ARMING.md): .env ORDER_TICKER_PREFIXES add `KXBTC`; DAILY_ORDER_BUDGET >= 4000 (81 replaces/window ×
 24 ≈ 1,950 creates/day); restart proxy; rule on the pinned thresholds and freeze ceremony/v32_falsifier.md; `armed` in ops/v32_mode.txt;
 register DegeneracyV3_2. First armed window: watch the MUST CONFIRM list (pilot/build/v32_phase3_review.md).
+
+## 2026-09-14 22:30Z — Claude → house: V3.2 ARMED DAY ONE — three live windows, two incidents caught at zero loss, hotfixes + full order-path audit, ms calibration, re-arm for the 23:40Z wake
+
+Brad's orders today (verbatim): "Go ahead and flip what of those levers you can and let me know what needs me ... Lets get it set up for the next
+wake up" / "Go ahead and run the command" / "Okay, go ahead and freeze it. That sounds good" / "Lets go ahead and run another review over all
+orders we might send. Just double check weve crossed our Ts, dotted our Is" / "If you think its ready, go ahead and arm it. After these fixes of course".
+
+Levers: Brad edited .env (ORDER_TICKER_PREFIXES + KXBTC, DAILY_ORDER_BUDGET 4000); proxy restarted 18:20Z; falsifier FROZEN (PR #41, on Brad's
+explicit order after the permission classifier refused Claude 3x — the freeze stays a Brad-only lever); v32_mode.txt armed 18:53Z; task
+DegeneracyV3_2 registered (hourly :40). Dry windows 17:00Z/18:00Z (clock-flap hotfix PR #38 in between; window 2 = 81 replaces, clean).
+First live shadow fill, 19:00Z shakedown window: E=0.10 offer 0.38, print 0.39 x1, W 1.2617, lock +10.2c (E=0.08 +8.2c, E=0.12 +12.2c).
+
+Armed window 20:00Z: 3 creates -> 404 (URL `/trade-api/v2/trade-api/v2/...`, doubled prefix; the proxy forwarded the unrecognized POST uncapped);
+executor stood down after 3 rejections; nothing reached the book. Hotfix PR #43 (compose_rest_url idempotent, URL-level tests).
+Window 21:00Z: stand-down by design ($250 hour).
+Armed window 22:00Z (INCIDENT): creates 201 OK, but EVERY `DELETE /portfolio/events/orders/{id}` -> 404 (orders live on exchange_index 2; the
+cancel needs `?exchange_index=2` — docs don't say so); executor treated 404 as gone and the core kept placing -> 21 rests stacked in 2.5 min.
+Claude killed the process 21:47:17Z, hand-cancelled all 21 with the sharded path by 21:49Z, mode file -> dry. No fills; balance $51.997 unchanged.
+Hotfix PR #46: shard-aware cancel; non-2xx DELETE -> order-status GET -> retry -> cancel_failed + stand-down; venue-truth invariant before every
+PLACE (never place while any of ours rests); ledger counters fixed; incident replay pins <= 1 live rest. Suite 845.
+ORDER-PATH AUDIT (Brad's ask; pilot/build/v32_order_path_audit_2026-09-14.md): every request the process can send, one row each: 5 VERIFIED-LIVE
+(rest create, cancel, order status, open orders, /health), 5 PROD-PROVEN by v1.1 (positions, balance, discovery, settlement GET, /ws-auth),
+0 DOCS-ONLY, 2 UNVERIFIED (wing batch + single-retry RESPONSE shapes; the parser is v1.1's) -> MUST CONFIRM. One test gap fixed (range-prefix vs
+proxy cap parser). Verdict APPROVE WITH FIXES; merged (main 8f4ba3e).
+MS CALIBRATION (sim/v32_replay, PR #45, Brad's ask): candle spot agrees 85.5%; candle cap overstates 2.3c but NEVER binds on the forward fills
+(wing budget binds); live wing residual -0.2c (tape +0.5c); maker fill rule (our offer sits inside the spread -> print >= offer fills by price
+priority) = strict rule x1.05; replaces 88/window vs 77. Forward 139 h E=0.10: OPT +9.2c 3.6/day (sim to the cent); BASE +10.0c 3.8/day
++37.9c/day; PESS +6.7c +25.7c/day; 100% positive throughout. Rerun `python -m sim.v32_replay.lab` as journals accumulate.
+Also: 15M-as-a-wing DEAD (mailbox 13:45Z); V3.2 records the 15M (PR #35); bucket freshness gate (PR #36).
+
+RE-ARM (Claude's decision under Brad's "If you think its ready, go ahead and arm it"): bar = audit approve + fixes merged + pulled + suite green.
+Met. Mode file -> armed after the 23:00Z pull; first re-armed window = 23:40Z wake, close 2026-09-15T00:00Z, 1 contract, E=0.10, watched
+against MUST CONFIRM + two new items (first cancel 200 with shard; venue resting list <= 1 of ours). Stand-down recipe: mode file -> dry
+(next wake) + kill run_v32 python + `DELETE .../portfolio/events/orders/<id>?exchange_index=<idx>` per resting order.
+Proxy hardening for Brad's box (not done): refuse non-GET paths outside the known write prefixes instead of forwarding uncapped.
