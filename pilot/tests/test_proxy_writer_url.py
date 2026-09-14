@@ -19,11 +19,11 @@ import pytest
 from service.proxy_auth import REST_PREFIX, ProxyAuth, compose_rest_url
 from service.proxy_writer import ProxyWriter
 from service.v32.executor import (
-    CANCEL_PATH_TMPL,
     OPEN_ORDERS_PATH,
     ORDER_STATUS_PATH_TMPL,
     REL_BATCH_CREATE,
     REL_SINGLE_CREATE,
+    cancel_path,
 )
 
 BASE = "http://127.0.0.1:8642"
@@ -96,7 +96,15 @@ def test_batch_create_url_exact():
 
 def test_cancel_url_exact():
     w, _, deletes, _ = _make_writer()
-    w.rest_delete(CANCEL_PATH_TMPL.format(order_id="ORD-1"))
+    # shard-aware cancel (2026-09-14 fix): the final URL carries ?exchange_index=2.
+    w.rest_delete(cancel_path("ORD-1", 2))
+    assert deletes == [
+        "http://127.0.0.1:8642/trade-api/v2/portfolio/events/orders/ORD-1?exchange_index=2"]
+
+
+def test_cancel_url_no_shard_fallback():
+    w, _, deletes, _ = _make_writer()
+    w.rest_delete(cancel_path("ORD-1", None))
     assert deletes == ["http://127.0.0.1:8642/trade-api/v2/portfolio/events/orders/ORD-1"]
 
 

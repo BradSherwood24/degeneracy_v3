@@ -1324,9 +1324,22 @@ def _compute_money_math(state: V32State, executor: Any) -> dict[str, Any]:
     ``build_v32_ledger_row`` (all empty/None when nothing filled — dry/shakedown windows). ``held_legs``
     are the bucket-NO + each FILLED wing leg (side/ticker/count), marked ``realized_unsettled`` so the
     settlement backfill sweep corrects the conservative floor booked here."""
+    # Operational counters ALWAYS travel to the row — even when nothing filled. The 2026-09-14 20:00Z
+    # armed row read 0/0 rests despite 3 rejected creates because the no-fill early-return below dropped
+    # these; they now ride both exits. Cancel/venue-truth counters added with the shard fix.
+    counters = {
+        "rests_placed": int(getattr(executor, "rests_placed", 0)),
+        "rests_rejected": int(getattr(executor, "rests_rejected", 0)),
+        "wing_batches": int(getattr(executor, "wing_batches", 0)),
+        "exec_price_mismatches": list(getattr(executor, "exec_price_mismatches", []) or []),
+        "cancels_attempted": int(getattr(executor, "cancels_attempted", 0)),
+        "cancels_confirmed": int(getattr(executor, "cancels_confirmed", 0)),
+        "cancel_404s": int(getattr(executor, "cancel_404s", 0)),
+        "rest_invariant_violations": int(getattr(executor, "rest_invariant_violations", 0)),
+    }
     fills = list(getattr(executor, "fills", []) or [])
     if not fills or state.rest_fill is None:
-        return {"fills": fills}
+        return {"fills": fills, **counters}
     rest_fills = [f for f in fills if f.get("leg") == "rest"]
     wing_fills = [f for f in fills if f.get("leg") == "wing"]
     held: list[dict[str, Any]] = []
@@ -1360,10 +1373,7 @@ def _compute_money_math(state: V32State, executor: Any) -> dict[str, Any]:
         "one_legged": bool(state.one_legged),
         "realized_unsettled": bool(held),
         "realized_delta": realized_delta,
-        "rests_placed": int(getattr(executor, "rests_placed", 0)),
-        "rests_rejected": int(getattr(executor, "rests_rejected", 0)),
-        "wing_batches": int(getattr(executor, "wing_batches", 0)),
-        "exec_price_mismatches": list(getattr(executor, "exec_price_mismatches", []) or []),
+        **counters,
     }
 
 

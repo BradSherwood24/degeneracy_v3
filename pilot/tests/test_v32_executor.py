@@ -21,11 +21,11 @@ from service.v32 import V32State, load_v32_params
 from service.v32.actions import ActionKind, V32Action
 from service.v32.core import WingLeg
 from service.v32.executor import (
-    CANCEL_PATH_TMPL,
     LiveExecutor,
     ORDER_STATUS_PATH_TMPL,
     REL_BATCH_CREATE,
     REL_SINGLE_CREATE,
+    cancel_path,
     cancel_stale_open_orders,
     parse_order_status,
 )
@@ -178,7 +178,7 @@ def test_cancel_confirms_filled_count_from_status_not_assumed_zero():
     from service.v32.events import OrderCancelled
     assert len(events) == 1 and isinstance(events[0], OrderCancelled)
     assert events[0].filled_count_before_cancel == Decimal(1)   # READ from status, not assumed 0
-    assert w.deletes == [CANCEL_PATH_TMPL.format(order_id=oid)]
+    assert w.deletes == [cancel_path(oid, 2)]                    # shard-aware (?exchange_index=2)
     assert ex.rest_book["c1"].status == "filled"               # RETAINED (F-1); the race fill happened
 
 
@@ -359,8 +359,8 @@ def test_startup_cancel_only_kxbtc_orders():
     ]}
     res = cancel_stale_open_orders(w, j, clock=lambda: 0.0)
     assert res["found"] == 2 and res["cancelled"] == 2
-    assert set(w.deletes) == {CANCEL_PATH_TMPL.format(order_id="o1"),
-                              CANCEL_PATH_TMPL.format(order_id="o2")}
+    # no exchange_index on these fake orders -> no-shard fallback path
+    assert set(w.deletes) == {cancel_path("o1", None), cancel_path("o2", None)}
 
 
 def test_startup_cancel_skips_foreign_coid_but_clears_our_and_coidless():
@@ -375,8 +375,7 @@ def test_startup_cancel_skips_foreign_coid_but_clears_our_and_coidless():
     ]}
     res = cancel_stale_open_orders(w, j, clock=lambda: 0.0)
     assert res["found"] == 2 and res["cancelled"] == 2
-    assert set(w.deletes) == {CANCEL_PATH_TMPL.format(order_id="v2"),
-                              CANCEL_PATH_TMPL.format(order_id="v3")}
+    assert set(w.deletes) == {cancel_path("v2", None), cancel_path("v3", None)}
     assert "v1" not in "".join(w.deletes)
     assert "startup_skip_foreign_order" in j.kinds()
 
