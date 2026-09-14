@@ -31,3 +31,4 @@ __pycache__/
 *.key
 pilot/ops/strategy.txt
 pilot/ops/stops_*.json
+pilot/ops/v32_stops_*.json
