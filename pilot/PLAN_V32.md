@@ -189,6 +189,11 @@ Phases 1-4 built on Opus 4.8, disclosed branches, reviewed.
   the S4 floor-netting RULING (banded `v32_pending_credit`), the falsifier scoreboard in
   `service/v32/report.py`, and `service/v32/falsifier_pins.py` (the `[pin]` constants, doc/code
   agreement test). Suite 787 passed.
+* **15M recording** (`v32/record-15m`) -- `run_v32` also subscribes + tapes the co-settling `KXBTC15M`
+  market on the bucket connection (RECORDING ONLY; the decision core never classifies a 15M ticker),
+  so V3.2 is the single tape recorder and the disabled v1.1 pilot leaves no 15M data gap. Absence of a
+  15M market journals `m15_missing` and continues (not a stand-down); ledger/report carry
+  `m15_tickers` + `m15_frames`. See `build/v32_m15_build_report.md`.
 
 Params sha (roster `DegeneracyV3_2`): `c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92`
 (E=0.10, tol=0.02, deb_ms=5000).

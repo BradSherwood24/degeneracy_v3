@@ -100,6 +100,9 @@ def build_v32_ledger_row(
     stand_down_reason: str | None,
     now: float,
     params_sha: str | None = None,
+    # Recording-only co-settling KXBTC15M leg (V3.2 is the single tape recorder; it never trades 15M).
+    m15_tickers: list[str] | None = None,
+    m15_frames: int = 0,
     # Phase-3 money-math slots (defaults preserve the Phase-2 row shape exactly).
     armed: bool = False,
     fills: list[Any] | None = None,
@@ -142,6 +145,9 @@ def build_v32_ledger_row(
         "strike_generations": strike_generations,
         "bucket_count": bucket_count,
         "bucket_generations": bucket_generations,
+        # recording-only co-settling 15M leg (list of tickers + frames tapped this window)
+        "m15_tickers": list(m15_tickers or []),
+        "m15_frames": int(m15_frames),
         # spot bucket at window end
         "spot_bucket_ticker": bucket_ticker,
         "Sd": spot_Sd,
