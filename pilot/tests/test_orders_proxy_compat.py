@@ -159,3 +159,109 @@ def test_extraction_touched_no_env_or_key_symbols():
     # the isolated namespace must NOT contain any config/signing symbol (proof we didn't run them)
     for forbidden in ("Config", "CONFIG", "Signer", "OrderBudget", "load_dotenv", "SESSION"):
         assert forbidden not in PROXY, f"{forbidden} leaked into the extracted parser namespace"
+
+
+# ---------------------------------------------------------------------------
+# Order-path audit (2026-09-14): the PRIMARY order V3.2 sends is the RESTING bucket-NO on a RANGE
+# ticker (KXBTC-...), NOT a strike (KXBTCD-...). Every create test above uses a strike/15M ticker, so
+# the resting-order create — the one that fires ~40x/window — was never cross-checked against the real
+# proxy cap parser, and the proxy's DEFAULT prefixes ("KXBTC15M,KXBTCD") do NOT cover a KXBTC- range
+# ticker. These pin (a) the ACTUAL executor REST body is proxy-accepted ONLY under a range-covering
+# prefix, and (b) the arming gate (v32_caps_agree) and the proxy cap AGREE on the range series in the
+# SAFE direction: any prefix set the arming gate accepts, the proxy also accepts a real KXBTC- bucket
+# ticker under — so an armed window can never send a create the proxy then rejects for its prefix.
+# ---------------------------------------------------------------------------
+_RANGE_BUCKET_TICKER = "KXBTC-26SEP1418-B78850"   # a real range bucket-NO ticker (starts "KXBTC-")
+_STRIKE_TICKER = "KXBTCD-26SEP1418-T78849.99"     # a real strike ticker (starts "KXBTCD-")
+
+
+def _executor_rest_body():
+    """The EXACT wire body the LiveExecutor POSTs for a resting bucket-NO (via its own _rest_body —
+    not a hand-rolled dict), captured through a recording writer. No network, no proxy dialed."""
+    from decimal import Decimal as _D
+
+    from service.proxy_writer import WriteResponse
+    from service.v32.actions import ActionKind, V32Action
+    from service.v32.executor import LiveExecutor
+
+    captured: dict = {}
+
+    class _RecW:
+        def rest_post(self, path, body):
+            captured["body"] = body
+            return WriteResponse(201, {"order": {"order_id": "oid", "client_order_id":
+                                                 body.get("client_order_id"), "fill_count": "0.00",
+                                                 "remaining_count": "1.00"}}, True)
+
+        def rest_get(self, path, params=None):
+            return {}   # pre-place invariant: empty resting list -> proceed
+
+        def rest_delete(self, path):
+            return WriteResponse(200, {"reduced_by": "0.00"}, True)
+
+    ex = LiveExecutor(_RecW(), {_RANGE_BUCKET_TICKER: (78850.0, 78949.99)},
+                      {_RANGE_BUCKET_TICKER: 2}, _FakeJournal(), 1789423200, 300,
+                      clock=lambda: 0.0, sleep=lambda _s: None)
+    act = V32Action(kind=ActionKind.PLACE_REST, ticker=_RANGE_BUCKET_TICKER, side="no",
+                    action="buy", count=1, price=_D("0.54"),
+                    expiration_epoch=1789423200 - 300, client_order_id="v32-x")
+    ex.on_action(act, None, 1789423200 - 600)
+    return captured["body"]
+
+
+class _FakeJournal:
+    def append(self, *a, **k):
+        pass
+
+
+def test_executor_rest_bucket_no_body_capped_only_under_range_prefix():
+    import json
+    body = _executor_rest_body()
+    # sanity: the live-verified wire shape for a NO bid at n=0.54 (2026-09-14 incident-2 create body).
+    assert body["ticker"] == _RANGE_BUCKET_TICKER
+    assert body["side"] == "ask" and body["price"] == "0.4600"
+    assert body["count"] == "1.00" and body["post_only"] is True
+    assert body["time_in_force"] == "good_till_canceled" and body["exchange_index"] == 2
+    entries = PROXY["parse_order_entries"](json.dumps(body).encode(), is_batch=False)
+    # DEFAULT proxy prefixes do NOT cover a KXBTC- range ticker -> the resting create would be capped.
+    v_default = PROXY["check_order_caps"](entries, MAX_CONTRACTS, ("KXBTC15M", "KXBTCD"))
+    assert v_default is not None and v_default["cap"] == "order_ticker_prefixes"
+    # a range-covering prefix accepts it (and exchange_index survives the parse, reaching Kalshi).
+    assert PROXY["check_order_caps"](entries, MAX_CONTRACTS, ("KXBTC",)) is None
+    assert entries[0].get("exchange_index") == 2
+
+
+def test_arming_gate_prefix_acceptance_implies_proxy_accepts_both_series():
+    # The SAFE-direction invariant that ties the arming gate to the proxy cap: for any prefix set the
+    # arming check accepts, the REAL proxy must accept BOTH a range (KXBTC-) and a strike (KXBTCD-)
+    # create — so an armed window never sends a create the proxy rejects for its ticker prefix. (The
+    # reverse is allowed to be conservative: the gate may refuse a set the proxy would have accepted.)
+    import json
+
+    from service.v32.stops import v32_caps_agree
+
+    range_entry = PROXY["parse_order_entries"](
+        json.dumps({"ticker": _RANGE_BUCKET_TICKER, "count": "1.00", "price": "0.4600"}).encode(),
+        is_batch=False)
+    strike_entry = PROXY["parse_order_entries"](
+        json.dumps({"ticker": _STRIKE_TICKER, "count": "1.00", "price": "0.9900"}).encode(),
+        is_batch=False)
+    candidate_prefix_sets = [
+        ("KXBTC15M", "KXBTCD"),      # proxy default: range NOT covered -> gate must refuse
+        ("KXBTC",),                  # covers both
+        ("KXBTC-", "KXBTCD-"),       # covers both, exact
+        ("KXBTCD",),                 # covers strike only -> gate must refuse (range uncovered)
+        ("KX",),                     # covers both (broad)
+        ("NOTBTC",),                 # covers neither -> gate must refuse
+    ]
+    for prefixes in candidate_prefix_sets:
+        health = {"orders_enabled": True,
+                  "caps": {"max_contracts_per_order": 2, "ticker_prefixes": list(prefixes)},
+                  "orders_remaining_today": 1000}
+        gate_ok, _ = v32_caps_agree(health, 1)
+        if gate_ok:
+            # arming accepted this prefix set -> the proxy MUST accept BOTH series' creates under it.
+            assert PROXY["check_order_caps"](range_entry, MAX_CONTRACTS, prefixes) is None, (
+                f"gate armed on {prefixes} but proxy caps the range create")
+            assert PROXY["check_order_caps"](strike_entry, MAX_CONTRACTS, prefixes) is None, (
+                f"gate armed on {prefixes} but proxy caps the strike create")
