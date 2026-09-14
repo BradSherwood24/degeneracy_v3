@@ -9,13 +9,14 @@ WHAT IT REPRODUCES — the forward sim (scratch ``pf_ms_requote.py`` ideal + ``p
 lagging-executor model), mapped onto a LIVE order feed. Per hourly close T, in the quoting window
 T-``quote_start_s`` .. T-``quote_end_s`` (T-15..T-5):
 
-  * Spot bucket B = [Sd, Sd+bucket_width): the live range bucket with the highest YES mid among
-    buckets with a valid two-sided book that is ALSO FRESH — bucket book age <= bucket_freshness_max_age_s
-    (a SEPARATE, larger bound than the strike gate; range buckets are thin and tick far less often). A
-    bucket-connection stall (or a partial blackout masked by the liquid co-listed 15M sharing that
-    connection) must not feed spot selection while the strike connection looks alive: stale buckets are
-    excluded, and if none fresh remain the hour stands down (reason ``stale_bucket``) — symmetric to the
-    strike gate below.
+  * Spot bucket B = [Sd, Sd+bucket_width): the range bucket with the highest YES mid among buckets
+    with a valid two-sided book, REGARDLESS OF AGE (ruling R-STALE-SPOT). The freshness gate is on the
+    SELECTED spot: if its OWN book is older than bucket_freshness_max_age_s (a SEPARATE, larger bound
+    than the 1.0 s strike gate; range buckets are thin and tick far less often), the hour stands down
+    (reason ``stale_bucket``) — it NEVER falls through to a fresh lower-mid bucket, because the edge is
+    spot-bucket-only (a non-spot pump is the wrong trade, not a lesser one). A bucket-connection stall
+    (or a partial blackout masked by the liquid co-listed 15M sharing that connection) thus cannot feed
+    a quote off a stale spot cap while the strike connection looks alive.
   * Pin wings priced as a taker from the hourly-strike books:
         W = yes_ask(Sd) + fee(yes_ask(Sd)) + no_ask(Su) + fee(no_ask(Su)),   Su = Sd + bucket_width,
     where no_ask(Su) = 1 - yes_bid(Su) (book identity). fee = the audited census fee (IMPORTED). Both
@@ -217,7 +218,7 @@ class V32State:
     W: Decimal | None = None
     cap: Decimal | None = None
     desired_n: Decimal | None = None
-    spot_bucket_stale: bool = False                     # spot None because a valid bucket book is stale
+    spot_bucket_stale: bool = False                     # selected spot's own book is stale (R-STALE-SPOT)
 
     # resting-order lifecycle
     rest_live: RestOrder | None = None
@@ -286,31 +287,27 @@ def _fresh(now: float, last_ts: float | None, bound: float) -> bool:
     return 0.0 <= age <= bound
 
 
-def _select_spot(st: V32State, params: V32Params, now: float) -> tuple[int | None, bool]:
-    """(floor, had_stale_valid): highest-YES-mid bucket among FRESH valid two-sided books.
+def _select_spot(st: V32State) -> int | None:
+    """Highest-YES-mid bucket among valid two-sided books, REGARDLESS OF AGE. Ties -> lowest floor.
 
-    Symmetric to the strike (wing) freshness gate: a bucket whose book age exceeds
-    ``bucket_freshness_max_age_s`` is EXCLUDED from selection (not just the one that would have been
-    picked). Ties -> lowest floor (deterministic). ``had_stale_valid`` is True iff at least one bucket
-    HAD a valid two-sided book but was excluded ONLY for staleness — so the requote gate can journal
-    ``stale_bucket`` (a bucket-feed stall) rather than ``no_spot_bucket`` (no two-sided book at all)
-    when nothing fresh remains. Buckets tick far less often than strikes, so the bound is a SEPARATE,
-    larger param (a 1.0 s bucket gate would stand the strategy down most of the time)."""
+    Ruling R-STALE-SPOT: spot selection runs over ALL two-sided bucket books, stale or not — the
+    highest-YES-mid bucket IS the spot bucket. The freshness gate is applied to the SELECTED spot
+    (``_recompute_context`` -> ``spot_bucket_stale``), NEVER by excluding stale buckets from
+    selection: the strategy's edge is spot-bucket-only (the 2026-09-01 range scan found the OTM-bucket
+    pumps are the informed ones — all-buckets pays far less than spot-only), so resting on a fresh
+    lower-mid bucket because the spot book went quiet is the WRONG trade, not a lesser one. A stale
+    spot stands the hour down instead."""
     best_floor: int | None = None
     best_mid: Decimal | None = None
-    had_stale_valid = False
     for floor in sorted(st.bucket_tops):
         top = st.bucket_tops[floor]
         if not _valid_two_sided(top):
-            continue
-        if not _fresh(now, st.bucket_ts.get(floor), params.bucket_freshness_max_age_s):
-            had_stale_valid = True
             continue
         mid = (top.yes_bid + top.yes_ask) / _TWO  # type: ignore[operator]
         if best_mid is None or mid > best_mid:
             best_mid = mid
             best_floor = floor
-    return best_floor, had_stale_valid
+    return best_floor
 
 
 def _compute_W(st: V32State, Sd: int, Su: int, now: float, params: V32Params) -> Decimal | None:
@@ -337,9 +334,9 @@ def _compute_W(st: V32State, Sd: int, Su: int, now: float, params: V32Params) ->
 def _bucket_cap(st: V32State, Sd: int) -> Decimal | None:
     """cap = no_ask(B) - 0.01 = (1 - yes_bid(B)) - 0.01, whole cents; None if bucket invalid.
 
-    Freshness is enforced transitively: the only caller (``_recompute_context``) passes the freshly
-    SELECTED spot ``Sd`` from ``_select_spot``, which already excluded stale buckets — so the cap can
-    never be read off a stale bucket book."""
+    Freshness is enforced by the caller: ``_recompute_context`` only computes the cap when the selected
+    spot's own book is fresh (``not spot_bucket_stale``, ruling R-STALE-SPOT) — so the cap is never
+    read off a stale bucket book."""
     top = st.bucket_tops.get(Sd)
     if not _valid_two_sided(top):
         return None
@@ -440,13 +437,18 @@ def _fold_book(st: V32State, event: BookUpdate) -> V32State:
 
 def _recompute_context(params: V32Params, st: V32State, now: float) -> V32State:
     """Re-derive spot bucket, W, cap, desired n, and every shadow n (no-lag) from current books."""
-    spot_Sd, had_stale_valid = _select_spot(st, params, now)
-    spot_bucket_stale = spot_Sd is None and had_stale_valid
+    spot_Sd = _select_spot(st)
     spot_Su = spot_Sd + params.bucket_width if spot_Sd is not None else None
+    # R-STALE-SPOT: the selected spot bucket's OWN book must be fresh; a stale spot stands the hour
+    # down (never falls through to a lower-mid bucket). W/cap/desired_n and every shadow n are only
+    # solved when the spot is present AND fresh, so a stale spot emits no quote and no shadow fill.
+    spot_bucket_stale = spot_Sd is not None and not _fresh(
+        now, st.bucket_ts.get(spot_Sd), params.bucket_freshness_max_age_s
+    )
     W = None
     cap = None
     desired_n = None
-    if spot_Sd is not None and spot_Su is not None:
+    if spot_Sd is not None and spot_Su is not None and not spot_bucket_stale:
         W = _compute_W(st, spot_Sd, spot_Su, now, params)
         cap = _bucket_cap(st, spot_Sd)
         budget = (_TWO - params.E - W) if W is not None else None
@@ -775,9 +777,12 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
         no_quote_reason = None  # warmup: seed only, nothing to cancel, no stand-down
         return st, actions
     elif st.spot_Sd is None:
-        # a bucket-feed stall (a valid book that aged past bucket_freshness_max_age_s) is reported
-        # distinctly from a genuine absence of any two-sided bucket book.
-        no_quote_reason = "stale_bucket" if st.spot_bucket_stale else "no_spot_bucket"
+        no_quote_reason = "no_spot_bucket"
+    elif st.spot_bucket_stale:
+        # R-STALE-SPOT: the selected spot bucket's own book aged past bucket_freshness_max_age_s.
+        # Stand down (never quote a fresh lower-mid bucket instead); checked before the wing gate
+        # because a stale spot also nulls W.
+        no_quote_reason = "stale_bucket"
     elif st.W is None:
         no_quote_reason = "stale_or_missing_wing"
     elif st.desired_n is None or st.desired_n < params.n_min:

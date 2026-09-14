@@ -434,12 +434,12 @@ def test_stale_wing_cancels_rest():
 
 
 # ===========================================================================
-# Spot-bucket freshness gate (symmetric to the strike gate)
+# Spot-bucket freshness gate (R-STALE-SPOT: gate the SELECTED spot, never fall through)
 # ===========================================================================
 def test_stale_spot_bucket_cancels_with_stale_bucket_reason():
-    # a bucket-feed stall (the sole bucket book ages past bucket_freshness_max_age_s = 30s) while a
-    # strike still ticks fresh -> the spot bucket is EXCLUDED, none fresh remain -> CANCEL + stand down
-    # with reason `stale_bucket`, and NO new PLACE.
+    # the selected spot bucket's own book ages past bucket_freshness_max_age_s = 30s (a bucket-feed
+    # stall) while a strike still ticks fresh -> CANCEL + stand down with reason `stale_bucket`, NO
+    # PLACE. The spot floor is UNCHANGED (still selected, just stale) — R-STALE-SPOT.
     p = _params()
     st = _state(p)
     now = T - 600
@@ -450,7 +450,7 @@ def test_stale_spot_bucket_cancels_with_stale_bucket_reason():
     assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
     sd = [a for a in acts if a.kind == ActionKind.STAND_DOWN]
     assert sd and sd[-1].reason == "stale_bucket"
-    assert st.rest_live is None and st.spot_Sd is None and st.spot_bucket_stale
+    assert st.rest_live is None and st.spot_Sd == 79600 and st.spot_bucket_stale
 
 
 def test_stale_bucket_then_fresh_resumes_place():
@@ -468,25 +468,51 @@ def test_stale_bucket_then_fresh_resumes_place():
     assert st.rest_pending is not None and st.spot_Sd == 79600 and not st.spot_bucket_stale
 
 
-def test_stale_non_spot_bucket_is_only_excluded():
-    # a STALE non-spot bucket is excluded from selection (not a stand-down): the spot simply falls back
-    # to the best FRESH two-sided bucket, and spot_bucket_stale stays False (a fresh bucket remains).
+def test_stale_non_spot_bucket_has_no_effect():
+    # R-STALE-SPOT (a): a stale NON-spot (lower-mid) bucket changes nothing — selection ignores age, so
+    # the higher-mid bucket is still the spot, it is fresh, and quoting continues on it.
     p = _params()
     st = _state(p)
     now = T - 600
-    st, _ = _feed(p, st, BookUpdate(B_SD, _top("0.35", "0.36"), now))   # mid 0.355
-    st, _ = _feed(p, st, BookUpdate(B_SU, _top("0.40", "0.42"), now))   # mid 0.41 -> spot 79700
-    assert st.spot_Sd == 79700
-    # refresh only B_SD 31s later; B_SU (the prior spot) is now stale -> excluded -> spot falls to 79600
-    st, _ = _feed(p, st, BookUpdate(B_SD, _top("0.35", "0.36"), now + 31.0))
-    assert st.spot_Sd == 79600 and not st.spot_bucket_stale
+    # B_SD (79600) set once at `now` and never refreshed -> the STALE lower-mid non-spot bucket.
+    st, _ = _feed(p, st, BookUpdate(B_SD, _top("0.35", "0.36"), now))         # mid 0.355 (lower)
+    # spot 79700 + its strikes (Sd=79700, Su=79800), all fresh at now+31; B_SD is now 31s stale.
+    st, _ = _feed(p, st, BookUpdate(B_SU, _top("0.40", "0.42"), now + 31.0))  # mid 0.41 -> spot 79700
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.75", "0.76"), now + 31.0))
+    st, acts = _feed(p, st, BookUpdate(STK_SU2, _top("0.36", "0.37"), now + 31.0))
+    assert st.spot_Sd == 79700 and not st.spot_bucket_stale
+    assert [a for a in acts if a.kind == ActionKind.PLACE_REST]  # quoting continues on the fresh spot
+    assert not [a for a in acts if a.kind == ActionKind.STAND_DOWN and a.reason == "stale_bucket"]
+
+
+def test_stale_spot_with_fresh_lower_bucket_stands_down():
+    # R-STALE-SPOT (b): the selected spot (higher-mid 79700) goes stale while a FRESH lower-mid bucket
+    # (79600) is present -> CANCEL + `stale_bucket`, and NO PLACE on the lower bucket or any other.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _feed(p, st, BookUpdate(B_SD, _top("0.35", "0.36"), now))         # lower bucket 79600
+    st, _ = _feed(p, st, BookUpdate(B_SU, _top("0.40", "0.42"), now))         # spot 79700 (higher mid)
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.75", "0.76"), now))       # Sd=79700 yes_ask
+    st, acts = _feed(p, st, BookUpdate(STK_SU2, _top("0.36", "0.37"), now))   # Su=79800 no_ask
+    place = [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert place and st.spot_Sd == 79700
+    st, _ = _feed(p, st, OrderAck(place[-1].client_order_id, "OID1", now))
+    assert st.rest_live is not None
+    # refresh ONLY the lower bucket (79600); the spot (79700) book is now 31s stale.
+    st, acts = _feed(p, st, BookUpdate(B_SD, _top("0.35", "0.36"), now + 31.0))
+    assert st.spot_Sd == 79700 and st.spot_bucket_stale      # still the selected spot, now stale
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]  # never quotes the fresh lower bucket
+    sd = [a for a in acts if a.kind == ActionKind.STAND_DOWN]
+    assert sd and sd[-1].reason == "stale_bucket"
+    assert st.rest_live is None
 
 
 def test_clocktick_only_stale_bucket_cancels():
     # a stalled bucket feed with NO further book frames must still cancel the rest on a ClockTick
-    # (law 3), symmetric to the strike silent-feed regression. The spot-None (stale bucket) branch is
-    # evaluated before the wing branch, so the reason is `stale_bucket` even though the strikes have
-    # also aged: the bucket-feed stall is the first fault detected.
+    # (law 3), symmetric to the strike silent-feed regression. The stale-spot branch is evaluated
+    # before the wing branch, so the reason is `stale_bucket` even though the strikes have also aged.
     p = _params()
     st = _state(p)
     now = T - 600
@@ -496,7 +522,7 @@ def test_clocktick_only_stale_bucket_cancels():
     assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
     sd = [a for a in acts if a.kind == ActionKind.STAND_DOWN]
     assert sd and sd[-1].reason == "stale_bucket"
-    assert st.rest_live is None and st.spot_Sd is None and st.spot_bucket_stale
+    assert st.rest_live is None and st.spot_Sd == 79600 and st.spot_bucket_stale
 
 
 def test_warmup_before_window_seeds_only():
