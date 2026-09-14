@@ -102,6 +102,7 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "would_places": r.get("would_places", 0),
                 "late_fills": r.get("late_fills", 0),
                 "shadow": {k: _shadow_cell(shadow, k) for k in e_keys},
+                "m15_frames": int(r.get("m15_frames", 0) or 0),
                 "strike_lag": r.get("strike_lag_seconds"),
                 "bucket_lag": r.get("bucket_lag_seconds"),
                 "stand_down_reason": r.get("stand_down_reason"),
@@ -288,7 +289,7 @@ def _render(report: dict[str, Any]) -> str:
               "repl".rjust(5), "wPlc".rjust(5)]
     for k in e_keys:
         header.append(("sh_E" + k).rjust(14))
-    header += ["sLag".rjust(6), "bLag".rjust(6)]
+    header += ["m15".rjust(6), "sLag".rjust(6), "bLag".rjust(6)]
     lines.append("  ".join(header))
     lines.append("-" * (len(lines[0])))
     for w in report["windows"]:
@@ -297,6 +298,7 @@ def _render(report: dict[str, Any]) -> str:
                str(w["would_places"]).rjust(5)]
         for k in e_keys:
             row.append(str(w["shadow"].get(k, "-")).rjust(14))
+        row.append(str(w.get("m15_frames", 0)).rjust(6))
         sl = w.get("strike_lag")
         bl = w.get("bucket_lag")
         row.append((f"{float(sl):.1f}" if sl is not None else "-").rjust(6))

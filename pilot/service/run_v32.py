@@ -129,6 +129,7 @@ from service.stops import (
 )
 from service.wake import (
     DEAD_STATUSES,
+    FIFTEEN_SERIES,
     MARKETS_PATH,
     StandDown,
     _group_ladders,
@@ -270,6 +271,55 @@ def discover_strike_ladder(
             tickers.append(tk)
     tickers = sorted(set(tickers))
     return StrikeDiscovery(close_iso, tuple(tickers), floor_by, exch_by, generations)
+
+
+@dataclass(frozen=True)
+class M15Discovery:
+    """The co-settling 15-minute (KXBTC15M) market(s) recorded ALONGSIDE the window (recording-only —
+    V3.2 never trades the 15M leg, it exists so this process is the single tape recorder and the v1.1
+    pilot can stay disabled with no data gap)."""
+
+    close_time: str
+    tickers: tuple[str, ...] = ()
+    exchange_index_by_ticker: dict[str, int | None] = field(default_factory=dict)
+
+
+def discover_co_settling_15m(
+    proxy: Any, close_iso: str, now_epoch: float, dead_statuses=DEAD_STATUSES
+) -> M15Discovery:
+    """Every LIVE KXBTC15M market co-settling at ``close_iso`` (usually one). Reuses the same
+    status-agnostic, close-ts-narrowed paged /markets fetch the wake/strike/bucket discoveries use;
+    liveness via ``_leg_is_live`` on each single-market ladder (close in the future AND not a dead
+    status). Absence is NOT a stand-down — the caller journals ``m15_missing`` and continues, because
+    this leg is RECORDING-ONLY (the decision path never classifies a 15M ticker)."""
+    markets = _fetch_series_markets(proxy, FIFTEEN_SERIES, close_iso)
+    tickers: list[str] = []
+    exch_by: dict[str, int | None] = {}
+    for m in markets:
+        tk = m.get("ticker")
+        if not tk:
+            continue
+        if not _leg_is_live([m], now_epoch, dead_statuses):
+            continue
+        tk = str(tk)
+        exch_by[tk] = coerce_exchange_index(m.get("exchange_index"))
+        tickers.append(tk)
+    tickers = sorted(set(tickers))
+    return M15Discovery(close_iso, tuple(tickers), exch_by)
+
+
+def discover_co_settling_15m_safe(
+    proxy: Any, close_iso: str, now_epoch: float, dead_statuses=DEAD_STATUSES
+) -> tuple[M15Discovery, str | None]:
+    """Recording-only 15M discovery that NEVER raises out. The strike/bucket discoveries ARE the trade
+    (their failure correctly stands the window down), but the 15M leg is RECORDING-ONLY, so a discovery
+    failure (proxy 5xx, malformed body) must never cost a viable trading window. Returns
+    ``(M15Discovery, error)`` — an empty discovery + an error string the caller journals as
+    ``m15_discovery_error`` before continuing, instead of aborting the window."""
+    try:
+        return discover_co_settling_15m(proxy, close_iso, now_epoch, dead_statuses), None
+    except Exception as e:  # noqa: BLE001 — recording-only leg: its failure must not stand the window down
+        return M15Discovery(close_iso), repr(e)
 
 
 def build_bucket_map(discovery) -> dict[str, tuple[float, float]]:
@@ -955,12 +1005,19 @@ class V32Recorder:
     serialized so the shared state needs no lock."""
 
     def __init__(self, journal: StreamJournal, driver: V32Driver,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 m15_tickers: frozenset[str] | set[str] | None = None) -> None:
         self.journal = journal
         self.driver = driver
         self.clock = clock
         self.books: dict[str, BookMirror] = {}
         self.counts: dict[str, int] = defaultdict(int)
+        # 15M (KXBTC15M) tickers subscribed on the bucket connection for RECORDING ONLY: their frames
+        # are tapped + folded into a BookMirror like any other, but they are NEVER driven into the core
+        # (a 15M ticker classifies as neither strike nor bucket, so it would only cause no-op recompute
+        # churn). Counted here so the ledger/report can show the recorded 15M frame volume per window.
+        self.m15_tickers: frozenset[str] = frozenset(m15_tickers or ())
+        self.m15_frames = 0
 
     def tap(self, stream: str, envelope: dict) -> None:
         self.journal.append(stream, envelope, self.clock())
@@ -984,13 +1041,22 @@ class V32Recorder:
 
     def on_snapshot(self, market: str, payload: dict) -> None:
         self._book(market).apply_snapshot(payload)
+        if market in self.m15_tickers:
+            self.m15_frames += 1
+            return  # recording only — fold the book, never drive the decision core
         self._drive_book(market, payload)
 
     def on_delta(self, market: str, payload: dict) -> None:
         self._book(market).apply_delta(payload)
+        if market in self.m15_tickers:
+            self.m15_frames += 1
+            return  # recording only — fold the book, never drive the decision core
         self._drive_book(market, payload)
 
     def on_trade(self, market: str, payload: dict) -> None:
+        if market in self.m15_tickers:
+            self.m15_frames += 1
+            return  # recording only — the 15M trade is tapped by the WS record hook, not decided on
         server_ts = _parse_server_ts(payload)
         if server_ts is None:
             self.journal.append("ws_frame_no_server_ts", {"market": market, "type": "trade"},
@@ -1197,6 +1263,7 @@ def _finalize(
     strike_disc: StrikeDiscovery, bucket_map: dict[str, tuple[float, float]],
     bucket_generations: int, journal_path: str, summary_path: str, ledger_path: str,
     strike_lag: float | None, bucket_lag: float | None, clock: Callable[[], float],
+    m15_tickers: list[str] | None = None,
     armed: bool = False, degrade_reason: str | None = None,
 ) -> dict:
     journal.close()
@@ -1223,6 +1290,8 @@ def _finalize(
         record_count=len(journal),
         stand_down_reason=None,
         now=clock(),
+        m15_tickers=list(m15_tickers or []),
+        m15_frames=shared.m15_frames,
         armed=armed,
         degrade_reason=degrade_reason,
         **money,
@@ -1242,6 +1311,8 @@ def _finalize(
         "would_places": driver.counts.get("would_place_rest", 0),
         "replaces": driver.state.replace_count,
         "sets_done": driver.state.sets_done,
+        "m15_tickers": list(m15_tickers or []),
+        "m15_frames": shared.m15_frames,
         "ws_counts": dict(shared.counts),
         "gzipped": bool(gz.get("gzipped")),
         "strike_lag_seconds": strike_lag,
@@ -1330,6 +1401,13 @@ def main(argv: list[str] | None = None) -> int:
     # Discovery.
     strike_disc = discover_strike_ladder(proxy, close_iso, clock())
     range_disc = discover_range_markets(proxy, close_iso, clock())
+    # Co-settling KXBTC15M market(s), RECORDING ONLY (this process is the single tape recorder so the
+    # disabled v1.1 pilot leaves no 15M data gap). Absence is NOT a stand-down (journaled below), and a
+    # discovery FAILURE (proxy 5xx) is likewise non-fatal: recording-only data must never cost a viable
+    # trading window, so it degrades to an empty discovery + a journaled m15_discovery_error.
+    m15_disc, m15_error = discover_co_settling_15m_safe(proxy, close_iso, clock())
+    if m15_error is not None:
+        logger.warning("[V32] 15M discovery failed (%s) — recording-only, window continues", m15_error)
     bucket_map = build_bucket_map(range_disc)
     # P3-2: drop any bucket whose width != params.bucket_width so a mixed-width hour cannot select a
     # wrong-width spot bucket and break the $2 pin.
@@ -1377,9 +1455,24 @@ def main(argv: list[str] | None = None) -> int:
             "bucket_generations": range_disc.generations,
             "bucket_width": params.bucket_width,
             "buckets": range_disc.window_meta().get("buckets", []),
+            "m15_series": FIFTEEN_SERIES,
+            "m15_tickers": list(m15_disc.tickers),
         },
         clock(),
     )
+    # Record the co-settling 15M leg (recording only). Absence is not a stand-down.
+    if m15_disc.tickers:
+        journal.append("m15_recording", {"tickers": list(m15_disc.tickers)}, clock())
+        logger.info("[V32] recording co-settling 15M: %s", ", ".join(m15_disc.tickers))
+    elif m15_error is not None:
+        journal.append("m15_discovery_error",
+                       {"series": FIFTEEN_SERIES, "close_time": close_iso, "error": m15_error},
+                       clock())
+        logger.info("[V32] 15M discovery error journaled (recording continues): %s", m15_error)
+    else:
+        journal.append("m15_missing", {"series": FIFTEEN_SERIES, "close_time": close_iso}, clock())
+        logger.info("[V32] no co-settling %s market at %s (recording continues)",
+                    FIFTEEN_SERIES, close_iso)
     # --- arming resolution (S5 + reconcile-first + day latch + S4), the ONE arm-or-degrade gate ---
     writer: ProxyWriter | None = None
     if resolved_mode == "armed":
@@ -1440,7 +1533,7 @@ def main(argv: list[str] | None = None) -> int:
         journal=journal, close_epoch_val=cts, params=params, writer=writer, clock=clock,
     )
     driver = V32Driver(params, state, journal, executor, clock=clock)
-    shared = V32Recorder(journal, driver, clock=clock)
+    shared = V32Recorder(journal, driver, clock=clock, m15_tickers=frozenset(m15_disc.tickers))
 
     # Startup safety (armed): cancel any of OUR resting KXBTC* orders a prior crash left behind.
     if armed and writer is not None:
@@ -1453,12 +1546,15 @@ def main(argv: list[str] | None = None) -> int:
         proxy_auth=proxy, tickers=list(strike_disc.tickers), callbacks=shared.callbacks(False),
         include_private=False, record=shared.tap, clock=clock, channels=STRIKE_CHANNELS,
     )
+    # The bucket connection also carries the recording-only 15M ticker(s) (orderbook_delta + trade,
+    # the same public channels — no private/ticker channel added for them).
+    bucket_sub_tickers = sorted(set(bucket_map) | set(m15_disc.tickers))
     bucket_ws = KalshiWebSocketClient(
-        proxy_auth=proxy, tickers=sorted(bucket_map), callbacks=shared.callbacks(include_private),
+        proxy_auth=proxy, tickers=bucket_sub_tickers, callbacks=shared.callbacks(include_private),
         include_private=include_private, record=shared.tap, clock=clock, channels=BUCKET_CHANNELS,
     )
     strike_conn = _ConnRecorder(shared, strike_ws, "strikes", list(strike_disc.tickers))
-    bucket_conn = _ConnRecorder(shared, bucket_ws, "buckets", sorted(bucket_map))
+    bucket_conn = _ConnRecorder(shared, bucket_ws, "buckets", bucket_sub_tickers)
 
     deadline = cts + GRACE_SECONDS
     gate = connect_gate_epoch(cts, params)
@@ -1489,7 +1585,8 @@ def main(argv: list[str] | None = None) -> int:
             bucket_generations=range_disc.generations, journal_path=journal_path,
             summary_path=summary_path, ledger_path=args.ledger,
             strike_lag=strike_ws.current_lag_seconds(), bucket_lag=bucket_ws.current_lag_seconds(),
-            clock=clock, armed=armed, degrade_reason=degrade_reason,
+            clock=clock, m15_tickers=list(m15_disc.tickers), armed=armed,
+            degrade_reason=degrade_reason,
         )
         logger.info("[V32] window done: %s", summary)
     return 0

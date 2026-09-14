@@ -1,7 +1,12 @@
 # V3.2 dry-run runbook (Brad's first manual dry window)
 
-Phase 2 sends NO orders. `armed` degrades to dry. This is the "a couple dry runs just to check
-functionality" step. One command, one window, then read the report.
+Dry mode sends NO orders. Since Phase 3, `armed` runs the LiveExecutor ONLY when
+`ceremony/v32_falsifier.md` is `STATUS: FROZEN` and the S5 / reconcile-first / day-latch / S4 gates
+all pass; otherwise it degrades to dry with a journaled `degrade_to_dry` reason (it is not a blanket
+Phase-2 no-op). This runbook is the "a couple dry runs just to check functionality" step. One command,
+one window, then read the report. The window also records the co-settling `KXBTC15M` (15-minute)
+market alongside the strikes and buckets — RECORDING ONLY (V3.2 never trades the 15M leg; it exists so
+this process is the single tape recorder and the disabled v1.1 pilot leaves no 15M data gap).
 
 ## Prerequisites
 
@@ -18,7 +23,7 @@ functionality" step. One command, one window, then read the report.
    `read_v32_mode_file` returns `""` on a missing file, which `resolve_v32_mode` maps to
    `shakedown`). To run a dry window either pass `--mode dry` (below) or create the file:
    ```
-   echo dry > ops\v32_mode.txt        # or: shakedown | armed  (armed degrades to dry in Phase 2)
+   echo dry > ops\v32_mode.txt        # or: shakedown | armed  (armed degrades to dry unless FROZEN + gates pass)
    ```
    The scheduled task passes no `--mode`, so it reads this file at run time — flip it with no
    re-registration. `--mode` on the command line always wins over the file.
