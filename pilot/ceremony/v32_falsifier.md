@@ -19,7 +19,7 @@ those constants disagree -- the doc does not merely describe the thresholds, the
 - Build: pilot V3.2, phases 1-4 on Opus 4.8, disclosed branches `v32/phase<N>-<name>`, reviewed and
   merged to `main` by Brad (Phases 1-3 = PRs #31, #32, #33; Phase 4 pending).
 - Policy: roster `DegeneracyV3_2`, `pilot/policy/v32_params.json`, canonical sha
-  `c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92` (pinned in code as
+  `0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc` (pinned in code as
   `service.v32.params.FROZEN_V32_PARAMS_SHA256`; the loader self-verifies and refuses drift).
 - Provenance of the numbers below: the 2026-09-13 sim (mailbox entries + `claudes-corner/
   the_flutter_that_wasnt_2026_09_13.md`); scratchpad `journals/pf_ms_requote2.py`,
@@ -49,9 +49,10 @@ Sim basis (forward 2026-08-30..09-04, 139 h, lagging-quote model, exact fees):
 
 ## Policy (roster `DegeneracyV3_2`, `pilot/policy/v32_params.json`, sha-pinned; loader refuses drift)
 
-sha `c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92`. Values: E 0.10, tol 0.02,
+sha `0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc`. Values: E 0.10, tol 0.02,
 deb_ms 5000, quote_start_s 900 (T-15), quote_end_s 300 (T-5), contracts 1, wing_margin 0.02, lock_floor
--0.10, no_orders_after_s_to_settle 1 (T-1 s hard cutoff), freshness_max_age_s 1.0, max_sets_per_hour 1,
+-0.10, no_orders_after_s_to_settle 1 (T-1 s hard cutoff), freshness_max_age_s 1.0,
+bucket_freshness_max_age_s 30.0 [pin], max_sets_per_hour 1,
 n_min 0.05, replace_rate_alarm_per_min 60, bucket_width 100 ($250/$500 hours stand down),
 shadow_Es {0.08, 0.10, 0.12}. One completed set per hour; hold to settlement.
 
@@ -82,8 +83,11 @@ few-tenths-of-a-cent shortfall. The sharp instrument for a small edge is the exe
 - A_REPLACE: replaces in a trailing 60 s above `replace_rate_alarm_per_min` (60) -> the pure core
   cancels the resting order and stands the HOUR down (no more quoting this window); the driver journals
   the alarm. (`service.v32.stops.A_REPLACE`.)
-- A_STALE: a strike (wing) or bucket book older than `freshness_max_age_s` (1.0 s) -> the core cancels
-  the rest and does not re-place until fresh (a lagging strike feed poisons W). (`A_STALE`.)
+- A_STALE: a strike (wing) book older than `freshness_max_age_s` (1.0 s), OR the spot-bucket
+  (range) book older than `bucket_freshness_max_age_s` (30.0 s) [pin] -> the core cancels the rest
+  and does not re-place until fresh (a lagging strike feed poisons W; a stalled bucket feed poisons
+  spot selection + the cap, reason `stale_bucket`). The bucket bound is SEPARATE and larger because
+  range buckets are thin and tick far less often than the strike books. (`A_STALE`.)
 - A_EXEC_PRICE (exec price mismatch): a leg's executed price != the resting/decided price beyond the
   wing margin is flagged per fill and its running mean reported (this feeds the execution-gap gate).
 - A_REJECT x3: three consecutive rest rejections (a definite 4xx: post_only cross, cap, or

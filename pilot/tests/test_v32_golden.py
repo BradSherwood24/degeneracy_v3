@@ -227,7 +227,16 @@ def _top(bc: int, ac: int) -> TopOfBook:
 def _run_core(fix, E: Decimal, tol: Decimal, deb_ms: int):
     cts = fix["close_epoch"]
     bucket_map = {b["ticker"]: (float(b["floor"]), float(b["cap"])) for b in fix["buckets"].values()}
-    params = dreplace(load_v32_params(), E=E, tol=tol, deb_ms=deb_ms)
+    # BUCKET FRESHNESS vs the fixture cadence: the range historical series is MINUTE candles, so this
+    # fixture stamps each bucket book once per 60 s (the strike ms books are dense). The reference fill
+    # print sits ~57 s after its spot-bucket candle — under the LIVE 30 s bucket-freshness gate the hour
+    # would (correctly, for a minute-candle artifact) stand down between candles. This golden asserts
+    # the fill ECONOMICS reproduce the reference; the freshness gate itself is covered by dedicated unit
+    # tests (test_v32_core). So we relax ONLY the bucket bound here (well above the 60 s candle cadence),
+    # restoring the pre-gate bucket behavior; the 1.0 s STRIKE gate still binds unchanged.
+    params = dreplace(
+        load_v32_params(), E=E, tol=tol, deb_ms=deb_ms, bucket_freshness_max_age_s=3600.0
+    )
     st = V32State.new(fix["close_time"], cts, bucket_map, params)
 
     heap: list = []

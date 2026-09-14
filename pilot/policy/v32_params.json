@@ -9,6 +9,7 @@
   "lock_floor": "-0.10",
   "no_orders_after_s_to_settle": 1,
   "freshness_max_age_s": 1.0,
+  "bucket_freshness_max_age_s": 30.0,
   "max_sets_per_hour": 1,
   "n_min": "0.05",
   "replace_rate_alarm_per_min": 60,

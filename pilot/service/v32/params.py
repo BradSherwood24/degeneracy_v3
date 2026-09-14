@@ -29,7 +29,7 @@ DEFAULT_V32_PARAMS_PATH = os.path.join(
 
 # The canonical sha256 of the shipped policy/v32_params.json (sha of json.dumps(sort_keys=True,
 # separators=(",",":")).encode("utf-8")). Recompute + re-pin only when INTENTIONALLY re-freezing.
-FROZEN_V32_PARAMS_SHA256 = "c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92"
+FROZEN_V32_PARAMS_SHA256 = "0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc"
 
 
 class V32ParamsShaMismatch(Exception):
@@ -66,6 +66,10 @@ class V32Params:
                          take is unconditional.
       * ``no_orders_after_s_to_settle`` hard order cutoff (T-1s): no PLACE/TAKE/RETRY after it.
       * ``freshness_max_age_s`` a STRIKE (wing) book older than this is stale -> cancel, do not place.
+      * ``bucket_freshness_max_age_s`` a spot-bucket (range) book older than this is stale -> excluded
+                         from spot selection; if none fresh remain, cancel + stand down (``stale_bucket``).
+                         SEPARATE from the strike bound because range buckets are thin and tick far less
+                         often (a 1.0 s bucket gate would stand the strategy down most of the time).
       * ``max_sets_per_hour`` stop quoting after this many completed sets (1).
       * ``n_min``        below this solved n, stand down for the tick (no place).
       * ``replace_rate_alarm_per_min`` replaces in a trailing 60 s above this -> cancel + stand down.
@@ -83,6 +87,7 @@ class V32Params:
     lock_floor: Decimal
     no_orders_after_s_to_settle: int
     freshness_max_age_s: float
+    bucket_freshness_max_age_s: float
     max_sets_per_hour: int
     n_min: Decimal
     replace_rate_alarm_per_min: int
@@ -130,6 +135,7 @@ def load_v32_params(
         lock_floor=Decimal(str(raw["lock_floor"])),
         no_orders_after_s_to_settle=int(raw["no_orders_after_s_to_settle"]),
         freshness_max_age_s=float(raw["freshness_max_age_s"]),
+        bucket_freshness_max_age_s=float(raw["bucket_freshness_max_age_s"]),
         max_sets_per_hour=int(raw["max_sets_per_hour"]),
         n_min=Decimal(str(raw["n_min"])),
         replace_rate_alarm_per_min=int(raw["replace_rate_alarm_per_min"]),
