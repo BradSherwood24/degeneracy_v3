@@ -37,6 +37,29 @@ LAGGING_COMPLETION_LAG_MS = 1500
 OLD_WING_LEAD_MS = -1000   # OLD model prices completion wings at print - 1 s (as the sim did)
 
 
+def maker_fill_decision(o: Decimal, a: Decimal | None, p: Decimal) -> tuple[str, bool]:
+    """The SPREAD-AWARE maker fill rule (coordinator ruling 2026-09-14, replacing 'book-swept').
+
+    Our resting bucket-NO bid at n is a YES ask at ``o = 1 - n``. ``a`` is the market's best YES ask
+    immediately before the print (from the ms bucket book); ``p`` is the YES-taker print price.
+
+      * regime (iii) ``o > a``: our offer is ABOVE the market ask -> a post_only order there would not
+        rest at/inside the top (or be rejected). No fill; the tick is a no-quote. Only happens when the
+        budget (2 - E - W) forces n well below the cap, lifting our offer 1 - n above the market ask.
+      * regime (ii) ``o == a``: we JOIN the existing best-ask level. Fill iff ``p > o`` (the level was
+        swept THROUGH; queue-independent) — the sim's strict rule.
+      * regime (i) ``o < a`` (we are the best ask, alone; also when ``a`` is unknown): by price priority a
+        YES taker who paid the higher market ask ``a`` would have hit OUR lower offer first. Fill iff
+        ``p >= o`` (any buyer crossing at/through our level takes us; there is no queue at our price but
+        us, so queue position is irrelevant).
+    """
+    if a is not None and o > a:
+        return "iii", False
+    if a is not None and o == a:
+        return "ii", p > o
+    return "i", p >= o
+
+
 @dataclass
 class Fill:
     """One recorded fill. ``lock`` / ``W_completion`` are filled in by the engine once the completion
@@ -54,7 +77,8 @@ class Fill:
     print_size: Decimal
     trade_ts: float            # epoch seconds
     completion_target_ts: float
-    book_swept: bool = False
+    regime: str = "i"          # maker-rule regime (i / ii / iii) at the fill
+    since_replace_ms: float | None = None   # ms since our offer was (re)placed (PESSIMISTIC LAT drop)
     W_completion: Decimal | None = None
     lock: Decimal | None = None
     complete: bool = False
@@ -86,13 +110,15 @@ class IdealModel:
         if W_now is None:               # completable-now proxy (ideal completes at the trade tick)
             return
         offer = _ONE - self.n
+        # OPTIMISTIC keeps the sim's strict rule (p > offer); regime recorded for information.
         if yp > offer:
+            regime, _ = maker_fill_decision(offer, best_yes_ask, yp)
             self.fill = Fill(
                 model="ideal", E=self.E, tol=None, deb=None,
                 spot_Sd=self.spot_Sd, spot_Su=self.spot_Su or (self.spot_Sd + 100),
                 n=self.n, offer=offer, print_price=yp, print_size=size,
                 trade_ts=t, completion_target_ts=t,       # no lag
-                book_swept=(best_yes_ask is not None and best_yes_ask <= offer),
+                regime=regime,
             )
 
 
@@ -169,14 +195,17 @@ class LaggingModel:
         if W_now is None:                # completable-now proxy (matches pf's "skip if W2 None")
             return
         offer = _ONE - self.n_rest
-        if not (yp > offer):
+        # SPREAD-AWARE maker fill rule (replaces 'book-swept').
+        regime, is_fill = maker_fill_decision(offer, best_yes_ask, yp)
+        if not is_fill:
             return
+        since_replace_ms = (t - self.last_rep) * 1000.0 if self.last_rep > -1e17 else None
         self.fill = Fill(
             model=self.model_name, E=self.E, tol=self.tol, deb=self.deb,
             spot_Sd=self.spot_Sd, spot_Su=self.spot_Su or (self.spot_Sd + 100),
             n=self.n_rest, offer=offer, print_price=yp, print_size=size,
             trade_ts=t, completion_target_ts=t + self.completion_lag_ms / 1000.0,
-            book_swept=(best_yes_ask is not None and best_yes_ask <= offer),
+            regime=regime, since_replace_ms=since_replace_ms,
         )
         self.filled = True
 

@@ -1,10 +1,23 @@
-"""The lagging + ideal fill models: gate, promotion, fill rule, book-swept flag."""
+"""The lagging + ideal fill models: gate, promotion, spread-aware maker fill rule."""
 
 from __future__ import annotations
 
 from decimal import Decimal
 
-from sim.v32_replay.models import IdealModel, LaggingModel
+from sim.v32_replay.models import IdealModel, LaggingModel, maker_fill_decision
+
+
+def test_maker_fill_decision_regimes():
+    o = Decimal("0.45")
+    # (i) o < a: we are the best ask alone; fill iff p >= o (including equality)
+    assert maker_fill_decision(o, Decimal("0.47"), Decimal("0.45")) == ("i", True)
+    assert maker_fill_decision(o, Decimal("0.47"), Decimal("0.44")) == ("i", False)
+    assert maker_fill_decision(o, None, Decimal("0.45")) == ("i", True)   # a unknown -> alone
+    # (ii) o == a: joined the level; fill iff p > o (strict sweep-through)
+    assert maker_fill_decision(o, Decimal("0.45"), Decimal("0.46")) == ("ii", True)
+    assert maker_fill_decision(o, Decimal("0.45"), Decimal("0.45")) == ("ii", False)
+    # (iii) o > a: our offer above the market ask -> no fill (no-quote)
+    assert maker_fill_decision(o, Decimal("0.44"), Decimal("0.50")) == ("iii", False)
 
 
 def test_lagging_places_promotes_and_fills():
@@ -18,11 +31,12 @@ def test_lagging_places_promotes_and_fills():
     # a tick at/after live_at promotes
     m.on_tick(1000.3, 100, 200, Decimal("0.55"))
     assert m.n_rest == Decimal("0.55")
-    # a YES print strictly above the offer (1-n = 0.45) fills; book was swept (ask <= offer)
-    m.on_trade(1001.0, 100, Decimal("0.50"), Decimal("5"), Decimal("0.90"), Decimal("0.44"))
+    # offer = 0.45; market ask 0.47 is ABOVE it -> regime (i): a YES print >= offer fills us
+    m.on_trade(1001.0, 100, Decimal("0.50"), Decimal("5"), Decimal("0.90"), Decimal("0.47"))
     assert m.fill is not None
     assert m.fill.n == Decimal("0.55") and m.fill.offer == Decimal("0.45")
-    assert m.fill.book_swept is True
+    assert m.fill.regime == "i"
+    assert m.fill.since_replace_ms is not None and m.fill.since_replace_ms >= 200
     assert m.fill.completion_target_ts == 1001.0 + 1.5
 
 
@@ -30,8 +44,17 @@ def test_lagging_no_fill_below_offer():
     m = LaggingModel(E=Decimal("0.10"), tol=Decimal("0.02"), deb=5000, lat=200)
     m.on_tick(1000.0, 100, 200, Decimal("0.55"))
     m.on_tick(1000.3, 100, 200, Decimal("0.55"))
-    # print exactly at offer (0.45) is NOT strictly above -> no fill
-    m.on_trade(1001.0, 100, Decimal("0.45"), Decimal("5"), Decimal("0.90"), Decimal("0.44"))
+    # regime (i) (ask 0.47 > offer 0.45); a print below the offer does NOT fill
+    m.on_trade(1001.0, 100, Decimal("0.44"), Decimal("5"), Decimal("0.90"), Decimal("0.47"))
+    assert m.fill is None
+
+
+def test_lagging_regime_iii_no_fill():
+    m = LaggingModel(E=Decimal("0.10"), tol=Decimal("0.02"), deb=5000, lat=200)
+    m.on_tick(1000.0, 100, 200, Decimal("0.55"))
+    m.on_tick(1000.3, 100, 200, Decimal("0.55"))
+    # offer 0.45 ABOVE market ask 0.40 -> regime (iii): no fill even on a high print
+    m.on_trade(1001.0, 100, Decimal("0.60"), Decimal("5"), Decimal("0.90"), Decimal("0.40"))
     assert m.fill is None
 
 
@@ -62,7 +85,8 @@ def test_bucket_change_forces_replace():
 def test_ideal_completes_at_trade_tick():
     m = IdealModel(E=Decimal("0.10"))
     m.on_tick(1000.0, 100, 200, Decimal("0.55"))
+    # ideal keeps the strict rule (p > offer); regime recorded for info (ask 0.46 > offer 0.45 -> i)
     m.on_trade(1001.0, 100, Decimal("0.50"), Decimal("5"), Decimal("0.90"), Decimal("0.46"))
     assert m.fill is not None
     assert m.fill.completion_target_ts == 1001.0     # no lag
-    assert m.fill.book_swept is False                # ask 0.46 > offer 0.45
+    assert m.fill.regime == "i"

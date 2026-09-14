@@ -45,33 +45,43 @@ def aggregate(results: list) -> dict:
     trades = sum(r.calib.get("n_trades", 0) for r in results)
     spot_agree = sum(r.calib.get("spot_agree", 0) for r in results)
     cap_err = [x for r in results for x in r.calib.get("cap_err_c", [])]
-    qualify = sum(r.calib.get("qualify", 0) for r in results)
-    qualify_swept = sum(r.calib.get("qualify_swept", 0) for r in results)
+    n_eval = sum(r.calib.get("eval", 0) for r in results)
+    regime = {"i": 0, "ii": 0, "iii": 0}
+    for r in results:
+        for k in regime:
+            regime[k] += r.calib.get("regime", {}).get(k, 0)
+    maker_fills = sum(r.calib.get("maker_fills", 0) for r in results)
+    strict_fills = sum(r.calib.get("strict_fills", 0) for r in results)
     print_sizes = [x for r in results for x in r.calib.get("print_sizes", [])]
     B = [x for r in results for x in r.calib.get("B_resid_c", [])]
     replaces = [r.calib.get("base_replaces", 0) for r in results]
 
-    # per-window P(swept) for the pessimistic p10
-    p_swept_by_window: list[float] = []
+    p_fill_maker = (maker_fills / n_eval) if n_eval else None
+    p_fill_strict = (strict_fills / n_eval) if n_eval else None
+    # how the maker rule reshapes the strict-rule fill count (the forward thinning factor)
+    fill_factor = (maker_fills / strict_fills) if strict_fills else (
+        1.0 if maker_fills else None)
+    factor_by_window: list[float] = []
     for r in results:
-        q, s = r.calib.get("qualify_window", (0, 0))
-        if q > 0:
-            p_swept_by_window.append(s / q)
-
-    p_swept = (qualify_swept / qualify) if qualify else None
-    p_swept_p10 = _pct(p_swept_by_window, 0.10) if p_swept_by_window else (
-        p_swept if p_swept is not None else None
-    )
+        m, s, _ = r.calib.get("fill_window", (0, 0, 0))
+        if s > 0:
+            factor_by_window.append(m / s)
+    fill_factor_p10 = _pct(factor_by_window, 0.10) if factor_by_window else fill_factor
 
     return {
         "n_windows": n_windows,
         "n_trades": trades,
+        "n_eval": n_eval,
         "spot_agreement": (spot_agree / trades) if trades else None,
         "cap_error_c": _stats(cap_err),
-        "p_swept": p_swept,
-        "p_swept_p10": p_swept_p10,
-        "n_qualify": qualify,
-        "n_qualify_swept": qualify_swept,
+        "regime": regime,
+        "regime_frac": {k: (v / n_eval if n_eval else None) for k, v in regime.items()},
+        "p_fill_maker": p_fill_maker,
+        "p_fill_strict": p_fill_strict,
+        "fill_factor": fill_factor,
+        "fill_factor_p10": fill_factor_p10,
+        "n_maker_fills": maker_fills,
+        "n_strict_fills": strict_fills,
         "print_size": _stats(print_sizes),
         "B_resid_c": _stats(B),
         "replaces_per_window_mean": statistics.mean(replaces) if replaces else None,

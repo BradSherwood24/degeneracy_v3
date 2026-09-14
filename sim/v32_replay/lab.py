@@ -117,13 +117,13 @@ def render_report(results: list[WindowResult], est: dict, run_date: str) -> str:
     L.append("")
     if all_fills:
         L.append("| close | model | E | TOL | DEB | spot Sd | n | offer | print | size | "
-                 "swept | W compl | lock c |")
+                 "regime | W compl | lock c |")
         L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for row in all_fills:
             L.append(
                 f"| {row['close'][11:19]} | {row['model']} | {row['E']} | {_fmt(row['tol'])} | "
                 f"{_fmt(row['deb'])} | {row['spot_Sd']} | {row['n']} | {row['offer']} | "
-                f"{row['print_price']} | {row['print_size']} | {'Y' if row['book_swept'] else 'n'} | "
+                f"{row['print_price']} | {row['print_size']} | {row['regime']} | "
                 f"{_fmt(row['W_completion'])} | {_fmt_c(row['lock_c'])} |"
             )
         L.append("")
@@ -132,13 +132,10 @@ def render_report(results: list[WindowResult], est: dict, run_date: str) -> str:
                  "the base fill rate is ~3.6/day)._")
         L.append("")
 
-    # base-cell fill realism (book-swept diagnostic)
-    base_total = sum(1 for r in results if r.base_fill is not None)
-    base_swept = sum(1 for r in results if r.base_fill is not None and r.base_fill.book_swept)
-    L.append(f"**Book-swept base-cell fills: {base_swept} of {base_total}.** A non-swept fill is one "
-             f"where our offer (1-n, resting ~1c above the bid, inside the spread) was BELOW the real "
-             f"best YES ask at the print — so the fill is counterfactual (our order would be the best "
-             f"ask), not a demonstrated sweep of existing depth. BASE counts only book-swept fills.")
+    # maker-rule regime note (replaces the retired book-swept diagnostic)
+    L.append("_Fill rule = spread-aware maker rule: regime (i) o<a fills iff print >= offer (we are the "
+             "best ask by price priority); (ii) o==a fills iff print > offer; (iii) o>a is a no-quote "
+             "(our offer would be above the market ask). 'swept' is retired._")
     L.append("")
 
     # --- estimates ---
@@ -159,8 +156,9 @@ def render_report(results: list[WindowResult], est: dict, run_date: str) -> str:
     for key in ("optimistic", "base", "pessimistic"):
         e = est[key]
         L.append(f"- **{e['name']}** windows-for-band basis: {e['windows_note']}")
-    L.append(f"- PESSIMISTIC dropped {est['pessimistic_dropped_small_prints']} small-print fills "
-             f"(< 2 lots); budget haircut hit {est['pessimistic_budget_haircut_windows']} windows "
+    L.append(f"- PESSIMISTIC dropped {est['pessimistic_dropped_small_prints']} sub-1-lot fills and "
+             f"{est.get('pessimistic_dropped_fresh_lat', 0)} fills placed within LAT=200 ms of the "
+             f"print; budget haircut hit {est['pessimistic_budget_haircut_windows']} windows "
              f"(per-window replace budget ~{est['per_window_replace_budget']:.0f}).")
     L.append(f"- At the assumed 3.6 fills/day the base rate is ~1 fill per 6.7 windows; "
              f"{len(results)} windows collected so far — too few for a stable mean (report firms up as "
@@ -178,14 +176,16 @@ def render_calibration(calib: dict) -> str:
     L.append("## Calibration (ms bucket books vs the sim's candle-side assumptions)")
     L.append("")
     L.append(f"Calibration windows: **{calib['n_windows']}**; spot-bucket YES trades measured: "
-             f"**{calib['n_trades']}**; qualifying prints (above the offer): **{calib['n_qualify']}**.")
+             f"**{calib['n_trades']}**; evaluated (n_shadow defined): **{calib['n_eval']}**.")
     L.append("")
     ce = calib["cap_error_c"]; ps = calib["print_size"]; B = calib["B_resid_c"]
+    rf = calib["regime_frac"]
     L.append("| quantity | value |")
     L.append("|---|---|")
     L.append(f"| (a) spot-bucket agreement (candle vs ms) | {_fmt((calib['spot_agreement'] or 0)*100,1,'%') if calib['spot_agreement'] is not None else 'n/a'} |")
     L.append(f"| (b) cap error mean / p10 / p90 (c) | {_fmt(ce['mean'],2)} / {_fmt(ce['p10'],2)} / {_fmt(ce['p90'],2)}  (n={ce['n']}) |")
-    L.append(f"| (c) P(swept \\| print rule) | {_fmt((calib['p_swept'] or 0)*100,1,'%') if calib['p_swept'] is not None else 'n/a'}  (swept {calib['n_qualify_swept']}/{calib['n_qualify']}); p10 {_fmt((calib['p_swept_p10'] or 0)*100,1,'%') if calib['p_swept_p10'] is not None else 'n/a'} |")
+    L.append(f"| (c) maker-rule regimes i / ii / iii | {_fmt((rf['i'] or 0)*100,1,'%')} / {_fmt((rf['ii'] or 0)*100,1,'%')} / {_fmt((rf['iii'] or 0)*100,1,'%')}  (n={calib['n_eval']}) |")
+    L.append(f"| (c) P(fill) maker vs strict rule | {_fmt((calib['p_fill_maker'] or 0)*100,1,'%') if calib['p_fill_maker'] is not None else 'n/a'} vs {_fmt((calib['p_fill_strict'] or 0)*100,1,'%') if calib['p_fill_strict'] is not None else 'n/a'}  (maker {calib['n_maker_fills']} / strict {calib['n_strict_fills']}); fill factor {_fmt(calib['fill_factor'],3)} (p10 {_fmt(calib['fill_factor_p10'],3)}) |")
     L.append(f"| (c) print size median / p10 (lots) | {_fmt(ps['median'],1)} / {_fmt(ps['p10'],1)}  (n={ps['n']}) |")
     L.append(f"| (d) wing residual B = W(+1.5s)-W(trade) mean / p90 (c) | {_fmt(B['mean'],2)} / {_fmt(B['p90'],2)}  (n={B['n']}) |")
     L.append(f"| (e) replaces/window (ms) vs sim's ~77 | {_fmt(calib['replaces_per_window_mean'],0)} vs 77 |")
@@ -199,9 +199,12 @@ def render_forward(fwd: dict) -> str:
     L.append("")
     L.append(f"Forward hours: **{fwd['n_hours']}** over {fwd['n_days']} days. "
              f"Corrections from the calibration above: cap shift base {_fmt(fwd['cap_shift_base_c'],2)}c / "
-             f"pess {_fmt(fwd['cap_shift_pess_c'],2)}c; fill thinning base x{_fmt(fwd['thin_base'],3)} / "
-             f"pess x{_fmt(fwd['thin_pess'],3)}; sim tape B {_fmt(fwd['sim_tape_B_c'],2)}c, "
-             f"lock B-correction base {_fmt(fwd['base_B_corr_c'],2)}c / pess {_fmt(fwd['pess_B_corr_c'],2)}c (+2c wing haircut pess).")
+             f"pess {_fmt(fwd['cap_shift_pess_c'],2)}c; maker-rule fill factor base "
+             f"x{_fmt(fwd['fill_factor_base'],3)} / pess x{_fmt(fwd['fill_factor_pess'],3)} "
+             f"(maker fills / strict fills, measured on the ms journals; the forward set has no ms bucket "
+             f"book so the rule is carried as this factor, not re-evaluated on the stale candle ask); "
+             f"sim tape B {_fmt(fwd['sim_tape_B_c'],2)}c, lock B-correction base "
+             f"{_fmt(fwd['base_B_corr_c'],2)}c / pess {_fmt(fwd['pess_B_corr_c'],2)}c (+2c wing haircut pess).")
     L.append("")
     L.append("| E | estimate | n fills | fills/day | mean c | median c | p10 c | min c | % pos | c/day |")
     L.append("|---|---|---|---|---|---|---|---|---|---|")
@@ -216,8 +219,21 @@ def render_forward(fwd: dict) -> str:
                 f"{_fmt(e['c_per_day'],1)} |"
             )
     L.append("")
-    L.append("_OPTIMISTIC = uncorrected sim; BASE = cap+mean-error, fills×P(swept), lock−(live B−tape B); "
-             "PESSIMISTIC = cap+p10-error, fills×P10(swept) & ≥2-lot prints, lock−(p90 B−tape B)−2c._")
+    L.append("_OPTIMISTIC = uncorrected sim; BASE = cap+mean-error, rate×maker-fill-factor, "
+             "lock−(live B−tape B); PESSIMISTIC = cap+p10-error, rate×p10-factor, ≥1-lot & "
+             "LAT-freshness drop, lock−(p90 B−tape B)−2c._")
+    L.append("")
+    # cap-correction-ALONE effect (the calibration that actually moves the number)
+    L.append("**Cap correction alone (strict rule both sides, mean cap shift):**")
+    L.append("")
+    L.append("| E | opt fills/day | cap fills/day | Δ fills | opt mean c | cap mean c | Δ mean c |")
+    L.append("|---|---|---|---|---|---|---|")
+    for E, ce in fwd["cap_effect"].items():
+        L.append(
+            f"| {E} | {_fmt(ce['opt_fills_per_day'],2)} | {_fmt(ce['cap_fills_per_day'],2)} | "
+            f"{ce['d_fills']:+d} | {_fmt_c(ce['opt_mean_c'])} | {_fmt_c(ce['cap_mean_c'])} | "
+            f"{_fmt_c(ce['d_mean_c'])} |"
+        )
     L.append("")
     return "\n".join(L)
 
@@ -238,7 +254,7 @@ def _collect_fills(results: list[WindowResult]) -> list[dict]:
                 "deb": f.deb, "spot_Sd": f.spot_Sd, "spot_Su": f.spot_Su,
                 "n": str(f.n), "offer": str(f.offer), "print_price": str(f.print_price),
                 "print_size": str(f.print_size), "trade_ts": f.trade_ts,
-                "book_swept": f.book_swept,
+                "regime": f.regime, "since_replace_ms": f.since_replace_ms,
                 "W_completion": str(f.W_completion) if f.W_completion is not None else None,
                 "lock_c": float(f.lock * 100) if f.lock is not None else None,
                 "complete": f.complete,

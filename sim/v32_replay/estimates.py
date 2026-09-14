@@ -118,26 +118,31 @@ def build_estimates(results: list, daily_budget: int = DEFAULT_DAILY_ORDER_BUDGE
             if f.E == base_E and f.lock is not None:
                 opt_locks.append(_cents(f.lock))
 
-    # BASE: lagging base cell, book-swept fills only.
+    # BASE: lagging base cell, spread-aware maker-rule fills (regime iii already excluded by the model,
+    # which only records a fill when the maker rule fires).
     base_locks: list[float] = []
     base_haircut_windows = 0
     per_window_budget = daily_budget / WINDOWS_PER_DAY
     for r in results:
         f = r.base_fill
-        reps = r.lag_replaces.get(BASE_CELL, 0)
-        if f is not None and f.book_swept and f.lock is not None:
+        if f is not None and f.lock is not None:
             base_locks.append(_cents(f.lock))
 
-    # PESSIMISTIC: BASE, minus 2c per set at completion, drop small through-prints + budget haircut.
+    # PESSIMISTIC: BASE minus 2c per set; drop < 1-lot prints and fills whose offer was (re)placed
+    # within LAT=200 ms of the print (not yet reliably live); budget haircut.
     pess_locks: list[float] = []
     dropped_small = 0
+    dropped_fresh = 0
     for r in results:
         f = r.base_fill
         reps = r.lag_replaces.get(BASE_CELL, 0)
-        if f is None or not f.book_swept or f.lock is None:
+        if f is None or f.lock is None:
             continue
-        if float(f.print_size) < MIN_THROUGH_PRINT_LOTS:
+        if float(f.print_size) < 1:
             dropped_small += 1
+            continue
+        if f.since_replace_ms is not None and f.since_replace_ms < 200:
+            dropped_fresh += 1
             continue
         if reps > per_window_budget:
             base_haircut_windows += 1
@@ -150,6 +155,7 @@ def build_estimates(results: list, daily_budget: int = DEFAULT_DAILY_ORDER_BUDGE
         "base": summarize("BASE", base_locks, n_windows).as_dict(),
         "pessimistic": summarize("PESSIMISTIC", pess_locks, n_windows).as_dict(),
         "pessimistic_dropped_small_prints": dropped_small,
+        "pessimistic_dropped_fresh_lat": dropped_fresh,
         "pessimistic_budget_haircut_windows": base_haircut_windows,
         "per_window_replace_budget": per_window_budget,
     }

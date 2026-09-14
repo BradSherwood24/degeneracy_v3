@@ -39,9 +39,16 @@ Per window it reconstructs, **from the raw frames only** (every decision record 
    * *lagging executor* (`LaggingModel`): replace only when `|Δn| ≥ TOL` and `≥ DEB ms` since the last
      replace; the new quote goes live `+LAT ms`; fill on a spot-bucket YES print above `1 − n_rest`;
      completion at the wing asks at **trade + 1.5 s**. Grid `E ∈ {0.08, 0.10, 0.12}`,
-     `TOL ∈ {0.01, 0.02, 0.03}`, `DEB ∈ {0, 2000, 5000}`, `LAT = 200 ms`. Each fill also carries a
-     `book_swept` flag (the bucket's best YES ask before the print was ≤ our offer) and the
-     through-print size.
+     `TOL ∈ {0.01, 0.02, 0.03}`, `DEB ∈ {0, 2000, 5000}`, `LAT = 200 ms`. The lagging fill uses the
+     **spread-aware maker rule** (below), not the strict `p > 1 − n`.
+
+   **Spread-aware maker fill rule** (`maker_fill_decision`, replacing the retired "book-swept" idea):
+   our resting bucket-NO bid at `n` is a YES ask at `o = 1 − n`; let `a` be the market's best YES ask
+   immediately before the print (from the ms bucket book) and `p` the taker print. (i) `o < a` (we are
+   the best ask alone — cap puts `o` ≈ bid+1c, inside the spread, below `a`): fill iff `p ≥ o` (a buyer
+   crossing at/through our level takes us by price priority; there is no queue at our price but us).
+   (ii) `o == a` (we join the level): fill iff `p > o` (swept through). (iii) `o > a` (our offer above
+   the market ask): a no-quote — no fill.
 
    Spot selection, `W`, `cap` and `n` mirror the live core (`_select_spot` / `_compute_W` /
    `_bucket_cap` / `solve_n`); the money math is the **pinned law** (`service.v32.core.solve_n` /
@@ -53,12 +60,13 @@ Per window it reconstructs, **from the raw frames only** (every decision record 
    last minute sample, the cap drift (cents), base-vs-old fill/lock differences, and the wing-drift
    residual `W(trade) − W(trade + 1.5 s)`.
 
-4. **Estimates**:
+4. **Estimates** (journal-side):
    * **OPTIMISTIC** = the ideal no-lag rule (E=0.10), completion at the ask.
-   * **BASE** = the lagging base cell (E=0.10, TOL=0.02, DEB=5000), **book-swept** fills only.
+   * **BASE** = the lagging base cell (E=0.10, TOL=0.02, DEB=5000), spread-aware maker-rule fills.
    * **PESSIMISTIC** = BASE − 1 tick per wing at completion (2c off the lock), dropping fills whose
-     through-print size < 2 lots, plus a replace-budget haircut (a window's fill is dropped when its
-     base-cell replaces exceed the per-window proxy budget, `DAILY_ORDER_BUDGET / 24`).
+     through-print size < 1 lot or whose offer was (re)placed within LAT=200 ms of the print, plus a
+     replace-budget haircut (a window's fill is dropped when its base-cell replaces exceed the
+     per-window proxy budget, `DAILY_ORDER_BUDGET / 24`).
 
    Each reports fills/day, mean/median/p10/min lock (cents), % positive, c/day, `n`, the number of
    windows, and how many windows are needed for a ±2c band on the mean (SE from the observed sd; 3.6
@@ -69,15 +77,19 @@ Per window it reconstructs, **from the raw frames only** (every decision record 
 The ms bucket books calibrate the sim's **bucket-side** assumptions (the sim priced buckets off minute
 candles). `sim.v32_replay.calibration` pools, from every journal window (T-15..T-5), at each
 spot-bucket YES trade: (a) spot-bucket agreement (candle proxy vs ms), (b) cap error
-`cap_ms − cap_candle`, (c) `P(swept | print rule)` (of yes prints above the offer, the fraction where
-the bucket's best YES ask was already ≤ the offer) + the print-size distribution, (d) the wing residual
-`B = W(trade + 1.5 s) − W(trade)` on live timing, and (e) replaces/window vs the sim's ~77.
+`cap_ms − cap_candle`, (c) the spread-aware maker-rule **regime split** (i/ii/iii) and `P(fill)` under
+the maker rule vs the sim's strict rule, giving the **fill factor** = maker fills / strict fills, plus
+the print-size distribution, (d) the wing residual `B = W(trade + 1.5 s) − W(trade)` on live timing, and
+(e) replaces/window vs the sim's ~77.
 
 `sim.v32_replay.forward` then re-runs `pf_ms_requote2.py`'s lagging model over the forward 139 h at
-E ∈ {0.08, 0.10, 0.12}, TOL 0.02, DEB 5000, and reports **OPTIMISTIC** (uncorrected sim), **BASE**
-(cap shifted by the mean cap error, fills thinned by `P(swept)`, lock reduced by the mean live B minus
-the sim's own tape B) and **PESSIMISTIC** (cap at the p10 error, fills thinned by the p10 of `P(swept)`
-and a 2-lot minimum print, lock reduced by the p90 B and one extra tick per wing). Re-runnable: the same
+E ∈ {0.08, 0.10, 0.12}, TOL 0.02, DEB 5000, and reports **OPTIMISTIC** (uncorrected sim), **BASE** (cap
+shifted by the mean cap error; fill rate carried by the maker-rule fill factor — the forward set has only
+candle bucket data, so the maker rule cannot be re-evaluated there and is applied as the journal-measured
+factor; lock reduced by the mean live B minus the sim's own tape B) and **PESSIMISTIC** (cap at the p10
+error, the p10 fill factor, ≥1-lot prints + a LAT-freshness drop, lock reduced by the p90 B and one extra
+tick per wing). A **cap-only** variant (strict rule + mean cap shift) isolates what the cap correction
+alone does to fill rate and lock — the piece that actually moves the number. Re-runnable: the same
 command tomorrow, with more journal windows, tightens every correction.
 
 ## Design notes / deliberate deviations

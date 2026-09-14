@@ -32,6 +32,7 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from .models import maker_fill_decision
 from .pricing import lock_value, solve_n, wing_cost
 
 # The scratchpad range loader location (session scratchpad); override via ``--range-loader``.
@@ -130,12 +131,14 @@ def _forward_days(R) -> list[str]:
     return [d for d in days if d >= FORWARD_START and not R.is_holdout(d)]
 
 
-def run_forward(cap_shift_c: float = 0.0, min_print: int = 0,
-                range_dir: str = _RANGE_DIR) -> dict:
+def run_forward(cap_shift_c: float = 0.0, rule: str = "strict", min_print: int = 0,
+                lat_drop: bool = False, range_dir: str = _RANGE_DIR) -> dict:
     """Run the lagging model over the forward hours for every E. Returns per-E fill lists + n_hours.
 
     ``cap_shift_c`` shifts the (candle) cap by that many cents (the calibration cap correction);
-    ``min_print`` drops fills whose through-print size is below it (the pessimistic 2-lot floor)."""
+    ``rule`` is "strict" (the sim, p > 1-n) or "maker" (the spread-aware rule vs the candle ask, since
+    the forward set has no ms bucket book); ``min_print`` drops sub-size prints; ``lat_drop`` drops fills
+    whose offer was (re)placed within LAT ms of the print."""
     R = _load_rangelab(range_dir)
     tob = _tob_index()
     cap_shift = Decimal(str(cap_shift_c)) / Decimal(100)
@@ -193,6 +196,7 @@ def run_forward(cap_shift_c: float = 0.0, min_print: int = 0,
                     continue
                 cap = ((Decimal(1) - _dec(qB[0])) - Decimal("0.01")).quantize(Decimal("0.01"))
                 cap = (cap + cap_shift)
+                ask_candle = _dec(qB[1])          # candle best YES ask (the maker-rule 'a' proxy)
                 ticks = sorted(
                     {r[0] for r in strikes[s][0] if ts * 1000 <= r[0] < (ts + 60) * 1000}
                     | {r[0] for r in strikes[s + WIDTH][0] if ts * 1000 <= r[0] < (ts + 60) * 1000}
@@ -200,20 +204,20 @@ def run_forward(cap_shift_c: float = 0.0, min_print: int = 0,
                 )
                 pr = [(pts, yp, sz) for pts, yp, sd, sz in prints.get((ct, s), [])
                       if ts < pts <= ts + 60 and sd == "yes"]
-                minutes.append((ts, s, cap, ticks, pr))
+                minutes.append((ts, s, cap, ask_candle, ticks, pr))
 
             for E in GRID_E:
-                fill = _run_hour(E, minutes, W_ms, min_print, ct)
+                fill = _run_hour(E, minutes, W_ms, rule, min_print, lat_drop, ct)
                 if fill is not None:
                     fills_by_E[E].append(fill)
 
     return {"fills_by_E": fills_by_E, "n_hours": n_hours, "days": days}
 
 
-def _run_hour(E: Decimal, minutes, W_ms, min_print: int, ct: str):
+def _run_hour(E: Decimal, minutes, W_ms, rule: str, min_print: int, lat_drop: bool, ct: str):
     """One hour of the lagging executor; returns the first fill dict or None."""
     n_rest = None; live_at = None; pending = None; last_rep = -1e18; prev_s = None
-    for ts, s, cap, ticks, pr in minutes:
+    for ts, s, cap, ask_candle, ticks, pr in minutes:
         if s != prev_s:
             n_rest = None; pending = None; forced = True; prev_s = s
         else:
@@ -237,9 +241,18 @@ def _run_hour(E: Decimal, minutes, W_ms, min_print: int, ct: str):
             else:
                 pts, yp, sz = payload
                 ypd = _dec(yp)
-                if n_rest is None or ypd is None or not (ypd > (Decimal(1) - n_rest)):
+                if n_rest is None or ypd is None:
+                    continue
+                offer = Decimal(1) - n_rest
+                if rule == "maker":
+                    regime, is_fill = maker_fill_decision(offer, ask_candle, ypd)
+                else:
+                    regime, is_fill = ("strict", ypd > offer)
+                if not is_fill:
                     continue
                 if min_print and sz < min_print:
+                    continue
+                if lat_drop and (tv - last_rep) < LAT_MS:      # not yet reliably live
                     continue
                 W_trade = W_ms(s, tv)
                 W15 = W_ms(s, tv + 1500)
@@ -247,7 +260,7 @@ def _run_hour(E: Decimal, minutes, W_ms, min_print: int, ct: str):
                     continue
                 lock = lock_value(n_rest, W15)
                 return {
-                    "ct": ct, "s": s, "n": n_rest, "yp": ypd, "size": sz,
+                    "ct": ct, "s": s, "n": n_rest, "yp": ypd, "size": sz, "regime": regime,
                     "lock_c": float(lock * 100),
                     "W_trade_c": float(W_trade * 100) if W_trade is not None else None,
                     "W15_c": float(W15 * 100),
@@ -284,21 +297,35 @@ def _lock_stats(locks, n_hours, thin=1.0):
 
 
 def build_forward_estimates(calib: dict, range_dir: str = _RANGE_DIR) -> dict:
-    """Run the three corrected forward estimates for each E, using the journal-side calibration."""
+    """Run the corrected forward estimates for each E, using the journal-side calibration.
+
+      * OPTIMISTIC  = uncorrected sim (strict rule, candle cap).
+      * BASE        = candle cap + mean cap error; fill rate carried by the MAKER-RULE FILL FACTOR
+                      (maker fills / strict fills, measured on the journals — the forward set has only
+                      candle bucket data, so the maker rule cannot be re-evaluated on it: the instant
+                      pre-trade ask is unavailable, and the stale minute-candle ask mis-classifies every
+                      pumped print as regime iii); lock − (live B − tape B).
+      * PESSIMISTIC = candle cap + p10 cap error; rate carried by the p10 fill factor; ≥1-lot prints +
+                      LAT freshness drop; lock − (p90 B − tape B) − 2c.
+    A cap-ONLY variant (strict rule + mean cap shift, no thinning) isolates the cap correction alone."""
     cap_err = calib.get("cap_error_c") or {}
     cap_err_mean = cap_err.get("mean") or 0.0
     cap_err_p10 = cap_err.get("p10") or 0.0
-    p_swept = calib.get("p_swept")
-    p_swept_p10 = calib.get("p_swept_p10")
     B = calib.get("B_resid_c") or {}
     B_live_mean = B.get("mean") or 0.0
     B_live_p90 = B.get("p90") or 0.0
-    thin_base = p_swept if p_swept is not None else 1.0
-    thin_pess = p_swept_p10 if p_swept_p10 is not None else thin_base
+    # the maker rule's measured effect on the fill count, from the ms journals (regime iii removes,
+    # regime i keeps; on the journals so far it is ~1.0 = the maker rule barely changes the count).
+    factor_base = calib.get("fill_factor")
+    factor_base = 1.0 if factor_base is None else factor_base
+    factor_pess = calib.get("fill_factor_p10")
+    factor_pess = factor_base if factor_pess is None else factor_pess
 
-    opt = run_forward(cap_shift_c=0.0, range_dir=range_dir)
-    base = run_forward(cap_shift_c=cap_err_mean, range_dir=range_dir)
-    pess = run_forward(cap_shift_c=cap_err_p10, min_print=2, range_dir=range_dir)
+    opt = run_forward(cap_shift_c=0.0, rule="strict", range_dir=range_dir)
+    cap_only = run_forward(cap_shift_c=cap_err_mean, rule="strict", range_dir=range_dir)
+    base = run_forward(cap_shift_c=cap_err_mean, rule="strict", range_dir=range_dir)
+    pess = run_forward(cap_shift_c=cap_err_p10, rule="strict", min_print=1, lat_drop=True,
+                       range_dir=range_dir)
 
     def _sim_tape_B(run) -> float:
         vals = [f["B_tape_c"] for E in GRID_E for f in run["fills_by_E"][E]
@@ -312,17 +339,28 @@ def build_forward_estimates(calib: dict, range_dir: str = _RANGE_DIR) -> dict:
     out: dict = {
         "n_hours": opt["n_hours"], "n_days": len(opt["days"]),
         "cap_shift_base_c": cap_err_mean, "cap_shift_pess_c": cap_err_p10,
-        "thin_base": thin_base, "thin_pess": thin_pess,
+        "fill_factor_base": factor_base, "fill_factor_pess": factor_pess,
         "sim_tape_B_c": sim_tape_B_opt, "base_B_corr_c": base_B_corr, "pess_B_corr_c": pess_B_corr,
-        "by_E": {},
+        "by_E": {}, "cap_effect": {},
     }
     for E in GRID_E:
         opt_locks = [f["lock_c"] for f in opt["fills_by_E"][E]]
+        cap_locks = [f["lock_c"] for f in cap_only["fills_by_E"][E]]
         base_locks = [f["lock_c"] - base_B_corr for f in base["fills_by_E"][E]]
         pess_locks = [f["lock_c"] - pess_B_corr - 2.0 for f in pess["fills_by_E"][E]]
         out["by_E"][str(E)] = {
-            "optimistic": _lock_stats(opt_locks, opt["n_hours"], thin=1.0),
-            "base": _lock_stats(base_locks, base["n_hours"], thin=thin_base),
-            "pessimistic": _lock_stats(pess_locks, pess["n_hours"], thin=thin_pess),
+            "optimistic": _lock_stats(opt_locks, opt["n_hours"]),
+            "base": _lock_stats(base_locks, base["n_hours"], thin=factor_base),
+            "pessimistic": _lock_stats(pess_locks, pess["n_hours"], thin=factor_pess),
+        }
+        # cap-correction-ALONE effect (strict rule both sides, no thinning): fill + mean-lock delta
+        oc = _lock_stats(opt_locks, opt["n_hours"])
+        cc = _lock_stats(cap_locks, cap_only["n_hours"])
+        out["cap_effect"][str(E)] = {
+            "opt_fills": oc["n_fills"], "cap_fills": cc["n_fills"],
+            "opt_fills_per_day": oc["fills_per_day"], "cap_fills_per_day": cc["fills_per_day"],
+            "opt_mean_c": oc["mean_c"], "cap_mean_c": cc["mean_c"],
+            "d_fills": cc["n_fills"] - oc["n_fills"],
+            "d_mean_c": (cc["mean_c"] - oc["mean_c"]) if (cc["mean_c"] is not None and oc["mean_c"] is not None) else None,
         }
     return out

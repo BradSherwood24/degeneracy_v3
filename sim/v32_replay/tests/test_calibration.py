@@ -23,9 +23,11 @@ def test_aggregate_on_head_fixture():
     assert cal["n_windows"] == 1
     # the head is ~10 s; the single spot-bucket yes trade is measured
     assert cal["n_trades"] == r.calib["n_trades"]
-    for key in ("spot_agreement", "cap_error_c", "p_swept", "B_resid_c",
-                "replaces_per_window_mean"):
+    for key in ("spot_agreement", "cap_error_c", "regime_frac", "p_fill_maker",
+                "p_fill_strict", "fill_factor", "B_resid_c", "replaces_per_window_mean"):
         assert key in cal
+    if cal["n_eval"]:
+        assert abs(sum(v for v in cal["regime_frac"].values() if v is not None) - 1.0) < 1e-9
     assert cal["sim_replaces_per_hour_reference"] == 77
 
 

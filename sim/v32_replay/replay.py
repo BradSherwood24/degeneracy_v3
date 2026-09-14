@@ -23,6 +23,7 @@ from service.v32.events import parse_strike_ticker
 from .frames import FRAME_DELTA, FRAME_SNAPSHOT, FRAME_TRADE, RawFrame, WindowMeta
 from .models import (
     BASE_CELL, GRID_DEB, GRID_E, GRID_TOL, LAT_MS, Fill, IdealModel, LaggingModel, OldModel,
+    maker_fill_decision,
 )
 from .pricing import bucket_cap, compute_W, lock_value, select_spot, solve_n, wing_cost
 
@@ -153,13 +154,13 @@ class WindowEngine:
         self._minute_bucket_yesbid: dict[int, Decimal] = {}   # per-bucket yes_bid at last boundary
         self._calib_trades = 0
         self._calib_spot_agree = 0
-        self._calib_cap_err: list[float] = []       # (cap_ms - cap_candle) dollars
-        self._calib_cap_binds_ms = 0
-        self._calib_cap_binds_candle = 0
-        self._calib_qualify = 0                     # yes prints with yp > offer (sim fill rule)
-        self._calib_qualify_swept = 0               # of those, best_yes_ask <= offer
-        self._calib_print_sizes: list[float] = []
-        self._calib_qualify_by_window = (0, 0)      # (qualify, swept) this window
+        self._calib_cap_err: list[float] = []       # (cap_ms - cap_candle) cents
+        self._calib_eval = 0                        # spot-yes trades with a defined n_shadow
+        self._calib_regime = {"i": 0, "ii": 0, "iii": 0}
+        self._calib_maker_fills = 0                 # fills under the spread-aware maker rule
+        self._calib_strict_fills = 0                # fills under the sim's strict rule (p > offer)
+        self._calib_print_sizes: list[float] = []   # print sizes of strict-qualifying prints
+        self._calib_fill_by_window = (0, 0, 0)      # (maker_fills, strict_fills, eval) this window
 
     # ---- window predicate ----
     def _in_window(self, t: float) -> bool:
@@ -361,7 +362,7 @@ class WindowEngine:
 
     def _collect_calibration(self, floor: int, yp: Decimal, size: Decimal,
                              best_yes_ask: Decimal | None, ms_spot: int) -> None:
-        """Per spot-bucket YES trade: spot agreement, cap error, print-rule sweep haircut, print size."""
+        """Per spot-bucket YES trade: spot agreement, cap error, maker-rule regime + P(fill), size."""
         self._calib_trades += 1
         # (a) spot-bucket agreement: ms choice at the trade vs the candle-proxy at the last boundary
         if self._minute_spot is not None and ms_spot == self._minute_spot:
@@ -374,19 +375,24 @@ class WindowEngine:
         cap_candle = ((_ONE - yb_candle) - _CENT) if yb_candle is not None else None
         if cap_ms is not None and cap_candle is not None:
             self._calib_cap_err.append(float((cap_ms - cap_candle) * 100))   # cents
-        # (c) fill-rule sweep haircut: over yes prints above our offer (1 - n_shadow), P(swept)
-        q_add = s_add = 0
+        # (c) spread-aware maker fill rule vs the sim's strict rule, per regime
+        m_add = s_add = e_add = 0
         if self._n_shadow_10 is not None:
             offer = _ONE - self._n_shadow_10
-            if yp > offer:
-                self._calib_qualify += 1
+            regime, is_fill = maker_fill_decision(offer, best_yes_ask, yp)
+            self._calib_eval += 1
+            e_add = 1
+            self._calib_regime[regime] += 1
+            if is_fill:
+                self._calib_maker_fills += 1
+                m_add = 1
+            if yp > offer:                       # the sim's strict rule
+                self._calib_strict_fills += 1
                 self._calib_print_sizes.append(float(size))
-                q_add = 1
-                if best_yes_ask is not None and best_yes_ask <= offer:
-                    self._calib_qualify_swept += 1
-                    s_add = 1
-        self._calib_qualify_by_window = (self._calib_qualify_by_window[0] + q_add,
-                                         self._calib_qualify_by_window[1] + s_add)
+                s_add = 1
+        self._calib_fill_by_window = (self._calib_fill_by_window[0] + m_add,
+                                      self._calib_fill_by_window[1] + s_add,
+                                      self._calib_fill_by_window[2] + e_add)
 
     def _register_fill(self, f: Fill) -> None:
         if f.completion_target_ts <= self.now:
@@ -540,12 +546,14 @@ class WindowEngine:
             "n_trades": self._calib_trades,
             "spot_agree": self._calib_spot_agree,
             "cap_err_c": list(self._calib_cap_err),
-            "qualify": self._calib_qualify,
-            "qualify_swept": self._calib_qualify_swept,
+            "eval": self._calib_eval,
+            "regime": dict(self._calib_regime),
+            "maker_fills": self._calib_maker_fills,
+            "strict_fills": self._calib_strict_fills,
             "print_sizes": list(self._calib_print_sizes),
             "B_resid_c": list(self._wing_drift),
             "base_replaces": self.lags[BASE_CELL].replaces,
-            "qualify_window": self._calib_qualify_by_window,
+            "fill_window": self._calib_fill_by_window,
         }
         return res
 
