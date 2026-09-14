@@ -1056,3 +1056,26 @@ Brad's levers, in order (runbooks pilot/ops/V32_DRY_RUN.md then pilot/ops/V32_AR
  3. Rule on the pinned thresholds; freeze v32_falsifier.md (STATUS: FROZEN + Registration line, verbatim go).
  4. `armed` in pilot/ops/v32_mode.txt; register DegeneracyV3_2 (pilot/ops/register_v32_task.ps1).
 Open (Brad): range recorder now for continuity (Claude leans yes); v1.1 retire vs re-arm; dark-week replay + wide-band re-fetch queued.
+
+## 2026-09-14 ~13:45Z — Claude → house: v1.1 on the back burner (V3.2 records the 15M too); 15M-as-a-wing DEAD; spot-bucket freshness gate; pre-arm code complete
+
+Brad 2026-09-14 (verbatim): "Lets put V1.1 'on the back burner'. Make a conscious effort to still collect data for it, but well do nothing with
+that data for now. Keep the pot warm sort of speak." -> ruled by Brad: V3.2 records the co-settling KXBTC15M market (recording only), so v1.1
+stays DISABLED (task Disabled, mode.txt still `armed`, no orders possible) with no data gap. No lever flip needed.
+
+PR #35 merged (4684bad): run_v32 discovers the 15M at :40, subscribes it on the bucket connection (books + trades), journals the frames in the
+same stream; the decision core never sees a 15M frame; a failed 15M discovery is non-fatal (`m15_discovery_error`). Runbook stale line fixed.
+PR #36 merged (6d5b63e): spot-bucket FRESHNESS gate — the highest-mid bucket is the spot regardless of age; if ITS book is older than
+`bucket_freshness_max_age_s` (new pin, 30 s; bucket books tick slowly) -> cancel rest, stand down `stale_bucket`, no shadow fill; ruling
+R-STALE-SPOT: never fall through to a fresh lower-mid bucket (OTM-bucket pumps are the informed ones, 9/01 scan). Params sha re-pinned
+0ac69795... (pre-freeze build act). Suite 808 tests.
+
+15M AS A WING (Brad's idea, "we'd lock a $2 hedge map for sub $2 entry, ... a slight window with a $3 outcome"): DEAD. Scratchpad
+journals/pf_ms_15m_wing.py, forward 139 h, settlement from historical-data results. K15 (the :45 anchor) sits INSIDE the spot bucket in
+118/139 hours, so the map has a $1 HOLE, not a $3 window; the 15M leg is ~29c cheaper than the deep-ITM hourly wing it replaces = exactly the
+fair value of the hole. E=10: baseline hourly wings 21 fills 3.6/day +9.3c realized 95% pos (every set paid $2); 15M replacing YES@Sd
+119 fills 20.6/day lock@$2 +23.9c but realized -14.7c, 61% pos, 46/119 paid $1, 0 paid $3; replacing NO@Su 124 fills -4.9c 73% pos.
+A lock becomes a coin flip on the 15M direction. The 15M's value to V3.2 is as recorded data.
+
+Dry run: from the live tree pilot/ `python -m service.run_v32 --mode dry` (no .env change). Pre-arm code is complete; remaining = Brad's levers
+(mailbox 9/13 ~21:40Z). Live tree pull of 6d5b63e at the 14:00Z window.
