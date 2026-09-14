@@ -1079,3 +1079,27 @@ A lock becomes a coin flip on the 15M direction. The 15M's value to V3.2 is as r
 
 Dry run: from the live tree pilot/ `python -m service.run_v32 --mode dry` (no .env change). Pre-arm code is complete; remaining = Brad's levers
 (mailbox 9/13 ~21:40Z). Live tree pull of 6d5b63e at the 14:00Z window.
+
+## 2026-09-14 18:05Z — Claude → house: V3.2 dry runs DONE (2 windows); clock-flap hotfix merged; pre-arm = Brad's levers only
+
+Brad: "Can you go ahead and run the dry run when ready?" -> two manual dry windows from the live tree (`python -m service.run_v32 --mode dry
+--close <close>Z`, launched detached at :40). A mis-timed first launch (assumed 14:xxZ, was 16:17Z) stood down cleanly on a past close.
+
+Window 1 (close 17:00Z): discovery 188 strikes / 186 buckets / 15M; both WS at 16:44:55; 1.35 M records; clean flush/gzip/summary/ledger.
+DEFECT: 61 place/cancel pairs in the first minute -> replace-rate alarm stood the hour down. Cause: BookUpdate evaluated at the frame's own
+server ts; the two connections interleave (23-300 ms) so a book folded from the other connection looked "in the future" and `_fresh`
+(0<=age) read it as stale -> W=None -> cancel; next frame -> place. Also: lag gauges read after force_close -> None in the row.
+HOTFIX PR #38 (main 8e42c01, 815 tests; Opus 4.8 review APPROVE, reverted-and-reran the real-frame fixture: 61/61/stood_down -> 1/0):
+monotone eval clock across connections, book's own ts kept for staleness, `_fresh` tolerates -bound..bound, LagSampler on the 0.5 s tick,
+shadow verified independent of stood_down.
+
+Window 2 (close 18:00Z, post-fix): 81 replaces over the 10-min quoting window (sim lagging model: ~77) — the requote cadence matches the
+sim; W valid on 369/370 evals; rest live at 0.53 vs desired 0.54 (inside 2c tol, no churn); no alarm, no stand-down; lag mean -0.39 s
+both connections (box clock ~0.4 s behind venue; data age ~0); 1.25 M records, 24.8 MB gz; 15M = 526 k frames. Shadow fills 0 in both
+windows (plausible: ~15% of hours fill; the shadow's independence from stand-down is test-pinned). Follow-ups (cosmetic, PR pending):
+ledger row shows spot bucket null at close (record the last quoted bucket/rest); scoreboard data-age p99 n/a while lag_stats exist.
+Disk: ~25 MB gz/hour ≈ 600 MB/day, 95% from the 15M market; option to thin it to TOB+trades later.
+
+Brad's levers now (pilot/ops/V32_ARMING.md): .env ORDER_TICKER_PREFIXES add `KXBTC`; DAILY_ORDER_BUDGET >= 4000 (81 replaces/window ×
+24 ≈ 1,950 creates/day); restart proxy; rule on the pinned thresholds and freeze ceremony/v32_falsifier.md; `armed` in ops/v32_mode.txt;
+register DegeneracyV3_2. First armed window: watch the MUST CONFIRM list (pilot/build/v32_phase3_review.md).
