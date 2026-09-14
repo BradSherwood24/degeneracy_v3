@@ -51,6 +51,7 @@ from service.orders.envelope import (
     parse_single_response,
 )
 from service.orders.translate import to_v2_order
+from service.proxy_auth import REST_PREFIX
 from service.proxy_writer import ProxyWriter
 from service.v32.actions import ActionKind
 from service.v32.core import BUY_NO
@@ -60,6 +61,21 @@ logger = logging.getLogger(__name__)
 
 _ONE = Decimal(1)
 _PRICE_Q = Decimal("0.0001")
+
+# --- create paths, RELATIVE to REST_PREFIX (2026-09-14 doubled-prefix fix) ---
+# ``ProxyWriter.rest_post`` composes {base}/trade-api/v2{path}; the envelope's
+# SINGLE_CREATE_PATH / BATCH_CREATE_PATH are FULL /trade-api/v2/... paths, so passing
+# them to rest_post doubled the prefix -> venue 404 -> stand-down (first armed window,
+# 2026-09-14 19:44:59Z). We pass the RELATIVE tail explicitly and pin it to the envelope
+# constants below, so a future envelope change cannot silently re-diverge.
+REL_SINGLE_CREATE = "/portfolio/events/orders"
+REL_BATCH_CREATE = "/portfolio/events/orders/batched"
+assert REL_SINGLE_CREATE == SINGLE_CREATE_PATH[len(REST_PREFIX):], (
+    f"REL_SINGLE_CREATE {REL_SINGLE_CREATE!r} != SINGLE_CREATE_PATH minus prefix "
+    f"{SINGLE_CREATE_PATH[len(REST_PREFIX):]!r}")
+assert REL_BATCH_CREATE == BATCH_CREATE_PATH[len(REST_PREFIX):], (
+    f"REL_BATCH_CREATE {REL_BATCH_CREATE!r} != BATCH_CREATE_PATH minus prefix "
+    f"{BATCH_CREATE_PATH[len(REST_PREFIX):]!r}")
 
 # --- wire constants (see module docstring / build report) ---
 REST_TIF = "good_till_canceled"          # the resting maker bid is GTC (auto-expires at quote end)
@@ -279,7 +295,7 @@ class LiveExecutor:
                                               if k != "self_trade_prevention_type"},
                                           "n": action.price, "bucket_Sd": self._bucket_sd(ticker)},
                             self.clock())
-        resp = self.writer.rest_post(SINGLE_CREATE_PATH, body)
+        resp = self.writer.rest_post(REL_SINGLE_CREATE, body)
         self.rests_placed += 1
         self._bump("rest_post")
         if not resp.ok:
@@ -476,13 +492,13 @@ class LiveExecutor:
         self._bump("wing_batch")
         if len(entries) == 1:
             self.journal.append("take_wings", {"legs": entries}, self.clock())
-            resp = self.writer.rest_post(SINGLE_CREATE_PATH, entries[0])
+            resp = self.writer.rest_post(REL_SINGLE_CREATE, entries[0])
             parsed = [parse_single_response(resp.body, side=legs_by_coid[
                 entries[0]["client_order_id"]].side)] if resp.ok else []
         else:
             body = build_batch(entries)
             self.journal.append("take_wings", {"legs": entries}, self.clock())
-            resp = self.writer.rest_post(BATCH_CREATE_PATH, body)
+            resp = self.writer.rest_post(REL_BATCH_CREATE, body)
             parsed = parse_batch_response(resp.body) if resp.ok else []
         events += self._wing_events(parsed, legs_by_coid, now, ok=resp.ok, status=resp.status_code)
         return events

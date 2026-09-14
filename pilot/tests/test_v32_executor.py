@@ -24,10 +24,11 @@ from service.v32.executor import (
     CANCEL_PATH_TMPL,
     LiveExecutor,
     ORDER_STATUS_PATH_TMPL,
+    REL_BATCH_CREATE,
+    REL_SINGLE_CREATE,
     cancel_stale_open_orders,
     parse_order_status,
 )
-from service.orders.envelope import SINGLE_CREATE_PATH, BATCH_CREATE_PATH
 import service.run_v32 as R
 
 CLOSE = "2026-09-13T20:00:00Z"
@@ -103,7 +104,7 @@ def test_place_rest_wire_body_post_only_gtc_expiration():
                                                                 load_v32_params()), CTS - 600)
     assert len(w.posts) == 1
     path, body = w.posts[0]
-    assert path == SINGLE_CREATE_PATH
+    assert path == REL_SINGLE_CREATE
     assert body["post_only"] is True
     assert body["time_in_force"] == "good_till_canceled"
     assert body["expiration_time"] == CTS - 300         # quote end (T-5); VERIFIED CreateOrderV2 field
@@ -285,7 +286,7 @@ def test_take_wings_batch_body_ioc_and_fills():
     ]}, True))
     events = ex.on_action(V32Action(kind=ActionKind.TAKE_WINGS), _state_with_wings(), CTS - 500)
     path, body = w.posts[0]
-    assert path == BATCH_CREATE_PATH
+    assert path == REL_BATCH_CREATE
     assert len(body["orders"]) == 2
     assert all(o["time_in_force"] == "immediate_or_cancel" for o in body["orders"])
     from service.v32.events import Fill

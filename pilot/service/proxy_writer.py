@@ -30,7 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from service.proxy_auth import DEFAULT_PROXY_BASE, REST_PREFIX, ProxyAuth
+from service.proxy_auth import DEFAULT_PROXY_BASE, ProxyAuth, compose_rest_url
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +85,10 @@ class ProxyWriter:
         """POST {base}/trade-api/v2{path} with ``body`` (JSON). Sent ONCE — never retried (a lost
         response on a server-side success would duplicate the order; the body's client_order_id is the
         idempotency key). Any transport error is returned as a non-ok WriteResponse, not raised."""
-        if not path.startswith("/"):
-            raise ValueError(f"rest_post path must start with '/': {path!r}")
-        url = self._base + REST_PREFIX + path
+        # Idempotent composition: an already-prefixed /trade-api/v2/... path is NOT
+        # re-prefixed (the 2026-09-14 doubled-prefix create-404). compose_rest_url
+        # also validates the leading '/' and asserts a single prefix.
+        url = compose_rest_url(self._base, path)
         try:
             resp = self._http_post(url, body, POST_TIMEOUT)
         except Exception as e:  # noqa: BLE001 — POST is never retried; a transport error is a no-send
@@ -101,9 +102,7 @@ class ProxyWriter:
         """DELETE {base}/trade-api/v2{path} (bounded retry on 429/5xx/connection blips; DELETE is
         idempotent). A 404 is returned to the caller (not retried) — the cancel path classifies a
         not_found body as terminal-success."""
-        if not path.startswith("/"):
-            raise ValueError(f"rest_delete path must start with '/': {path!r}")
-        url = self._base + REST_PREFIX + path
+        url = compose_rest_url(self._base, path)
         backoff = _INITIAL_BACKOFF
         last: WriteResponse | None = None
         for attempt in range(_DELETE_RETRY_ATTEMPTS):
