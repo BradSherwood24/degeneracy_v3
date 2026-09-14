@@ -1,8 +1,8 @@
 # V3.2 FALSIFIER -- continuous-requote spot-bucket pump-fader (maker rest, taker completion)
 
-STATUS: DRAFT
+STATUS: FROZEN
 
-This file is a DRAFT. Brad ALONE flips the line above to exactly `STATUS: FROZEN` on his verbatim go,
+This file is FROZEN (see Registration). It was a DRAFT until then. Brad ALONE flips the line above to exactly `STATUS: FROZEN` on his verbatim go,
 and appends the go under Registration. Until then V3.2 cannot arm: the S5 arming gate
 (`service.v32.stops.v32_arming_check` -> `service.stops.falsifier_is_frozen`, wired in
 `service.run_v32` at `--falsifier` default `pilot/ceremony/v32_falsifier.md`) requires this exact path
@@ -183,7 +183,7 @@ showing >= 10 lots [pin] available at every completion (`V32_PROMOTION_MIN_DEPTH
 
 ## Registration (append-only; the freeze line, Brad's verbatim go, and every verdict go here)
 
-- (empty -- awaiting Brad's freeze)
+- 2026-09-14 ~18:58Z -- FROZEN on Brad's order. Brad, verbatim (2026-09-14, after reading the judged quantity, the five gates and the one/two-leg handling): "Okay, go ahead and freeze it. That sounds good" (earlier the same day: "Go ahead and flip what of those levers you can and let me know what needs me ... Lets get it set up for the next wake up"). Thresholds frozen AS PROPOSED above. Roster `DegeneracyV3_2`, params sha 0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc. Preconditions at freeze: two dry windows (closes 17:00Z, 18:00Z; window 2 clean post-hotfix PR #38, 81 replaces, no alarm), scheduler wake 18:40Z confirmed, proxy restarted 18:20Z with ORDER_TICKER_PREFIXES incl. KXBTC and DAILY_ORDER_BUDGET 4000, `ops/v32_mode.txt` = armed (written 18:53Z on Brad's "Go ahead and run the command"). Mechanical edit performed by Claude on Brad's explicit order; merged to main as the freeze act.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
