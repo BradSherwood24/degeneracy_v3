@@ -66,8 +66,10 @@ class V32Params:
                          take is unconditional.
       * ``no_orders_after_s_to_settle`` hard order cutoff (T-1s): no PLACE/TAKE/RETRY after it.
       * ``freshness_max_age_s`` a STRIKE (wing) book older than this is stale -> cancel, do not place.
-      * ``bucket_freshness_max_age_s`` a spot-bucket (range) book older than this is stale -> excluded
-                         from spot selection; if none fresh remain, cancel + stand down (``stale_bucket``).
+      * ``bucket_freshness_max_age_s`` freshness bound on the SELECTED spot bucket (ruling
+                         R-STALE-SPOT): spot selection runs over ALL two-sided books regardless of age,
+                         then if the selected spot's OWN book is older than this the hour stands down
+                         (cancel + ``stale_bucket``) — it NEVER falls through to a fresh lower-mid bucket.
                          SEPARATE from the strike bound because range buckets are thin and tick far less
                          often (a 1.0 s bucket gate would stand the strategy down most of the time).
       * ``max_sets_per_hour`` stop quoting after this many completed sets (1).
