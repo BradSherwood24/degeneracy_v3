@@ -24,7 +24,7 @@ from service.v32.falsifier_pins import (
     V32_R4_EXEC_GAP_CENTS,
     V32_R4_MIN_N,
 )
-from service.v32.params import FROZEN_V32_PARAMS_SHA256
+from service.v32.params import FROZEN_V32_PARAMS_SHA256, load_v32_params
 from service.v32.stops import (
     V32_MAX_CONTRACTS_PER_ORDER,
     V32_MIN_ORDER_BUDGET_AT_ARM,
@@ -80,3 +80,13 @@ def test_stop_pins_and_sha_match_doc():
     assert f"({V32_MIN_ORDER_BUDGET_AT_ARM})" in doc                 # (200)
     assert f"= {V32_MAX_CONTRACTS_PER_ORDER})" in doc                # = 2)
     assert f"after {V32_S1_LEGGED_LATCH_THRESHOLD} [pin]" in doc     # after 2 [pin]
+
+
+def test_bucket_freshness_pin_matches_params_and_doc():
+    # the new spot-bucket freshness gate's bound is a policy param (sha-pinned JSON) mirrored as a
+    # [pin] in the falsifier doc; doc text, the doc's sha, and the loaded value must all agree.
+    doc = _doc()
+    p = load_v32_params()
+    assert p.bucket_freshness_max_age_s == 30.0
+    assert f"bucket_freshness_max_age_s {p.bucket_freshness_max_age_s} [pin]" in doc  # 30.0 [pin]
+    assert p.sha256 == FROZEN_V32_PARAMS_SHA256 and FROZEN_V32_PARAMS_SHA256 in doc
