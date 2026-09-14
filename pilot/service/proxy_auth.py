@@ -51,6 +51,31 @@ PROXY_UNSIGNED_STATUS = 503
 HttpGet = Callable[[str, "dict[str, Any] | None", float], Any]
 
 
+def compose_rest_url(base: str, path: str) -> str:
+    """Compose ``{base}/trade-api/v2{path}`` IDEMPOTENTLY.
+
+    ``path`` must begin with '/'. If it is ALREADY under ``REST_PREFIX`` (a full
+    ``/trade-api/v2/...`` path), the prefix is NOT prepended a second time — the
+    2026-09-14 doubled-prefix bug (``.../trade-api/v2/trade-api/v2/portfolio/events/orders``
+    -> venue 404, forwarded uncapped, executor stand-down). Asserts the final URL path
+    carries EXACTLY ONE ``/trade-api/v2/`` prefix, so no caller — present or future —
+    can smuggle a doubled prefix past this choke point.
+    """
+    if not path.startswith("/"):
+        raise ValueError(f"rest path must start with '/': {path!r}")
+    base = base.rstrip("/")
+    if path == REST_PREFIX or path.startswith(REST_PREFIX + "/"):
+        url = base + path
+    else:
+        url = base + REST_PREFIX + path
+    url_path = url[len(base):]
+    assert url_path.startswith(REST_PREFIX + "/"), (
+        f"composed REST url path must start with {REST_PREFIX!r}/: {url_path!r}")
+    assert not url_path[len(REST_PREFIX):].startswith(REST_PREFIX + "/"), (
+        f"composed REST url has a doubled {REST_PREFIX!r} prefix: {url_path!r}")
+    return url
+
+
 class ProxyError(Exception):
     """Any non-success response from the proxy that is not classified more specifically."""
 
@@ -106,9 +131,9 @@ class ProxyAuth:
         1s -> 2s -> 4s, 4 attempts); the final attempt propagates the real failure so callers fail
         closed rather than looping forever.
         """
-        if not path.startswith("/"):
-            raise ValueError(f"rest_get path must start with '/': {path!r}")
-        url = self._base + REST_PREFIX + path
+        # Idempotent composition: a path already under REST_PREFIX is NOT re-prefixed
+        # (guards the 2026-09-14 doubled-prefix bug at every REST entry point).
+        url = compose_rest_url(self._base, path)
         backoff = _INITIAL_BACKOFF
         last_exc: Exception | None = None
         for attempt in range(_RETRY_ATTEMPTS):
