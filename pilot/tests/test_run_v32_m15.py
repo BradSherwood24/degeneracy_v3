@@ -82,6 +82,26 @@ def test_discover_15m_all_dead_is_empty_not_a_crash():
     assert disc.tickers == ()  # empty is a journaled m15_missing upstream, NOT a stand-down
 
 
+class BoomProxy:
+    """A proxy whose /markets fetch raises (a 5xx / dead proxy) — the adversarial recording-only case."""
+
+    def rest_get(self, path, params=None):
+        raise RuntimeError("proxy 503 Service Unavailable")
+
+
+def test_discover_15m_failure_is_non_fatal():
+    # A 15M discovery failure must NEVER cost a viable trading window (recording-only leg): the safe
+    # wrapper swallows the raise -> empty discovery + an error string the caller journals + continues.
+    disc, err = R.discover_co_settling_15m_safe(BoomProxy(), CLOSE, CTS - 1200)
+    assert disc.tickers == ()
+    assert disc.close_time == CLOSE
+    assert err is not None and "503" in err
+    # the raw (unwrapped) discovery still raises — the safety is deliberately in the wrapper.
+    import pytest
+    with pytest.raises(RuntimeError):
+        R.discover_co_settling_15m(BoomProxy(), CLOSE, CTS - 1200)
+
+
 # ===========================================================================
 # the 15M ticker rides the bucket connection, recording only (no core event)
 # ===========================================================================
@@ -133,6 +153,26 @@ def test_15m_frame_recorded_but_not_decided(tmp_path):
     assert "v32_trade_unparsed" not in kinds  # a 15M trade is not driven, so never "unparsed" spam
     # the raw frames ARE in the tape stream
     assert sum(1 for r in recs if r["kind"] == "kalshi_ws") == 3
+
+
+def test_15m_fill_frame_dropped_as_foreign(tmp_path):
+    """Adversarial + impossible: a private FILL frame naming a 15M ticker (V3.2 never places a 15M
+    order, so no coid/oid we placed can appear on it). on_fill attributes by client_order_id/order_id
+    against the RestBook, so an unknown coid -> FOREIGN fill, journaled + dropped, never booked. Proves
+    the fill path's isolation does not depend on ticker matching (a stronger guard than a name check)."""
+    _p, j, jpath, drv, shared = _recorder(tmp_path, {M15})
+    ts = CTS - 605
+    shared.on_fill(M15, {"market_ticker": M15, "client_order_id": "not-ours-15m",
+                         "order_id": "zzz", "trade_id": "t-15m", "ts_ms": int(ts * 1000),
+                         "count": 10, "price": "0.50"})
+    j.close()
+    assert shared.m15_frames == 0                 # a fill is not a book/trade frame; the counter is untouched
+    assert drv.counts.get("rest_fill", 0) == 0
+    assert drv.counts.get("late_fill", 0) == 0
+    assert drv.counts["foreign_fill_ignored"] == 1
+    recs = _read(jpath)
+    foreign = [r for r in recs if r["kind"] == "foreign_fill_ignored"]
+    assert len(foreign) == 1 and foreign[0]["obj"]["market"] == M15
 
 
 def test_bucket_connection_carries_the_15m_ticker():

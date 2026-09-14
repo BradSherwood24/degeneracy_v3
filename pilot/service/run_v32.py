@@ -308,6 +308,20 @@ def discover_co_settling_15m(
     return M15Discovery(close_iso, tuple(tickers), exch_by)
 
 
+def discover_co_settling_15m_safe(
+    proxy: Any, close_iso: str, now_epoch: float, dead_statuses=DEAD_STATUSES
+) -> tuple[M15Discovery, str | None]:
+    """Recording-only 15M discovery that NEVER raises out. The strike/bucket discoveries ARE the trade
+    (their failure correctly stands the window down), but the 15M leg is RECORDING-ONLY, so a discovery
+    failure (proxy 5xx, malformed body) must never cost a viable trading window. Returns
+    ``(M15Discovery, error)`` — an empty discovery + an error string the caller journals as
+    ``m15_discovery_error`` before continuing, instead of aborting the window."""
+    try:
+        return discover_co_settling_15m(proxy, close_iso, now_epoch, dead_statuses), None
+    except Exception as e:  # noqa: BLE001 — recording-only leg: its failure must not stand the window down
+        return M15Discovery(close_iso), repr(e)
+
+
 def build_bucket_map(discovery) -> dict[str, tuple[float, float]]:
     """ticker -> (floor, cap) for every discovered bucket (the static map the pure core keys on).
 
@@ -1388,8 +1402,12 @@ def main(argv: list[str] | None = None) -> int:
     strike_disc = discover_strike_ladder(proxy, close_iso, clock())
     range_disc = discover_range_markets(proxy, close_iso, clock())
     # Co-settling KXBTC15M market(s), RECORDING ONLY (this process is the single tape recorder so the
-    # disabled v1.1 pilot leaves no 15M data gap). Absence is NOT a stand-down (journaled below).
-    m15_disc = discover_co_settling_15m(proxy, close_iso, clock())
+    # disabled v1.1 pilot leaves no 15M data gap). Absence is NOT a stand-down (journaled below), and a
+    # discovery FAILURE (proxy 5xx) is likewise non-fatal: recording-only data must never cost a viable
+    # trading window, so it degrades to an empty discovery + a journaled m15_discovery_error.
+    m15_disc, m15_error = discover_co_settling_15m_safe(proxy, close_iso, clock())
+    if m15_error is not None:
+        logger.warning("[V32] 15M discovery failed (%s) — recording-only, window continues", m15_error)
     bucket_map = build_bucket_map(range_disc)
     # P3-2: drop any bucket whose width != params.bucket_width so a mixed-width hour cannot select a
     # wrong-width spot bucket and break the $2 pin.
@@ -1446,6 +1464,11 @@ def main(argv: list[str] | None = None) -> int:
     if m15_disc.tickers:
         journal.append("m15_recording", {"tickers": list(m15_disc.tickers)}, clock())
         logger.info("[V32] recording co-settling 15M: %s", ", ".join(m15_disc.tickers))
+    elif m15_error is not None:
+        journal.append("m15_discovery_error",
+                       {"series": FIFTEEN_SERIES, "close_time": close_iso, "error": m15_error},
+                       clock())
+        logger.info("[V32] 15M discovery error journaled (recording continues): %s", m15_error)
     else:
         journal.append("m15_missing", {"series": FIFTEEN_SERIES, "close_time": close_iso}, clock())
         logger.info("[V32] no co-settling %s market at %s (recording continues)",
