@@ -87,14 +87,37 @@ DEFAULT_STP = "taker_at_cross"
 # /portfolio/orders/{id} began returning HTTP 410 deprecated_v1_order_endpoint on 2026-07-12, so
 # cancels MUST use the /events/orders/{id} namespace (same host as create). The proxy routes any
 # DELETE under /portfolio/events/orders to the orders host, uncapped/unbudgeted.
-CANCEL_PATH_TMPL = "/portfolio/events/orders/{order_id}"
-# Order-status + open-orders READS are GETs (routed to the market-data host by the proxy).
+#
+# SHARD FIX (2026-09-14 21:44Z incident): crypto lives on ``exchange_index: 2`` (Kalshi exchange
+# sharding, in force since 2026-08-24). A cancel WITHOUT the shard query param returns
+# HTTP 404 {"error":{"code":"not_found"}} even though the order is live and resting; WITH
+# ``?exchange_index=2`` it returns 200 {"order_id":..,"reduced_by":..}. The docs page for
+# cancel-order-v2 does NOT mention exchange_index (why the review missed it), so the path template
+# carries it explicitly and every cancel routes the order's own shard. A DELETE 404 is NEVER treated
+# as "already gone" (that misread stacked 21 live rests in the first armed window) — see _cancel_rest.
+CANCEL_PATH_TMPL = "/portfolio/events/orders/{order_id}?exchange_index={exchange_index}"
+_CANCEL_PATH_NOSHARD_TMPL = "/portfolio/events/orders/{order_id}"  # fallback only when shard unknown
+# Order-status + open-orders READS are GETs (routed to the market-data host by the proxy). The
+# order-status GET works WITHOUT the shard param and returns the full order (incl. exchange_index).
 ORDER_STATUS_PATH_TMPL = "/portfolio/orders/{order_id}"   # VERIFIED docs.kalshi.com/api-reference/orders/get-order
 OPEN_ORDERS_PATH = "/portfolio/orders"                    # ?status=resting (VERIFIED get-orders; ticker/order_id/client_order_id)
 
+# a resolved-terminal order status: the order is off the book, the fill count is final.
+_TERMINAL_STATUSES = ("canceled", "cancelled", "executed", "expired")
+
 CANCEL_CONFIRM_POLLS = 3
 CANCEL_CONFIRM_INTERVAL_S = 0.2
+CANCEL_RETRY_ATTEMPTS = 3           # a DELETE that still-rests is retried this many times (shard-aware)
 CONSECUTIVE_REJECT_STANDDOWN = 3
+
+
+def cancel_path(order_id: str, exchange_index: int | None) -> str:
+    """The DELETE path for a cancel, carrying the order's shard. Falls back to the no-shard path only
+    when the exchange_index is unknown (the venue then 404s a sharded order — handled by the caller as
+    still-resting, never as gone)."""
+    if exchange_index is None:
+        return _CANCEL_PATH_NOSHARD_TMPL.format(order_id=order_id)
+    return CANCEL_PATH_TMPL.format(order_id=order_id, exchange_index=int(exchange_index))
 
 _KXBTC_PREFIX = "KXBTC"  # covers both range (KXBTC-) and strikes (KXBTCD-) via startswith
 _V32_COID_PREFIX = "v32-"  # our client_order_id prefix (core._mint_coid); scopes the startup sweep
@@ -136,6 +159,7 @@ class RestRecord:
     bucket_Sd: int | None
     placed_ts: float
     status: str
+    exchange_index: int | None = None  # the order's shard; REQUIRED to cancel (2026-09-14 shard fix)
 
 
 @dataclass(frozen=True)
@@ -237,6 +261,13 @@ class LiveExecutor:
         self.wing_batches = 0
         self.exec_price_mismatches: list[dict[str, Any]] = []
         self.alarms: list[dict[str, Any]] = []
+        # cancel/venue-truth bookkeeping (2026-09-14 shard fix) — surfaced on the ledger row.
+        self.cancels_attempted = 0        # CANCEL_REST actions that reached a DELETE
+        self.cancels_confirmed = 0        # cancels resolved terminal (2xx reduced_by or terminal status)
+        self.cancel_404s = 0              # DELETEs that came back 404 (shard-missing / already terminal)
+        self.cancel_failed_count = 0      # orders still resting after the shard-aware retries
+        self.rest_invariant_violations = 0  # pre-PLACE venue check found one of ours already resting
+        self._last_confirmed_gone_oid: str | None = None  # excluded from the pre-PLACE invariant
 
     # ---- RestBook API (shared with FrozenExecutor; the driver is executor-agnostic) ----
     def attribute(self, coid: str | None = None, order_id: str | None = None) -> RestRecord | None:
@@ -290,6 +321,13 @@ class LiveExecutor:
         if exch is None:
             # never send an unrouted order (2026-08-27 market_not_found): treat as a rejection.
             return self._reject_place(coid, ticker, now, {"reason": "no_exchange_index"})
+        # Belt over the braces (2026-09-14 shard fix): NEVER place while the VENUE already shows one of
+        # our orders resting. Internal state can never again disagree with the venue by more than one
+        # order — the misread-cancel incident stacked 21 live rests because internal state said "gone"
+        # while the venue said "resting". This check consults venue truth, not our RestBook.
+        violation = self._pre_place_invariant(coid, now)
+        if violation is not None:
+            return violation
         body = self._rest_body(action, coid, exch)
         self.journal.append("place_rest", {**{k: v for k, v in body.items()
                                               if k != "self_trade_prevention_type"},
@@ -321,7 +359,7 @@ class LiveExecutor:
             client_order_id=coid, order_id=oid,
             price=action.price if action.price is not None else Decimal(0),
             count=int(action.count), ticker=ticker, bucket_Sd=self._bucket_sd(ticker),
-            placed_ts=now, status="live",
+            placed_ts=now, status="live", exchange_index=exch,
         )
         self._by_order_id[oid] = coid
         self._consecutive_rejects = 0
@@ -351,6 +389,7 @@ class LiveExecutor:
                 client_order_id=coid, order_id=None,
                 price=n if n is not None else Decimal(0), count=1, ticker=ticker,
                 bucket_Sd=self._bucket_sd(ticker), placed_ts=now, status="unknown",
+                exchange_index=self._exch(ticker),
             )
             if self.stand_down_reason is None:
                 self.stand_down_reason = "post_unknown_outcome"
@@ -396,46 +435,179 @@ class LiveExecutor:
         body["expiration_time"] = int(exp)  # docs.kalshi.com CreateOrderV2Request (int Unix seconds)
         return body
 
+    # ---- pre-PLACE venue-truth invariant (belt over the braces) ----
+    def _venue_resting_ours(self, exclude_oid: str | None) -> list[dict[str, Any]] | None:
+        """GET the venue's resting orders, filtered to OUR coid prefix (``v32-``). Returns a list of
+        {order_id, client_order_id, exchange_index} (excluding ``exclude_oid``), or None if the venue
+        list is unreadable (the caller then proceeds — the working cancel path is the primary guard;
+        we never self-DoS the strategy on a transient read failure)."""
+        try:
+            body = self.writer.rest_get(OPEN_ORDERS_PATH, {"status": "resting"})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[V32-EXEC] pre-place open-orders GET failed: %s", e)
+            return None
+        orders = (body or {}).get("orders") if isinstance(body, dict) else None
+        if not isinstance(orders, list):
+            return None
+        out: list[dict[str, Any]] = []
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            coid = str(o.get("client_order_id") or "")
+            if not coid.startswith(_V32_COID_PREFIX):
+                continue
+            oid = o.get("order_id")
+            if oid is None or (exclude_oid is not None and oid == exclude_oid):
+                continue
+            exch = o.get("exchange_index")
+            try:
+                exch = int(exch) if exch is not None else self._exch(str(o.get("ticker") or ""))
+            except (TypeError, ValueError):
+                exch = self._exch(str(o.get("ticker") or ""))
+            out.append({"order_id": oid, "client_order_id": coid, "exchange_index": exch})
+        return out
+
+    def _pre_place_invariant(self, coid: str, now: float) -> list[Any] | None:
+        """Before every PLACE_REST, confirm the venue holds NONE of our orders resting (other than the
+        one we just confirmed gone this replace cycle). If any remain, our internal state disagreed with
+        the venue by more than one order — cancel them shard-aware, journal ``rest_invariant_violation``,
+        alarm, and stand down the hour. Returns an event list to short-circuit the place, or None to
+        proceed (invariant held / venue unreadable)."""
+        resting = self._venue_resting_ours(self._last_confirmed_gone_oid)
+        if not resting:  # None (unreadable) or [] (clean) -> proceed to place
+            return None
+        self.rest_invariant_violations += 1
+        self._bump("rest_invariant_violation")
+        self.journal.append("rest_invariant_violation",
+                            {"count": len(resting), "coid_attempted": coid,
+                             "resting": [{"order_id": r["order_id"],
+                                          "client_order_id": r["client_order_id"]} for r in resting]},
+                            self.clock())
+        self._record_alarm("rest_invariant_violation",
+                           {"count": len(resting), "coid_attempted": coid})
+        # cancel the stragglers, shard-aware (the same fix that makes any cancel land).
+        for r in resting:
+            self.cancels_attempted += 1
+            wr = self.writer.rest_delete(cancel_path(r["order_id"], r["exchange_index"]))
+            self._bump("cancel_delete")
+            if wr.status_code == 404:
+                self.cancel_404s += 1
+            if wr.ok:
+                self.cancels_confirmed += 1
+            self.journal.append("rest_invariant_cancel",
+                                {"order_id": r["order_id"], "status": wr.status_code}, self.clock())
+        if self.stand_down_reason is None:
+            self.stand_down_reason = "rest_invariant_violation"
+        # Feed the core a filled-0 confirm so it clears the pending slot; the stand-down (applied this
+        # event, before the queued OrderCancelled is decided) guarantees no replacement rest is placed.
+        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+
     # ---- CANCEL_REST ----
     def _cancel_rest(self, action, now: float) -> list[Any]:
         coid = action.client_order_id
         oid = action.order_id
-        if oid is None and coid is not None:
-            rec = self.rest_book.get(coid)
-            oid = rec.order_id if rec is not None else None
+        rec = self.rest_book.get(coid) if coid is not None else None
+        if oid is None and rec is not None:
+            oid = rec.order_id
         if oid is None:
             # nothing to cancel on the exchange (a still-pending create with no order_id yet). Clear
             # the core's slot with a filled-0 confirm.
             self._bump("cancel_noop")
             return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
-        self.journal.append("cancel_rest", {"order_id": oid, "client_order_id": coid}, self.clock())
-        wr = self.writer.rest_delete(CANCEL_PATH_TMPL.format(order_id=oid))
+        if rec is None:
+            rec = self.attribute(coid=coid, order_id=oid)
+        exch = rec.exchange_index if rec is not None else None
+        if exch is None and rec is not None:
+            exch = self._exch(rec.ticker)
+        self.cancels_attempted += 1
+        self.journal.append("cancel_rest",
+                            {"order_id": oid, "client_order_id": coid, "exchange_index": exch},
+                            self.clock())
+        wr = self.writer.rest_delete(cancel_path(oid, exch))  # shard-aware (2026-09-14 fix)
         self._bump("cancel_delete")
-        rec = self.attribute(coid=coid, order_id=oid)
-        # The DELETE response is AUTHORITATIVE for the race: docs.kalshi.com cancel-order-v2 returns
-        # ``reduced_by`` = "the remaining count at time of cancellation" (contracts pulled off the book),
-        # so filled_before_cancel = placed_count - reduced_by. Cross-check with the order-status GET and
-        # take the MAX so a fill is NEVER under-counted (an under-count would leave a filled bucket-NO
-        # unhedged). A 404 (order already terminal) leaves reduced_by absent -> rely on the status GET.
+        if wr.status_code == 404:
+            self.cancel_404s += 1
+        if wr.ok:
+            return self._resolve_cancel_success(wr, rec, oid, now)
+        # NON-2xx DELETE (incl 404): a 404 is NOT "already gone". Ask the venue for the truth (the
+        # order-status GET works WITHOUT the shard param); resolve from a terminal status, else retry
+        # the DELETE shard-aware, else declare cancel_failed + stand down (never free a place).
+        return self._cancel_nonok(wr, rec, oid, exch, coid, now)
+
+    def _resolve_cancel_success(self, wr, rec, oid: str, now: float) -> list[Any]:
+        """A 2xx DELETE: the response's ``reduced_by`` (remaining pulled off the book) is authoritative
+        for the race, cross-checked with the order-status GET (take the MAX so a fill is never
+        under-counted). The order is off the book synchronously — record it as confirmed-gone."""
         filled_delete: int | None = None
         rb = _dec_or_none(wr.body.get("reduced_by")) if isinstance(wr.body, dict) else None
         if rb is not None and rec is not None:
             filled_delete = max(0, int(rec.count) - int(rb))
         filled_status = self._confirm_cancel_filled(oid, now)
         filled = max(filled_delete or 0, filled_status)
+        self.cancels_confirmed += 1
+        self._last_confirmed_gone_oid = oid
+        return self._finish_cancel(rec, oid, filled, wr.status_code, rb, now)
+
+    def _cancel_nonok(self, wr, rec, oid: str, exch: int | None, coid, now: float) -> list[Any]:
+        """A non-2xx DELETE. GET the order status (no shard param needed): a terminal status resolves
+        it (filled from ``fill_count``); a still-resting status means the cancel did NOT land — retry
+        the DELETE shard-aware up to CANCEL_RETRY_ATTEMPTS times, and if it STILL rests, journal
+        ``cancel_failed`` + stand down (and NEVER place another rest while it rests)."""
+        st = self.order_status(oid)
+        if st.available and st.status in _TERMINAL_STATUSES:
+            self.cancels_confirmed += 1
+            self._last_confirmed_gone_oid = oid
+            return self._finish_cancel(rec, oid, int(st.filled_count), wr.status_code, None, now,
+                                       via="status_terminal")
+        last_status = wr.status_code
+        for _ in range(CANCEL_RETRY_ATTEMPTS):
+            self.cancels_attempted += 1
+            rwr = self.writer.rest_delete(cancel_path(oid, exch))
+            self._bump("cancel_delete")
+            last_status = rwr.status_code
+            if rwr.status_code == 404:
+                self.cancel_404s += 1
+            if rwr.ok:
+                return self._resolve_cancel_success(rwr, rec, oid, now)
+            st = self.order_status(oid)
+            if st.available and st.status in _TERMINAL_STATUSES:
+                self.cancels_confirmed += 1
+                self._last_confirmed_gone_oid = oid
+                return self._finish_cancel(rec, oid, int(st.filled_count), rwr.status_code, None, now,
+                                           via="status_terminal_retry")
+        # STILL resting after the shard-aware retries: the order is live on the venue and we could NOT
+        # pull it. Stand down the hour; the pre-PLACE invariant is the belt that also blocks any place.
+        self.cancel_failed_count += 1
         if rec is not None:
-            rec.status = "filled" if filled > 0 else "cancelled"  # RETAINED for late-fill attr (F-1)
+            rec.status = "cancel_failed"   # still resting on the venue (NOT "cancelled")
+        if self.stand_down_reason is None:
+            self.stand_down_reason = "cancel_failed"
+        self.journal.append("cancel_failed",
+                            {"order_id": oid, "client_order_id": coid, "exchange_index": exch,
+                             "delete_status": last_status, "last_status": st.status}, self.clock())
+        self._record_alarm("cancel_failed", {"order_id": oid, "exchange_index": exch,
+                                             "delete_status": last_status})
+        # Return a filled-0 confirm so the core's slot resolves; stand-down + the pre-PLACE invariant
+        # guarantee no replacement rest is placed while this one rests on the venue.
+        return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0))]
+
+    def _finish_cancel(self, rec, oid: str, filled: int, delete_status, rb, now: float,
+                       *, via: str = "delete") -> list[Any]:
+        """Common cancel resolution: mark the RestRecord (RETAINED for late-fill attr, F-1), book a
+        race fill into money-math if one slipped in (maker fee 0, de-duped by order_id), journal
+        ``cancel_confirmed``, and hand the core an OrderCancelled carrying the filled count."""
+        if rec is not None:
+            rec.status = "filled" if filled > 0 else "cancelled"
             if filled > 0 and rec.order_id is not None and rec.order_id not in self.booked_rest_oids:
-                # book the race fill into money-math (maker fee 0). De-duped by order_id so a later WS
-                # echo of the same fill (driver._record_fill) does NOT double-count the rest leg.
                 self.booked_rest_oids.add(rec.order_id)
                 self.fills.append({"leg": "rest", "side": "no", "ticker": rec.ticker,
                                    "price": rec.price, "exec_price": None, "fee": Decimal(0),
                                    "count": int(filled), "bucket_Sd": rec.bucket_Sd,
                                    "path": "cancel_race", "client_order_id": rec.client_order_id})
         self.journal.append("cancel_confirmed",
-                            {"order_id": oid, "delete_status": wr.status_code, "reduced_by": str(rb),
-                             "filled_before_cancel": filled}, self.clock())
+                            {"order_id": oid, "delete_status": delete_status,
+                             "reduced_by": (str(rb) if rb is not None else None),
+                             "filled_before_cancel": filled, "via": via}, self.clock())
         return [OrderCancelled(order_id=oid, server_ts=now,
                                filled_count_before_cancel=Decimal(filled))]
 
@@ -600,12 +772,21 @@ def cancel_stale_open_orders(writer: ProxyWriter, journal: Any,
                            {"ticker": ticker, "order_id": oid, "client_order_id": coid}, clock())
             continue
         result["found"] += 1
-        wr = writer.rest_delete(CANCEL_PATH_TMPL.format(order_id=oid))
-        if wr.ok or (wr.status_code == 404):
+        # Route the cancel by the order's OWN shard (2026-09-14 fix): a crypto order lives on
+        # exchange_index 2 and a cancel without the shard param 404s while the order stays resting.
+        exch = o.get("exchange_index")
+        try:
+            exch = int(exch) if exch is not None else None
+        except (TypeError, ValueError):
+            exch = None
+        wr = writer.rest_delete(cancel_path(oid, exch))
+        # A 404 is only "gone" if the shard param was present AND the venue still 404s (already
+        # terminal). With no shard we cannot be sure, so a 404 there counts as an error, not cancelled.
+        if wr.ok or (wr.status_code == 404 and exch is not None):
             result["cancelled"] += 1
         else:
             result["errors"] += 1
         journal.append("startup_cancel", {"ticker": ticker, "order_id": oid,
-                                          "status": wr.status_code}, clock())
+                                          "exchange_index": exch, "status": wr.status_code}, clock())
     journal.append("startup_cancel_sweep", result, clock())
     return result
