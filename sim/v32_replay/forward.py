@@ -13,9 +13,10 @@ scratch float sim to the cent.
 
 Estimates, using the journal-side calibration (``calibration.aggregate``):
   * OPTIMISTIC  = uncorrected sim.
-  * BASE        = cap shifted by the MEAN cap error; fills thinned by P(swept); lock reduced by
+  * BASE        = cap shifted by the MEAN cap error; fill rate carried by the maker-rule fill factor
+                  (maker fills / strict fills, measured on the journals); lock reduced by
                   (mean live B residual - the sim's own tape B).
-  * PESSIMISTIC = cap at the P10 cap error; fills thinned by the P10 of P(swept) and a 2-lot minimum
+  * PESSIMISTIC = cap at the P10 cap error; rate carried by the p10 fill factor and a 1-lot minimum
                   print; lock reduced by the P90 B residual and 1 extra tick per wing (2c).
 """
 

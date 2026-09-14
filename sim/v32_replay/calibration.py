@@ -6,9 +6,10 @@ journal window (T-15..T-5) we measure, at each spot-bucket YES trade:
   (a) spot-bucket agreement: the candle proxy (highest yes-mid at the minute boundary) vs the ms choice
       -> agreement rate.
   (b) cap error: cap_ms - cap_candle (cents), mean / p10 / p90, at each trade.
-  (c) fill-rule sweep haircut: over yes prints above the offer (1 - n_shadow, the sim's fill rule), the
-      fraction where the bucket's best YES ask immediately before the print was <= our offer (genuinely
-      swept) -> P(swept | print rule); plus the print-size distribution.
+  (c) spread-aware maker rule vs the sim's strict rule: over spot-bucket yes prints (offer = 1 -
+      n_shadow), the maker-rule regime split (i/ii/iii) and P(fill) under the maker rule vs the strict
+      rule (p > offer), giving the fill factor = maker fills / strict fills; plus the print-size
+      distribution of the strict-qualifying prints.
   (d) wing residual B on live timing: W(trade + 1.5 s) - W(trade), mean / p90.
   (e) requote cadence: replaces/window (ms model) vs the sim's 77.
 

@@ -2,9 +2,10 @@
 
 Definitions (task):
   * OPTIMISTIC  = the ideal no-lag rule (``IdealModel``), completion at the ask (no +1.5 s lag).
-  * BASE        = the lagging model at E=0.10, TOL=0.02, DEB=5000, counting only BOOK-SWEPT fills.
+  * BASE        = the lagging model at E=0.10, TOL=0.02, DEB=5000, counting spread-aware maker-rule
+                  fills (the model only records a fill when the maker rule fires; regime iii excluded).
   * PESSIMISTIC = BASE minus 1 tick per wing at completion (2c off the lock), dropping fills whose
-                  through-print size < 2 lots, plus a replace-budget haircut (drop a window's fill when
+                  through-print size < 1 lot, plus a replace-budget haircut (drop a window's fill when
                   its BASE replaces would exceed the per-window proxy budget).
 
 Each estimate reports fills/day, mean/median/p10/min lock, % positive, c/day (all in CENTS), with n and
@@ -26,7 +27,7 @@ DEFAULT_DAILY_ORDER_BUDGET = 4000
 WINDOWS_PER_DAY = 24
 ASSUMED_FILLS_PER_DAY = 3.6         # PLAN_V32 forward-sim fill rate, used when n < 5
 PESSIMISTIC_WING_HAIRCUT_C = 2.0    # 1 tick per wing at completion
-MIN_THROUGH_PRINT_LOTS = 2
+PESSIMISTIC_MIN_PRINT_LOTS = 1      # drop fills whose through-print size is below this (lots)
 
 
 def _cents(lock: Decimal | None) -> float | None:
@@ -138,7 +139,7 @@ def build_estimates(results: list, daily_budget: int = DEFAULT_DAILY_ORDER_BUDGE
         reps = r.lag_replaces.get(BASE_CELL, 0)
         if f is None or f.lock is None:
             continue
-        if float(f.print_size) < 1:
+        if float(f.print_size) < PESSIMISTIC_MIN_PRINT_LOTS:
             dropped_small += 1
             continue
         if f.since_replace_ms is not None and f.since_replace_ms < 200:
