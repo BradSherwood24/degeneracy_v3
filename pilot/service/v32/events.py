@@ -26,11 +26,20 @@ STRIKE_SERIES_PREFIX = "KXBTCD"
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class BookUpdate:
-    """A top-of-book update for ONE market (a strike KXBTCD-... or a bucket KXBTC-...)."""
+    """A top-of-book update for ONE market (a strike KXBTCD-... or a bucket KXBTC-...).
+
+    ``server_ts`` is the EVALUATION clock (``now``) — the driver folds books onto a MONOTONE clock
+    across the two interleaving WS connections (``run_v32.V32Driver``), so it never runs behind a
+    folded book. ``book_ts`` is the FRAME'S OWN server ts, recorded as this market's book age anchor
+    (``_fold_book``), so a genuinely stalled feed still ages that book out even while the monotone
+    ``server_ts`` keeps advancing off the other connection. ``book_ts is None`` (the default, e.g. a
+    unit test or the golden harness that constructs events directly) falls back to ``server_ts`` for
+    the recorded book ts — the pre-2026-09-14 single-clock behavior."""
 
     market_ticker: str
     top: TopOfBook
     server_ts: float
+    book_ts: float | None = None
 
 
 @dataclass(frozen=True)

@@ -25,6 +25,8 @@ from service.v32.ledger import build_v32_ledger_row, load_v32_rows
 from service.v32.report import build_report
 import service.run_v32 as R
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 CLOSE = "2026-09-13T20:00:00Z"
 CTS = 1789156800  # epoch of CLOSE (not a sealed/holdout date)
 B_SD = "KXBTC-26SEP1316-B68200"
@@ -498,6 +500,183 @@ def test_two_connection_run_and_clock_pump(tmp_path):
     assert "kalshi_ws" in kinds  # raw frames streamed
     # the pump advanced the clock past quote_end -> a cutoff decision was journaled
     assert "stand_down" in kinds or "would_cancel_rest" in kinds
+
+
+def _ws_snap(market, ts, **fp):
+    """A raw orderbook_snapshot payload with a server ts_ms and the _dollars_fp price fields."""
+    d = {"market_ticker": market, "ts_ms": int(ts * 1000)}
+    d.update(fp)
+    return d
+
+
+def _quote_frames_skewed(shared, base, k, *, strike_clock, bucket_clock, mid="0.40"):
+    """Feed one full round of the spot bucket + both strikes as SNAPSHOTS, the bucket stamped on
+    ``bucket_clock`` and the strikes on ``strike_clock`` (the two interleaving connections). Prices are
+    constant across rounds, so the ONLY thing that changes tick-to-tick is the skewed server ts."""
+    # bucket first (its clock), then the two strikes (their clock) — the interleave that flapped live.
+    shared.on_snapshot(B_SD, _ws_snap(B_SD, bucket_clock,
+                                      yes_dollars_fp=[[float(mid), 100]], no_dollars_fp=[[0.55, 100]]))
+    shared.on_snapshot(S_SU, _ws_snap(S_SU, strike_clock, yes_dollars_fp=[[0.80, 100]]))  # no_ask 0.20
+    shared.on_snapshot(S_SD, _ws_snap(S_SD, strike_clock, no_dollars_fp=[[0.70, 100]]))   # yes_ask 0.30
+
+
+def test_recorder_clock_skew_never_cancels_then_stale_still_does(tmp_path):
+    # Recorder-level: two fake connections whose server clocks are skewed ~300 ms and interleaved. With
+    # constant prices, the monotone evaluation clock (driver fix) + the negative-age tolerance (core
+    # fix) mean ZERO would_cancel_rest over N rounds. Then a genuine > bound gap DOES cancel.
+    p = _params()
+    drv, j, jpath = _driver(tmp_path, p, shakedown=True)
+    shared = R.V32Recorder(j, drv, clock=lambda: 0.0)
+    base = CTS - 600  # in the quoting window
+
+    # round 0 establishes the live rest (both clocks aligned); ack is synthesized inside the pump.
+    _quote_frames_skewed(shared, base, 0, strike_clock=base, bucket_clock=base)
+    assert drv.state.rest_live is not None, "expected a live rest after the first aligned round"
+    cancels0 = drv.counts.get("would_cancel_rest", 0)
+
+    # 40 skewed rounds: the bucket clock runs ~300 ms AHEAD of the strike clock, so each strike frame's
+    # own ts is behind the bucket book already folded from the other connection (the live flap shape).
+    for k in range(1, 41):
+        _quote_frames_skewed(
+            shared, base, k, strike_clock=base + k * 0.001, bucket_clock=base + 0.30 + k * 0.001
+        )
+    assert drv.counts.get("would_cancel_rest", 0) == cancels0, "clock skew must not churn the rest"
+    assert not drv.state.stood_down and drv.state.rest_live is not None
+
+    # now a GENUINE stall: no strike frame for 2 s while the bucket ticks -> strikes age past the 1.0 s
+    # strike bound -> W None -> the rest IS cancelled (staleness detection unbroken by the tolerance).
+    stale_ts = base + 0.30 + 2.5
+    shared.on_snapshot(B_SD, _ws_snap(B_SD, stale_ts,
+                                      yes_dollars_fp=[[0.40, 100]], no_dollars_fp=[[0.55, 100]]))
+    j.close()
+    assert drv.counts.get("would_cancel_rest", 0) > cancels0, "a real > bound gap must still cancel"
+
+
+def test_replay_live_window_head_fixture_no_flap(tmp_path):
+    # REAL fixture: the head of the first live-dry window (close 2026-09-14T17:00:00Z), window_meta +
+    # the raw WS frames through the point where the pre-fix core had flapped 61 place/cancel pairs and
+    # tripped the replace-rate alarm. Replayed through the real recorder in dry mode with a fake clock
+    # following each frame's local_ts. Post-fix: <= 3 replaces and the alarm does NOT trip.
+    import gzip
+    fix = os.path.join(_HERE, "fixtures", "v32", "live_window_20260914T170000Z_head.jsonl.gz")
+    if not os.path.exists(fix):
+        pytest.skip("live-window fixture absent")
+    meta = None
+    m15: set = set()
+    frames = []
+    with gzip.open(fix, "rt", encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            k = r["kind"]
+            if k == "window_meta":
+                meta = r["obj"]
+            elif k == "m15_recording":
+                m15 = set(r["obj"]["tickers"])
+            elif k == "kalshi_ws":
+                o = r["obj"]
+                frames.append((r["local_ts"], o.get("type"), o.get("msg", {})))
+    assert meta is not None and frames, "fixture must carry window_meta + frames"
+
+    close_iso = "2026-09-14T17:00:00Z"
+    cts = R.close_epoch(close_iso)
+    bucket_map = {
+        b["ticker"]: (float(b["floor"]), float(b["cap"]))
+        for b in meta["buckets"]
+        if b.get("floor") is not None and b.get("cap") is not None
+    }
+    p = _params()
+    clk = {"t": frames[0][0]}
+    jpath = os.path.join(tmp_path, "replay.jsonl")
+    j = StreamJournal(jpath, flush_every=1_000_000)
+    j.open()
+    state = V32State.new(close_iso, cts, bucket_map, p, shakedown=True)
+    drv = R.V32Driver(p, state, j, R.FrozenExecutor(bucket_map), clock=lambda: clk["t"])
+    shared = R.V32Recorder(j, drv, clock=lambda: clk["t"], m15_tickers=m15)
+    for lts, typ, msg in frames:
+        clk["t"] = lts
+        mt = msg.get("market_ticker")
+        if typ == "orderbook_snapshot":
+            shared.on_snapshot(mt, msg)
+        elif typ == "orderbook_delta":
+            shared.on_delta(mt, msg)
+        elif typ == "trade":
+            shared.on_trade(mt, msg)
+    j.close()
+
+    # pre-fix over this exact excerpt: 61 would_place + 61 would_cancel, then stood_down. Post-fix:
+    assert drv.counts.get("would_place_rest", 0) <= 3, "the clock-flap must be gone"
+    assert drv.counts.get("would_cancel_rest", 0) <= 3
+    assert not drv.state.stood_down, "the replace-rate alarm must NOT trip post-fix"
+    recs = _read(jpath)
+    reasons = [r["obj"].get("reason") for r in recs if r["kind"] == "stand_down"]
+    assert "replace_rate" not in reasons and "stood_down" not in reasons
+    assert drv.state.spot_Sd == 78600  # the real spot bucket, selection unchanged by the fix
+
+
+def test_lag_sampler_captures_real_lag_despite_post_close_null(tmp_path):
+    # Item A regression: the per-connection data-age gauge is nulled by force_close() at window end, so
+    # reading it AT FINALIZE gave None (ledger `strike/bucket_lag_seconds: null`, report "n/a") even with
+    # ~1.35 M frames. The LagSampler samples on the 0.5 s pump tick while the sockets are live, so the
+    # finalized mean is a real number. Here the fakes report distinct constant lags during the run.
+    p = _params()
+    clock = FakeClock(CTS - 610.0)
+    jpath = os.path.join(tmp_path, "w.jsonl")
+    j = StreamJournal(jpath, flush_every=1)
+    j.open()
+    state = V32State.new(CLOSE, CTS, BUCKET_MAP, p, shakedown=True)
+    drv = R.V32Driver(p, state, j, R.FrozenExecutor(BUCKET_MAP), clock=clock)
+    shared = R.V32Recorder(j, drv, clock=clock)
+    ts = CTS - 605
+    strike_ws = FakeWsClient(shared, [
+        ("kalshi_ws", {"type": "orderbook_snapshot",
+                       "msg": {"market_ticker": S_SD, "ts_ms": int(ts * 1000),
+                               "no_dollars_fp": [[0.70, 100]]}}),
+    ], lag=0.30)
+    bucket_ws = FakeWsClient(shared, [
+        ("kalshi_ws", {"type": "orderbook_snapshot",
+                       "msg": {"market_ticker": B_SD, "ts_ms": int(ts * 1000),
+                               "yes_dollars_fp": [[0.40, 100]], "no_dollars_fp": [[0.55, 100]]}}),
+    ], lag=0.50)
+    strike_conn = R._ConnRecorder(shared, strike_ws, "strikes", [S_SD, S_SU])
+    bucket_conn = R._ConnRecorder(shared, bucket_ws, "buckets", [B_SD, B_SU])
+    sampler = R.LagSampler({"strikes": strike_ws, "buckets": bucket_ws})
+    deadline = CTS + 10
+    gate = R.connect_gate_epoch(CTS, p)
+
+    async def fast_sleep(_):
+        clock.t += 5.0
+
+    asyncio.run(R.run_v32_window(shared, strike_conn, bucket_conn, drv, clock, deadline, gate,
+                                 sleep=fast_sleep, pump_interval=0.5, lag_sampler=sampler))
+    j.close()
+    # sampled during the window -> real numbers per connection
+    ss = sampler.summary("strikes")
+    bs = sampler.summary("buckets")
+    assert ss is not None and bs is not None and ss["n"] > 0 and bs["n"] > 0
+    assert sampler.mean("strikes") == 0.30 and sampler.mean("buckets") == 0.50
+    assert ss["p99"] == 0.30 and ss["last"] == 0.30
+    # the old post-close read WOULD be None (fix motivation) but the sampler still has the value
+    strike_ws._lag = None
+    assert strike_ws.current_lag_seconds() is None
+    assert sampler.mean("strikes") == 0.30
+
+    # and _finalize now carries the sampled mean into the ledger row + summary (not None)
+    from service.run_v32 import StrikeDiscovery
+    sd = StrikeDiscovery(CLOSE, (S_SD, S_SU), {S_SD: 68200, S_SU: 68300}, {S_SD: 2, S_SU: 2}, 1)
+    j2 = StreamJournal(jpath, flush_every=1)  # reopen a fresh journal handle for finalize
+    j2.open()
+    summary = R._finalize(
+        journal=j2, shared=shared, driver=drv, close_iso=CLOSE, resolved_mode="dry",
+        effective_mode="dry", degrade=None, params=p, strike_disc=sd, bucket_map=BUCKET_MAP,
+        bucket_generations=1, journal_path=jpath, summary_path=os.path.join(tmp_path, "s.jsonl"),
+        ledger_path=os.path.join(tmp_path, "l.jsonl"),
+        strike_lag=sampler.mean("strikes"), bucket_lag=sampler.mean("buckets"),
+        lag_stats=sampler.summaries(), clock=clock,
+    )
+    assert summary["strike_lag_seconds"] == 0.30 and summary["bucket_lag_seconds"] == 0.50
+    assert summary["lag_stats"]["buckets"]["mean"] == 0.50
+    rows = load_v32_rows(os.path.join(tmp_path, "l.jsonl"))
+    assert rows[0]["strike_lag_seconds"] == 0.30 and rows[0]["bucket_lag_seconds"] == 0.50
 
 
 def test_finalize_writes_ledger_summary_and_gzip(tmp_path):

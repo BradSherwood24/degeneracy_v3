@@ -434,6 +434,64 @@ def test_stale_wing_cancels_rest():
 
 
 # ===========================================================================
+# Clock-interleave tolerance (2026-09-14 clock-flap fix): a book stamped slightly AHEAD of the
+# evaluation clock (the two WS connections' skewed clocks) is FRESH, not stale -> no spurious cancel.
+# ===========================================================================
+def test_interleave_negative_age_within_bound_keeps_wing_priced():
+    # Bring up a live rest, then feed the OTHER strike with a ts 250 ms NEWER, and re-tick the first
+    # strike at an OLDER ts -> the evaluation clock (that older tick's ts) is BEHIND the newer strike's
+    # stored ts, so its age is -0.25 s. Pre-fix (0.0 <= age) that read "stale" -> W None -> CANCEL +
+    # stand down (the ~1 ms flap). Post-fix (-bound <= age <= bound) it is fresh: W stays priced, the
+    # live rest is untouched, and NOTHING is cancelled.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_live_rest(p, st, now)
+    assert st.W == Decimal("1.4290") and st.rest_live is not None
+    # Su (79700) stamped 300 ms in the future (the faster connection); prices unchanged.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.30))
+    # Sd (79600) re-ticks at now+0.05 -> eval clock now+0.05 < Su's stored now+0.30 -> age(Su) = -0.25 s.
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 0.05))
+    assert not [a for a in acts if a.kind == ActionKind.CANCEL_REST], "no cancel on a within-bound skew"
+    assert not [a for a in acts if a.kind == ActionKind.STAND_DOWN]
+    assert st.W == Decimal("1.4290"), "wing stays priced through the clock interleave"
+    assert st.rest_live is not None and st.rest_live.price == Decimal("0.45")
+
+
+def test_interleave_flap_over_many_regressing_ticks_never_cancels():
+    # Fifty strike ticks whose ts alternate between the two connections' clocks (a ~40 ms skew each
+    # way), prices constant -> pre-fix this is the exact 61-place/61-cancel flap; post-fix ZERO cancels.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_live_rest(p, st, now)
+    cancels = 0
+    for i in range(50):
+        # even i: Su newer (+0.30); odd i: Sd re-ticks 40 ms behind -> negative age on Su.
+        if i % 2 == 0:
+            st, acts = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.30 + i * 0.001))
+        else:
+            st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 0.26 + i * 0.001))
+        cancels += len([a for a in acts if a.kind == ActionKind.CANCEL_REST])
+    assert cancels == 0, f"clock interleave must not churn the rest (got {cancels} cancels)"
+    assert st.rest_live is not None
+
+
+def test_genuinely_stale_wing_beyond_bound_still_cancels_after_fix():
+    # The tolerance is exactly one ``bound`` (1.0 s for strikes): a book more than a full bound STALE
+    # (positive age > bound) is still stale and still cancels — genuine staleness detection unchanged.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_live_rest(p, st, now)
+    # a bucket tick 1.5 s later leaves both strike books 1.5 s old (> 1.0 s strike bound) -> W stale.
+    st, acts = _feed(p, st, BookUpdate(B_SD, _top("0.35", "0.36"), now + 1.5))
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    sd = [a for a in acts if a.kind == ActionKind.STAND_DOWN]
+    assert sd and sd[0].reason == "stale_or_missing_wing"
+
+
+# ===========================================================================
 # Spot-bucket freshness gate (R-STALE-SPOT: gate the SELECTED spot, never fall through)
 # ===========================================================================
 def test_stale_spot_bucket_cancels_with_stale_bucket_reason():
@@ -814,6 +872,32 @@ def test_shadow_fill_and_completion():
     assert sub.fill.lock == Decimal("0.1036")
     # E=0.12 shadow (n=0.43, offer 0.57) does NOT fill on a 0.56 print (0.56 !> 0.57).
     assert not st.shadows["0.12"].filled
+
+
+def test_shadow_still_books_when_stood_down():
+    # ITEM B (2026-09-14): the shadow is the IDEAL-rule statistic and must keep running for the whole
+    # quoting window regardless of the live stand-down / replace-rate alarm / rest state — it depends
+    # ONLY on a fresh spot bucket + fresh wings + the bucket trade tape. This asserts the alarm's
+    # ``stood_down`` latch does NOT gate the shadow: n is still re-solved on a book tick and a
+    # qualifying spot-bucket YES print still books a shadow fill, while the LIVE path emits nothing.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _feed_all(p, st, _fresh_books(now))
+    # simulate the replace-rate alarm having latched the hour down.
+    st = replace(st, stood_down=True)
+    # a book tick under stood_down must still re-solve every shadow n (W valid -> n priced).
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 0.001))
+    assert st.stood_down
+    assert st.shadows["0.10"].n == Decimal("0.45"), "shadow n must be re-solved under stand-down"
+    # the LIVE path is suppressed (stood_down -> no place/quote)
+    assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.WOULD_PLACE_REST)]
+    # a qualifying spot-bucket YES print still books the shadow fill despite the stand-down.
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.56"), "yes", Decimal(80), now + 0.01))
+    sub = st.shadows["0.10"]
+    assert sub.filled and sub.fill is not None
+    assert sub.fill.n == Decimal("0.45") and sub.fill.print_price == Decimal("0.56")
+    assert sub.fill.lock == Decimal("0.1036")
 
 
 def test_shadow_fills_once_per_hour():
