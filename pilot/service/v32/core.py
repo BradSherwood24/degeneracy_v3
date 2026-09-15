@@ -881,13 +881,34 @@ def _shadow_on_trade(
     # the live-path gate in _select_spot / _recompute_context.
     if not _fresh(event.server_ts, st.bucket_ts.get(st.spot_Sd), params.bucket_freshness_max_age_s):
         return st, []
+    # WINDOW GATE (2026-09-15 shadow-window fix): the shadow (the ideal no-lag rule) may only take a
+    # print while the LIVE path would have been quoting — inside the same T-15..T-5 window the live
+    # path enforces in ``_requote`` (``params.quote_start_s >= t_to_close >= params.quote_end_s``).
+    # Bucket books connect ~T-20 and the live path cancels its rest at T-5 by design, so a print
+    # outside [quote_end_s, quote_start_s] is one the live path could NEVER have taken. Evaluate
+    # against the TRADE's own clock (``event.server_ts`` — the same ``now`` the live requote uses).
+    # Outside the window a qualifying print does NOT fill the shadow (the sub is left unfilled so a
+    # later in-window print can still fill it) and instead emits an observability-only action so the
+    # driver journals + counts the suppressed would-be fill.
+    t_to_close = st.close_epoch - event.server_ts
+    in_window = params.quote_start_s >= t_to_close >= params.quote_end_s
     shadows = dict(st.shadows)
+    actions: list[V32Action] = []
     changed = False
     for key, sub in shadows.items():
         if sub.filled or sub.n is None:
             continue
         offer = _ONE - sub.n
         if event.yes_price > offer:
+            if not in_window:
+                actions.append(
+                    V32Action(
+                        kind=ActionKind.SHADOW_FILL_OUTSIDE_WINDOW,
+                        shadow_E=sub.E, offer=offer, print_price=event.yes_price,
+                        count=int(event.count), t_to_close=Decimal(str(round(t_to_close, 3))),
+                    )
+                )
+                continue
             shadows[key] = replace(
                 sub, filled=True, awaiting_completion=True,
                 fill=ShadowFill(
@@ -898,7 +919,7 @@ def _shadow_on_trade(
             changed = True
     if changed:
         st = replace(st, shadows=shadows)
-    return st, []
+    return st, actions
 
 
 # ---------------------------------------------------------------------------

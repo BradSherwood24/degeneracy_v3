@@ -196,6 +196,9 @@ def build_v32_ledger_row(
         "sets_done": getattr(state, "sets_done", 0) if state is not None else 0,
         "stand_downs": stand_downs,
         "late_fills": int(driver_counts.get("late_fill", 0)),
+        # would-be shadow fills SUPPRESSED by the quoting-window gate (print outside T-15..T-5, which
+        # the live path could never have taken). Additive: ``.get``/default 0 so older rows still parse.
+        "shadow_fills_outside_window": int(driver_counts.get("shadow_fill_outside_window", 0)),
         # shadow (the ideal fill rule running live) — per E, with locks
         "shadow": _shadow_summary(state),
         # alarms

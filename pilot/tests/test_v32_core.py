@@ -936,3 +936,84 @@ def test_shadow_does_not_fill_on_stale_bucket():
     st2, _ = _feed_all(p, st2, _fresh_books(now))
     st2, _ = _feed(p, st2, Trade(B_SD, Decimal("0.60"), "yes", Decimal(5), now + 0.5))
     assert st2.shadows["0.10"].filled
+
+# ---------------------------------------------------------------------------
+# Shadow window gate (2026-09-15): the shadow may only take a print while the live path would have
+# been quoting (T-15..T-5). A print outside [quote_end_s, quote_start_s] is one the live path could
+# NEVER have taken (books connect ~T-20; live cancels its rest at T-5), so it must NOT fill the
+# shadow — it emits an observability-only SHADOW_FILL_OUTSIDE_WINDOW action and leaves the sub open.
+# ---------------------------------------------------------------------------
+def _outside_window_actions(acts):
+    return [a for a in acts if a.kind == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW]
+
+
+def test_shadow_print_after_t5_is_suppressed_not_filled():
+    # (a) a qualifying spot-bucket YES print at t_to_close = ~249 s (AFTER T-5, past quote end) does
+    # NOT fill the shadow and emits the suppressed record.
+    p = _params()
+    st = _state(p)
+    now = T - 249  # t_to_close 249 < quote_end_s (300): after T-5
+    st, _ = _feed_all(p, st, _fresh_books(now))
+    assert st.shadows["0.10"].n == Decimal("0.45")  # n still solved (recompute is NOT window-gated)
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.56"), "yes", Decimal(80), now + 0.01))
+    assert not st.shadows["0.10"].filled, "a print after T-5 must not fill the shadow"
+    assert st.shadows["0.10"].fill is None
+    outside = _outside_window_actions(acts)
+    assert outside, "expected a SHADOW_FILL_OUTSIDE_WINDOW record for the suppressed fill"
+    a10 = [a for a in outside if a.shadow_E == Decimal("0.10")]
+    assert a10, "expected a suppressed record for E=0.10"
+    a = a10[0]
+    assert a.offer == Decimal("0.55") and a.print_price == Decimal("0.56")
+    assert a.t_to_close < Decimal("300"), "suppressed print is past the quote end"
+
+
+def test_shadow_print_in_window_fills_and_emits_no_suppressed_record():
+    # (b) the SAME print at t_to_close = 600 s (inside T-15..T-5) DOES fill and emits no suppressed
+    # record — isolates the window gate as the sole cause of (a).
+    p = _params()
+    st = _state(p)
+    now = T - 600  # in window
+    st, _ = _feed_all(p, st, _fresh_books(now))
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.56"), "yes", Decimal(80), now + 0.01))
+    assert st.shadows["0.10"].filled and st.shadows["0.10"].fill is not None
+    assert st.shadows["0.10"].fill.print_price == Decimal("0.56")
+    assert not _outside_window_actions(acts), "an in-window fill emits no suppressed record"
+
+
+def test_shadow_print_before_t15_is_suppressed_not_filled():
+    # (c) a qualifying print at t_to_close = ~1000 s (BEFORE T-15, before the window opens) does NOT
+    # fill the shadow and emits the suppressed record.
+    p = _params()
+    st = _state(p)
+    now = T - 1000  # t_to_close 1000 > quote_start_s (900): before T-15
+    st, _ = _feed_all(p, st, _fresh_books(now))
+    assert st.shadows["0.10"].n == Decimal("0.45")
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.56"), "yes", Decimal(80), now + 0.01))
+    assert not st.shadows["0.10"].filled and st.shadows["0.10"].fill is None
+    outside = _outside_window_actions(acts)
+    a10 = [a for a in outside if a.shadow_E == Decimal("0.10")]
+    assert a10, "expected a suppressed record for E=0.10 before T-15"
+    assert a10[0].t_to_close > Decimal("900"), "suppressed print is before the window opens"
+
+
+def test_shadow_completion_after_t5_for_in_window_fill_still_completes():
+    # (d) a shadow fill recorded INSIDE the window whose completion tick lands AFTER T-5 still
+    # completes (the window gate touches the FILL, never the completion). The fill defers completion
+    # because the wing strikes are stale at the fill instant (age > freshness_max_age_s = 1 s); a
+    # fresh strike book after T-5 (t_to_close 295) completes the lock.
+    p = _params()
+    st = _state(p)
+    now0 = T - 400  # in window; solves n, stamps strikes+bucket
+    st, _ = _feed_all(p, st, _fresh_books(now0))
+    # trade 1.5 s later: in window (t_to_close ~398.5, not suppressed), bucket still fresh (age<30) so
+    # the fill records, but the wing strikes are stale (age 1.5 > 1) so completion cannot happen yet.
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.56"), "yes", Decimal(80), now0 + 1.5))
+    assert not _outside_window_actions(acts), "an in-window fill emits no suppressed record"
+    sub = st.shadows["0.10"]
+    assert sub.filled and sub.fill is not None
+    assert sub.awaiting_completion and sub.fill.lock is None, "completion must defer (stale wings)"
+    # fresh strike books after T-5 complete the lock (t_to_close 295 < quote_end_s 300).
+    st, _ = _feed_all(p, st, _fresh_books(T - 295))
+    sub = st.shadows["0.10"]
+    assert not sub.awaiting_completion and sub.fill.lock == Decimal("0.1036"), \
+        "an in-window shadow fill still completes after T-5"
