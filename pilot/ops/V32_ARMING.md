@@ -153,18 +153,29 @@ The falsifier's "FIRST ARMED WINDOW MUST CONFIRM" list, and where each item appe
 6. **exec price == resting price.** `wing_fill` / rest-fill records show the executed price equal to the
    resting/decided price within the wing margin; the `exec_price_mismatch` alarm (A_EXEC_PRICE) stays
    quiet in the ledger row's `exec_price_mismatches` (empty).
+7. **amend-first replace lands (Brad 2026-09-15).** The FIRST `amend_confirmed` record carries a 2xx with
+   the SAME `order_id` as the pre-amend rest persisted and `remaining_count` 1 (an amend that did NOT
+   cross); the ledger row's `amends_confirmed` climbs with `replaces` and `amends_failed` stays low. The
+   cancel+create FALLBACK path is exercised at least once in the tests (`test_v32_amend.py`
+   `test_amend_failure_falls_back_to_cancel_create`) so an amend outage degrades to the proven sequential
+   cancel -> confirm -> create, never to a naked or doubled rest. If `amends_failed` spikes or an
+   `amend_confirmed` shows a CHANGED `order_id`, the amend semantics are wrong at the venue -- STOP.
 
-Also watch: no `A_REPLACE` (replaces/min under 60), no `A_STALE` bursts (strike/bucket data-age under
-1.0 s), and the ledger row's `realized_lock` positive and near the shadow E=0.10 lock.
+Also watch: no `A_REPLACE` (replaces/min under 60 -- an amend counts as a replace), no `A_STALE` bursts
+(strike/bucket data-age under 1.0 s), and the ledger row's `realized_lock` positive and near the shadow
+E=0.10 lock.
 
 ---
 
 ## E. Budget math (creates/day vs DAILY_ORDER_BUDGET)
 
-- Every requote is one DELETE (cancel; uncapped, unbudgeted) + one POST (create; budgeted). At the
-  chosen gate (tol 2c, deb 5000 ms) the sim measures ~77 replaces/hour over the 10-minute quoting
-  window, plus the completion batch. Across ~24 armed hours that is ~1,860 creates/day; a completion is
-  2 more per set.
+- With amend-first (Brad 2026-09-15) a requote is normally ONE POST (the amend; budgeted like a create)
+  with NO cancel — cheaper on the wire than the old cancel(DELETE)+create(POST) pair. Only the FALLBACK
+  (an amend that fails) spends a DELETE (cancel; uncapped, unbudgeted) + a POST (create; budgeted). At the
+  chosen gate (tol 2c, deb 5000 ms) the sim measures ~77 replaces/hour over the 10-minute quoting window,
+  plus the completion batch. Across ~24 armed hours that is ~1,860 amend/create POSTs/day; a completion is
+  2 more per set. NOTE the proxy does not yet contract-cap or ticker-check the amend endpoint (see
+  `pilot/ops/proxy_amend_cap.md`) — apply that proxy change before arming leans on amends at volume.
 - `DAILY_ORDER_BUDGET` must be >= 4000 (2x margin) before arming. Each armed window's S5 refuses to arm
   unless `orders_remaining_today` >= 200 (`V32_MIN_ORDER_BUDGET_AT_ARM`) at :40 -- i.e. one hour needs
   headroom of at least 200 creates. If a day's requoting runs the budget down toward 200, later windows

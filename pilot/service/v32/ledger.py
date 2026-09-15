@@ -124,6 +124,12 @@ def build_v32_ledger_row(
     cancels_via_status: int = 0,
     cancels_expired: int = 0,
     rest_invariant_violations: int = 0,
+    # amend-first replace counters (Brad 2026-09-15) — additive, default 0 so older rows still parse.
+    amends_attempted: int = 0,
+    amends_confirmed: int = 0,
+    amends_failed: int = 0,
+    amend_fallbacks: int = 0,
+    fills_on_amend: int = 0,
     degrade_reason: str | None = None,
     # Last-quoted spot bucket + stand-down bookkeeping, captured WHILE quoting by the driver (see
     # ``run_v32.V32Driver._capture_quote``). These win over the post-quote-end ``state`` so the row
@@ -230,6 +236,12 @@ def build_v32_ledger_row(
         "cancels_via_status": int(cancels_via_status),
         "cancels_expired": int(cancels_expired),
         "rest_invariant_violations": int(rest_invariant_violations),
+        # amend-first replace counters (Brad 2026-09-15) — surfaced next to `replaces` by the report.
+        "amends_attempted": int(amends_attempted),
+        "amends_confirmed": int(amends_confirmed),
+        "amends_failed": int(amends_failed),
+        "amend_fallbacks": int(amend_fallbacks),
+        "fills_on_amend": int(fills_on_amend),
         # settlement backfill slots (the sweep appends its own backfill row)
         "realized_unsettled": bool(realized_unsettled),
         "unsettled_legs": (held_legs or []) if realized_unsettled else [],

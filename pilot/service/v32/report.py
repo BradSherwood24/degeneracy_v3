@@ -72,6 +72,12 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     tot_replaces = 0
     tot_stand_downs = 0
     tot_late_fills = 0
+    # amend-first replace totals (Brad 2026-09-15) — additive; older rows lack the keys -> .get default 0.
+    tot_amends = 0
+    tot_amends_confirmed = 0
+    tot_amends_failed = 0
+    tot_amend_fallbacks = 0
+    tot_fills_on_amend = 0
     shadow_fills: dict[str, int] = {k: 0 for k in e_keys}
     shadow_locks: dict[str, list[Decimal]] = {k: [] for k in e_keys}
     lags: list[Decimal] = []
@@ -91,6 +97,11 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         tot_would_places += int(r.get("would_places", 0) or 0)
         tot_replaces += int(r.get("replaces", 0) or 0)
         tot_late_fills += int(r.get("late_fills", 0) or 0)
+        tot_amends += int(r.get("amends_attempted", 0) or 0)
+        tot_amends_confirmed += int(r.get("amends_confirmed", 0) or 0)
+        tot_amends_failed += int(r.get("amends_failed", 0) or 0)
+        tot_amend_fallbacks += int(r.get("amend_fallbacks", 0) or 0)
+        tot_fills_on_amend += int(r.get("fills_on_amend", 0) or 0)
         if r.get("stand_down"):
             tot_stand_downs += 1
         windows.append(
@@ -122,6 +133,11 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "windows": len(rows),
             "would_places": tot_would_places,
             "replaces": tot_replaces,
+            "amends": tot_amends,
+            "amends_confirmed": tot_amends_confirmed,
+            "amends_failed": tot_amends_failed,
+            "amend_fallbacks": tot_amend_fallbacks,
+            "fills_on_amend": tot_fills_on_amend,
             "stand_downs": tot_stand_downs,
             "late_fills": tot_late_fills,
             "shadow_fills": shadow_fills,
@@ -366,6 +382,13 @@ def _render(report: dict[str, Any]) -> str:
     lines.append(
         f"windows={t['windows']}  would_places={t['would_places']}  replaces={t['replaces']}  "
         f"stand_downs={t['stand_downs']}  late_fills={t['late_fills']}"
+    )
+    # amend-first replace totals (Brad 2026-09-15): amends attempted/confirmed/failed, cancel+create
+    # fallbacks, and fills booked by an amend that crossed. Shown next to replaces.
+    lines.append(
+        f"  amends={t.get('amends', 0)}  confirmed={t.get('amends_confirmed', 0)}  "
+        f"failed={t.get('amends_failed', 0)}  fallbacks(cancel+create)={t.get('amend_fallbacks', 0)}  "
+        f"fills_on_amend={t.get('fills_on_amend', 0)}"
     )
     for k in e_keys:
         ml = t["shadow_mean_lock"].get(k)

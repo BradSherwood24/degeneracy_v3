@@ -86,6 +86,25 @@ class OrderCancelled:
 
 
 @dataclass(frozen=True)
+class OrderAmended:
+    """The exchange confirmed an AMEND of one of our resting orders (Kalshi Amend Order V2, the
+    amend-first replace mechanic, Brad 2026-09-15). The ``order_id`` PERSISTS across the amend; a price
+    change forfeits queue position exactly as cancel+create did. ``client_order_id`` is the UPDATED
+    coid, ``price`` the new resting n (NO-space dollars). ``fill_count`` > 0 means the amend CROSSED and
+    filled that many contracts at ``average_fill_price`` (a TAKER fill in NO-space; the core routes it
+    into the wings like a fill-before-cancel). With count 1 a fill leaves ``remaining_count`` 0, so no
+    remainder rests."""
+
+    order_id: str
+    client_order_id: str
+    price: Decimal | None
+    server_ts: float
+    remaining_count: Decimal = Decimal(0)
+    fill_count: Decimal = Decimal(0)
+    average_fill_price: Decimal | None = None
+
+
+@dataclass(frozen=True)
 class ClockTick:
     """A time-only event (no book change): server-derived ``server_ts`` (epoch seconds). Drives the
     window cutoffs (cancel the rest at T-quote_end_s) when no book frame is arriving."""

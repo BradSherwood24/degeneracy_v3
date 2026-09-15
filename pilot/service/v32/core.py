@@ -24,7 +24,9 @@ T-``quote_start_s`` .. T-``quote_end_s`` (T-15..T-5):
   * Rest one bucket-NO bid (post-only; maker fee 0) at the largest whole-cent n with
         n + fee(n) <= 2 - E - W,   capped at no_ask(B) - 0.01 = (1 - yes_bid(B)) - 0.01  (never cross).
     Re-solve n on every strike/bucket book tick; REPLACE per the requote gate (tol / deb_ms).
-    Replace = cancel -> confirm -> create; never two live rests (R-OVERLAP ruling 2026-09-13).
+    Replace = AMEND-FIRST (Kalshi Amend Order V2: same order_id, a price change forfeits queue
+    position exactly as cancel+create did), with cancel -> confirm -> create as the executor's fallback
+    on any amend failure; never two live rests (R-OVERLAP ruling 2026-09-13; amend-first Brad 2026-09-15).
   * Fill of the rest (Fill event, or OrderCancelled with filled_count_before_cancel > 0): immediately
     TAKE both wings (buy YES@Sd, buy NO@Su, taker, limit = ask + wing_margin) for the filled count,
     UNCONDITIONALLY (ruling F-2 — the fill happened, so we bound the position to the $2 pin). A
@@ -71,6 +73,7 @@ from service.v32.events import (
     ClockTick,
     Fill,
     OrderAck,
+    OrderAmended,
     OrderCancelled,
     Trade,
     classify_ticker,
@@ -228,6 +231,7 @@ class V32State:
     rest_live: RestOrder | None = None
     rest_pending: RestOrder | None = None
     cancel_in_flight: bool = False
+    amend_in_flight: bool = False                       # amend-first replace: AMEND emitted, awaiting OrderAmended (or fallback OrderCancelled)
     awaiting_replace: bool = False                      # bucket change: cancelled old, place after cxl
     rest_bucket_Sd: int | None = None
     last_replace_ts: float | None = None
@@ -401,6 +405,11 @@ def decide_v32(
         st = _apply_ack(st, event)
         return st, actions
 
+    if isinstance(event, OrderAmended):
+        st, aa = _apply_amended(params, st, event, now)
+        actions += aa
+        return st, actions
+
     if isinstance(event, OrderCancelled):
         st, ca = _apply_cancelled(params, st, event, now)
         actions += ca
@@ -522,9 +531,11 @@ def _apply_cancelled(
         matched = True
     # A cancel confirm clears the in-flight flag whether or not the slot is still populated (on a
     # bucket change we clear rest_live at cancel-request time, so this OrderCancelled won't match a
-    # slot but still confirms the outstanding cancel).
-    if matched or st.cancel_in_flight:
-        st = replace(st, cancel_in_flight=False)
+    # slot but still confirms the outstanding cancel). It ALSO clears ``amend_in_flight``: the
+    # amend-first fallback runs a cancel -> confirm -> create, so the fallback's OrderCancelled is what
+    # releases the held requotes and lets the next tick place the fresh (create) rest.
+    if matched or st.cancel_in_flight or st.amend_in_flight:
+        st = replace(st, cancel_in_flight=False, amend_in_flight=False)
     if event.filled_count_before_cancel > _ZERO and st.rest_fill is None:
         # a fill slipped in before the cancel landed -> book it at the CANCELLED order's price
         # and take wings. (When the slot was eagerly cleared before the cancel confirm — a bucket
@@ -579,8 +590,59 @@ def _apply_fill(
             rest_live=None,
             rest_pending=None,
             cancel_in_flight=False,
+            amend_in_flight=False,
             wings_needed=True,
             wing_taken=False,
+        )
+        st, wa = _wing_step(params, st, now)
+        actions += wa
+    return st, actions
+
+
+def _apply_amended(
+    params: V32Params, st: V32State, event: OrderAmended, now: float
+) -> tuple[V32State, list[V32Action]]:
+    """An amend confirm (amend-first replace, Brad 2026-09-15). The order_id PERSISTS; we update the
+    live rest's price + coid IN PLACE (no rest_pending, no cancel_in_flight) and clear amend_in_flight.
+    A price change forfeited queue position on the venue, but there is exactly ONE order. If the amend
+    CROSSED (``fill_count`` > 0) we book the rest fill at the venue's average_fill_price and TAKE the
+    wings, exactly like a fill-before-cancel (with count 1 the order is fully filled, nothing remains).
+    The replace is counted HERE (replace_count / replace_times / last_replace_ts) — mirroring the
+    cancel+create path, which counts at the create, not the request — so a fallback (no OrderAmended,
+    a create instead) counts exactly once too."""
+    actions: list[V32Action] = []
+    live = st.rest_live
+    matched = live is not None and (
+        (event.order_id is not None and live.order_id == event.order_id)
+        or live.client_order_id == event.client_order_id
+        or (event.client_order_id is not None
+            and live.client_order_id == event.client_order_id)
+    )
+    if not matched:
+        # an amend confirm for an order the core no longer tracks -> just release the in-flight hold.
+        return replace(st, amend_in_flight=False), actions
+    # Count the confirmed replace (an amend IS a replace: replace_count, the A_REPLACE alarm's
+    # replace_times, and the ledger `replaces` counter). Same convention as _emit_place.
+    times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
+    updated = replace(
+        live,
+        price=event.price if event.price is not None else live.price,
+        client_order_id=event.client_order_id or live.client_order_id,
+    )
+    st = replace(
+        st, rest_live=updated, amend_in_flight=False,
+        last_replace_ts=now, replace_count=st.replace_count + 1, replace_times=times,
+    )
+    # A fill during the amend (the amend crossed) -> book the rest fill at the venue's average fill
+    # price (NO-space; a TAKER fill, its fee booked by the executor) and take the wings. Idempotent
+    # via the rest_fill-is-None guard.
+    if event.fill_count and event.fill_count > _ZERO and st.rest_fill is None:
+        n = event.average_fill_price if event.average_fill_price is not None else updated.price
+        st = replace(
+            st,
+            rest_fill=RestFill(price=n, count=int(event.fill_count), server_ts=now),
+            rest_live=None, rest_pending=None, cancel_in_flight=False, amend_in_flight=False,
+            wings_needed=True, wing_taken=False,
         )
         st, wa = _wing_step(params, st, now)
         actions += wa
@@ -746,6 +808,33 @@ def _emit_place(st: V32State, params: V32Params, now: float) -> tuple[V32State, 
     return st, [_place_action(st, params, coid, n)]
 
 
+def _amend_action(
+    st: V32State, params: V32Params, old_coid: str, new_coid: str, order_id: str | None, n: Decimal
+) -> V32Action:
+    exp = st.close_epoch - params.quote_end_s
+    return _mk(
+        ActionKind.AMEND_REST, st.shakedown,
+        order_id=order_id, ticker=st.bucket_tickers.get(st.spot_Sd, ""), side=BUY_NO, action="buy",
+        count=params.contracts, price=n, expiration_epoch=exp,
+        client_order_id=old_coid, updated_client_order_id=new_coid,
+    )
+
+
+def _emit_amend(st: V32State, params: V32Params, now: float) -> tuple[V32State, list[V32Action]]:
+    """Emit an AMEND_REST for the current desired n on the live rest (amend-first replace, same bucket).
+
+    Mints a NEW coid (a price change forfeits queue position, so the venue treats it as a fresh order
+    under the persisting order_id) and sets ``amend_in_flight`` so no second replace/place fires until
+    OrderAmended (success) or the executor's fallback OrderCancelled clears it. The rest_live slot is
+    RETAINED (never eagerly cleared) so a fill during the amend books at the RESTING price. The replace
+    is counted on CONFIRM (``_apply_amended``), not here, so a fallback (cancel+create) counts once."""
+    live = st.rest_live
+    assert live is not None and st.desired_n is not None
+    new_coid, st = _mint_coid(st)
+    st = replace(st, amend_in_flight=True)
+    return st, [_amend_action(st, params, live.client_order_id, new_coid, live.order_id, st.desired_n)]
+
+
 def _standdown(st: V32State, reason: str) -> tuple[V32State, list[V32Action]]:
     """Emit STAND_DOWN(reason) once per reason-change (dedupe like signal.py)."""
     if reason == st.last_standdown_reason:
@@ -822,7 +911,8 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
     # bucket change: cancel ANY live and/or pending order on the old bucket, then place on the new
     # bucket after OrderCancelled (safe reading of the spec). rest_bucket_Sd -> None so we don't
     # re-enter this branch; awaiting_replace holds the place until the cancel(s) confirm.
-    if st.rest_bucket_Sd is not None and st.rest_bucket_Sd != st.spot_Sd:
+    if (st.rest_bucket_Sd is not None and st.rest_bucket_Sd != st.spot_Sd
+            and not st.amend_in_flight):
         emitted_cancel = False
         if st.rest_live is not None and not st.cancel_in_flight:
             actions.append(_cancel_action(st, st.rest_live))
@@ -837,10 +927,14 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
         )
         return st, actions
 
-    # hold while a create is in flight, or while a bucket-change cancel is unconfirmed.
+    # hold while a create is in flight, a bucket-change cancel is unconfirmed, or an amend is in flight.
     if st.rest_pending is not None:
         return st, actions
     if st.awaiting_replace and st.cancel_in_flight:
+        return st, actions
+    if st.amend_in_flight:
+        # amend-first replace: the resting order is being amended in place; do not place, cancel, or
+        # re-amend until OrderAmended (success) or the executor's fallback OrderCancelled resolves it.
         return st, actions
 
     # place / replace
@@ -850,21 +944,28 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
         st, pa = _emit_place(st, params, now)
         return st, actions + pa
 
-    # a live rest exists: replace iff |dn| >= tol AND >= deb_ms since the last replace.
+    # a live rest exists on the SAME bucket: replace iff |dn| >= tol AND >= deb_ms since the last replace.
     dn = abs(st.desired_n - st.rest_live.price)  # type: ignore[operator]
     since_ms = (now - (st.last_replace_ts if st.last_replace_ts is not None else -1e18)) * 1000.0
     if dn >= params.tol and since_ms >= params.deb_ms and st.desired_n != st.rest_live.price:
-        # SEQUENTIAL replace (R-OVERLAP ruling 2026-09-13): CANCEL the old, WAIT for OrderCancelled,
-        # and only THEN PLACE the new at the freshly re-solved n on a later tick — like the bucket-change
-        # path. NEVER two live rests, NEVER a fillable old rest beside a new one in flight. A fill during
-        # the cancel surfaces as OrderCancelled.filled_count_before_cancel > 0 (or a Fill event) ->
-        # TAKE_WINGS, not PLACE. rest_live is kept populated (not eagerly cleared) so such a fill books
-        # at the RESTING price, not the drifted desired_n; ``awaiting_replace`` + the cancel-in-flight
-        # hold above suppress any PLACE until OrderCancelled clears the slot. The ~200-400 ms of no quote
-        # per replace is accepted (~30 s/hour unquoted at ~77 replaces/hour).
-        actions.append(_cancel_action(st, st.rest_live))
-        st = replace(st, cancel_in_flight=True, awaiting_replace=True)
-        return st, actions
+        # AMEND-FIRST replace (Brad 2026-09-15, verbatim: "Use the cancel and recreate flow as a backup
+        # if our post to ammend the order fails. Go ahead and build that"): amend the resting order IN
+        # PLACE (Kalshi Amend Order V2) rather than cancel -> confirm -> create. The order_id persists;
+        # a price change forfeits queue position exactly as cancel+create did; there is never a second
+        # live rest. The executor POSTs the amend and, on ANY non-2xx/timeout, FALLS BACK to the
+        # sequential cancel -> confirm -> create path (R-OVERLAP). This removes the ~0.7 s/replace of
+        # nothing-resting the old sequential cancel opened (the 14:00Z 2026-09-15 missed fill). A fill
+        # during the amend surfaces as OrderAmended.fill_count > 0 (or a Fill) -> TAKE_WINGS, not PLACE;
+        # rest_live is kept populated so such a fill books at the RESTING price. ``amend_in_flight``
+        # suppresses any further replace/place until OrderAmended (or the fallback's OrderCancelled).
+        if st.rest_live.order_id is None:
+            # no venue order id yet (a rest still awaiting ack, defensive) — cannot amend; fall to the
+            # sequential cancel -> confirm -> create path instead.
+            actions.append(_cancel_action(st, st.rest_live))
+            st = replace(st, cancel_in_flight=True, awaiting_replace=True)
+            return st, actions
+        st, aa = _emit_amend(st, params, now)
+        return st, actions + aa
     return st, actions
 
 
