@@ -117,10 +117,12 @@ def build_v32_ledger_row(
     rests_rejected: int = 0,
     wing_batches: int = 0,
     exec_price_mismatches: list[Any] | None = None,
-    # cancel / venue-truth counters (2026-09-14 shard fix)
+    # cancel / venue-truth counters (2026-09-14 shard fix; 2026-09-15 quote-end-race adds the last two)
     cancels_attempted: int = 0,
     cancels_confirmed: int = 0,
     cancel_404s: int = 0,
+    cancels_via_status: int = 0,
+    cancels_expired: int = 0,
     rest_invariant_violations: int = 0,
     degrade_reason: str | None = None,
     # Last-quoted spot bucket + stand-down bookkeeping, captured WHILE quoting by the driver (see
@@ -222,6 +224,8 @@ def build_v32_ledger_row(
         "cancels_attempted": int(cancels_attempted),
         "cancels_confirmed": int(cancels_confirmed),
         "cancel_404s": int(cancel_404s),
+        "cancels_via_status": int(cancels_via_status),
+        "cancels_expired": int(cancels_expired),
         "rest_invariant_violations": int(rest_invariant_violations),
         # settlement backfill slots (the sweep appends its own backfill row)
         "realized_unsettled": bool(realized_unsettled),
