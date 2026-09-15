@@ -1001,6 +1001,15 @@ class V32Driver:
             else:
                 self._last_stand_down_reason = a.reason
                 self._real_stand_downs += 1
+        elif k == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW:
+            # A would-be shadow fill the live path could NOT have taken (print outside T-15..T-5).
+            # Observability only: journal the suppressed fill; the generic tally below counts it under
+            # ``shadow_fill_outside_window`` (the ledger surfaces it as ``shadow_fills_outside_window``).
+            rk = "shadow_fill_outside_window"
+            payload = {
+                "E": a.shadow_E, "offer": a.offer, "print": a.print_price,
+                "count": a.count, "t_to_close": a.t_to_close,
+            }
         else:
             rk = "v32_action"
             payload = {"kind": str(k)}

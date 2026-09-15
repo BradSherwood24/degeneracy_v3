@@ -193,3 +193,24 @@ def test_scoreboard_armed_days_is_windows_over_24():
     assert sb["fill_rate_per_day"] == Decimal(1) / (Decimal(7) / Decimal(24))  # 24/7 = 3.428.../day
     # n=1 < 30 so the verdict is still pending; the denominator clarification does not change that
     assert sb["verdict"].startswith("n<")
+
+
+def test_scoreboard_surfaces_shadow_fills_outside_window():
+    # Reviewer nit (2026-09-15 ~18:10Z / PR #54): the additive ledger counter
+    # ``shadow_fills_outside_window`` (would-be shadow fills SUPPRESSED by the T-15..T-5 window gate)
+    # is summed across rows and surfaced on the scoreboard tail. Older rows lack the key -> counted 0.
+    from service.v32.report import _render_scoreboard
+    rows = _thirty_sets("0.09", "0.10")
+    rows[0]["shadow_fills_outside_window"] = 2
+    rows[1]["shadow_fills_outside_window"] = 1
+    # rows[2:] carry NO key (older-row shape) -> must contribute 0, not raise.
+    sb = build_falsifier_scoreboard(rows)
+    assert sb["shadow_fills_outside_window"] == 3
+    line = [l for l in _render_scoreboard(sb) if "shadow fills outside window" in l]
+    assert line and "= 3" in line[0]
+
+
+def test_scoreboard_shadow_fills_outside_window_defaults_zero():
+    # A ledger with no row carrying the counter (pre-PR#54 rows) reports 0, never a KeyError.
+    sb = build_falsifier_scoreboard(_thirty_sets("0.09", "0.10"))
+    assert sb["shadow_fills_outside_window"] == 0

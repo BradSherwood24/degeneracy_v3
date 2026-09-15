@@ -22,6 +22,10 @@ class ActionKind(str, enum.Enum):
     TAKE_WINGS = "TAKE_WINGS"
     RETRY_WING = "RETRY_WING"
     STAND_DOWN = "STAND_DOWN"
+    # Observability-only (order-free, no WOULD_* twin): a would-be shadow fill that the live path
+    # could NOT have taken because it printed outside the T-15..T-5 quoting window. Emitted by
+    # ``_shadow_on_trade`` so the driver can journal + count it; carries no order.
+    SHADOW_FILL_OUTSIDE_WINDOW = "SHADOW_FILL_OUTSIDE_WINDOW"
     # shakedown twins
     WOULD_PLACE_REST = "WOULD_PLACE_REST"
     WOULD_CANCEL_REST = "WOULD_CANCEL_REST"
@@ -67,6 +71,8 @@ class V32Action:
       * TAKE_WINGS / WOULD_TAKE_WINGS: legs (2), count.
       * RETRY_WING: legs (1), count.
       * STAND_DOWN: reason.
+      * SHADOW_FILL_OUTSIDE_WINDOW: shadow_E, offer, print_price, count, t_to_close (all
+        informational; observability of a shadow print the live window would not have taken).
     """
 
     kind: ActionKind
@@ -82,3 +88,8 @@ class V32Action:
     reason: str | None = None
     # informational (carried for the journal/report; never load-bearing for execution)
     lock: Decimal | None = field(default=None)
+    # SHADOW_FILL_OUTSIDE_WINDOW informational payload (observability only)
+    shadow_E: Decimal | None = field(default=None)
+    offer: Decimal | None = field(default=None)
+    print_price: Decimal | None = field(default=None)
+    t_to_close: Decimal | None = field(default=None)
