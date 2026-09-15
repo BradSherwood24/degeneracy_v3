@@ -15,8 +15,9 @@ silently book phantom or live money.
 
 Actions:
   * PLACE_REST  — single create: bucket-NO buy at n, ``post_only`` true, ``good_till_canceled`` with an
-    ``expiration_time`` at the quote end (a crashed process leaves nothing resting past the window),
-    routed by ``exchange_index``. A successful create -> OrderAck (the rest is now live); an immediate
+    ``expiration_time`` set EXPIRATION_GRACE_S AFTER the quote end (a crash backstop; the quote-end
+    cancel is the primary path, un-raced by the grace — 2026-09-15 fix), routed by ``exchange_index``.
+    A successful create -> OrderAck (the rest is now live); an immediate
     fill on a post_only order is impossible but ``fill_count > 0`` is routed as a Fill anyway. A
     rejection (post_only cross, cap, budget, transport) -> journal ``rest_rejected`` + OrderCancelled
     (filled 0) so the core re-solves; three CONSECUTIVE rejections latch a stand-down for the hour.
@@ -78,7 +79,7 @@ assert REL_BATCH_CREATE == BATCH_CREATE_PATH[len(REST_PREFIX):], (
     f"{BATCH_CREATE_PATH[len(REST_PREFIX):]!r}")
 
 # --- wire constants (see module docstring / build report) ---
-REST_TIF = "good_till_canceled"          # the resting maker bid is GTC (auto-expires at quote end)
+REST_TIF = "good_till_canceled"          # the resting maker bid is GTC (auto-expires EXPIRATION_GRACE_S past quote end)
 REST_STP = "taker_at_cross"              # self-trade prevention (as the pilot uses)
 WING_TIF = "immediate_or_cancel"         # taker completion legs are IOC (build_entry default)
 DEFAULT_STP = "taker_at_cross"
@@ -109,6 +110,21 @@ CANCEL_CONFIRM_POLLS = 3
 CANCEL_CONFIRM_INTERVAL_S = 0.2
 CANCEL_RETRY_ATTEMPTS = 3           # a DELETE that still-rests is retried this many times (shard-aware)
 CONSECUTIVE_REJECT_STANDDOWN = 3
+
+# Backoff between the DELETE-retry / status re-read attempts on a non-2xx cancel (2026-09-15
+# quote-end-race fix). The 01:00:00Z incident retried the DELETE 3x at the SAME wall-clock instant
+# (no delay), so the venue's eventually-consistent order-status read still said "resting" every time
+# and a clean (already-expired) order was misdiagnosed as ``cancel_failed``. Sleeping between the
+# re-reads lets the terminal status settle so status-truth resolves the cancel. Injectable (tests
+# pass a no-op sleep and assert the exact sequence). One entry per CANCEL_RETRY_ATTEMPTS.
+CANCEL_BACKOFF_S = (0.25, 0.75, 2.0)
+
+# The GTC rest's ``expiration_time`` is set EXPIRATION_GRACE_S past the quote end (crash backstop)
+# rather than AT the quote end, so the executor's own quote-end DELETE (issued at T-quote_end_s) is
+# not racing the venue's auto-expiry for the same instant (2026-09-15 01:00Z race). At quote_end_s=300
+# the rest expires at T-4 (close-240), well before the wings' T-1 order cutoff and the close; the
+# expiry remains the backstop for a CRASHED process, but the quote-end cancel is the primary path.
+EXPIRATION_GRACE_S = 60
 
 
 def cancel_path(order_id: str, exchange_index: int | None) -> str:
@@ -160,6 +176,8 @@ class RestRecord:
     placed_ts: float
     status: str
     exchange_index: int | None = None  # the order's shard; REQUIRED to cancel (2026-09-14 shard fix)
+    expiration_epoch: int | None = None  # the venue auto-expiry we sent (2026-09-15 quote-end-race fix);
+    # lets the cancel path tell an ``expired_at_quote_end`` terminal status from a plain cancel.
 
 
 @dataclass(frozen=True)
@@ -265,6 +283,8 @@ class LiveExecutor:
         self.cancels_attempted = 0        # CANCEL_REST actions that reached a DELETE
         self.cancels_confirmed = 0        # cancels resolved terminal (2xx reduced_by or terminal status)
         self.cancel_404s = 0              # DELETEs that came back 404 (shard-missing / already terminal)
+        self.cancels_via_status = 0       # 404 DELETE but a terminal status GET confirmed it gone
+        self.cancels_expired = 0          # 404 DELETE at/after expiration_time -> expired_at_quote_end
         self.cancel_failed_count = 0      # orders still resting after the shard-aware retries
         self.rest_invariant_violations = 0  # pre-PLACE venue check found one of ours already resting
         self._last_confirmed_gone_oid: str | None = None  # excluded from the pre-PLACE invariant
@@ -360,6 +380,7 @@ class LiveExecutor:
             price=action.price if action.price is not None else Decimal(0),
             count=int(action.count), ticker=ticker, bucket_Sd=self._bucket_sd(ticker),
             placed_ts=now, status="live", exchange_index=exch,
+            expiration_epoch=self._expiration_epoch(action),
         )
         self._by_order_id[oid] = coid
         self._consecutive_rejects = 0
@@ -389,7 +410,7 @@ class LiveExecutor:
                 client_order_id=coid, order_id=None,
                 price=n if n is not None else Decimal(0), count=1, ticker=ticker,
                 bucket_Sd=self._bucket_sd(ticker), placed_ts=now, status="unknown",
-                exchange_index=self._exch(ticker),
+                exchange_index=self._exch(ticker), expiration_epoch=self._expiration_epoch(None),
             )
             if self.stand_down_reason is None:
                 self.stand_down_reason = "post_unknown_outcome"
@@ -424,16 +445,25 @@ class LiveExecutor:
         }
         body = to_v2_order(legacy)
         body["price"] = _wire_price_no(n)  # full 4-dp precision (translate rounds to whole cents)
-        # expiration at the quote end so a crashed process leaves nothing resting past the window.
+        # expiration EXPIRATION_GRACE_S past the quote end (crash backstop; the quote-end cancel is the
+        # primary path) so a crashed process leaves nothing resting past the window while a live process
+        # cancels first, un-raced (2026-09-15 01:00Z fix).
         # VERIFIED (docs.kalshi.com/api-reference/orders/create-order-v2, 2026-09-13): the field is
         # `expiration_time` (int Unix SECONDS), valid only with time_in_force=good_till_canceled. The
         # earlier build set `expiration_ts` (a non-existent field the venue would ignore), which would
         # have defeated crash-safety by leaving the rest with no auto-expiry.
-        exp = action.expiration_epoch
+        body["expiration_time"] = self._expiration_epoch(action)  # int Unix seconds (CreateOrderV2Request)
+        return body
+
+    def _expiration_epoch(self, action) -> int:
+        """The GTC rest's ``expiration_time`` (Unix seconds): the quote end PLUS EXPIRATION_GRACE_S, so
+        the venue's auto-expiry backstop lands AFTER the executor's own quote-end cancel rather than at
+        the same instant (2026-09-15 quote-end-race fix). ``action`` may be None (unknown-outcome path):
+        the quote-end reference then falls back to the window's own ``close_epoch - quote_end_s``."""
+        exp = getattr(action, "expiration_epoch", None) if action is not None else None
         if exp is None:
             exp = self.close_epoch - self.quote_end_s
-        body["expiration_time"] = int(exp)  # docs.kalshi.com CreateOrderV2Request (int Unix seconds)
-        return body
+        return int(exp) + EXPIRATION_GRACE_S
 
     # ---- pre-PLACE venue-truth invariant (belt over the braces) ----
     def _venue_resting_ours(self, exclude_oid: str | None) -> list[dict[str, Any]] | None:
@@ -549,18 +579,27 @@ class LiveExecutor:
         return self._finish_cancel(rec, oid, filled, wr.status_code, rb, now)
 
     def _cancel_nonok(self, wr, rec, oid: str, exch: int | None, coid, now: float) -> list[Any]:
-        """A non-2xx DELETE. GET the order status (no shard param needed): a terminal status resolves
-        it (filled from ``fill_count``); a still-resting status means the cancel did NOT land — retry
-        the DELETE shard-aware up to CANCEL_RETRY_ATTEMPTS times, and if it STILL rests, journal
-        ``cancel_failed`` + stand down (and NEVER place another rest while it rests)."""
+        """A non-2xx DELETE (incl 404) is NOT proof the order is gone AND is not proof it still rests —
+        the venue is the truth. GET the order status (no shard param needed): a TERMINAL status resolves
+        the cancel by status-truth (2026-09-15 fix), distinguishing an ``expired_at_quote_end`` (we sent
+        that expiry and ``now`` is at/after it) from a plain terminal-status confirm. A still-``resting``
+        read means the cancel did NOT land yet — sleep the CANCEL_BACKOFF_S step (the 01:00Z incident
+        hammered the DELETE 3x at the SAME instant so the eventually-consistent read never settled),
+        retry the DELETE shard-aware up to CANCEL_RETRY_ATTEMPTS times, re-reading after each. Only if
+        the venue STILL reports resting after the whole backoff sequence do we journal ``cancel_failed``
+        + stand down (and NEVER place another rest while it rests)."""
+        # expiration-awareness: the executor sent this order's auto-expiry; if ``now`` is at/after it, a
+        # subsequent terminal status is an expiry landing (crash backstop), classified distinctly.
+        exp = rec.expiration_epoch if rec is not None else None
+        expired = exp is not None and now >= exp
         st = self.order_status(oid)
-        if st.available and st.status in _TERMINAL_STATUSES:
-            self.cancels_confirmed += 1
-            self._last_confirmed_gone_oid = oid
-            return self._finish_cancel(rec, oid, int(st.filled_count), wr.status_code, None, now,
-                                       via="status_terminal")
+        resolved = self._resolve_cancel_from_status(st, rec, oid, wr.status_code, now, expired)
+        if resolved is not None:
+            return resolved
         last_status = wr.status_code
-        for _ in range(CANCEL_RETRY_ATTEMPTS):
+        for i in range(CANCEL_RETRY_ATTEMPTS):
+            # backoff BEFORE the retry so the venue's terminal status has time to settle (status-truth).
+            self.sleep(CANCEL_BACKOFF_S[min(i, len(CANCEL_BACKOFF_S) - 1)])
             self.cancels_attempted += 1
             rwr = self.writer.rest_delete(cancel_path(oid, exch))
             self._bump("cancel_delete")
@@ -570,13 +609,11 @@ class LiveExecutor:
             if rwr.ok:
                 return self._resolve_cancel_success(rwr, rec, oid, now)
             st = self.order_status(oid)
-            if st.available and st.status in _TERMINAL_STATUSES:
-                self.cancels_confirmed += 1
-                self._last_confirmed_gone_oid = oid
-                return self._finish_cancel(rec, oid, int(st.filled_count), rwr.status_code, None, now,
-                                           via="status_terminal_retry")
-        # STILL resting after the shard-aware retries: the order is live on the venue and we could NOT
-        # pull it. Stand down the hour; the pre-PLACE invariant is the belt that also blocks any place.
+            resolved = self._resolve_cancel_from_status(st, rec, oid, rwr.status_code, now, expired)
+            if resolved is not None:
+                return resolved
+        # STILL resting after the backoff-spaced shard-aware retries: the order is live on the venue and
+        # we could NOT pull it. Stand down the hour; the pre-PLACE invariant blocks any place too.
         self.cancel_failed_count += 1
         if rec is not None:
             rec.status = "cancel_failed"   # still resting on the venue (NOT "cancelled")
@@ -590,6 +627,25 @@ class LiveExecutor:
         # Return a filled-0 confirm so the core's slot resolves; stand-down + the pre-PLACE invariant
         # guarantee no replacement rest is placed while this one rests on the venue.
         return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0))]
+
+    def _resolve_cancel_from_status(self, st: OrderStatus, rec, oid: str, delete_status, now: float,
+                                    expired: bool) -> list[Any] | None:
+        """If an order-status GET shows a TERMINAL status, resolve the cancel by status-truth: the order
+        is off the book and ``filled_count`` is final (a race fill is booked/routed by ``_finish_cancel``
+        exactly as a fill-before-cancel). Classify ``expired`` (we sent the expiry and ``now`` >= it) vs a
+        plain status confirm for the ledger. Returns the event list, or None if the status is not
+        terminal (the caller then retries / declares cancel_failed)."""
+        if not (st.available and st.status in _TERMINAL_STATUSES):
+            return None
+        self.cancels_confirmed += 1
+        self._last_confirmed_gone_oid = oid
+        if expired:
+            self.cancels_expired += 1
+            via = "expired"
+        else:
+            self.cancels_via_status += 1
+            via = "status"
+        return self._finish_cancel(rec, oid, int(st.filled_count), delete_status, None, now, via=via)
 
     def _finish_cancel(self, rec, oid: str, filled: int, delete_status, rb, now: float,
                        *, via: str = "delete") -> list[Any]:

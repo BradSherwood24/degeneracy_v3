@@ -21,6 +21,7 @@ from service.v32 import V32State, load_v32_params
 from service.v32.actions import ActionKind, V32Action
 from service.v32.core import WingLeg
 from service.v32.executor import (
+    EXPIRATION_GRACE_S,
     LiveExecutor,
     ORDER_STATUS_PATH_TMPL,
     REL_BATCH_CREATE,
@@ -107,7 +108,9 @@ def test_place_rest_wire_body_post_only_gtc_expiration():
     assert path == REL_SINGLE_CREATE
     assert body["post_only"] is True
     assert body["time_in_force"] == "good_till_canceled"
-    assert body["expiration_time"] == CTS - 300         # quote end (T-5); VERIFIED CreateOrderV2 field
+    # expiration = quote end (T-5) + EXPIRATION_GRACE_S (crash backstop at T-4; the quote-end cancel
+    # is the primary path, so the venue auto-expiry no longer races the cancel — 2026-09-15 fix).
+    assert body["expiration_time"] == CTS - 300 + EXPIRATION_GRACE_S
     assert "expiration_ts" not in body                   # the non-existent field must NOT be sent
     assert body["side"] == "ask"                          # buy NO == sell YES == ask
     assert body["price"] == "0.5500"                      # NO at 0.45 == YES ask at 1-0.45
