@@ -119,6 +119,17 @@ CONSECUTIVE_REJECT_STANDDOWN = 3
 # pass a no-op sleep and assert the exact sequence). One entry per CANCEL_RETRY_ATTEMPTS.
 CANCEL_BACKOFF_S = (0.25, 0.75, 2.0)
 
+# Read-path lag on the resting-orders LIST (2026-09-15 18:00Z phantom incident). Kalshi's order LIST
+# read lags the matching engine by up to ~1 s (the same eventual-consistency class as the T-5 cancel
+# race fixed in PR #50): a DELETE 2xx with reduced_by covering the full count is engine truth, yet a
+# LIST read up to ~1 s later can still show that order resting. The pre-PLACE invariant misread that
+# phantom as "one of ours already resting" and stood the hour down (18:00Z: cancel_confirmed -184 at
+# 17:54:58.886, invariant saw -184 still listed 0.89 s later at 17:54:59.776). CANCEL_SETTLE_S bounds
+# how recently a confirmed-cancel makes a still-listed order a phantom rather than a real violation;
+# INVARIANT_RECHECK_S is the single re-read wait before an unknown stray is declared a violation.
+CANCEL_SETTLE_S = 5.0
+INVARIANT_RECHECK_S = 0.5     # injectable via ``sleep`` (tests pass a no-op and assert the sequence)
+
 # The GTC rest's ``expiration_time`` is set EXPIRATION_GRACE_S past the quote end (crash backstop)
 # rather than AT the quote end, so the executor's own quote-end DELETE (issued at T-quote_end_s) is
 # not racing the venue's auto-expiry for the same instant (2026-09-15 01:00Z race). At quote_end_s=300
@@ -178,6 +189,9 @@ class RestRecord:
     exchange_index: int | None = None  # the order's shard; REQUIRED to cancel (2026-09-14 shard fix)
     expiration_epoch: int | None = None  # the venue auto-expiry we sent (2026-09-15 quote-end-race fix);
     # lets the cancel path tell an ``expired_at_quote_end`` terminal status from a plain cancel.
+    cancel_confirmed_ts: float | None = None  # when this order was CONFIRMED off the book (2026-09-15
+    # read-path-lag fix): a resting-LIST read still showing this order within CANCEL_SETTLE_S of the
+    # confirm is a phantom (engine truth beats a lagging list read), not a pre-PLACE invariant violation.
 
 
 @dataclass(frozen=True)
@@ -286,7 +300,9 @@ class LiveExecutor:
         self.cancels_via_status = 0       # 404 DELETE but a terminal status GET confirmed it gone
         self.cancels_expired = 0          # 404 DELETE at/after expiration_time -> expired_at_quote_end
         self.cancel_failed_count = 0      # orders still resting after the shard-aware retries
-        self.rest_invariant_violations = 0  # pre-PLACE venue check found one of ours already resting
+        self.rest_invariant_violations = 0  # pre-PLACE venue check found one of ours REALLY resting
+        self.rest_invariant_phantoms = 0    # resting-list entries filtered as read-path phantoms (not real)
+        self.rest_invariant_rechecks = 0    # times the invariant re-read the list before declaring a stray
         self._last_confirmed_gone_oid: str | None = None  # excluded from the pre-PLACE invariant
 
     # ---- RestBook API (shared with FrozenExecutor; the driver is executor-agnostic) ----
@@ -497,35 +513,109 @@ class LiveExecutor:
             out.append({"order_id": oid, "client_order_id": coid, "exchange_index": exch})
         return out
 
+    def _filter_phantoms(self, resting: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+        """Drop resting-LIST entries that are read-path phantoms: an order our RestBook shows
+        cancel-CONFIRMED (DELETE 2xx covering the full count, or a terminal/expired status per PR #50)
+        within the last CANCEL_SETTLE_S seconds. Engine truth (the confirm) beats a lagging list read.
+        Journals ``rest_invariant_phantom`` and counts each; returns only the entries that survive."""
+        kept: list[dict[str, Any]] = []
+        for r in resting:
+            rec = self.attribute(order_id=r["order_id"])
+            if (rec is not None and rec.cancel_confirmed_ts is not None
+                    and rec.status in ("cancelled", "filled")
+                    and (now - rec.cancel_confirmed_ts) <= CANCEL_SETTLE_S):
+                age = now - rec.cancel_confirmed_ts
+                self.rest_invariant_phantoms += 1
+                self._bump("rest_invariant_phantom")
+                self.journal.append("rest_invariant_phantom",
+                                    {"order_id": r["order_id"], "coid": r["client_order_id"],
+                                     "age_s": round(age, 3), "via": "book_confirm"}, self.clock())
+                continue
+            kept.append(r)
+        return kept
+
+    def _status_confirms_gone(self, order_id: str) -> bool:
+        """PR #50 status-truth for a 404-on-cancel: an order-status GET that shows a terminal status,
+        or a ``not_found`` read (available, no ``status`` field), proves the order is off the book. An
+        UNREADABLE status (GET failed) proves nothing -> not gone."""
+        st = self.order_status(order_id)
+        if not st.available:
+            return False
+        return st.status in _TERMINAL_STATUSES or st.status is None
+
     def _pre_place_invariant(self, coid: str, now: float) -> list[Any] | None:
-        """Before every PLACE_REST, confirm the venue holds NONE of our orders resting (other than the
-        one we just confirmed gone this replace cycle). If any remain, our internal state disagreed with
-        the venue by more than one order — cancel them shard-aware, journal ``rest_invariant_violation``,
-        alarm, and stand down the hour. Returns an event list to short-circuit the place, or None to
-        proceed (invariant held / venue unreadable)."""
+        """Before every PLACE_REST, confirm the venue holds NONE of our orders REALLY resting (other than
+        the one we just confirmed gone this replace cycle). The resting-orders LIST read lags the engine
+        by up to ~1 s (2026-09-15 18:00Z phantom incident), so a raw hit is not yet a violation:
+
+          1. Phantom filter — drop entries our RestBook shows cancel-CONFIRMED within CANCEL_SETTLE_S
+             (engine truth beats the lagging list). If nothing survives, PLACE proceeds.
+          2. Re-read once after INVARIANT_RECHECK_S — a persisting stray is real; a cleared one was lag.
+          3. Confirm each surviving stray against engine truth at cancel time: a DELETE 404 whose
+             status GET says terminal/not-found (or a 2xx that pulled nothing) is a phantom — zero rests
+             is the invariant's goal, so PLACE proceeds. Only a stray still genuinely resting (2xx with
+             reduced_by > 0, or status still ``resting``) is a REAL violation: cancel, alarm, stand down.
+
+        Returns an event list to short-circuit the place, or None to proceed."""
         resting = self._venue_resting_ours(self._last_confirmed_gone_oid)
         if not resting:  # None (unreadable) or [] (clean) -> proceed to place
             return None
-        self.rest_invariant_violations += 1
-        self._bump("rest_invariant_violation")
-        self.journal.append("rest_invariant_violation",
-                            {"count": len(resting), "coid_attempted": coid,
-                             "resting": [{"order_id": r["order_id"],
-                                          "client_order_id": r["client_order_id"]} for r in resting]},
-                            self.clock())
-        self._record_alarm("rest_invariant_violation",
-                           {"count": len(resting), "coid_attempted": coid})
-        # cancel the stragglers, shard-aware (the same fix that makes any cancel land).
+        resting = self._filter_phantoms(resting, now)
+        if not resting:  # every listed order was a just-confirmed-cancel phantom -> proceed
+            return None
+        # A survivor could still be read-path lag on an order NOT in our recently-cancelled book. Wait
+        # once and re-read before declaring; only a persisting stray is treated as a candidate violation.
+        self.rest_invariant_rechecks += 1
+        self._bump("rest_invariant_recheck")
+        self.sleep(INVARIANT_RECHECK_S)
+        reread = self._venue_resting_ours(self._last_confirmed_gone_oid)
+        if not reread:  # cleared on re-read (or unreadable) -> the survivor was lag -> proceed
+            return None
+        resting = self._filter_phantoms(reread, now)
+        if not resting:
+            return None
+        # Surviving candidates: confirm each against engine truth AT CANCEL TIME. Separate the genuine
+        # (still resting) strays from phantoms (already off the book) before declaring a violation.
+        real_strays: list[dict[str, Any]] = []
         for r in resting:
             self.cancels_attempted += 1
             wr = self.writer.rest_delete(cancel_path(r["order_id"], r["exchange_index"]))
             self._bump("cancel_delete")
             if wr.status_code == 404:
                 self.cancel_404s += 1
+            phantom = False
             if wr.ok:
-                self.cancels_confirmed += 1
+                rb = _dec_or_none(wr.body.get("reduced_by")) if isinstance(wr.body, dict) else None
+                if rb is not None and rb <= 0:
+                    phantom = True   # 2xx that pulled nothing off the book -> nothing was resting
+                else:
+                    self.cancels_confirmed += 1  # we just pulled a genuinely-resting order
+            elif wr.status_code == 404 and self._status_confirms_gone(r["order_id"]):
+                phantom = True       # 404 + status terminal/not-found (PR #50 status-truth) -> gone
+            if phantom:
+                self.rest_invariant_phantoms += 1
+                self._bump("rest_invariant_phantom")
+                self.journal.append("rest_invariant_phantom",
+                                    {"order_id": r["order_id"], "coid": r["client_order_id"],
+                                     "via": "cancel_confirm", "delete_status": wr.status_code},
+                                    self.clock())
+                continue
+            real_strays.append(r)
             self.journal.append("rest_invariant_cancel",
                                 {"order_id": r["order_id"], "status": wr.status_code}, self.clock())
+        if not real_strays:
+            # Every candidate was a phantom (zero rests on the venue) -> the invariant's goal is met.
+            return None
+        self.rest_invariant_violations += 1
+        self._bump("rest_invariant_violation")
+        self.journal.append("rest_invariant_violation",
+                            {"count": len(real_strays), "coid_attempted": coid,
+                             "resting": [{"order_id": r["order_id"],
+                                          "client_order_id": r["client_order_id"]}
+                                         for r in real_strays]},
+                            self.clock())
+        self._record_alarm("rest_invariant_violation",
+                           {"count": len(real_strays), "coid_attempted": coid})
         if self.stand_down_reason is None:
             self.stand_down_reason = "rest_invariant_violation"
         # Feed the core a filled-0 confirm so it clears the pending slot; the stand-down (applied this
@@ -654,6 +744,8 @@ class LiveExecutor:
         ``cancel_confirmed``, and hand the core an OrderCancelled carrying the filled count."""
         if rec is not None:
             rec.status = "filled" if filled > 0 else "cancelled"
+            rec.cancel_confirmed_ts = now  # engine-truth confirm time; a later resting-LIST read still
+            # showing this order within CANCEL_SETTLE_S is a phantom (2026-09-15 read-path-lag fix).
             if filled > 0 and rec.order_id is not None and rec.order_id not in self.booked_rest_oids:
                 self.booked_rest_oids.add(rec.order_id)
                 self.fills.append({"leg": "rest", "side": "no", "ticker": rec.ticker,
