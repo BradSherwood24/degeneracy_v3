@@ -153,6 +153,14 @@ The falsifier's "FIRST ARMED WINDOW MUST CONFIRM" list, and where each item appe
 6. **exec price == resting price.** `wing_fill` / rest-fill records show the executed price equal to the
    resting/decided price within the wing margin; the `exec_price_mismatch` alarm (A_EXEC_PRICE) stays
    quiet in the ledger row's `exec_price_mismatches` (empty).
+7. **invariant phantom handled without stand-down (counter > 0 acceptable; violations counter stays 0).**
+   The pre-PLACE venue-truth invariant reads `/portfolio/orders?status=resting`, which lags the matching
+   engine by up to ~1 s (2026-09-15 18:00Z incident). A `rest_invariant_phantom` record (a just-confirmed
+   cancel still on the LIST, or a stray whose cancel 404s with a terminal/not-found status) is EXPECTED
+   read-path lag and does NOT stand the hour down: PLACE proceeds. `rest_invariant_phantoms` > 0 in the
+   ledger row is acceptable; a `rest_invariant_recheck` (one re-read after 0.5 s) is normal. Only
+   `rest_invariant_violations` > 0 (a stray still genuinely resting after the re-read) is a real event --
+   it cancels + alarms + stands the hour down, and that counter must stay 0 in a clean window.
 
 Also watch: no `A_REPLACE` (replaces/min under 60), no `A_STALE` bursts (strike/bucket data-age under
 1.0 s), and the ledger row's `realized_lock` positive and near the shadow E=0.10 lock.
