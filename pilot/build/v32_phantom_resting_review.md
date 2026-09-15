@@ -174,3 +174,98 @@ Cross-check `order_status().filled_count` (or route through `_finish_cancel`) in
 branches so an unknown stray that left the book by FILLING has its fill booked, or at minimum alarms —
 so no real fill is swallowed silently (§1(a)). Consider the one-tick fail-closed on an unreadable
 re-read (§1(e)) and the two test omissions (§4) at the same time.
+
+---
+
+# Delta re-review — commit `0d996b0` (addresses §1a fast-follow)
+
+Re-reviewed `git diff 448c1b4..0d996b0` (executor invariant path, report, tests). The builder took the
+§1a fast-follow. Scope of change: `_status_confirms_gone` → `_status_says_gone` (now static, returns via
+an already-fetched `OrderStatus` so the caller reads `filled_count`); step-3 now cross-checks
+`filled_count` before ANY phantom classification (both the `2xx reduced_by==0` and the `404 + terminal`
+sub-cases); a TRACKED filled stray is booked via `_finish_cancel(..., via="invariant_fill")` and routed
+to the core as the hour's entry with the PLACE short-circuited and NO stand-down; an UNTRACKED/unpriceable
+filled stray raises `rest_invariant_unbooked_fill` alarm + stand-down; report renders `rechecks`; 4 new
+tests (13 total in `test_v32_phantom_resting.py`).
+
+## Verdict: APPROVE. The §1a gap is closed; no new blocking items. Ship.
+
+Receipts: `test_v32_phantom_resting.py` → **13 passed**; full suite **864 passed, 2 skipped, 2 errors**
+(the +4 are the new tests; the 2 errors remain `test_quintile.py` FileNotFoundError on `historical-data`,
+unrelated to the diff). The two prior nits are also resolved: `rest_invariant_rechecks` is now surfaced
+in the report render, and there is now a report-render test.
+
+## Check 1 — booked-fill routing cannot double-book / cannot take wings twice: PASS
+
+The routed fill uses the exact established cancel-race mechanism, and dedupe holds on all three fill
+paths by `order_id`:
+- **Money ledger (`executor.fills`).** `_finish_cancel` books only if
+  `rec.order_id not in self.booked_rest_oids`, adding the id on book. The driver's `_record_fill`
+  (the WS / poll paths) guards on the SAME `booked_rest_oids` set (`if rec.order_id in booked: return`)
+  and appends to the SAME `executor.fills` list. So the invariant books once via `_finish_cancel`; any
+  later WS echo or status-poll of that same fill is dropped by the shared id set. No double economic
+  booking. `test_known_stray_that_filled_is_booked_and_routed_not_dropped` asserts exactly one rest fill
+  (`len(rest_fills) == 1`), booked at the order's price (0.48), path `cancel_race`.
+- **Core state / wings.** The routed `OrderCancelled(filled>0)` flows through `_pump` → `decide_v32` →
+  `_apply_cancelled`, which books the set and calls `_wing_step` ONLY under
+  `event.filled_count_before_cancel > 0 AND st.rest_fill is None`. The `st.rest_fill is None` gate is the
+  single-set latch; a second fill event (WS echo, another cancel) finds `rest_fill` already set and
+  neither re-books nor re-wings. The F-1 late-fill hook `book_late_rest_fill` is explicitly idempotent
+  (`if st.rest_fill is not None: return st, []`), closing the WS-echo-after-routed-fill vector. Wings
+  therefore fire exactly once for the booked stray.
+- Not a new vector: `via="invariant_fill"` reuses the identical routing and `path:"cancel_race"` money
+  tag as the pre-existing, integration-tested cancel-race fill; the delta adds no new booking channel.
+
+## Check 2 — booked stray fill latches one-set-per-hour: PASS
+
+The one-set rule is latched by `st.rest_fill` in the pure core. Once the routed `OrderCancelled(filled>0)`
+sets `rest_fill` (via `_apply_cancelled`), every downstream path that could open a second set is gated:
+`_apply_fill` (`is_ours and st.rest_fill is None`), `_apply_cancelled` (`... and st.rest_fill is None`),
+and `book_late_rest_fill` (idempotent no-op). The invariant additionally short-circuits the in-flight
+PLACE (returns the fill events INSTEAD of an `OrderAck`), so the candidate re-place is never sent to the
+exchange (`test_known_stray_… asserts "v32-new" not in rest_book`, `len(w.posts) == 1`). Result: the
+surprise fill becomes the hour's single set, hedged by one wing take; no second rest, no second set.
+Minor coverage note (non-blocking): the executor unit tests prove the executor returns the right events,
+but do not drive the full `_pump`/`decide_v32` loop to assert the routed fill yields exactly one
+`TAKE_WINGS` and flips the latch at the core level — that behavior is inherited from the shared
+cancel-race path, which is integration-tested elsewhere (`test_v32_phase3_ledger`, `…quote_end_race`).
+
+## Check 3 — builder's judgment (continue vs stand down after a bookable surprise fill): money-safe; PREFER CONTINUE
+
+Both branches are money-safe, and the builder's split is the correct one:
+- **Tracked / priceable fill → CONTINUE (book + wing, no stand-down): preferred and safer.** A surprise
+  fill on an order whose price we know is economically identical to a cancel-race fill — the strategy's
+  designed steady state (rest fills → take wings → hour done). Booking at the retained `rec.price` and
+  hedging via the standard wing path leaves a properly hedged one-set. Standing down INSTEAD would strand
+  an unhedged bucket-NO (the exact F-1 failure the late-fill hook exists to prevent) or force a flatten —
+  and flattens were a documented source of unbooked losses in the first armed campaign. So continuing is
+  the more conservative choice here, not the riskier one.
+- **Untracked / unpriceable fill → STAND DOWN (after alarm): correct fail-closed.** You cannot honestly
+  book or hedge a fill you cannot attribute or price; standing down + alarming hands it to a human rather
+  than guessing a price or leaving a silent unhedged leg. Aligns with house law (no silent unhedged leg;
+  honest fill conventions).
+
+Preference: keep the builder's design as-is. One belt-and-suspenders suggestion (non-blocking): the
+`rest_invariant_unbooked_fill` alarm is the money-critical signal — confirm it is on the ops page's
+watched-alarm list so an untracked surprise fill is reconciled promptly, not just stood down.
+
+## Check 4 — tests exercise both branches: PASS
+
+- Tracked booked/routed: `test_known_stray_that_filled_is_booked_and_routed_not_dropped`
+  (2xx reduced_by 0 + status executed on a RestBook order → booked at 0.48, routed, no stand-down,
+  single fill).
+- Untracked unbooked, 2xx path: `test_unknown_stray_2xx_reduced_by_0_but_executed_fill_alarms_stands_down`.
+- Untracked unbooked, 404 path: `test_unknown_stray_404_status_executed_fill_alarms_stands_down`.
+- Report render: `test_report_render_surfaces_phantoms_and_rechecks`.
+Both the book-and-continue and the alarm-and-stand-down branches are exercised, across both the 2xx-rb0
+and 404 gone-ness signals. The original 9 (genuine violation, clean phantom, recheck, fixture, settle
+boundary) remain green.
+
+## Residual / carried-over (all non-blocking)
+- Item 1(e) (unreadable re-read → PROCEED) is unchanged and still ACCEPTABLE per the original review
+  (per-order auto-expiry bound + PR #46 posture).
+- Integration-level assertion of the routed fill's single TAKE_WINGS at the core is inferred from the
+  shared cancel-race path (Check 2 note).
+- Suggest verifying `rest_invariant_unbooked_fill` is on the watched-alarm ops list (Check 3).
+
+## Blocking items (delta): none.
