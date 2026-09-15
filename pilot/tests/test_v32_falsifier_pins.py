@@ -83,6 +83,18 @@ def test_registration_carries_2026_09_15_shadow_window_clarification():
     assert "shadow_fills_outside_window" in reg
 
 
+def test_registration_carries_2026_09_15_amend_mechanics_clarification():
+    """MECHANICS CLARIFICATION (amend-first replace, 2026-09-15 ~18:10Z, Brad's verbatim go): the
+    mid-window replace is amend-first (Kalshi Amend Order V2, same order_id, queue position forfeited
+    exactly as cancel+create), with cancel -> confirm -> create as the fallback. A MECHANICS
+    CLARIFICATION, not a threshold change -- the frozen [pin] gates, the params sha, and the STATUS line
+    are untouched (asserted by the other tests in this file, which stay green)."""
+    doc = _doc()
+    reg = doc.split("## Registration", 1)[1].split("## Pre-registered shadow observations", 1)[0]
+    assert "MECHANICS CLARIFICATION" in reg
+    assert "amend" in reg
+
+
 def test_verdict_pins_match_doc():
     doc = _doc()
     assert f"n >= {V32_FALSIFIER_MIN_N}" in doc
