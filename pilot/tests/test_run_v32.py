@@ -208,38 +208,43 @@ def test_connect_gate_epoch():
 # ===========================================================================
 def _replace_to_new_order(drv, p, now):
     """Place one rest, keep both strikes fresh across the debounce window (no |dn| replace), then move
-    a wing so the core does a SEQUENTIAL replace (R-OVERLAP): the moving-wing tick emits CANCEL only
-    (the FrozenExecutor synth-confirms it in the same pump), and the NEXT tick places the new rest.
+    a wing so the core does an AMEND-FIRST replace (Brad 2026-09-15): the moving-wing tick emits
+    WOULD_AMEND_REST, the FrozenExecutor synth-confirms it (OrderAmended) in the SAME pump, and the
+    resting order updates IN PLACE — same order_id, new coid, exactly one live rest (no cancel gap).
     Returns (first_coid, second_coid)."""
     # Deep wings (W ~ 1.33) so the BUDGET binds n (not the bucket cap); then moving a wing shifts n.
     _feed_quote(drv, "0.70", "0.60", now)
     first = drv.state.rest_live.client_order_id
+    first_oid = drv.state.rest_live.order_id
     t = now
     while t < now + (p.deb_ms / 1000.0) + 0.5:  # tick both strikes fresh, prices unchanged -> no replace
         t += 0.5
         _feed_quote(drv, "0.70", "0.60", t)
     assert drv.state.rest_live.client_order_id == first, "no premature replace while |dn| < tol"
     t += 0.5
-    _feed_quote(drv, "0.76", "0.60", t)   # yes_ask up -> n down >= tol, debounce elapsed -> CANCEL only
-    assert drv.state.rest_live is None and drv.state.awaiting_replace  # sequential: old cancelled, no new yet
-    t += 0.5
-    _feed_quote(drv, "0.76", "0.60", t)   # after the cancel confirms -> PLACE the new rest
+    _feed_quote(drv, "0.76", "0.60", t)   # yes_ask up -> n down >= tol, debounce elapsed -> AMEND in place
+    # amend-first: the order is amended in place; same order_id, a new coid, exactly one live rest.
+    assert drv.state.rest_live is not None and not drv.state.amend_in_flight
+    assert drv.state.rest_live.order_id == first_oid   # order_id persists across the amend
     second = drv.state.rest_live.client_order_id
     return first, second
 
 
-def test_frozen_executor_cycles_place_ack_replace_cancel(tmp_path):
+def test_frozen_executor_cycles_place_ack_amend(tmp_path):
     p = _params()
     drv, j, _ = _driver(tmp_path, p)
     now = CTS - 700  # t_to_close = 700, leaves room for the debounce window inside [300, 900]
     first, second = _replace_to_new_order(drv, p, now)
-    assert drv.counts["would_place_rest"] == 2
-    assert drv.counts["would_cancel_rest"] >= 1
+    # amend-first: ONE place (the initial rest) and ONE amend; no cancel+recreate.
+    assert drv.counts["would_place_rest"] == 1
+    assert drv.counts["would_amend_rest"] >= 1
+    assert drv.counts.get("would_cancel_rest", 0) == 0
     assert second != first
-    # F-1: the old order is RETAINED as cancelled (not deleted); the new one is live
-    assert drv.executor.rest_book[first].status == "cancelled"
+    # F-1: the old coid is RETAINED as `amended` (not deleted); the new coid is the live rest, SAME oid.
+    assert drv.executor.rest_book[first].status == "amended"
     assert drv.executor.rest_book[second].status == "live"
     assert drv.state.rest_live.client_order_id == second
+    assert drv.executor.rest_book[second].order_id == drv.executor.rest_book[first].order_id
     j.close()
 
 
@@ -252,9 +257,9 @@ def test_late_fill_attributed_to_retained_coid(tmp_path):
     now = CTS - 700
     old_coid, new_coid = _replace_to_new_order(drv, p, now)
     assert new_coid != old_coid
-    assert drv.executor.rest_book[old_coid].status == "cancelled"
+    assert drv.executor.rest_book[old_coid].status == "amended"  # RETAINED for late-fill attribution (F-1)
 
-    # a fill lands on the OLD (replaced) order — the core no longer tracks it
+    # a fill lands on the OLD (pre-amend) coid — the core no longer tracks it
     drv.on_fill(B_SD, {"client_order_id": old_coid, "count": 1}, drv.server_now())
     assert drv.counts["late_fill"] == 1
     assert drv.state.rest_fill is not None  # booked into the core (not dropped)
