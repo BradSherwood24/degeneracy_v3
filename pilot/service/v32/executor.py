@@ -534,14 +534,13 @@ class LiveExecutor:
             kept.append(r)
         return kept
 
-    def _status_confirms_gone(self, order_id: str) -> bool:
-        """PR #50 status-truth for a 404-on-cancel: an order-status GET that shows a terminal status,
-        or a ``not_found`` read (available, no ``status`` field), proves the order is off the book. An
-        UNREADABLE status (GET failed) proves nothing -> not gone."""
-        st = self.order_status(order_id)
-        if not st.available:
-            return False
-        return st.status in _TERMINAL_STATUSES or st.status is None
+    @staticmethod
+    def _status_says_gone(st: OrderStatus) -> bool:
+        """PR #50 status-truth: a terminal status (incl. ``executed``), or a ``not_found`` read
+        (available, no ``status`` field), proves the order is off the book. An UNREADABLE status
+        (GET failed) proves nothing -> not gone. (``executed`` here means it left the book by FILLING —
+        the caller must still book that fill via ``st.filled_count``, never treat it as a clean phantom.)"""
+        return st.available and (st.status in _TERMINAL_STATUSES or st.status is None)
 
     def _pre_place_invariant(self, coid: str, now: float) -> list[Any] | None:
         """Before every PLACE_REST, confirm the venue holds NONE of our orders REALLY resting (other than
@@ -551,10 +550,14 @@ class LiveExecutor:
           1. Phantom filter — drop entries our RestBook shows cancel-CONFIRMED within CANCEL_SETTLE_S
              (engine truth beats the lagging list). If nothing survives, PLACE proceeds.
           2. Re-read once after INVARIANT_RECHECK_S — a persisting stray is real; a cleared one was lag.
-          3. Confirm each surviving stray against engine truth at cancel time: a DELETE 404 whose
-             status GET says terminal/not-found (or a 2xx that pulled nothing) is a phantom — zero rests
-             is the invariant's goal, so PLACE proceeds. Only a stray still genuinely resting (2xx with
-             reduced_by > 0, or status still ``resting``) is a REAL violation: cancel, alarm, stand down.
+          3. Confirm each surviving stray against engine truth at cancel time. A stray that is off the
+             book with NO fill (DELETE 404 + terminal/not-found status, or a 2xx that pulled nothing and
+             a status showing no fill) is a phantom — zero rests is the invariant's goal, so PLACE
+             proceeds. A stray still genuinely resting (2xx reduced_by > 0, or status still ``resting``)
+             is a REAL violation: cancel, alarm, stand down. A stray that left the book by FILLING
+             (status terminal with ``filled_count`` > 0 — ``_TERMINAL_STATUSES`` includes ``executed``)
+             is NEVER a silent phantom: book it at the order's price if we know it (routed to the core
+             like a cancel-race entry), else alarm ``rest_invariant_unbooked_fill`` and stand down.
 
         Returns an event list to short-circuit the place, or None to proceed."""
         resting = self._venue_resting_ours(self._last_confirmed_gone_oid)
@@ -575,36 +578,78 @@ class LiveExecutor:
         if not resting:
             return None
         # Surviving candidates: confirm each against engine truth AT CANCEL TIME. Separate the genuine
-        # (still resting) strays from phantoms (already off the book) before declaring a violation.
+        # (still resting) strays from phantoms (already off the book), and NEVER drop a stray that left
+        # the book by FILLING (reviewer §1a): a status GET with filled_count > 0 is booked, not swallowed.
         real_strays: list[dict[str, Any]] = []
+        fill_events: list[Any] = []
+        unbooked_fill = False
         for r in resting:
+            oid = r["order_id"]
             self.cancels_attempted += 1
-            wr = self.writer.rest_delete(cancel_path(r["order_id"], r["exchange_index"]))
+            wr = self.writer.rest_delete(cancel_path(oid, r["exchange_index"]))
             self._bump("cancel_delete")
             if wr.status_code == 404:
                 self.cancel_404s += 1
-            phantom = False
+            # Decide gone-ness. A 2xx with reduced_by > 0 pulled a genuinely-resting order -> real stray.
+            # Any other outcome (2xx pulled nothing, or a 404) needs the order status to tell a clean
+            # phantom from a fill (``_TERMINAL_STATUSES`` includes ``executed``) from a still-resting stray.
             if wr.ok:
                 rb = _dec_or_none(wr.body.get("reduced_by")) if isinstance(wr.body, dict) else None
-                if rb is not None and rb <= 0:
-                    phantom = True   # 2xx that pulled nothing off the book -> nothing was resting
-                else:
-                    self.cancels_confirmed += 1  # we just pulled a genuinely-resting order
-            elif wr.status_code == 404 and self._status_confirms_gone(r["order_id"]):
-                phantom = True       # 404 + status terminal/not-found (PR #50 status-truth) -> gone
-            if phantom:
-                self.rest_invariant_phantoms += 1
-                self._bump("rest_invariant_phantom")
-                self.journal.append("rest_invariant_phantom",
-                                    {"order_id": r["order_id"], "coid": r["client_order_id"],
-                                     "via": "cancel_confirm", "delete_status": wr.status_code},
-                                    self.clock())
+                if rb is not None and rb > 0:
+                    self.cancels_confirmed += 1
+                    real_strays.append(r)
+                    self.journal.append("rest_invariant_cancel",
+                                        {"order_id": oid, "status": wr.status_code}, self.clock())
+                    continue
+            elif wr.status_code != 404:
+                # a non-404 error DELETE cannot prove the order gone -> conservative real stray.
+                real_strays.append(r)
+                self.journal.append("rest_invariant_cancel",
+                                    {"order_id": oid, "status": wr.status_code}, self.clock())
                 continue
-            real_strays.append(r)
-            self.journal.append("rest_invariant_cancel",
-                                {"order_id": r["order_id"], "status": wr.status_code}, self.clock())
+            st = self.order_status(oid)
+            if not self._status_says_gone(st):
+                # 404/empty-2xx but the status says STILL resting (or is unreadable) -> real stray.
+                real_strays.append(r)
+                self.journal.append("rest_invariant_cancel",
+                                    {"order_id": oid, "status": wr.status_code}, self.clock())
+                continue
+            filled = int(st.filled_count) if st.available else 0
+            if filled > 0:
+                # The stray left the book by FILLING — never silently drop it (reviewer §1a).
+                rec = self.attribute(order_id=oid)
+                if rec is not None:
+                    self._last_confirmed_gone_oid = oid
+                    fill_events += self._finish_cancel(rec, oid, filled, wr.status_code, None, now,
+                                                       via="invariant_fill")
+                else:
+                    unbooked_fill = True
+                    self._record_alarm("rest_invariant_unbooked_fill",
+                                       {"order_id": oid, "coid": r["client_order_id"], "filled": filled})
+                    self.journal.append("rest_invariant_unbooked_fill",
+                                        {"order_id": oid, "coid": r["client_order_id"],
+                                         "filled": filled, "delete_status": wr.status_code}, self.clock())
+                continue
+            # off the book with no fill -> a genuine read-path phantom.
+            self.rest_invariant_phantoms += 1
+            self._bump("rest_invariant_phantom")
+            self.journal.append("rest_invariant_phantom",
+                                {"order_id": oid, "coid": r["client_order_id"],
+                                 "via": "cancel_confirm", "delete_status": wr.status_code},
+                                self.clock())
         if not real_strays:
-            # Every candidate was a phantom (zero rests on the venue) -> the invariant's goal is met.
+            if unbooked_fill:
+                # a fill on an untracked stray we could not price -> already alarmed; stand the hour down
+                # and clear the core's slot (never place on top of an unaccounted fill).
+                if self.stand_down_reason is None:
+                    self.stand_down_reason = "rest_invariant_unbooked_fill"
+                return [OrderCancelled(order_id=None, server_ts=now,
+                                       filled_count_before_cancel=Decimal(0))]
+            if fill_events:
+                # a surprise fill on a tracked stray was booked -> route it to the core as the entry
+                # (mirrors the cancel-race entry); the place is short-circuited (never place on a fresh fill).
+                return fill_events
+            # Every candidate was a clean phantom (zero rests on the venue) -> the invariant's goal is met.
             return None
         self.rest_invariant_violations += 1
         self._bump("rest_invariant_violation")

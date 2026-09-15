@@ -281,6 +281,97 @@ def test_stray_cancel_404_but_status_still_resting_is_a_violation():
 
 
 # ===========================================================================
+# (§1a) A stray that left the book by FILLING is NEVER a silent phantom — the status GET's fill_count is
+#       cross-checked (_TERMINAL_STATUSES includes "executed") and the fill is booked or alarmed.
+# ===========================================================================
+def test_unknown_stray_2xx_reduced_by_0_but_executed_fill_alarms_stands_down():
+    # DELETE 2xx pulled nothing (reduced_by 0) BUT the status shows executed fill 1: the order left the
+    # book by filling. It is not in our RestBook (unknown coid) -> unbookable -> alarm + stand-down,
+    # NOT a silent phantom that drops the fill.
+    w = _PhantomWriter()
+    j = FakeJournal()
+    sleeps: list[float] = []
+    ex = _exec(w, j, sleeps)
+    ghost = _listed("ghost-f1", "v32-ghost")
+    w.list_queue.append({"orders": [ghost]})
+    w.list_queue.append({"orders": [ghost]})
+    w.delete_fn = lambda p: WriteResponse(200, {"reduced_by": "0.00"}, True)   # pulled nothing
+    w.status_map["ghost-f1"] = {"order": {"order_id": "ghost-f1", "status": "executed",
+                                          "fill_count_fp": "1.00", "remaining_count_fp": "0.00"}}
+    events = ex.on_action(_place("v32-new", "0.48"), _st(), 100.0)
+    assert ex.rest_invariant_phantoms == 0            # the fill was NOT swallowed as a phantom
+    assert ex.rest_invariant_violations == 0
+    assert ex.stand_down_reason == "rest_invariant_unbooked_fill"
+    assert any(a.get("alarm") == "rest_invariant_unbooked_fill" for a in ex.alarms)
+    assert "rest_invariant_unbooked_fill" in j.kinds()
+    assert j.of("rest_invariant_unbooked_fill")[0]["filled"] == 1
+    assert len(w.posts) == 0                          # PLACE short-circuited
+    assert isinstance(events[0], OrderCancelled)
+
+
+def test_unknown_stray_404_status_executed_fill_alarms_stands_down():
+    # 404 DELETE + status executed fill 1 on an UNKNOWN order -> unbookable fill -> alarm + stand-down.
+    w = _PhantomWriter()
+    j = FakeJournal()
+    sleeps: list[float] = []
+    ex = _exec(w, j, sleeps)
+    ghost = _listed("ghost-f2", "v32-ghost")
+    w.list_queue.append({"orders": [ghost]})
+    w.list_queue.append({"orders": [ghost]})
+    w.delete_fn = lambda p: WriteResponse(404, {"error": {"code": "not_found"}}, False, "http_404")
+    w.status_map["ghost-f2"] = {"order": {"order_id": "ghost-f2", "status": "executed",
+                                          "fill_count_fp": "1.00", "remaining_count_fp": "0.00"}}
+    ex.on_action(_place("v32-new", "0.48"), _st(), 100.0)
+    assert ex.rest_invariant_phantoms == 0 and ex.rest_invariant_violations == 0
+    assert ex.stand_down_reason == "rest_invariant_unbooked_fill"
+    assert any(a.get("alarm") == "rest_invariant_unbooked_fill" for a in ex.alarms)
+    assert len(w.posts) == 0
+
+
+def test_known_stray_that_filled_is_booked_and_routed_not_dropped():
+    # A stray we DO track (in RestBook, price known) that left the book by filling is booked at the
+    # order's price (routed to the core like a cancel-race entry), NOT dropped, NOT stood down.
+    w = _PhantomWriter()
+    j = FakeJournal()
+    sleeps: list[float] = []
+    ex = _exec(w, j, sleeps)
+    ex.on_action(_place("v32-live", "0.48"), _st(), 100.0)   # a live rest, never cancelled
+    oid = w.oid_by_coid["v32-live"]
+    w.list_queue.append({"orders": [_listed(oid, "v32-live")]})
+    w.list_queue.append({"orders": [_listed(oid, "v32-live")]})
+    w.delete_fn = lambda p: WriteResponse(200, {"reduced_by": "0.00"}, True)   # nothing to pull: it filled
+    w.status_map[oid] = {"order": {"order_id": oid, "status": "executed",
+                                   "fill_count_fp": "1.00", "remaining_count_fp": "0.00"}}
+    events = ex.on_action(_place("v32-new", "0.49"), _st(), 101.0)
+    assert ex.rest_invariant_phantoms == 0 and ex.rest_invariant_violations == 0
+    assert ex.stand_down_reason is None
+    assert not any(a.get("alarm") == "rest_invariant_unbooked_fill" for a in ex.alarms)
+    rest_fills = [f for f in ex.fills if f.get("leg") == "rest"]
+    assert len(rest_fills) == 1
+    assert rest_fills[0]["price"] == Decimal("0.48") and rest_fills[0]["path"] == "cancel_race"
+    assert ex.rest_book["v32-live"].status == "filled"
+    # the surprise fill is routed to the core as the entry; the PLACE is short-circuited.
+    assert any(isinstance(e, OrderCancelled) and e.filled_count_before_cancel == Decimal(1)
+               for e in events)
+    assert "v32-new" not in ex.rest_book
+    assert len(w.posts) == 1        # only the initial live place; the re-place was short-circuited
+
+
+def test_report_render_surfaces_phantoms_and_rechecks():
+    # The build report claims report.py surfaces phantoms AND rechecks next to violations — pin it.
+    from service.v32.report import _render, build_report
+    rows = [{"close_time": "2026-09-15T18:00:00Z", "armed": True, "rest_invariant_violations": 0,
+             "rest_invariant_phantoms": 3, "rest_invariant_rechecks": 2, "shadow": {}}]
+    rep = build_report(rows)
+    t = rep["totals"]
+    assert t["rest_invariant_violations"] == 0
+    assert t["rest_invariant_phantoms"] == 3
+    assert t["rest_invariant_rechecks"] == 2
+    line = next(l for l in _render(rep).splitlines() if "rest_invariant:" in l)
+    assert "violations=0" in line and "phantoms=3" in line and "rechecks=2" in line
+
+
+# ===========================================================================
 # (d) The sleep sequence: a phantom-only pass sleeps 0; an unknown-survivor pass sleeps exactly once.
 # ===========================================================================
 def test_invariant_sleep_sequence():

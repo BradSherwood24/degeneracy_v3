@@ -3,7 +3,7 @@
 Branch: `fix/phantom-resting` (off `origin/main` @ 9c048b3)
 Scope: `pilot/service/v32/executor.py` (invariant path only), `ledger.py`, `run_v32.py`,
 `service/v32/report.py`, `pilot/ops/V32_ARMING.md`, tests + one fixture. No policy JSON, no falsifier
-edit, no live tree touched, no proxy write. Suite: **804 passed, 2 skipped** on the touched surface
+edit, no live tree touched, no proxy write. Suite: **808 passed, 2 skipped** on the touched surface
 (`python -m pytest pilot/tests -q`); five test files error at collection in this fresh detached
 worktree because they read uncommitted data artifacts (`sim/out/census_train.csv`, `historical-data/**`)
 — not this change, and green in the live tree that holds those artifacts.
@@ -57,17 +57,28 @@ violation:
    `INVARIANT_RECHECK_S` and re-GET the list once (`rest_invariant_rechecks++`); a survivor that cleared
    was lag → proceed. An unreadable re-read → proceed (never self-DoS on a transient read, matching the
    existing invariant philosophy).
-3. **Confirm each survivor at cancel time** — a stray whose DELETE returns 404 with a terminal/not-found
-   status GET (`_status_confirms_gone`, PR #50 status-truth), or a 2xx that pulled nothing
-   (`reduced_by <= 0`), is a phantom (zero rests) → journal `rest_invariant_phantom`
-   `{via:"cancel_confirm", delete_status}` and PLACE proceeds. Only a stray still **genuinely resting**
-   (2xx `reduced_by > 0`, or status still `resting`) is a REAL violation → cancel, alarm, stand down
-   (PR #46 behaviour preserved). `rest_invariant_violations` now counts REAL violations only.
+3. **Confirm each survivor at cancel time** — a stray still **genuinely resting** (DELETE 2xx
+   `reduced_by > 0`, or a 404/empty-2xx whose status GET still says `resting`, or an unreadable status)
+   is a REAL violation → cancel, alarm, stand down (PR #46 behaviour preserved). A stray **off the book
+   with no fill** (DELETE 404 + terminal/not-found status, or a 2xx that pulled nothing and a status
+   showing `filled_count == 0`) is a phantom → journal `rest_invariant_phantom`
+   `{via:"cancel_confirm", delete_status}` and PLACE proceeds. `rest_invariant_violations` now counts
+   REAL violations only.
+
+   **Fill cross-check (reviewer §1a).** `_TERMINAL_STATUSES` includes `executed`, so a stray can leave
+   the book by **filling**. Before declaring any step-3 phantom the code now GETs the order status (for
+   the 2xx-`reduced_by==0` case too, not just 404s) via `_status_says_gone` and inspects
+   `st.filled_count`: a fill is **never** swallowed. If the filled order is one we track (in RestBook,
+   price known) it is booked at the order's price through `_finish_cancel` — the same path the cancel-race
+   entry uses (money-math `path:"cancel_race"`, `via:"invariant_fill"`) — and routed to the core as the
+   hourly entry (the PLACE is short-circuited, never placed on top of a fresh fill). If it is an
+   **untracked** order we cannot price, we raise the `rest_invariant_unbooked_fill` alarm, journal it,
+   and stand the hour down rather than drop the fill.
 
 Counters (`.get`-default-0, additive): `rest_invariant_phantoms`, `rest_invariant_rechecks` added to the
 executor, threaded through `run_v32._compute_money_math` → `build_v32_ledger_row` (new kwargs, defaults
 preserve the row shape) and surfaced in `report.py` totals + render (`rest_invariant: violations=…
-phantoms=… (read-path lag, no stand-down)`), next to violations, wired exactly like PR #50/#54.
+phantoms=… rechecks=… (read-path lag, no stand-down)`), next to violations, wired exactly like PR #50/#54.
 
 `pilot/ops/V32_ARMING.md` — MUST-CONFIRM item 7 added: invariant phantom handled without stand-down
 (phantoms counter > 0 acceptable, rechecks normal; violations counter stays 0 in a clean window).
@@ -94,6 +105,14 @@ phantoms=… (read-path lag, no stand-down)`), next to violations, wired exactly
   confirm→re-listing age of **0.890 s** (0 < age < `CANCEL_SETTLE_S`).
 - `test_confirmed_cancel_older_than_settle_is_not_a_phantom` — a confirmed order stale beyond
   `CANCEL_SETTLE_S` that is genuinely resting is NOT swallowed → recheck + real violation.
+- **(§1a fill cross-check)** `test_unknown_stray_2xx_reduced_by_0_but_executed_fill_alarms_stands_down`
+  and `test_unknown_stray_404_status_executed_fill_alarms_stands_down` — an UNKNOWN stray that left the
+  book by filling (status `executed`, `fill_count 1`) is NOT a silent phantom: `rest_invariant_unbooked_fill`
+  alarm + stand-down, no PLACE. `test_known_stray_that_filled_is_booked_and_routed_not_dropped` — a
+  TRACKED stray that filled is booked at its price (`path:"cancel_race"`) and routed to the core as the
+  entry, no stand-down.
+- `test_report_render_surfaces_phantoms_and_rechecks` — the render line carries `violations=`, `phantoms=`
+  and `rechecks=`.
 
 Existing invariant/ledger/report tests stay green (`test_v32_cancel_shard.py`, `test_v32_report_*`,
 `test_v32_phase3_ledger.py`, `test_v32_quote_end_race.py`); `test_v32_falsifier_pins.py` untouched;

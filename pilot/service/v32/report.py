@@ -74,6 +74,7 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     tot_late_fills = 0
     tot_invariant_violations = 0
     tot_invariant_phantoms = 0
+    tot_invariant_rechecks = 0
     shadow_fills: dict[str, int] = {k: 0 for k in e_keys}
     shadow_locks: dict[str, list[Decimal]] = {k: [] for k in e_keys}
     lags: list[Decimal] = []
@@ -95,6 +96,7 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         tot_late_fills += int(r.get("late_fills", 0) or 0)
         tot_invariant_violations += int(r.get("rest_invariant_violations", 0) or 0)
         tot_invariant_phantoms += int(r.get("rest_invariant_phantoms", 0) or 0)
+        tot_invariant_rechecks += int(r.get("rest_invariant_rechecks", 0) or 0)
         if r.get("stand_down"):
             tot_stand_downs += 1
         windows.append(
@@ -130,6 +132,7 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "late_fills": tot_late_fills,
             "rest_invariant_violations": tot_invariant_violations,
             "rest_invariant_phantoms": tot_invariant_phantoms,
+            "rest_invariant_rechecks": tot_invariant_rechecks,
             "shadow_fills": shadow_fills,
             "shadow_mean_lock": mean_locks,
             "mean_lag_seconds": mean_lag,
@@ -368,7 +371,8 @@ def _render(report: dict[str, Any]) -> str:
     )
     lines.append(
         f"  rest_invariant: violations={t.get('rest_invariant_violations', 0)}  "
-        f"phantoms={t.get('rest_invariant_phantoms', 0)} (read-path lag, no stand-down)"
+        f"phantoms={t.get('rest_invariant_phantoms', 0)}  "
+        f"rechecks={t.get('rest_invariant_rechecks', 0)} (read-path lag, no stand-down)"
     )
     for k in e_keys:
         ml = t["shadow_mean_lock"].get(k)
