@@ -207,7 +207,15 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 gaps_c.append(slock * 100 - rlock * 100)
 
     n = len(completed)
-    n_days = len(armed_days)
+    n_days = len(armed_days)  # distinct armed UTC calendar days (retained key; NOT the fill-rate denom)
+    # armed_windows = number of armed windows the pilot actually RAN (ledger rows whose effective_mode
+    # is armed, whatever their stand-down reason). A dark hour (reboot/proxy-down/task-not-started)
+    # leaves no row and so contributes 0. Backfill rows carry no effective_mode, so they never count
+    # here (they would double-count a window otherwise). Registered clarification 2026-09-15 ~13:30Z.
+    armed_windows = sum(1 for r in rows if r.get("effective_mode") == "armed")
+    # "armed evaluation days" = armed_windows / 24 (an hour is a 24th of a day). fill_rate is the
+    # sets-per-day the >= 2.0 [pin] gate reads; None only when NO armed window ran.
+    armed_days = Decimal(armed_windows) / Decimal(24)
     # fills_total = number of armed windows with a rest fill (completed + one-legged)
     fills_total = sum(
         1 for r in rows if r.get("armed") and (
@@ -221,7 +229,7 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     min_lock = slocks[0] if n else None
     pos = sum(1 for x in live_locks_c if x > 0)
     pct_positive = (Decimal(pos) * 100 / Decimal(n)) if n else None
-    fill_rate = (Decimal(fills_total) / Decimal(n_days)) if n_days else None
+    fill_rate = (Decimal(fills_total) / armed_days) if armed_windows else None
     shadow_mean = ((sum(shadow_locks_c, Decimal(0)) / Decimal(len(shadow_locks_c)))
                    if shadow_locks_c else None)
     exec_gap = (sum(gaps_c, Decimal(0)) / Decimal(len(gaps_c))) if gaps_c else None
@@ -257,6 +265,8 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "fills_total": fills_total,
         "one_legged": legged,
         "n_days": n_days,
+        "armed_windows": armed_windows,
+        "armed_days": armed_days,
         "mean_lock_c": mean_lock,
         "median_lock_c": median_lock,
         "p10_lock_c": p10_lock,
@@ -299,7 +309,8 @@ def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
         "FALSIFIER SCOREBOARD (DegeneracyV3_2, continuous-requote pump-fader, E=0.10) -- [pin] gates",
         "-" * 78,
         f"  completed sets n = {sb['n']}   (rest fills total = {sb['fills_total']}, one-legged = "
-        f"{sb['one_legged']})   armed days = {sb['n_days']}",
+        f"{sb['one_legged']})   armed windows = {sb['armed_windows']}   "
+        f"armed days = {sb['armed_windows']}/24 = {_num(sb['armed_days'], 2)}",
         f"  realized lock: mean {_c(sb['mean_lock_c'])}  median {_c(sb['median_lock_c'])}  "
         f"p10 {_c(sb['p10_lock_c'])}  min {_c(sb['min_lock_c'])}",
         f"  %positive = {_num(pct, 1) if pct is not None else 'n/a'}   "
