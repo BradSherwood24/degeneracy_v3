@@ -43,6 +43,7 @@ from service.v32 import (
     BookUpdate,
     Fill,
     OrderAck,
+    OrderAmended,
     OrderCancelled,
     Trade,
     V32State,
@@ -278,6 +279,12 @@ def _run_core(fix, E: Decimal, tol: Decimal, deb_ms: int):
                 # SEQUENTIAL replace (R-OVERLAP): confirm the cancel after one RTT so the core can then
                 # place the new quote. filled 0 (no fill during this cancel in the fixture).
                 push(ev.server_ts + _LAT_MS / 1000.0, 0, "cancelled", (a.order_id,))
+            if a.kind == ActionKind.AMEND_REST:
+                # AMEND-FIRST replace (Brad 2026-09-15): confirm the amend after one RTT — the order_id
+                # persists, the resting price + coid update IN PLACE, and the OLD price rests during the
+                # hop (a single-lag replace, no cancel gap — the same single-lag the reference models).
+                push(ev.server_ts + _LAT_MS / 1000.0, 0, "amended",
+                     (a.order_id, a.updated_client_order_id, a.price))
             if a.kind == ActionKind.TAKE_WINGS:
                 take[0] = a
 
@@ -292,6 +299,9 @@ def _run_core(fix, E: Decimal, tol: Decimal, deb_ms: int):
         elif kind == "cancelled":
             (oid,) = payload
             feed(OrderCancelled(oid, ts, Decimal(0)))
+        elif kind == "amended":
+            oid, new_coid, new_price = payload
+            feed(OrderAmended(oid, new_coid, new_price, ts))
         elif kind == "trade":
             tk, pc, side, cnt = payload
             feed(Trade(tk, _D(pc), side, Decimal(cnt), ts))
