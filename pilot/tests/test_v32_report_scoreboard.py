@@ -23,6 +23,7 @@ def _set_row(day: int, hour: int, lock: str | None, shadow_lock: str | None = No
     shadow = {"0.10": {"filled": True, "lock": shadow_lock}} if shadow_lock is not None else {}
     return {
         "armed": True,
+        "effective_mode": "armed",
         "close_time": f"2026-09-{day:02d}T{hour:02d}:00:00Z",
         "realized_lock": lock,
         "one_legged": one_legged,
@@ -31,6 +32,20 @@ def _set_row(day: int, hour: int, lock: str | None, shadow_lock: str | None = No
         "replaces": replaces,
         "strike_lag_seconds": slag,
         "bucket_lag_seconds": blag,
+    }
+
+
+def _armed_no_fill_row(day: int, hour: int) -> dict:
+    """An armed window that RAN but whose rest never filled (no completed set, no one-legged). It counts
+    toward armed_windows (effective_mode armed) but not toward fills_total/n."""
+    return {
+        "armed": True,
+        "effective_mode": "armed",
+        "close_time": f"2026-09-{day:02d}T{hour:02d}:00:00Z",
+        "realized_lock": None,
+        "one_legged": False,
+        "realized_unsettled": False,
+        "shadow": {},
     }
 
 
@@ -69,8 +84,11 @@ def test_scoreboard_statistics_percentiles_and_gap():
 def test_scoreboard_alive_when_all_pins_pass():
     sb = build_falsifier_scoreboard(_thirty_sets("0.09", "0.10"))
     assert sb["n"] == 30 and sb["one_legged"] == 0 and sb["n_days"] == 10
+    # clarified denominator: armed_windows / 24 (30 armed windows -> 30/24 armed days)
+    assert sb["armed_windows"] == 30 and sb["armed_days"] == Decimal(30) / Decimal(24)
     assert sb["mean_lock_c"] == Decimal(9)
-    assert sb["fill_rate_per_day"] == Decimal(3)
+    # 30 rest fills over 30 armed windows = 30 / (30/24) = 24.0 sets/day (>= the 2.0 pin)
+    assert sb["fill_rate_per_day"] == Decimal(30) / (Decimal(30) / Decimal(24))
     assert sb["exec_gap_c"] == Decimal(1)
     assert sb["verdict"] == "ALIVE-so-far"
 
@@ -104,19 +122,25 @@ def test_scoreboard_kill_on_too_many_one_legged():
 
 
 def test_scoreboard_kill_on_low_fill_rate():
-    # 30 completed sets but spread thin: 2/day on 5 days + 1/day on 20 days = 25 armed days -> 30/25 =
-    # 1.2/day < the 2.0 pin. Locks/gap/legged all fine, so the ONLY miss is the fill-rate gate.
+    # Clarified denominator = armed_windows / 24. 30 rest fills spread across 400 armed windows =
+    # 30 / (400/24) = 1.8 sets/day < the 2.0 pin. Locks/gap/legged all fine, so the ONLY miss is the
+    # fill-rate gate. The calendar span does not matter now -- only the count of armed windows the
+    # pilot ran (the 370 armed windows whose rest never filled dilute the rate honestly).
     rows: list[dict] = []
-    d = 1
-    for _ in range(5):          # 5 days x 2 sets = 10
-        rows += [_set_row(d, 16, "0.09", "0.10"), _set_row(d, 17, "0.09", "0.10")]
-        d += 1
-    for _ in range(20):         # 20 days x 1 set = 20  (total 30 over 25 days)
-        rows.append(_set_row(d, 16, "0.09", "0.10"))
-        d += 1
+    made = 0
+    day, hour = 1, 0
+    while made < 400:
+        rows.append(_set_row(day, hour, "0.09", "0.10") if made < 30
+                    else _armed_no_fill_row(day, hour))
+        made += 1
+        hour += 1
+        if hour == 24:
+            hour, day = 0, day + 1
     sb = build_falsifier_scoreboard(rows)
-    assert sb["n"] == 30 and sb["n_days"] == 25
-    assert sb["fill_rate_per_day"] == Decimal(30) / Decimal(25)   # 1.2/day < 2.0
+    assert sb["n"] == 30 and sb["armed_windows"] == 400
+    assert sb["armed_days"] == Decimal(400) / Decimal(24)
+    assert sb["fill_rate_per_day"] == Decimal(30) / (Decimal(400) / Decimal(24))  # 1.8/day
+    assert sb["fill_rate_per_day"] < Decimal("2.0")
     assert sb["verdict"].startswith("KILL") and "fill rate" in sb["verdict"]
 
 
@@ -143,8 +167,29 @@ def test_scoreboard_p99_data_age_per_connection():
 
 
 def test_scoreboard_ignores_dry_rows():
-    # a dry/shakedown row (armed False) never counts toward the live scoreboard
+    # a dry/shakedown row (armed False, effective_mode not armed) never counts toward the live
+    # scoreboard -- not as a completed set, a rest fill, or an armed window
     rows = [_set_row(1, 16, "0.09", "0.10")]
     rows[0]["armed"] = False
+    rows[0]["effective_mode"] = "dry"
     sb = build_falsifier_scoreboard(rows)
     assert sb["n"] == 0 and sb["fills_total"] == 0
+    assert sb["armed_windows"] == 0 and sb["armed_days"] == Decimal(0)
+    assert sb["fill_rate_per_day"] is None
+
+
+def test_scoreboard_armed_days_is_windows_over_24():
+    # Registered clarification 2026-09-15: "armed evaluation days" = armed_windows / 24, NOT distinct
+    # calendar days. 7 armed windows across TWO UTC dates (3 on the 14th, 4 on the 15th) with a single
+    # completed set -> armed_windows 7, armed_days 7/24, fill rate 1 / (7/24) = 24/7 = 3.43/day.
+    rows = [_set_row(14, 16, "0.09", "0.10")]                       # the one completed set (a fill)
+    rows += [_armed_no_fill_row(14, h) for h in (17, 18)]           # 2 more armed windows, no fill
+    rows += [_armed_no_fill_row(15, h) for h in (16, 17, 18, 19)]   # 4 armed windows next UTC day
+    sb = build_falsifier_scoreboard(rows)
+    assert sb["armed_windows"] == 7
+    assert sb["armed_days"] == Decimal(7) / Decimal(24)
+    assert sb["n"] == 1 and sb["fills_total"] == 1
+    assert sb["n_days"] == 2                                        # two distinct calendar dates
+    assert sb["fill_rate_per_day"] == Decimal(1) / (Decimal(7) / Decimal(24))  # 24/7 = 3.428.../day
+    # n=1 < 30 so the verdict is still pending; the denominator clarification does not change that
+    assert sb["verdict"].startswith("n<")
