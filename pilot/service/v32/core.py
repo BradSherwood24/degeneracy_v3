@@ -33,7 +33,11 @@ T-``quote_start_s`` .. T-``quote_end_s`` (T-15..T-5):
     are then a $1 floor, so a deferred retry is bounded, not naked). One completed set/hour.
   * Shadow (every E in shadow_Es, regardless of mode): re-solve n_shadow(E) each book tick with NO
     lag and NO requote gate; a spot-bucket YES trade strictly above 1 - n_shadow records a shadow
-    fill (once per hour per E); shadow completion = wing asks at the trade tick (both strikes fresh)
+    fill (once per hour per E), but ONLY on prints inside the live quoting window T-15..T-5 (the same
+    window gate the live path enforces, on the same eval clock) — a qualifying print outside the
+    window emits SHADOW_FILL_OUTSIDE_WINDOW and never fills, since the shadow is the no-lag
+    counterfactual of a LIVE fill and live cannot quote outside the window; shadow completion = wing
+    asks at the trade tick (both strikes fresh)
     or the next strike book update; shadow lock = 2 - (n_shadow + fee) - W_at_completion. Emits no
     actions — this IS the ideal fill rule running live, so a dry run yields the sim statistic.
 

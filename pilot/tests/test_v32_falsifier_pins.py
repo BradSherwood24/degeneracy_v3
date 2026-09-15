@@ -71,6 +71,18 @@ def test_registration_carries_2026_09_15_clarification():
     assert "EXPIRATION_GRACE_S` = 60, PR #50" in doc
 
 
+def test_registration_carries_2026_09_15_shadow_window_clarification():
+    """MEASUREMENT CLARIFICATION 2 (shadow window gate, 2026-09-15 ~18:10Z, Brad's verbatim go, PR #54):
+    the shadow records a fill only on prints inside the live quoting window T-15..T-5; prints outside
+    are journaled/counted (``shadow_fills_outside_window``) but never fill. A MEASUREMENT DEFINITION,
+    not a threshold change -- the frozen [pin] gates and the STATUS line are untouched (asserted
+    elsewhere in this file)."""
+    doc = _doc()
+    reg = doc.split("## Registration", 1)[1].split("## Pre-registered shadow observations", 1)[0]
+    assert "MEASUREMENT CLARIFICATION 2" in reg
+    assert "shadow_fills_outside_window" in reg
+
+
 def test_verdict_pins_match_doc():
     doc = _doc()
     assert f"n >= {V32_FALSIFIER_MIN_N}" in doc

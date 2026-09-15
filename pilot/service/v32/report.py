@@ -216,6 +216,10 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     # "armed evaluation days" = armed_windows / 24 (an hour is a 24th of a day). fill_rate is the
     # sets-per-day the >= 2.0 [pin] gate reads; None only when NO armed window ran.
     armed_days = Decimal(armed_windows) / Decimal(24)
+    # measurement-integrity gauge: would-be shadow fills SUPPRESSED by the T-15..T-5 window gate
+    # (prints outside the live quoting window the live path could never have taken). Additive: older
+    # ledger rows lack the key, so ``.get(...,0)``. Registered clarification 2026-09-15 ~18:10Z / PR #54.
+    shadow_fills_outside_window = sum(int(r.get("shadow_fills_outside_window", 0) or 0) for r in rows)
     # fills_total = number of armed windows with a rest fill (completed + one-legged)
     fills_total = sum(
         1 for r in rows if r.get("armed") and (
@@ -280,6 +284,7 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "bucket_lag_p99_s": bucket_p99,
         "strike_lag_stats_p99_s": strike_stats_p99,
         "bucket_lag_stats_p99_s": bucket_stats_p99,
+        "shadow_fills_outside_window": shadow_fills_outside_window,
         "verdict": verdict,
     }
 
@@ -320,6 +325,8 @@ def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
         f"  replaces/hour mean = {_num(sb['replaces_per_hour_mean'], 1)}   "
         f"data-age p99 (max/window): strike {_num(strike_age, 2, 's')}  "
         f"bucket {_num(bucket_age, 2, 's')}",
+        f"  shadow fills outside window (suppressed, T-15..T-5 gate) = "
+        f"{sb.get('shadow_fills_outside_window', 0)}",
         f"  VERDICT: {sb['verdict']}",
     ]
 
