@@ -54,6 +54,23 @@ def test_falsifier_is_frozen_with_registration():
     assert falsifier_is_frozen(_DOC) is True
 
 
+def test_registration_carries_2026_09_15_clarification():
+    """The 2026-09-15 measurement clarification (armed-days = armed_windows/24 + the T-4 expiry wording
+    fix) is registered on Brad's verbatim go. A MEASUREMENT DEFINITION, not a threshold change -- the
+    frozen [pin] gates and the STATUS line are untouched (asserted elsewhere in this file)."""
+    doc = _doc()
+    reg = doc.split("## Registration", 1)[1].split("## Pre-registered shadow observations", 1)[0]
+    assert "MEASUREMENT CLARIFICATION" in reg
+    assert "Lets do option 2" in reg
+    assert "armed_windows / 24" in reg
+    # the T-4 expiry wording fix landed in MUST CONFIRM item 1: that section no longer claims the rest
+    # "auto-expires at T-5" (the Registration entry may still quote the OLD phrase to record the change)
+    confirm = doc.split("## FIRST ARMED WINDOW MUST CONFIRM", 1)[1].split("## Registration", 1)[0]
+    assert "auto-expires at T-5" not in confirm
+    assert "quote-end cancel at T-5 is the PRIMARY path" in confirm
+    assert "EXPIRATION_GRACE_S` = 60, PR #50" in doc
+
+
 def test_verdict_pins_match_doc():
     doc = _doc()
     assert f"n >= {V32_FALSIFIER_MIN_N}" in doc
