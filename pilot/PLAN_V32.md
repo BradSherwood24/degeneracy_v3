@@ -83,10 +83,21 @@ single-flight / token budget (hostile to requoting), `WakeResult` (mandates a 15
 
 ## Requote policy
 
-**Replace = cancel -> confirm -> create; never two live rests** (R-OVERLAP ruling 2026-09-13): a replace is
-strictly sequential — emit CANCEL_REST, wait for OrderCancelled (a fill there means TAKE_WINGS, not PLACE),
-then PLACE_REST at the freshly re-solved n on the next tick. The ~200-400 ms of no quote per replace is
-accepted (~30 s/hour unquoted at ~77 replaces/hour). No fillable old rest is ever left beside a new one in flight.
+**Replace = AMEND-FIRST, cancel -> confirm -> create as the fallback; never two live rests**
+(R-OVERLAP ruling 2026-09-13; amend-first Brad 2026-09-15, verbatim: "Use the cancel and recreate flow as a
+backup if our post to ammend the order fails. Go ahead and build that"): a same-bucket requote emits
+`AMEND_REST` — Kalshi Amend Order V2 (`POST /portfolio/events/orders/{id}/amend?exchange_index=<idx>`, the
+`exchange_index` also in the body), same `order_id`, a price change forfeits queue position EXACTLY as
+cancel+create did. The core holds all requotes while `amend_in_flight` and updates the resting price + coid
+IN PLACE on `OrderAmended`; a fill during the amend (`fill_count > 0`, a TAKER fill at `average_fill_price`)
+is routed into the wings exactly like a fill-before-cancel. On ANY non-2xx/timeout the executor journals
+`amend_failed` and FALLS BACK to the strictly-sequential cancel -> confirm -> create (the sharded DELETE with
+PR #50 backoff/status-truth, then a PLACE_REST through the pre-PLACE venue invariant). Bucket changes (a
+different ticker — an amend cannot change the ticker) and the quote-end cancel are unchanged. This removes the
+~0.7 s/replace (60-90 s/busy hour) the old sequential cancel left with NOTHING resting — the cause of the
+2026-09-15 14:00Z missed fill. An amend IS a replace for `replace_count`, the A_REPLACE alarm, and the ledger
+`replaces` counter; it reaches the new price one RTT sooner and never leaves a no-rest gap, so its lock is
+`>=` the cancel+create lock. No fillable old rest is ever left beside a new one in flight.
 
 From `pf_ms_requote2.py` (lagging-quote model: replace only when |dn| >= TOL and >= DEB ms since the last replace;
 new quote live +200 ms; fill = print > 1 - n_resting; completion +1.5 s; one per hour; forward 139 h):
