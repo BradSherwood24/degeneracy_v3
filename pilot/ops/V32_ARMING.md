@@ -76,12 +76,14 @@ Set `pilot/ops/v32_mode.txt` back to `dry` (or `shakedown`):
 Set-Content -Path ops\v32_mode.txt -Value "dry" -NoNewline -Encoding ascii
 ```
 Takes effect at the next `:40` process (mode is read once per fresh process; a window already running is
-unaffected). The running process cancels its own resting order at the quote end (T-5) via
-`expiration_time` regardless, so standing down mid-window leaves nothing resting past the window.
-Standing down does NOT un-freeze the falsifier -- only Brad edits that line.
+unaffected). The running process cancels its own resting order at the quote end (T-5) with a DELETE (the
+primary path); the order also carries an `expiration_time` set EXPIRATION_GRACE_S (60 s) PAST the quote
+end (T-4) as a crash backstop, so standing down mid-window leaves nothing resting past the window either
+way. Standing down does NOT un-freeze the falsifier -- only Brad edits that line.
 
 **Cancel a stray resting order by hand** (only if you have confirmed one is genuinely still resting --
-e.g. a crashed process before its `expiration_time`; normally the venue auto-expires it at T-5). Find
+e.g. a crashed process before its `expiration_time`; normally the venue auto-expires it just after the
+quote end, at T-4). Find
 the order id from the journal (`place_rest`/`order_ack`) or from the proxy, then:
 ```
 Invoke-RestMethod -Method Delete http://127.0.0.1:8642/trade-api/v2/portfolio/events/orders/<id>
@@ -133,9 +135,11 @@ day-scoped design exists to prevent.
 
 The falsifier's "FIRST ARMED WINDOW MUST CONFIRM" list, and where each item appears:
 
-1. **`expiration_time` honored (rest gone at T-5).** `place_rest` record carries `expiration_time`
-   (Unix seconds = the quote end); after T-5 the venue reports no resting order (poll/status shows the
-   rest gone). If a rest lingers past T-5, the field name is wrong at the venue -- STOP.
+1. **`expiration_time` honored (rest gone by the quote end).** `place_rest` record carries
+   `expiration_time` (Unix seconds = EXPIRATION_GRACE_S (60 s) past the quote end, i.e. T-4 — the crash
+   backstop). The running process's quote-end DELETE pulls the rest at T-5 (the primary path); after the
+   backstop (T-4) the venue reports no resting order regardless (poll/status shows the rest gone). If a
+   rest lingers past T-4, the field name is wrong at the venue -- STOP.
 2. **get-order fp fields present.** The order-status poll/cancel-confirm records carry `fill_count_fp`,
    `remaining_count_fp`, `initial_count_fp` and a `status` the confirm treats as terminal
    (`status not in ("resting", None)`). If a filled order still parses `filled=0`, the fp fields are

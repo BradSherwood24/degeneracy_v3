@@ -149,7 +149,8 @@ Exchange write rate ~0.15/s, far under Kalshi limits. Full grid in scratchpad `j
 
 ### Phase 3 — maker execution + money math — branch `v32/phase3-exec`
 * `service/v32/executor.py`: `place_rest` (POST single create: side no, action buy, count, price n, `post_only`
-  true, `time_in_force good_till_canceled`, `expiration_time` = quote end (T-5) so a crashed process leaves nothing
+  true, `time_in_force good_till_canceled`, `expiration_time` = EXPIRATION_GRACE_S past the quote end (T-4; crash
+  backstop, the quote-end cancel is the primary path) so a crashed process leaves nothing
   resting past the window, `client_order_id`, `exchange_index`), `cancel(order_id)` (DELETE
   `/trade-api/v2/portfolio/orders/{order_id}`; confirm via GET order status), `take_wings` (batch create, 2 legs,
   IOC, limit ask + margin, `exchange_index` per leg), `order_status(order_id)`. Fills from the `fill` WS channel
