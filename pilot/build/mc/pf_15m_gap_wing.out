@@ -1,0 +1,27 @@
+forward days: ['2026-08-30', '2026-08-31', '2026-09-01', '2026-09-02', '2026-09-03', '2026-09-04']
+hours 139 with 15M books+result 139; minute-samples K15 position: {'above': 434, 'below': 372, 'inside': 723}
+samples with both legs priced + results: 761  (payoffs: Counter({2: 657, 3: 104}))
+
+      gap     n hours  15M-hourly cost (c)  P(pay=3) gap value (c)  NET (c)  pay<2
+     <$25   256    48                +3.20      0.0%           0.0     -3.2      0
+   $25-50   126    29               +12.19     20.6%          20.6     +8.4      0
+  $50-100   235    53               +20.84     15.7%          15.7     -5.1      0
+ $100-200   108    34               +26.94     34.3%          34.3     +7.3      0
+    >$200    36    11               +41.65     11.1%          11.1    -30.5      0
+      ALL   761   116               +15.32     13.7%          13.7     -1.7      0
+    above   411    70               +14.34     11.4%          11.4     -2.9
+    below   350    61               +16.48     16.3%          16.3     -0.2
+
+== CONDITIONAL on the hourly set being enterable at that minute (lock at cap >= 0) ==
+lock@cap >= 0: n=301 hours=109  15M-hourly cost +18.87c  P(pay=3) 15.0%  NET -3.9c  pay<2: 0
+         <$25 n= 102 hours= 39 cost  +4.05c  P3   0.0%  NET   -4.0c
+       $25-50 n=  46 hours= 25 cost +15.96c  P3  23.9%  NET   +8.0c
+      $50-100 n= 103 hours= 48 cost +25.49c  P3  21.4%  NET   -4.1c
+     $100-200 n=  37 hours= 26 cost +33.72c  P3  32.4%  NET   -1.3c
+        >$200 n=  13 hours=  8 cost +50.74c  P3   0.0%  NET  -50.7c
+lock@cap >= 10c (E): n=46 hours=39  15M-hourly cost +28.86c  P(pay=3) 26.1%  NET -2.8c  pay<2: 0
+         <$25 n=   9 hours=  9 cost  +5.59c  P3   0.0%  NET   -5.6c
+       $25-50 n=  11 hours=  8 cost +20.87c  P3  18.2%  NET   -2.7c
+      $50-100 n=  18 hours= 15 cost +33.00c  P3  44.4%  NET  +11.4c
+     $100-200 n=   4 hours=  4 cost +51.16c  P3  50.0%  NET   -1.2c
+        >$200 n=   4 hours=  4 cost +62.27c  P3   0.0%  NET  -62.3c

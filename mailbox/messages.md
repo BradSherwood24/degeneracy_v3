@@ -1138,3 +1138,63 @@ Met. Mode file -> armed after the 23:00Z pull; first re-armed window = 23:40Z wa
 against MUST CONFIRM + two new items (first cancel 200 with shard; venue resting list <= 1 of ours). Stand-down recipe: mode file -> dry
 (next wake) + kill run_v32 python + `DELETE .../portfolio/events/orders/<id>?exchange_index=<idx>` per resting order.
 Proxy hardening for Brad's box (not done): refuse non-GET paths outside the known write prefixes instead of forwarding uncapped.
+
+
+---
+
+## 2026-09-16 ~16:00Z — Claude → house: V3.2 armed days 2-3 — three sets banked (3/3, +36c true), reboot outage, T-5 race + phantom-resting fixes, amend-first built, capacity and 15M studies, pre-compact handoff
+
+**Live tally (re-arm 2026-09-14 23:00Z -> 2026-09-16 15:45Z):** 3 completed sets, 3 wins, zero one-legged, zero dollars lost.
+00:00Z 09-15 B78250 NO 0.32 + wings 0.85/0.69 -> +11.6c true (ledger +10.07c); 17:00Z 09-15 B76450 NO 0.33 + 0.67/0.85 -> +12.5c (+11.0c);
+05:00Z 09-16 B75750 NO 0.15 + 0.91/0.80 -> +12.3c (+11.4c). Balance 51.997 -> 52.36. Scoreboard n=3, mean +10.8c ledger, 100% positive,
+exec gap -0.4c (live beat shadow on set 3), fill rate 2.1-2.7/day against the 2.0 gate after ~14 quiet hours (shadow equally dry = market, not
+execution). Ledger locks understate by ~1.5c (frozen spec reserves a taker fee on the fee-free maker rest) -- reported, not changed.
+
+**Incidents, all zero-loss, all fixed or in PR:**
+- 09-15 01:00Z T-5 RACE: rest expiry (T-5) and quote-end cancel (T-5) raced; venue expired at 00:55:00.000, our DELETE +367 ms -> 404, status
+  GET stale "resting", 3 immediate retries -> cancel_failed + hour stand-down. PR #50 (Brad merged 13:24Z): expiry T-4 (EXPIRATION_GRACE_S=60,
+  code constant), CANCEL_BACKOFF_S (0.25/0.75/2.0) + status-truth confirmation, counters cancels_via_status/cancels_expired. 14:00Z+ windows 0 404s.
+- 09-15 05:30Z WINDOWS UPDATE REBOOT (TrustedInstaller "OS Upgrade"): proxy died (plain process, not a service); task DegeneracyV3_2 is
+  Interactive-logon so it slept until Brad logged in ~12:31Z; 7 windows lost (06Z-12Z). Venue clean throughout. Claude restarted the proxy
+  detached 12:35Z (Start-Process; logs degeneracy-proxy/proxy.out.restart.log). Brad's levers: proxy as logon task/service, task "run whether
+  logged on", Windows Update active hours / auto-update off (Brad: "seems like I forgot to turn auto update off").
+- 09-15 17:54:59Z and 18:52:27Z PHANTOM RESTING (x2): the pre-place venue-truth invariant's orders list still showed an order 0.86-0.89 s AFTER
+  its DELETE returned 200; stray-cancel 404; hour stood down (18:00Z lost a +10c shadow fill). Read-path lag, same class as the T-5 race.
+  PR #56 (fix/phantom-resting, APPROVE + delta APPROVE, review PRs #57/#58, 864 tests): phantom filter (CANCEL_SETTLE_S 5 s), one 0.5 s re-read,
+  404 on the stray-cancel = phantom -> PLACE proceeds; filled strays booked (tracked) or alarm+stand-down (untracked); counters phantoms/rechecks.
+  **OPEN -- awaiting Brad's merge; the live tree still runs without it.** Two windows lost to it on 09-15; none overnight.
+- Shadow window: the ideal shadow filled at 03:55:51Z (T-4:09) where live cannot quote. PR #54 (merged 18:16Z): shadow fills gated to
+  T-15..T-5, journaled/counted when suppressed (counter currently over-counts every out-of-window print -- cosmetic nit queued).
+
+**Falsifier (FROZEN) Registration clarifications on Brad's verbatim words:** (1) 13:30Z "Yea, I agree. Lets do option 2." -> armed evaluation
+days = armed windows / 24 (PR #52; 0.50/day -> 2.67/day at the time; /24 not /23 because the design stand-down hours write armed rows too) +
+T-4 expiry wording; (2) 18:10Z "Yea, I agree." -> shadow window gate (PR #54); (3) 18:10Z "Use the cancel and recreate flow as a backup if our
+post to ammend the order fails. Go ahead and build that" -> MECHANICS CLARIFICATION in PR #59.
+
+**Amend-first replace (PR #59, APPROVE WITH NITS, review PR #60, 877 tests) -- OPEN awaiting Brad, to be REBASED onto #56 first.** Kalshi Amend
+Order V2 (POST /portfolio/events/orders/{id}/amend?exchange_index=2; order_id persists; price change forfeits queue like cancel+create);
+fallback = PR #50 cancel->confirm->create; fill_count>0 on amend booked as rest fill -> wings. Why: replace gap ~0.7 s x 100-200/h = rest
+absent 11-15% of busy windows (14:00Z 09-15 miss landed in a gap; stale-wing stand-downs only 1-28 s/window). CORRECTION: the proxy REFUSES
+non-create order-write POSTs (403) today, so amends fall back until Brad applies pilot/ops/proxy_amend_cap.md and restarts -> merge is
+behaviour-neutral, benefit dormant. Nits before size > 1: remaining_count guard on crossed amends; timeout-race price note.
+
+**Studies (pilot/build/mc/, scripts + outputs committed here, README table):**
+- MONTE CARLO (PR #49): 20k paths from $52.11; 1 contract -> $62.6/30 d, $83.8/90 d BASE; 20 contracts -> $384/90 d; P(loss)=0 is the model
+  (leg-fail assumed <= 5%); size bound by print size (median 4 lots), not capital; days to n=30 median 8.1 (5.4-12.6).
+- CAPACITY (Brad: "$1000/day?"): needs ~2,700 contracts/set; walls = bucket taker flow (~4,000 lots/window, sweeps ~1,500 in 1 s) and wing
+  depth (+2c median 2,800, p10 1,000). Book-owner ceiling (ladder at every profitable level, unlimited size, no slippage): $300-700/day; realistic
+  $100-300/day; lowering E adds NO hours (profitable flow in the same 4/13 windows at E 4c/8c/10c), only lots inside pump hours. $300/day
+  needs ~$2-2.5k in flight ($5k comfortable); capital is not the constraint, flow is. Path = more series + stepwise size + ladder (V3.3 candidate).
+- 15M STUDIES, all DEAD: outside-bucket wing = valid $2-floor box with a $3 gap, but the 15M leg costs +15.6c vs the hourly leg for a 13.8%
+  gap hit (fair-priced lottery) and the set is enterable at E in 4-7 hours/139 vs 52; sub-$1 box (NO@hourly(B) + YES bucket(K15) + YES 15M):
+  tape showed 6-13% minutes < $1 = stale-leg artifacts; on ms books taker NEVER < $1 (7 of 13,000 s within 1.6c), maker-bucket 1-3c flickers
+  in half the windows for 1-11 s; grinder sim 9 maker fills, lock at fill -0.0/-1.4c, $2 zone 0/9, total -6c. Fee moat 4-5c > dislocations.
+  Brad's framing: "find the free money" -> found: the spot-bucket lock; fair: every 15M variant; unfillable: 1-3c maker flickers.
+
+**Ops notes:** Claude may merge DOCS PRs; the auto-mode classifier blocks Claude merging CODE PRs (self-approval) -> Brad's explicit word per PR.
+Background watchers die with the Claude session (reboot) and get killed by the harness under low RAM (Steam/Spotify ~2.5 GB) -> check by hand.
+Four worktrees: dv3_wt_v11 (builds), dv3_wt_review (reviews/docs), dv3_wt_fix (hotfixes), dv3_wt_amend (amend build). Never two agents in one.
+
+**Open for Brad:** merge #56 then rebased #59; apply proxy_amend_cap.md + restart proxy; proxy as service + task logon setting + auto-update off;
+Spotify/Steam RAM; falsifier verdict at n=30 (~8 days of uptime); v1.1 back burner; dark-week replay + wide-band re-fetch still queued.
+— Claude

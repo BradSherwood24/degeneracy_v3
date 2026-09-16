@@ -1,0 +1,21 @@
+== 20260914T170000Z K15=78627.27 B=78600 pay A/M=1/1 sub-$1 seconds A=0 M=7 | fill A: - | fill M: -
+== 20260914T180000Z K15=78839.4 B=78800 pay A/M=1/1 sub-$1 seconds A=0 M=3 | fill A: - | fill M: t-54 cost $1.0691 lock -6.9c print 0.15 x18
+== 20260914T190000Z K15=79198.85 B=79100 pay A/M=1/1 sub-$1 seconds A=11 M=0 | fill A: t-138 cost $0.9892 lock +1.1c print 0.10 x1 | fill M: -
+== 20260914T200000Z K15=79118.17 B=79100 pay A/M=1/1 sub-$1 seconds A=0 M=0 | fill A: - | fill M: -
+== 20260914T230000Z K15=78638.67 B=78600 pay A/M=1/1 sub-$1 seconds A=0 M=0 | fill A: - | fill M: -
+== 20260915T000000Z K15=78316.89 B=78300 pay A/M=1/1 sub-$1 seconds A=0 M=5 | fill A: - | fill M: -
+== 20260915T010000Z K15=77964.78 B=77900 pay A/M=1/2 sub-$1 seconds A=0 M=0 | fill A: - | fill M: -
+== 20260915T020000Z K15=77991.72 B=77900 pay A/M=1/2 sub-$1 seconds A=10 M=0 | fill A: t-96 cost $1.0363 lock -3.6c print 0.71 x20 | fill M: -
+== 20260915T030000Z K15=77867.9 B=77800 pay A/M=2/1 sub-$1 seconds A=0 M=2 | fill A: - | fill M: t-22 cost $0.9940 lock +0.6c print 0.97 x30
+== 20260915T040000Z K15=77781.34 B=77700 pay A/M=1/1 sub-$1 seconds A=5 M=0 | fill A: t-295 cost $1.0006 lock -0.1c print 0.39 x1 | fill M: -
+== 20260915T050000Z K15=77616.38 B=77600 pay A/M=1/1 sub-$1 seconds A=0 M=0 | fill A: - | fill M: -
+== 20260915T130000Z K15=76908.62 B=76900 pay A/M=2/1 sub-$1 seconds A=1 M=0 | fill A: - | fill M: -
+== 20260915T140000Z K15=76386.13 B=76300 pay A/M=1/1 sub-$1 seconds A=4 M=0 | fill A: t-430 cost $0.9890 lock +1.1c print 0.08 x53 | fill M: -
+== 20260915T150000Z K15=75883.08 B=75800 pay A/M=2/1 sub-$1 seconds A=1 M=6 | fill A: - | fill M: t-12 cost $0.9763 lock +2.4c print 0.90 x13
+== 20260915T160000Z K15=76395.36 B=76300 pay A/M=1/1 sub-$1 seconds A=11 M=0 | fill A: t-555 cost $0.9857 lock +1.4c print 0.11 x186 | fill M: -
+== 20260915T170000Z K15=76315.78 B=76300 pay A/M=2/1 sub-$1 seconds A=0 M=9 | fill A: - | fill M: t-150 cost $1.0179 lock -1.8c print 0.56 x28
+== 20260915T180000Z K15=76725.4 B=76700 pay A/M=1/1 sub-$1 seconds A=0 M=7 | fill A: - | fill M: -
+
+== pooled ==
+variant A: windows with any sub-$1 resting 7/17; maker fills 5; lock at fill mean -0.0c min -3.6c; payoffs Counter({1: 5}); realized mean -0.0c total -0c over 17 windows
+variant M: windows with any sub-$1 resting 7/17; maker fills 4; lock at fill mean -1.4c min -6.9c; payoffs Counter({1: 4}); realized mean -1.4c total -6c over 17 windows
