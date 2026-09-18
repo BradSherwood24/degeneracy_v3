@@ -83,6 +83,44 @@ def test_registration_carries_2026_09_15_shadow_window_clarification():
     assert "shadow_fills_outside_window" in reg
 
 
+def test_registration_carries_2026_09_18_partial_fill_clarification():
+    """MECHANICS + MEASUREMENT CLARIFICATION (partial fills / sizing step, 2026-09-18 ~18:30Z, Brad's
+    verbatim ruling): on each rest fill event take both wings sized to the fill, the remainder stays
+    resting, a completed SET = one rest-fill event with both wings filled, lock reported per contract,
+    fill rate = set events / armed day. A MECHANICS + MEASUREMENT DEFINITION registered at n=6 live sets
+    BEFORE any size change -- no [pin], threshold, params sha, or the STATUS line is touched (asserted
+    elsewhere in this file). ``params.contracts`` remains Brad's lever and stays 1 here; a raise gets its
+    own params-sha Registration entry."""
+    doc = _doc()
+    reg = doc.split("## Registration", 1)[1].split("## Pre-registered shadow observations", 1)[0]
+    assert "MECHANICS + MEASUREMENT CLARIFICATION" in reg
+    # Brad's verbatim ruling is quoted
+    assert "we open 8 wings and leave the 2 unfilled" in reg
+    assert "Hopefully another taker comes and fills the remainder" in reg
+    # the mechanics: wings sized to the fill, remainder stays resting, delta booking
+    assert "sized to the fill" in reg
+    assert "REMAINDER stays on the book" in reg
+    assert "CUMULATIVE per order" in reg and "DELTA" in reg
+    # the measurement: set = rest-fill event with both wings filled; lock per contract; set-event rate
+    assert "one rest-fill EVENT" in reg
+    assert "PER CONTRACT" in reg
+    assert "SET EVENTS per armed evaluation day" in reg
+    # ladders/levels out of scope; contracts stays 1 (the params sha pin gets its own entry on a raise)
+    assert "OUT of scope" in reg
+    assert "params.contracts` remains BRAD'S lever and stays 1" in reg
+    # STATUS line + the frozen params sha untouched by this MEASUREMENT/MECHANICS entry
+    assert doc.splitlines()[2].strip() == "STATUS: FROZEN"
+    assert FROZEN_V32_PARAMS_SHA256 in doc
+
+
+def test_partial_fill_contracts_lever_unchanged_at_one():
+    """The partial-fill clarification does NOT change ``contracts`` -- the frozen policy still rests 1
+    lot (any raise is a separate amendment with its own pinned sha)."""
+    p = load_v32_params()
+    assert p.contracts == 1
+    assert p.sha256 == FROZEN_V32_PARAMS_SHA256
+
+
 def test_verdict_pins_match_doc():
     doc = _doc()
     assert f"n >= {V32_FALSIFIER_MIN_N}" in doc

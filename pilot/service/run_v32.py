@@ -1328,11 +1328,48 @@ def _gzip_journal(journal_path: str) -> dict:
                 "raw_bytes": None, "gz_bytes": None, "error": str(e)}
 
 
-def _compute_money_math(state: V32State, executor: Any) -> dict[str, Any]:
+def _batch_set_records(state: V32State) -> list[dict[str, Any]]:
+    """One record per wing batch (PARTIAL-FILL WINGS, Brad 2026-09-18): a completed batch is one SET.
+
+    Each record carries the batch's per-contract realized lock (``lock_value`` is already per contract,
+    so per-set stats stay comparable to the size-1 history), completion, one_legged, and the legs held
+    to settlement for that batch. At ``contracts`` = 1 there is exactly one batch and this mirrors the
+    single-set row the pre-partial build produced."""
+    out: list[dict[str, Any]] = []
+    for b in getattr(state, "wing_batches", ()):  # type: ignore[attr-defined]
+        legs = [lg for lg in state.wing_legs if lg.batch == b.index]
+        completed = bool(legs) and all(lg.status == "filled" for lg in legs)
+        w_paid = Decimal(0)
+        held = 1  # the bucket-NO lot is always held once the rest fills
+        for lg in legs:
+            if lg.status == "filled":
+                held += 1
+                if lg.fill_price is not None:
+                    w_paid += lg.fill_price + _fee(lg.fill_price)
+        lock = lock_value(b.fill_price, w_paid) if completed else None
+        out.append({
+            "index": b.index,
+            "fill_price": str(b.fill_price),
+            "fill_count": int(b.fill_count),
+            "completed": bool(completed),
+            "one_legged": bool(b.one_legged),
+            "realized_lock": (str(lock) if lock is not None else None),
+            "held_legs": held,
+        })
+    return out
+
+
+def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> dict[str, Any]:
     """Fold the completed window's fills into the ledger's money-math slots. Returns the kwargs for
     ``build_v32_ledger_row`` (all empty/None when nothing filled — dry/shakedown windows). ``held_legs``
     are the bucket-NO + each FILLED wing leg (side/ticker/count), marked ``realized_unsettled`` so the
-    settlement backfill sweep corrects the conservative floor booked here."""
+    settlement backfill sweep corrects the conservative floor booked here.
+
+    PARTIAL-FILL WINGS (Brad 2026-09-18): the money math is derived PER BATCH (each rest fill event is
+    its own set), so a partial-fill window books one held bucket-NO + wings per fill and one per-contract
+    realized lock per completed set. At ``contracts`` = 1 there is one batch and every existing key keeps
+    its exact value (the hard acceptance test); the new keys (``rest_fills``, ``wing_batch_sets``,
+    ``lots_filled``, ``lots_unfilled_at_quote_end``, ``partial_fills``) are additive."""
     # Operational counters ALWAYS travel to the row — even when nothing filled. The 2026-09-14 20:00Z
     # armed row read 0/0 rests despite 3 rejected creates because the no-fill early-return below dropped
     # these; they now ride both exits. Cancel/venue-truth counters added with the shard fix.
@@ -1351,20 +1388,30 @@ def _compute_money_math(state: V32State, executor: Any) -> dict[str, Any]:
     fills = list(getattr(executor, "fills", []) or [])
     if not fills or state.rest_fill is None:
         return {"fills": fills, **counters}
-    rest_fills = [f for f in fills if f.get("leg") == "rest"]
+    rest_fills_mm = [f for f in fills if f.get("leg") == "rest"]
     wing_fills = [f for f in fills if f.get("leg") == "wing"]
-    held: list[dict[str, Any]] = []
     bt = state.bucket_tickers.get(state.spot_Sd) if state.spot_Sd is not None else None
-    if bt:
-        held.append({"ticker": bt, "side": "no", "count": int(state.rest_fill.count)})
-    w_paid = Decimal(0)
-    all_wings_filled = bool(state.wing_legs) and all(lg.status == "filled" for lg in state.wing_legs)
-    for lg in state.wing_legs:
-        if lg.status == "filled":
-            held.append({"ticker": lg.ticker, "side": lg.side, "count": int(lg.count)})
-            if lg.fill_price is not None:
-                w_paid += lg.fill_price + _fee(lg.fill_price)
-    realized_lock = lock_value(state.rest_fill.price, w_paid) if all_wings_filled else None
+    # Per-batch held legs, floor and first-completed-set lock (PARTIAL-FILL WINGS). At contracts=1 the
+    # single batch reproduces the pre-partial held list, floor and realized_lock exactly.
+    held: list[dict[str, Any]] = []
+    floor = Decimal(0)
+    realized_lock: Decimal | None = None
+    for b in getattr(state, "wing_batches", ()):  # type: ignore[attr-defined]
+        legs = [lg for lg in state.wing_legs if lg.batch == b.index]
+        held_this = 1
+        if bt:
+            held.append({"ticker": bt, "side": "no", "count": int(b.fill_count)})
+        w_paid = Decimal(0)
+        completed = bool(legs) and all(lg.status == "filled" for lg in legs)
+        for lg in legs:
+            if lg.status == "filled":
+                held_this += 1
+                held.append({"ticker": lg.ticker, "side": lg.side, "count": int(lg.count)})
+                if lg.fill_price is not None:
+                    w_paid += lg.fill_price + _fee(lg.fill_price)
+        floor += v32_set_floor_dollars(held_this, int(b.fill_count))
+        if completed and realized_lock is None:
+            realized_lock = lock_value(b.fill_price, w_paid)
     # conservative realized at close = floor guaranteed by the held legs − cash actually paid.
     cost = Decimal(0)
     for f in fills:
@@ -1374,16 +1421,27 @@ def _compute_money_math(state: V32State, executor: Any) -> dict[str, Any]:
                 cost += Decimal(str(f.get("fee")))
         except (ArithmeticError, ValueError, TypeError):
             continue
-    floor = v32_set_floor_dollars(len(held))
     realized_delta = floor - cost
+    rest_fills_events = [
+        {"price": str(rf.price), "count": int(rf.count), "server_ts": rf.server_ts}
+        for rf in getattr(state, "rest_fills", ())
+    ]
+    lots_filled = sum(int(rf.count) for rf in getattr(state, "rest_fills", ()))
+    lots_unfilled = max(0, int(contracts) - lots_filled)
     return {
-        "fills": rest_fills,
+        "fills": rest_fills_mm,
         "wing_fills": wing_fills,
         "held_legs": held,
         "realized_lock": realized_lock,
         "one_legged": bool(state.one_legged),
         "realized_unsettled": bool(held),
         "realized_delta": realized_delta,
+        # PARTIAL-FILL WINGS additive slots
+        "rest_fills": rest_fills_events,
+        "wing_batch_sets": _batch_set_records(state),
+        "lots_filled": int(lots_filled),
+        "lots_unfilled_at_quote_end": int(lots_unfilled),
+        "partial_fills": int(getattr(state, "partial_fills", 0)),
         **counters,
     }
 
@@ -1400,7 +1458,7 @@ def _finalize(
     journal.close()
     gz = _gzip_journal(journal_path)
     final_path = os.path.abspath(gz.get("final_path") or journal_path)
-    money = _compute_money_math(driver.state, driver.executor)
+    money = _compute_money_math(driver.state, driver.executor, contracts=params.contracts)
     row = build_v32_ledger_row(
         close_time=close_iso,
         resolved_mode=resolved_mode,

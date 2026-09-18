@@ -161,7 +161,14 @@ class RestFill:
 
 @dataclass(frozen=True)
 class WingLeg:
-    """One taker completion leg. ``status`` in {"pending","filled","unfilled"}."""
+    """One taker completion leg. ``status`` in {"pending","filled","unfilled"}.
+
+    ``batch`` (PARTIAL-FILL WINGS, Brad 2026-09-18) is the index of the ``WingBatch`` this leg belongs
+    to. At ``contracts`` = 1 every leg is batch 0 (byte-identical to the pre-partial single-batch build);
+    at ``contracts`` > 1 each rest FILL EVENT spawns its own batch (its own two legs) so the wings are
+    sized to the fill and tracked/retried/completed independently. ``wing_legs`` is a FLAT tuple across
+    all batches (the executor's ``_take_wings`` sends every ``pending`` leg unchanged); the per-leg
+    ``batch`` is how the core attributes a leg to its batch."""
 
     ticker: str
     side: str
@@ -171,6 +178,27 @@ class WingLeg:
     status: str = "pending"
     fill_price: Decimal | None = None
     fill_fee: Decimal | None = None
+    batch: int = 0
+
+
+@dataclass(frozen=True)
+class WingBatch:
+    """One taker-completion batch spawned by ONE rest fill of ``fill_count`` lots at ``fill_price``
+    (PARTIAL-FILL WINGS, Brad 2026-09-18: "open N wings for the size it filled at"). Its two legs live
+    in ``V32State.wing_legs`` tagged with this batch's ``index``; this record carries the batch's fill
+    economics and lifecycle flags so multiple batches per hour are tracked independently.
+
+    ``taken`` — the initial both-wings take has been emitted for this batch.
+    ``completed`` — both of this batch's wings filled (this batch is one counted SET).
+    ``one_legged`` — this batch reached the T-1 s cutoff with a wing missing (drives S1_LEGGED)."""
+
+    index: int
+    fill_price: Decimal
+    fill_count: int
+    server_ts: float
+    taken: bool = False
+    completed: bool = False
+    one_legged: bool = False
 
 
 @dataclass(frozen=True)
@@ -236,12 +264,28 @@ class V32State:
     coid_seq: int = 0
 
     # completion / wings
-    rest_fill: RestFill | None = None
-    wings_needed: bool = False
-    wing_taken: bool = False
+    #
+    # SCALAR MIRRORS (rest_fill / wings_needed / wing_taken / one_legged): kept for backward
+    # compatibility (the driver, ledger and the existing tests read them) and re-derived from the
+    # batch state on every transition by ``_sync_wing_mirrors``. At ``contracts`` = 1 there is exactly
+    # ONE batch and these mirrors carry the same values, same actions and same counters as the
+    # pre-partial build (the hard acceptance test). ``wing_legs`` is the FLAT, authoritative tuple of
+    # legs across all batches.
+    rest_fill: RestFill | None = None          # mirror: the most recent rest fill (rest_fills[-1])
+    wings_needed: bool = False                  # mirror: any batch not yet completed
+    wing_taken: bool = False                    # mirror: the most recent batch's initial take fired
     wing_legs: tuple[WingLeg, ...] = ()
     sets_done: int = 0
-    one_legged: bool = False
+    one_legged: bool = False                    # mirror: any batch flagged one_legged
+
+    # PARTIAL-FILL WINGS (Brad 2026-09-18): per-fill wing batches + the resting remainder.
+    wing_batches: tuple[WingBatch, ...] = ()    # one per rest fill event, tracked independently
+    rest_fills: tuple[RestFill, ...] = ()       # every rest fill booked this hour (each spawns a batch)
+    rest_remaining: int | None = None           # lots of the allotment still resting (None == full)
+    rest_allotment_done: bool = False           # the whole allotment (params.contracts lots) has filled
+    rest_booked_by_coid: Mapping[str, int] = field(default_factory=dict)  # cumulative lots booked / order
+    next_batch_index: int = 0
+    partial_fills: int = 0                       # rest fills that left a resting remainder
 
     # shadow (keyed by str(E))
     shadows: Mapping[str, ShadowSub] = field(default_factory=dict)
@@ -369,6 +413,84 @@ def _mint_coid(st: V32State) -> tuple[str, V32State]:
     seq = st.coid_seq + 1
     coid = f"v32-{st.close_time}-{seq}"
     return coid, replace(st, coid_seq=seq)
+
+
+# ===========================================================================
+# PARTIAL-FILL WINGS helpers (Brad 2026-09-18)
+# ===========================================================================
+def _rest_size(params: V32Params, st: V32State) -> int:
+    """The number of lots to REST right now: the full allotment (``params.contracts``) until a fill
+    reduces it, then the still-resting remainder. ``rest_remaining`` is None until the first fill."""
+    return params.contracts if st.rest_remaining is None else int(st.rest_remaining)
+
+
+def _replace_batch(batches: tuple[WingBatch, ...], index: int, **fields) -> tuple[WingBatch, ...]:
+    """Return ``batches`` with the batch at ``index`` replaced by ``dataclasses.replace(b, **fields)``."""
+    out = list(batches)
+    for i, b in enumerate(out):
+        if b.index == index:
+            out[i] = replace(b, **fields)
+            break
+    return tuple(out)
+
+
+def _sync_wing_mirrors(st: V32State) -> V32State:
+    """Re-derive the scalar mirrors from the batch state (kept for backward compatibility; see V32State).
+
+    At ``contracts`` = 1 (one batch) these carry exactly the pre-partial single-batch values."""
+    rest_fill = st.rest_fills[-1] if st.rest_fills else None
+    wings_needed = any(not b.completed for b in st.wing_batches)
+    wing_taken = st.wing_batches[-1].taken if st.wing_batches else False
+    one_legged = any(b.one_legged for b in st.wing_batches)
+    return replace(
+        st, rest_fill=rest_fill, wings_needed=wings_needed, wing_taken=wing_taken,
+        one_legged=one_legged,
+    )
+
+
+def _book_rest_delta(
+    params: V32Params, st: V32State, coid: str, price: Decimal, delta: int, now: float
+) -> tuple[V32State, list[V32Action]]:
+    """Book ``delta`` newly-filled lots of OUR resting bucket-NO (order ``coid``) at ``price``.
+
+    PARTIAL-FILL WINGS (Brad 2026-09-18, verbatim): "only send orders for the wings on the signal that
+    our maker order filled, for the size it filled at ... leave the [remainder] unfilled. Hopefully
+    another taker comes and fills the remainder." So each fill event spawns ITS OWN wing batch sized to
+    the fill; the remainder stays resting and keeps being requoted; the allotment is done only when the
+    last lot fills. ``delta`` must be > 0 (the caller does the cumulative->delta arithmetic and dedup)."""
+    size_before = _rest_size(params, st)
+    new_remaining = max(0, size_before - int(delta))
+    rf = RestFill(price=price, count=int(delta), server_ts=now)
+    idx = st.next_batch_index
+    batch = WingBatch(index=idx, fill_price=price, fill_count=int(delta), server_ts=now)
+    booked = dict(st.rest_booked_by_coid)
+    booked[coid] = booked.get(coid, 0) + int(delta)
+    partial_fills = st.partial_fills + (1 if new_remaining > 0 else 0)
+    common = dict(
+        rest_fills=st.rest_fills + (rf,),
+        wing_batches=st.wing_batches + (batch,),
+        next_batch_index=idx + 1,
+        rest_booked_by_coid=booked,
+        rest_remaining=new_remaining,
+        partial_fills=partial_fills,
+    )
+    if new_remaining == 0:
+        # the whole allotment has filled -> stop resting/quoting (one allotment per hour).
+        st = replace(
+            st, rest_allotment_done=True, rest_live=None, rest_pending=None,
+            cancel_in_flight=False, **common,
+        )
+    else:
+        # a PARTIAL fill: keep the still-resting remainder tracked (same order) at the reduced count so
+        # ``_requote`` keeps requoting it; a later fill spawns the next batch. The exchange has already
+        # reduced the live order's remaining count.
+        live = st.rest_live
+        if live is not None and live.client_order_id == coid:
+            live = replace(live, count=new_remaining)
+        st = replace(st, rest_live=live, **common)
+    st, wa = _wing_step(params, st, now)
+    st = _sync_wing_mirrors(st)
+    return st, wa
 
 
 # ===========================================================================
@@ -525,25 +647,27 @@ def _apply_cancelled(
     # slot but still confirms the outstanding cancel).
     if matched or st.cancel_in_flight:
         st = replace(st, cancel_in_flight=False)
-    if event.filled_count_before_cancel > _ZERO and st.rest_fill is None:
-        # a fill slipped in before the cancel landed -> book it at the CANCELLED order's price
-        # and take wings. (When the slot was eagerly cleared before the cancel confirm — a bucket
-        # change or a stand-down cancel — matched_order is None and we fall back to desired_n;
-        # see the Phase-1 review's retained-cancel-context finding.)
+    filled = int(event.filled_count_before_cancel)
+    if filled > 0:
+        # ``filled_count_before_cancel`` is CUMULATIVE for this order (venue truth). Book only the DELTA
+        # over the lots already booked for it (a fill can arrive on the ws channel AND then be re-reported
+        # by the cancel's status poll — see PARTIAL-FILL WINGS): one lot booked via a ws Fill, then a
+        # cancel poll reporting filled 2 books exactly ONE more.
         if matched_order is not None:
-            n = matched_order.price
-        elif st.desired_n is not None:
-            n = st.desired_n
-        else:
-            n = _ZERO
-        st = replace(
-            st,
-            rest_fill=RestFill(price=n, count=int(event.filled_count_before_cancel), server_ts=now),
-            wings_needed=True,
-            wing_taken=False,
-        )
-        st, wa = _wing_step(params, st, now)
-        actions += wa
+            coid = matched_order.client_order_id
+            already = st.rest_booked_by_coid.get(coid, 0)
+            delta = filled - already
+            if delta > 0:
+                st, wa = _book_rest_delta(params, st, coid, matched_order.price, delta, now)
+                actions += wa
+        elif not st.rest_fills:
+            # the slot was eagerly cleared before the cancel confirm (a bucket change / stand-down
+            # cancel), so we cannot attribute by coid — fall back to booking the reported count at
+            # ``desired_n`` (retained-cancel-context finding), once.
+            n = st.desired_n if st.desired_n is not None else _ZERO
+            fallback_coid = f"__cxl__{event.order_id}"
+            st, wa = _book_rest_delta(params, st, fallback_coid, n, filled, now)
+            actions += wa
     return st, actions
 
 
@@ -563,27 +687,23 @@ def _apply_fill(
             else:
                 legs[i] = replace(leg, status="unfilled")
             st = replace(st, wing_legs=tuple(legs))
-            st = _maybe_close_set(st)
+            st = _maybe_close_set(st, leg.batch)
             return st, actions
-    # rest fill?
-    is_ours = (st.rest_live is not None and st.rest_live.client_order_id == event.client_order_id) or (
-        st.rest_pending is not None and st.rest_pending.client_order_id == event.client_order_id
-    )
-    if is_ours and st.rest_fill is None:
-        n = event.price if event.price is not None else (
-            st.rest_live.price if st.rest_live is not None else st.desired_n
-        )
-        st = replace(
-            st,
-            rest_fill=RestFill(price=n, count=int(event.count), server_ts=now),
-            rest_live=None,
-            rest_pending=None,
-            cancel_in_flight=False,
-            wings_needed=True,
-            wing_taken=False,
-        )
-        st, wa = _wing_step(params, st, now)
-        actions += wa
+    # rest fill? A ws Fill's ``count`` is the PER-FILL lot count (a delta), so each fill event spawns its
+    # own wing batch sized to the fill and the remainder stays resting (PARTIAL-FILL WINGS, Brad
+    # 2026-09-18). ``rest_booked_by_coid`` also lets a later CUMULATIVE OrderCancelled/poll book only the
+    # extra lots (never double-book the ws lot).
+    matched: RestOrder | None = None
+    if st.rest_live is not None and st.rest_live.client_order_id == event.client_order_id:
+        matched = st.rest_live
+    elif st.rest_pending is not None and st.rest_pending.client_order_id == event.client_order_id:
+        matched = st.rest_pending
+    if matched is not None:
+        delta = int(event.count)
+        if delta > 0:
+            n = event.price if event.price is not None else matched.price
+            st, wa = _book_rest_delta(params, st, matched.client_order_id, n, delta, now)
+            actions += wa
     return st, actions
 
 
@@ -611,67 +731,94 @@ def _wing_prices(st: V32State, now: float, params: V32Params) -> tuple[Decimal, 
     return sd.yes_ask, su.no_ask
 
 
-def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, list[V32Action]]:
-    """Take (or retry) the wings after a rest fill.
+def _batch_legs(st: V32State, index: int) -> list[WingLeg]:
+    """The legs of one wing batch (by ``batch`` tag) within the flat ``wing_legs`` tuple."""
+    return [l for l in st.wing_legs if l.batch == index]
 
-    The INITIAL both-wings take is UNCONDITIONAL (ruling F-2): once the bucket-NO fills we assemble
-    the $2 pin regardless of lock_floor. lock_floor gates ONLY the RETRY of a single missing leg
-    after an IOC no-fill — at which point the two already-held legs are a $1 floor, so we never
-    overpay for the last leg. Both branches honor the settle cutoff (no_orders_after_s_to_settle)."""
+
+def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, list[V32Action]]:
+    """Take (or retry) the wings for EVERY incomplete batch (PARTIAL-FILL WINGS, Brad 2026-09-18).
+
+    Each rest fill event has its own ``WingBatch`` (its own two legs, sized to that fill); this steps
+    each batch independently. The INITIAL both-wings take of a batch is UNCONDITIONAL (ruling F-2):
+    once a lot of the bucket-NO fills we assemble that lot's $2 pin regardless of lock_floor. lock_floor
+    gates ONLY the RETRY of a single missing leg after an IOC no-fill — at which point the two already-
+    held legs are a $1 floor, so we never overpay for the last leg. Both branches honor the settle
+    cutoff (no_orders_after_s_to_settle). At ``contracts`` = 1 there is one batch and this is
+    byte-identical to the single-batch build."""
     actions: list[V32Action] = []
-    if not st.wings_needed:
+    if not st.wing_batches:
         return st, actions
     t_to_close = st.close_epoch - now
     if t_to_close < params.no_orders_after_s_to_settle:
-        # cutoff: a rest filled but the $2 pin never completed -> a bounded, unhedged set. Flag it
-        # one_legged (drives S1_LEGGED). This covers BOTH the wings-taken-but-a-leg-missed case AND
-        # the wings-NEVER-taken case (strike feed dead from fill to deadline = a lone bucket-NO), which
-        # the earlier ``st.wing_taken and ...`` guard silently missed — leaving the worst unhedged case
-        # unflagged and uncounted toward the day latch.
-        if st.rest_fill is not None and st.wings_needed:
-            incomplete = (not st.wing_legs) or any(l.status != "filled" for l in st.wing_legs)
+        # cutoff: any batch whose $2 pin never completed -> a bounded, unhedged set. Flag that batch
+        # one_legged (drives S1_LEGGED). Covers BOTH a wing-taken-but-a-leg-missed batch AND a
+        # wings-NEVER-taken batch (strike feed dead from fill to deadline = a lone bucket-NO lot).
+        for b in list(st.wing_batches):
+            if b.completed or b.one_legged:
+                continue
+            legs = _batch_legs(st, b.index)
+            incomplete = (not legs) or any(l.status != "filled" for l in legs)
             if incomplete:
-                st = replace(st, one_legged=True)
-        return st, actions
+                st = replace(st, wing_batches=_replace_batch(st.wing_batches, b.index, one_legged=True))
+        return _sync_wing_mirrors(st), actions
 
     prices = _wing_prices(st, now, params)
     if prices is None:
         return st, actions
     ya, na = prices
+    for index in [b.index for b in st.wing_batches]:
+        b = next((x for x in st.wing_batches if x.index == index), None)
+        if b is None or b.completed:
+            continue
+        if not b.taken:
+            st, a = _take_batch(params, st, b, ya, na, now)
+        else:
+            st, a = _retry_batch(params, st, b, ya, na, now)
+        actions += a
+    return _sync_wing_mirrors(st), actions
 
-    if not st.wing_taken:
-        # UNCONDITIONAL initial take (ruling F-2): take BOTH wings at ask + wing_margin now,
-        # regardless of lock_floor. The fill already happened; completing the pin bounds the
-        # position to the $2 payoff. (lock is still computed for the journal/report.)
-        n = st.rest_fill.price if st.rest_fill is not None else _ZERO
-        w_paid = ya + fee(ya) + na + fee(na)
-        lock = lock_value(n, w_paid)
-        count = st.rest_fill.count if st.rest_fill is not None else params.contracts
-        coid_y, st = _mint_coid(st)
-        coid_n, st = _mint_coid(st)
-        yes_limit = min(ya + params.wing_margin, _LIMIT_CEILING)
-        no_limit = min(na + params.wing_margin, _LIMIT_CEILING)
-        legs = (
-            LegOrder(st.strike_tickers.get(st.spot_Sd, ""), BUY_YES, "buy", count, yes_limit),
-            LegOrder(st.strike_tickers.get(st.spot_Su, ""), BUY_NO, "buy", count, no_limit),
-        )
-        wing_legs = (
-            WingLeg(legs[0].ticker, BUY_YES, count, yes_limit, coid_y),
-            WingLeg(legs[1].ticker, BUY_NO, count, no_limit, coid_n),
-        )
-        st = replace(st, wing_taken=True, wing_legs=wing_legs)
-        actions.append(
-            _mk(ActionKind.TAKE_WINGS, st.shakedown, legs=legs, count=count, lock=lock)
-        )
-        return st, actions
 
-    # already taken: retry any leg reported unfilled, at the fresh ask — but only while the
-    # projected set lock (filled legs at their fill price, unfilled legs at the current ask) stays
-    # at/above lock_floor (ruling F-2). The already-held leg(s) form the $1 floor, so a deferred
-    # retry is bounded, not naked; the retry fires as soon as the ask improves enough.
-    n = st.rest_fill.price if st.rest_fill is not None else _ZERO
+def _take_batch(
+    params: V32Params, st: V32State, b: WingBatch, ya: Decimal, na: Decimal, now: float
+) -> tuple[V32State, list[V32Action]]:
+    """UNCONDITIONAL initial take (ruling F-2) of ONE batch's two wings at ask + wing_margin, sized to
+    that batch's fill count. ``lock`` (per contract) is still computed for the journal/report."""
+    n = b.fill_price
+    w_paid = ya + fee(ya) + na + fee(na)
+    lock = lock_value(n, w_paid)
+    count = b.fill_count
+    coid_y, st = _mint_coid(st)
+    coid_n, st = _mint_coid(st)
+    yes_limit = min(ya + params.wing_margin, _LIMIT_CEILING)
+    no_limit = min(na + params.wing_margin, _LIMIT_CEILING)
+    legs = (
+        LegOrder(st.strike_tickers.get(st.spot_Sd, ""), BUY_YES, "buy", count, yes_limit),
+        LegOrder(st.strike_tickers.get(st.spot_Su, ""), BUY_NO, "buy", count, no_limit),
+    )
+    new_legs = (
+        WingLeg(legs[0].ticker, BUY_YES, count, yes_limit, coid_y, batch=b.index),
+        WingLeg(legs[1].ticker, BUY_NO, count, no_limit, coid_n, batch=b.index),
+    )
+    st = replace(
+        st, wing_legs=st.wing_legs + new_legs,
+        wing_batches=_replace_batch(st.wing_batches, b.index, taken=True),
+    )
+    return st, [_mk(ActionKind.TAKE_WINGS, st.shakedown, legs=legs, count=count, lock=lock)]
+
+
+def _retry_batch(
+    params: V32Params, st: V32State, b: WingBatch, ya: Decimal, na: Decimal, now: float
+) -> tuple[V32State, list[V32Action]]:
+    """Retry any leg of ONE batch reported unfilled, at the fresh ask — but only while the projected
+    set lock (this batch's filled legs at their fill price, unfilled legs at the current ask) stays
+    at/above lock_floor (ruling F-2). The already-held leg(s) form the $1 floor, so a deferred retry is
+    bounded, not naked; the retry fires as soon as the ask improves enough."""
+    actions: list[V32Action] = []
+    legs = _batch_legs(st, b.index)
+    n = b.fill_price
     projected_cost = _ZERO
-    for leg in st.wing_legs:
+    for leg in legs:
         if leg.status == "filled" and leg.fill_price is not None:
             projected_cost += leg.fill_price + fee(leg.fill_price)
         else:
@@ -684,7 +831,7 @@ def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, l
     legs_out = list(st.wing_legs)
     changed = False
     for i, leg in enumerate(st.wing_legs):
-        if leg.status != "unfilled":
+        if leg.batch != b.index or leg.status != "unfilled":
             continue
         ask = ya if leg.side == BUY_YES else na
         limit = min(ask + params.wing_margin, _LIMIT_CEILING)
@@ -698,16 +845,21 @@ def _wing_step(params: V32Params, st: V32State, now: float) -> tuple[V32State, l
     return st, actions
 
 
-def _maybe_close_set(st: V32State) -> V32State:
-    """Both wings filled -> the set is complete: count it and clear the completion flags.
+def _maybe_close_set(st: V32State, index: int) -> V32State:
+    """Both wings of BATCH ``index`` filled -> that set is complete: count it and mark the batch done.
 
-    Gated on ``wings_needed`` so a DUPLICATE fill event for an already-filled leg (same fill
-    reported twice by the channel + the status poll) does not increment ``sets_done`` again."""
-    if st.wings_needed and st.wing_legs and all(l.status == "filled" for l in st.wing_legs):
-        return replace(
-            st, sets_done=st.sets_done + 1, wings_needed=False, one_legged=False
+    Gated on the batch not already completed so a DUPLICATE fill event for an already-filled leg (same
+    fill reported twice by the channel + the status poll) does not increment ``sets_done`` again."""
+    b = next((x for x in st.wing_batches if x.index == index), None)
+    if b is None or b.completed:
+        return _sync_wing_mirrors(st)
+    legs = _batch_legs(st, index)
+    if legs and all(l.status == "filled" for l in legs):
+        st = replace(
+            st, sets_done=st.sets_done + 1,
+            wing_batches=_replace_batch(st.wing_batches, index, completed=True, one_legged=False),
         )
-    return st
+    return _sync_wing_mirrors(st)
 
 
 # ---------------------------------------------------------------------------
@@ -725,17 +877,20 @@ def _place_action(st: V32State, params: V32Params, coid: str, n: Decimal) -> V32
     return _mk(
         ActionKind.PLACE_REST, st.shakedown,
         ticker=st.bucket_tickers.get(st.spot_Sd, ""), side=BUY_NO, action="buy",
-        count=params.contracts, price=n, expiration_epoch=exp, client_order_id=coid,
+        count=_rest_size(params, st), price=n, expiration_epoch=exp, client_order_id=coid,
     )
 
 
 def _emit_place(st: V32State, params: V32Params, now: float) -> tuple[V32State, list[V32Action]]:
-    """Mint + emit a PLACE_REST for the current desired n; record it as the pending rest."""
+    """Mint + emit a PLACE_REST for the current desired n; record it as the pending rest.
+
+    The count is the STILL-RESTING remainder (``_rest_size``): the full allotment until a partial fill
+    reduces it, then the remainder (PARTIAL-FILL WINGS, Brad 2026-09-18)."""
     coid, st = _mint_coid(st)
     n = st.desired_n
     assert n is not None
     order = RestOrder(
-        client_order_id=coid, order_id=None, price=n, count=params.contracts,
+        client_order_id=coid, order_id=None, price=n, count=_rest_size(params, st),
         placed_ts=now, live=False, pending=True, bucket_Sd=st.spot_Sd,  # type: ignore[arg-type]
     )
     times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
@@ -772,10 +927,13 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
     t_to_close = st.close_epoch - now
     in_window = params.quote_start_s >= t_to_close >= params.quote_end_s
 
-    # entered: one rest fill = the one entry for the hour. Stop quoting (wings are handled by
-    # _wing_step); cancel any lingering rest. This is the "one completed set per hour" latch at the
-    # rest-fill instant (sets_done increments later, when both wings fill).
-    if st.rest_fill is not None:
+    # entered: the whole allotment has filled = the one allotment for the hour. Stop quoting (wings are
+    # handled by _wing_step); cancel any lingering rest. PARTIAL-FILL WINGS (Brad 2026-09-18): a PARTIAL
+    # fill does NOT latch here — the still-resting remainder keeps being requoted below until it fills or
+    # the window closes; only ``rest_allotment_done`` (every lot filled) stops the quoting. At
+    # ``contracts`` = 1 a single full fill sets ``rest_allotment_done`` immediately, so this is
+    # byte-identical to the old ``rest_fill is not None`` latch.
+    if st.rest_allotment_done:
         st, ca = _cancel_live_if_any(st)
         return st, actions + ca
 
@@ -788,11 +946,14 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
         return st, ca + sa
 
     # any reason we must not hold a quote -> cancel + stand down (dedup reason)
+    # NB the allotment-complete latch is handled ABOVE (``rest_allotment_done``); ``sets_done`` is NOT
+    # a quoting gate any more — at ``contracts`` > 1 a single completed set can coexist with a still-
+    # resting remainder we must keep quoting (PARTIAL-FILL WINGS). At ``contracts`` = 1 the allotment
+    # latch fires at the fill (before any set completes), so removing the ``sets_done`` gate changes no
+    # contracts=1 behavior.
     no_quote_reason = None
     if st.stood_down:
         no_quote_reason = "stood_down"
-    elif st.sets_done >= params.max_sets_per_hour:
-        no_quote_reason = "set_complete"
     elif t_to_close < params.quote_end_s:
         no_quote_reason = "past_quote_end"
     elif t_to_close > params.quote_start_s:
@@ -957,18 +1118,28 @@ def book_late_rest_fill(
         return st, []
     spot_Sd = bucket_Sd if bucket_Sd is not None else st.spot_Sd
     spot_Su = (spot_Sd + params.bucket_width) if spot_Sd is not None else st.spot_Su
+    # Book the late fill as one batch on the RETAINED bucket context and latch the allotment (a late
+    # fill on a replaced/eagerly-cancelled order is an entry the core stopped tracking). Idempotent via
+    # the ``rest_fill is not None`` guard above. At ``contracts`` = 1 this books the single set exactly
+    # as before (PARTIAL-FILL WINGS keeps the F-1 hook single-batch — a partial on a replaced order is
+    # a rare tail; the batch machinery still books whatever ``count`` is reported).
+    idx = st.next_batch_index
+    rf = RestFill(price=price, count=int(count), server_ts=server_ts)
+    batch = WingBatch(index=idx, fill_price=price, fill_count=int(count), server_ts=server_ts)
     st = replace(
         st,
-        rest_fill=RestFill(price=price, count=int(count), server_ts=server_ts),
+        rest_fills=st.rest_fills + (rf,),
+        wing_batches=st.wing_batches + (batch,),
+        next_batch_index=idx + 1,
+        rest_allotment_done=True,
         rest_live=None,
         rest_pending=None,
         cancel_in_flight=False,
-        wings_needed=True,
-        wing_taken=False,
         spot_Sd=spot_Sd,
         spot_Su=spot_Su,
     )
     st, wa = _wing_step(params, st, server_ts)
+    st = _sync_wing_mirrors(st)
     return st, wa
 
 
