@@ -225,3 +225,102 @@ the remainder must clear/rebuild `cancel_ctx` consistently with the amend replac
 ## Cleanup
 Throwaway worktree `C:\Users\Brads\Python_stuff\dv3_wt_review_pr62` was created for the test run and probe
 and is removed after this review.
+
+---
+
+# Review round 2 — new head `eaa634f` (delta re-review)
+
+Verdict: **APPROVE WITH NITS**. The BLOCK (B1) is fixed and independently reproduced-as-fixed; the N1
+poll backstop is now delta-aware and byte-identical at `contracts` = 1; N2/N3 addressed. Delta since the
+reviewed head `39ca86c`: `core.py` (+cancel_ctx machinery), `run_v32.py` (delta-aware poll),
+`test_v32_partial_fill.py` (+6 tests), build report. No falsifier/ledger/report/`__init__` change since
+round 1 (Registration entry still append-only — unchanged).
+
+## B1 — FIXED (verified)
+
+- `V32State.cancel_ctx: Mapping[str, tuple[str, Decimal]]` (order_id -> (coid, resting price));
+  `_remember_cancel_ctx` (`core.py:928`) records it before an eager clear; `_apply_cancelled`
+  (`core.py:658-676`) uses it when `matched_order is None` to book `delta = filled - rest_booked_by_coid[coid]`
+  at the retained price.
+- **Every eager-clear site audited.** Grepped all `rest_live=None` in `core.py` (new head): `485`
+  (inside `_book_rest_delta`, allotment-done — post-booking, everything already in
+  `rest_booked_by_coid`, so a later cancel yields delta 0; no ctx needed), `644` (the `_apply_cancelled`
+  MATCH path — coid/price captured inline before nulling), `945` (`_cancel_live_if_any` — covered by
+  `_remember_cancel_ctx` at `944`), `1024` (bucket-change branch — covered at `1018`), `1171`
+  (`book_late_rest_fill` F-1 tail — pre-existing, latches allotment; the order it books has already had
+  its cancel processed, so this is the N2-documented duplicate path). All B1-relevant eager clears
+  (quote-end / stand-down / replace-rate via `_cancel_live_if_any`, and bucket-change) are covered.
+- **Probe A re-run against `eaa634f`:** `cancel_ctx has oid? True`, `TAKE_WINGS for lot2? True`,
+  `rest_fills=2`, `allotment_done=True` -> **FIXED (lot2 hedged + booked)**. (Round-1 Probe A on `39ca86c`
+  was `LOT2 DROPPED`.)
+- **No double-booking (verified):**
+  - *Cancel confirm arrives twice* (Probe C): 2nd `OrderCancelled(filled=2)` -> `already=2`, `delta=0`
+    -> nothing booked; `rest_fills` stays 2. The `cancel_ctx` entry is never cleared but cannot
+    double-book because `rest_booked_by_coid` gates the delta.
+  - *Late-WS copy after the ctx booking* (Probe D): reaches `book_late_rest_fill` -> `rest_fill is not
+    None` guard -> dropped; `rest_fills` stays 2, no actions.
+  - *Executor cancel-race money-math*: `_finish_cancel` de-dups by `order_id` in `booked_rest_oids`
+    (lot 1's WS `_record_fill` already added it), so it does not re-book the same order. The core's
+    `cancel_ctx` booking and the executor's money-math are separate accounting sides (floor-from-core vs
+    cost-from-executor, the round-1 "reconciliation slot"), not a shared counter — no double-count of the
+    lot. (Residual: at `contracts` > 1 the money-math `cost` can under-list a lot the core booked, making
+    `realized_delta` slightly conservative-or-not; the FALSIFIER scoreboard reads core-derived
+    `wing_batch_sets`, unaffected. Pre-existing, non-blocking — see N4.)
+
+## N1 — poll delta-aware (verified byte-identical at contracts=1)
+
+`on_poll_fill` (`run_v32.py:906`) now books `delta = filled_count - rest_booked_by_coid[coid]` and feeds
+`Fill(count=delta)`; `if delta <= 0: return`.
+- **contracts=2 backstop:** after a ws lot 1, a poll reporting cumulative 2 books exactly one more and
+  completes its wings (`test_poll_backstops_missed_second_lot_contracts2`, and my Probe A confirms the
+  cancel path also catches it — belt AND braces now both live).
+- **contracts=1 byte-identity:** after a ws lot fully fills, a poll reporting the same total -> delta 0 ->
+  no `rest_fill_poll`, no booking (`test_poll_noop_at_contracts1_after_ws_fill`). Poll-first-when-ws-missed
+  still books once (`test_poll_first_when_ws_missed_books_the_lot`).
+- **WS-then-poll / poll-before-WS dedup:** the ws lot advances `rest_booked_by_coid`, so the poll delta
+  is 0; poll-first advances it, so the later ws copy routes to `book_late` and no-ops. No double.
+- **Poll reports LOWER than booked** (Probe E): `delta = 1 - 2 = -1` -> `delta <= 0` guard -> return.
+  No negative booking, no crash.
+- **Poll + cancel-confirm both seeing the lot:** whichever runs first advances `rest_booked_by_coid`;
+  the second computes delta 0. Verified consistent.
+
+## N2 / N3 — addressed
+
+- N2: `book_late_rest_fill` docstring now states the guard is coarser than per-lot at `contracts` > 1 and
+  is defended by the cancel path, pinned by `test_book_late_second_lot_caught_by_cancel_path` (passes).
+- N3: `test_quote_end_cancel_books_missed_second_lot` asserts
+  `lots_filled + lots_unfilled_at_quote_end == contracts` and `lots_filled == 2` after the ctx booking —
+  the dropped-lot misclassification cannot occur once B1 books the lot.
+
+## Receipts
+
+- **Byte-identity** on a fresh READ-ONLY copy of the live ledger (99 rows) — PR head `eaa634f` vs
+  `origin/main`: `--days 4` table, `--days 4 --json`, full `--json` all **IDENTICAL** (both full-json
+  36 605 bytes; scoreboard `n` = 6, verdict `n<30 pending (n=6)`).
+- **Tests:** `test_v32_partial_fill.py` + `test_v32_falsifier_pins.py` = **28 passed** (22 + 6 new). Full
+  suite in a fresh worktree: **822 passed, 2 skipped**; the gap to the builder's 882 is entirely the
+  data-file-dependent files absent in a fresh checkout (`test_parity`, `test_shakedown`, `test_quintile`,
+  `test_review_probes2`, `reference_impl_review` — need `sim/out/census_train.csv` /
+  `historical-data/15-minute/...`). Environmental, not code; no failures.
+
+## Remaining nits (non-blocking; do not gate the merge)
+
+- **N4 (was the round-1 reconciliation observation):** at `contracts` > 1 the money-math `realized_delta`
+  / `cost` come from `executor.fills`, which can under-list a lot the core booked via `cancel_ctx` (the
+  executor de-dups the cancel-race by `order_id`). The falsifier verdict reads core-derived
+  `wing_batch_sets`, so the kill/verdict is unaffected, but `realized_delta` in the ledger row may not
+  reflect a ctx-booked lot's wing cost. Worth a follow-up reconciliation once `contracts` is actually
+  raised; not a correctness gate at `contracts` = 1.
+- **N5:** `cancel_ctx` is never pruned within a window (grows by one per eager-clear). Bounded by the
+  window's replace count and harmless (delta gating prevents any stale-entry double-book), but a small
+  `del ctx[order_id]` after a terminal booking would keep it tidy. Cosmetic.
+
+## Rebase note (#59)
+Unchanged from round 1, plus: the B1 fix adds `cancel_ctx` to `V32State` and calls `_remember_cancel_ctx`
+in `_cancel_live_if_any` and the bucket-change branch. #59's amend path replaces the resting order id; it
+must record `cancel_ctx` for the amended-away order id too (or rely on the amend keeping `rest_live`
+populated like the drift-replace path), so a missed-WS lot on an amended order stays attributable.
+
+**Round-2 verdict: APPROVE WITH NITS.** B1 fixed and reproduced-as-fixed; N1 delta-aware and
+contracts=1 byte-identical; no double-booking on any path checked; nits N4/N5 are non-blocking follow-ups.
+Merge decision remains Brad's.
