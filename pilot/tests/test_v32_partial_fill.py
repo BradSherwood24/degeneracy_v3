@@ -37,9 +37,11 @@ CLOSE = "2026-09-04T20:00:00Z"
 T = 1_000_000
 
 BK = {"KXBTC-RANGE-B79600": (79600.0, 79699.99), "KXBTC-RANGE-B79700": (79700.0, 79799.99)}
-STK_SD = "KXBTCD-26SEP0416-T79599.99"   # -> 79600
-STK_SU = "KXBTCD-26SEP0416-T79699.99"   # -> 79700
+STK_SD = "KXBTCD-26SEP0416-T79599.99"    # -> 79600
+STK_SU = "KXBTCD-26SEP0416-T79699.99"    # -> 79700
+STK_SU2 = "KXBTCD-26SEP0416-T79799.99"   # -> 79800 (Su of the 79700 spot bucket)
 B_SD = "KXBTC-RANGE-B79600"
+B_SU = "KXBTC-RANGE-B79700"
 
 
 def _top(bid: str, ask: str, *, suspect: bool = False) -> TopOfBook:
@@ -387,3 +389,161 @@ def test_contracts2_one_set_one_legged_scoreboard():
     row = _row(st, p, money)
     sb = build_falsifier_scoreboard([row])
     assert sb["n"] == 1 and sb["one_legged"] == 1 and sb["fills_total"] == 2
+
+
+# ===========================================================================
+# B1 (BLOCKING, from the PR #62 review): a missed-WS lot caught only by an EAGER-CLEAR cancel
+# (quote-end / bucket-change) must be booked + hedged from the cumulative OrderCancelled, never dropped
+# naked to settlement.
+# ===========================================================================
+def test_quote_end_cancel_books_missed_second_lot():
+    """contracts=2: lot 1 fills on ws; lot 2 fills at the venue but its ws fill is MISSED. The remainder
+    is caught only by the T-5 quote-end cancel, whose OrderCancelled reports the CUMULATIVE filled=2. The
+    core MUST book the delta lot (via cancel_ctx) and take its wings -- else lot 2 settles naked/unbooked.
+    (Fresh strike books are fed at the cancel instant so the wings can be taken -- t_to_close ~200s is
+    far above the T-1 s cutoff.)"""
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid, oid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, Fill(oid, coid, Decimal(1), Decimal("0.45"), "no", now + 0.1))  # lot 1 (ws)
+    assert st.rest_live is not None and st.rest_live.count == 1
+    # T-5 quote-end: the remainder is cancelled (rest_live eagerly nulled), cancel_ctx remembers it.
+    st, acts = _feed(p, st, ClockTick(T - 200))
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert st.rest_live is None and oid in st.cancel_ctx
+    # keep the wing books fresh at the cancel instant (a live strike feed ticks continuously).
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), T - 199))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), T - 199))
+    # the executor's cancel confirm carries venue truth: both lots filled (cumulative 2).
+    st, acts = _feed(p, st, OrderCancelled(oid, T - 199, filled_count_before_cancel=Decimal(2)))
+    assert len(st.rest_fills) == 2, "lot 2 must be booked from the cumulative cancel"
+    assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS], "lot 2 must get wings"
+    assert st.rest_allotment_done
+    # N3: the booked lot is NOT misclassified as an unfilled remainder.
+    money = R._compute_money_math(st, _stub_executor(st), contracts=p.contracts)
+    assert money["lots_filled"] == 2 and money["lots_unfilled_at_quote_end"] == 0
+    assert money["lots_filled"] + money["lots_unfilled_at_quote_end"] == p.contracts
+
+
+def test_bucket_change_cancel_books_missed_second_lot():
+    """B1 bucket-change variant: lot 1 fills on ws, then the spot bucket moves so the remainder is
+    eagerly cancelled by the bucket-change branch; a later OrderCancelled(filled=2) must still book +
+    hedge lot 2 via cancel_ctx (at the ORIGINAL resting price, not the drifted desired_n)."""
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid, oid = _bring_up_live_rest(p, st, now)   # spot 79600
+    st, _ = _feed(p, st, Fill(oid, coid, Decimal(1), Decimal("0.45"), "no", now + 0.1))  # lot 1 (ws)
+    assert st.rest_live is not None and st.spot_Sd == 79600
+    # the spot bucket moves to 79700 (its mid now the highest) -> the remainder on 79600 is eagerly
+    # cancelled (bucket-change branch, or the stale-wing no-quote branch while 79700's strikes catch up);
+    # either eager-clear path records cancel_ctx. Collect all ticks' actions.
+    st, acts = _feed_all(p, st, [
+        BookUpdate(B_SU, _top("0.50", "0.52"), now + 1),      # 79700 becomes spot
+        BookUpdate(STK_SU, _top("0.75", "0.76"), now + 1),    # Sd=79700 yes_ask
+        BookUpdate(STK_SU2, _top("0.36", "0.37"), now + 1),   # Su=79800 no_ask
+    ])
+    assert st.spot_Sd == 79700
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert st.rest_live is None and oid in st.cancel_ctx
+    # the cancel confirm reports cumulative 2 -> lot 2 booked at the original resting price via cancel_ctx.
+    st, acts = _feed(p, st, OrderCancelled(oid, now + 1.1, filled_count_before_cancel=Decimal(2)))
+    assert len(st.rest_fills) == 2
+    assert st.rest_fills[1].price == Decimal("0.45")   # original resting price, not desired_n
+    assert st.rest_allotment_done
+
+
+# ===========================================================================
+# N1: the 1 s status poll backstops the missed 2nd lot at contracts>1 (delta-aware), and is a no-op at
+# contracts=1 / for a duplicate cumulative report.
+# ===========================================================================
+def _shakedown_driver(params):
+    import os as _os
+    import tempfile
+    from service.record_range import StreamJournal
+    d = tempfile.mkdtemp()
+    j = StreamJournal(_os.path.join(d, "w.jsonl"), flush_every=1)
+    j.open()
+    state = V32State.new(CLOSE, T, BK, params, shakedown=True)
+    drv = R.V32Driver(params, state, j, R.FrozenExecutor(BK), clock=lambda: 0.0)
+    return drv, j
+
+
+def _place_rest_via_driver(drv, now):
+    drv.on_book_update(B_SD, _top("0.35", "0.36"), now)
+    drv.on_book_update(STK_SU, _top("0.36", "0.37"), now)
+    drv.on_book_update(STK_SD, _top("0.75", "0.76"), now)
+    assert drv.state.rest_live is not None
+    return drv.state.rest_live.client_order_id, drv.state.rest_live.order_id
+
+
+def test_poll_backstops_missed_second_lot_contracts2():
+    p = _params(contracts=2, tol=Decimal("0.50"), deb_ms=100000)  # no drift-requote churn
+    drv, j = _shakedown_driver(p)
+    now = T - 600
+    coid, oid = _place_rest_via_driver(drv, now)
+    n = drv.state.rest_live.price
+    # lot 1 arrives on the ws channel; its wings synth-fill -> set 1.
+    drv.on_fill(B_SD, {"client_order_id": coid, "order_id": oid, "trade_id": "t1", "count": 1,
+                       "purchased_side": "no", "yes_price_dollars": str(Decimal(1) - n)}, now + 0.1)
+    assert drv.state.rest_remaining == 1 and drv.state.sets_done == 1
+    # lot 2 fills silently (ws MISSED); the next poll reports the CUMULATIVE filled 2 -> exactly one more.
+    drv.on_poll_fill(oid, 2, now + 0.2)
+    assert len(drv.state.rest_fills) == 2 and drv.state.rest_allotment_done
+    assert drv.counts["rest_fill_poll"] == 1 and drv.state.sets_done == 2
+    # a further poll reporting 2 again -> nothing (delta 0).
+    drv.on_poll_fill(oid, 2, now + 0.3)
+    assert len(drv.state.rest_fills) == 2 and drv.counts["rest_fill_poll"] == 1
+    j.close()
+
+
+def test_poll_noop_at_contracts1_after_ws_fill():
+    # contracts=1 byte-identical: after the ws lot fully fills, a poll reporting the same total does
+    # nothing (delta 0) -- no rest_fill_poll, no extra booking.
+    p = _params()  # contracts = 1
+    drv, j = _shakedown_driver(p)
+    now = T - 600
+    coid, oid = _place_rest_via_driver(drv, now)
+    n = drv.state.rest_live.price
+    drv.on_fill(B_SD, {"client_order_id": coid, "order_id": oid, "trade_id": "t1", "count": 1,
+                       "purchased_side": "no", "yes_price_dollars": str(Decimal(1) - n)}, now + 0.1)
+    assert drv.state.sets_done == 1 and len(drv.state.rest_fills) == 1
+    drv.on_poll_fill(oid, 1, now + 0.2)
+    assert drv.counts.get("rest_fill_poll", 0) == 0 and len(drv.state.rest_fills) == 1
+    j.close()
+
+
+def test_poll_first_when_ws_missed_books_the_lot():
+    # if the ws fill is missed entirely, the poll (delta over 0 booked) books the lot -- same as before.
+    p = _params()  # contracts = 1
+    drv, j = _shakedown_driver(p)
+    now = T - 600
+    coid, oid = _place_rest_via_driver(drv, now)
+    drv.on_poll_fill(oid, 1, now + 0.2)
+    assert drv.counts["rest_fill_poll"] == 1 and len(drv.state.rest_fills) == 1
+    assert drv.state.sets_done == 1  # wings synth-completed
+    j.close()
+
+
+# ===========================================================================
+# N2: book_late_rest_fill's coarse guard is defended by the cancel path (a distinct 2nd late lot is
+# caught by the cumulative cancel, and the late-ws copy is a genuine duplicate this guard drops).
+# ===========================================================================
+def test_book_late_second_lot_caught_by_cancel_path():
+    from service.v32 import book_late_rest_fill
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid, oid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, Fill(oid, coid, Decimal(1), Decimal("0.45"), "no", now + 0.1))  # lot 1 (ws)
+    # eager-clear (quote-end) then the cumulative cancel books lot 2 (the cancel path is the backstop).
+    st, _ = _feed(p, st, ClockTick(T - 200))
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), T - 199))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), T - 199))
+    st, _ = _feed(p, st, OrderCancelled(oid, T - 199, filled_count_before_cancel=Decimal(2)))
+    assert len(st.rest_fills) == 2
+    # a late-ws copy of lot 2 now reaches book_late_rest_fill -> genuine duplicate, dropped (no 3rd fill).
+    st2, acts = book_late_rest_fill(p, st, price=Decimal("0.45"), count=1, server_ts=T - 198,
+                                    bucket_Sd=79600)
+    assert len(st2.rest_fills) == 2 and acts == []

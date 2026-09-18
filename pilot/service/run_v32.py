@@ -904,12 +904,25 @@ class V32Driver:
                       "client_order_id": rec.client_order_id})
 
     def on_poll_fill(self, order_id: str, filled_count: int, server_ts: float) -> None:
-        """Book a REST fill discovered by the 1 s order-status poll (belt and braces). De-duped against
-        the WS channel by ``order_id`` so a fill seen on both paths is booked once."""
-        if filled_count <= 0 or order_id in self._rest_fill_booked_oids:
+        """Book a REST fill discovered by the 1 s order-status poll (belt and braces).
+
+        ``filled_count`` is the venue-CUMULATIVE fill for this order. The core treats ``Fill.count`` as a
+        PER-FILL delta, so we feed only the DELTA over what the core has already booked for this order
+        (``rest_booked_by_coid``) — mirroring the cancel path's cumulative->delta arithmetic. This is
+        what makes the poll BACKSTOP the extra lots at ``contracts`` > 1 (PARTIAL-FILL WINGS N1): a lot
+        whose WS ``fill`` was missed (WS hiccup / reconnect / low-RAM watcher death — the reason the poll
+        exists) is topped up here instead of sitting naked until the T-5 quote-end cancel. At
+        ``contracts`` = 1 the order is fully booked after one fill, so a poll reporting the same total
+        yields delta 0 and does nothing — byte-identical to the pre-partial single-shot poll (and the
+        WS-then-poll dedup: the WS lot already advanced ``rest_booked_by_coid``)."""
+        if filled_count <= 0:
             return
         rec = self.executor.attribute(order_id=order_id)
         if rec is None:
+            return
+        already = int(self.state.rest_booked_by_coid.get(rec.client_order_id, 0))
+        delta = int(filled_count) - already
+        if delta <= 0:
             return
         self._rest_fill_booked_oids.add(order_id)
         self._stamp(server_ts)
@@ -917,15 +930,15 @@ class V32Driver:
         self.counts["rest_fill_poll"] += 1
         self.journal.append(
             "rest_fill", {"client_order_id": rec.client_order_id, "order_id": order_id,
-                          "rest_price": rec.price, "count": int(filled_count), "path": "poll"},
+                          "rest_price": rec.price, "count": int(delta), "path": "poll"},
             self.clock(),
         )
-        self._record_fill(rec, None, None, int(filled_count), path="poll")
-        # feed the core (idempotent: rest_fill-is-None guard) so the wings complete.
+        self._record_fill(rec, None, None, int(delta), path="poll")
+        # feed the core the DELTA (per-fill) so it books the newly-filled lot(s) and completes their wings.
         self.state, actions = decide_v32(
             self.params, self.state,
             Fill(order_id=order_id, client_order_id=rec.client_order_id,
-                 count=Decimal(int(filled_count)), price=rec.price, side="no", server_ts=server_ts),
+                 count=Decimal(int(delta)), price=rec.price, side="no", server_ts=server_ts),
         )
         synth: list[Any] = []
         for a in actions:

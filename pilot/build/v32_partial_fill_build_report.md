@@ -108,8 +108,8 @@ At `contracts` = 1: `rest_fills` = 1 entry, `wing_batch_sets` = 1 entry, `lots_f
 ## Report-diff result at contracts = 1 (acceptance test)
 
 Ran `python -m service.v32.report` on a read-only COPY of the live ledger
-(`C:\Users\Brads\Python_stuff\degeneracy_v3\pilot\ledger\v32_ledger.jsonl`, 98 rows) from this branch
-vs a throwaway `origin/main` worktree:
+(`C:\Users\Brads\Python_stuff\degeneracy_v3\pilot\ledger\v32_ledger.jsonl`, 99 rows) from this branch
+vs a throwaway `origin/main` worktree (RE-VERIFIED after the review-round-2 B1/N1 fixes):
 - `--days 4` table: **IDENTICAL**
 - `--days 4 --json`: **IDENTICAL**
 - full `--json`: **IDENTICAL**
@@ -119,8 +119,44 @@ exec gap −0.7c, VERDICT `n<30 pending (n=6)`.
 
 ## Tests
 
-`cd pilot && python -m pytest -q` → **876 passed** (862 baseline + 12 partial-fill + 2 falsifier-pins).
+`cd pilot && python -m pytest -q` → **882 passed** (862 baseline + 18 partial-fill + 2 falsifier-pins).
 `tests/test_v32_falsifier_pins.py` add-only (no existing assertion changed).
+
+## Review round 2 — PR #62 BLOCK resolved (B1) + N1/N2/N3
+
+The adversarial review (`dv3_wt_review/pilot/build/v32_partial_fill_review.md`) returned BLOCK on one
+correctness defect and three nits. All addressed on this branch:
+
+- **B1 (BLOCKING) — a missed-WS lot caught only by an EAGER-CLEAR cancel was dropped naked to
+  settlement.** After a partial fill the remainder rests; if lot 2 then fills but its WS `fill` is
+  missed, the only backstop is the cancel path — and the quote-end (T-5) / bucket-change / stand-down
+  cancels EAGER-CLEAR `rest_live` before the `OrderCancelled(filled=cumulative)` arrives, so
+  `matched_order` was None, the delta branch could not run, and the `elif not st.rest_fills` fallback
+  refused (lot 1 already booked). Lot 2 reached settlement unhedged AND unbooked (and was mis-reported as
+  an unfilled remainder). **Fix (core-only, contracts=1-safe):** new `V32State.cancel_ctx`
+  (order_id → (client_order_id, resting price)); `_remember_cancel_ctx` records it whenever a POPULATED
+  `rest_live` is eagerly cleared (`_cancel_live_if_any` and the `_requote` bucket-change branch); in
+  `_apply_cancelled`, when `matched_order is None` the order is looked up in `cancel_ctx` and the delta
+  (`filled − rest_booked_by_coid[coid]`) is booked at the retained resting price, then wings are taken.
+  The unattributable `__cxl__` fallback is kept for the truly-no-context case. Reviewer's failing test
+  `test_quote_end_cancel_books_missed_second_lot` included (+ a `test_bucket_change_..._second_lot`
+  variant); both pass. contracts=1-safe because a post-fill eager-clear never carries a populated slot
+  there (the full fill nulls `rest_live` inside `_book_rest_delta`).
+- **N1 (done now, not deferred) — the 1 s status poll is delta-aware at `contracts` > 1.**
+  `on_poll_fill` no longer early-returns on `_rest_fill_booked_oids` membership; it books
+  `delta = poll_cumulative − rest_booked_by_coid[coid]` and feeds the core that delta. At `contracts` = 1
+  the order is fully booked after one fill, so a poll reporting the same total yields delta 0 and does
+  nothing — byte-identical to the pre-partial single-shot poll (and the WS-then-poll dedup still holds).
+  At `contracts` > 1 a lot whose WS fill was missed is topped up on the next poll (~1 s) instead of
+  waiting for the T-5 cancel. Tests: `test_poll_backstops_missed_second_lot_contracts2`,
+  `test_poll_noop_at_contracts1_after_ws_fill`, `test_poll_first_when_ws_missed_books_the_lot`.
+- **N2 — `book_late_rest_fill` guard documented + pinned.** The coarse `rest_fill is not None` guard is
+  defended by the cancel path (a genuinely distinct second late lot is caught by the cumulative cancel
+  via `cancel_ctx`; the late-WS copy is a true duplicate the guard correctly drops). Comment added to the
+  hook; pinned by `test_book_late_second_lot_caught_by_cancel_path`.
+- **N3 — ledger no longer misclassifies a booked-late lot.** With B1 fixed, `lots_filled` counts the
+  cancel-booked lot, so `lots_filled + lots_unfilled_at_quote_end == contracts`; asserted inside the B1
+  test's money-math check.
 
 ## #56 / #59 conflict hunks (for the later rebase)
 
@@ -146,6 +182,10 @@ and the intended resolution:
    it. Not a textual conflict, but a SEMANTIC follow-up: #59's amend of the remainder must amend at
    `_rest_size(params, st)` (the remaining count), not `params.contracts`.
 6. `decide_v32` dispatch — #59 adds an `OrderAmended` branch; I did not touch the dispatch → clean.
+7. `V32State.cancel_ctx` (B1 fix) — a NEW field #59 does not touch; #59 also edits `V32State`, so this is
+   a trivial both-keep merge. SEMANTIC follow-up: #59's amend REPLACES the order id, so on an amend it
+   must rebuild/clear `cancel_ctx` for the new order id consistently (an eager-clear of an amended order
+   must remember the new id → resting price), mirroring how the create/replace path is handled.
 
 ## Open nits / known limitations
 
@@ -154,13 +194,10 @@ and the intended resolution:
   remainder; wing legs carry the batch fill count; the cancel confirm returns the CUMULATIVE
   `filled_count_before_cancel` and the CORE does the delta. This keeps the diff off #56/#59's executor
   file.
-- **Driver poll path stays single-shot per order** (`on_poll_fill` retains its existing
-  `_rest_fill_booked_oids` gate) to preserve `contracts` = 1 byte-identity. At `contracts` > 1 a
-  poll-only second lot would not top up the CORE via the poll; hedging of extra lots comes from the ws
-  `fill` channel and the cancel-race (both fully wired). The cumulative→delta mechanism IS implemented
-  and tested via the OrderCancelled path (the executor's cancel confirm). If Brad wants the belt-and-
-  braces poll to top up at `contracts` > 1, that is a small follow-up (feed the poll's cumulative and
-  let the core dedup) — deferred to avoid churning the byte-identical poll path.
+- **Driver poll is now delta-aware (N1 done).** `on_poll_fill` books `poll_cumulative −
+  rest_booked_by_coid[coid]` and feeds the core that delta, so the 1 s poll backstops a missed-WS lot at
+  `contracts` > 1 (topped up ~1 s later) while remaining a no-op at `contracts` = 1 (delta 0 after the
+  full fill) — byte-identity preserved (report diff empty; suite green).
 - **`realized_delta` / `fills` money-math capture** still comes from `executor.fills` (exec-price
   reconciliation slot); at `contracts` > 1 the executor's rest-leg capture may under-list lots that
   never reach `_record_fill`, but the FALSIFIER measurement (per-set locks, set counting, held legs)

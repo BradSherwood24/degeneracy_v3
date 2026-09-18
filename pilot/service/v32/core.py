@@ -286,6 +286,11 @@ class V32State:
     rest_booked_by_coid: Mapping[str, int] = field(default_factory=dict)  # cumulative lots booked / order
     next_batch_index: int = 0
     partial_fills: int = 0                       # rest fills that left a resting remainder
+    # B1 fix: order_id -> (client_order_id, resting price) for a POPULATED rest_live that was EAGERLY
+    # cleared (quote-end / bucket-change / stand-down cancel). Lets ``_apply_cancelled`` attribute a
+    # later OrderCancelled(filled=cumulative) whose slot is already None, so a missed-WS lot caught only
+    # by the eager-clear cancel is booked + hedged, never dropped naked to settlement.
+    cancel_ctx: Mapping[str, tuple[str, Decimal]] = field(default_factory=dict)
 
     # shadow (keyed by str(E))
     shadows: Mapping[str, ShadowSub] = field(default_factory=dict)
@@ -653,17 +658,28 @@ def _apply_cancelled(
         # over the lots already booked for it (a fill can arrive on the ws channel AND then be re-reported
         # by the cancel's status poll — see PARTIAL-FILL WINGS): one lot booked via a ws Fill, then a
         # cancel poll reporting filled 2 books exactly ONE more.
+        #
+        # Attribute by (client_order_id, resting price): the still-populated slot when the cancel
+        # matched it, ELSE ``cancel_ctx`` for an EAGERLY-cleared order (B1 fix — quote-end /
+        # bucket-change / stand-down cancels null rest_live before this OrderCancelled arrives, so a
+        # missed-WS lot would otherwise be dropped naked to settlement).
+        coid: str | None = None
+        price: Decimal | None = None
         if matched_order is not None:
-            coid = matched_order.client_order_id
+            coid, price = matched_order.client_order_id, matched_order.price
+        else:
+            ctx = st.cancel_ctx.get(event.order_id)
+            if ctx is not None:
+                coid, price = ctx
+        if coid is not None and price is not None:
             already = st.rest_booked_by_coid.get(coid, 0)
             delta = filled - already
             if delta > 0:
-                st, wa = _book_rest_delta(params, st, coid, matched_order.price, delta, now)
+                st, wa = _book_rest_delta(params, st, coid, price, delta, now)
                 actions += wa
         elif not st.rest_fills:
-            # the slot was eagerly cleared before the cancel confirm (a bucket change / stand-down
-            # cancel), so we cannot attribute by coid — fall back to booking the reported count at
-            # ``desired_n`` (retained-cancel-context finding), once.
+            # truly unattributable (no populated slot AND no cancel_ctx AND no prior fill): fall back to
+            # booking the reported count at ``desired_n`` once (retained-cancel-context finding).
             n = st.desired_n if st.desired_n is not None else _ZERO
             fallback_coid = f"__cxl__{event.order_id}"
             st, wa = _book_rest_delta(params, st, fallback_coid, n, filled, now)
@@ -909,11 +925,23 @@ def _standdown(st: V32State, reason: str) -> tuple[V32State, list[V32Action]]:
     return st, [V32Action(kind=ActionKind.STAND_DOWN, reason=reason)]
 
 
+def _remember_cancel_ctx(st: V32State, order: RestOrder | None) -> V32State:
+    """Record an EAGERLY-cleared populated order's (client_order_id, resting price) keyed by order_id so
+    a later OrderCancelled(filled=cumulative) on it is still attributable (B1 fix). No-op when the order
+    has no order_id yet (a still-pending create — its cancel confirm carries filled 0)."""
+    if order is None or order.order_id is None:
+        return st
+    ctx = dict(st.cancel_ctx)
+    ctx[order.order_id] = (order.client_order_id, order.price)
+    return replace(st, cancel_ctx=ctx)
+
+
 def _cancel_live_if_any(st: V32State) -> tuple[V32State, list[V32Action]]:
     """Cancel a live or pending rest (no new place). Used by every no-quote branch."""
     actions: list[V32Action] = []
     if st.rest_live is not None and not st.cancel_in_flight:
         actions.append(_cancel_action(st, st.rest_live))
+        st = _remember_cancel_ctx(st, st.rest_live)   # B1: attributable after the eager clear
         st = replace(st, rest_live=None, cancel_in_flight=True)
     if st.rest_pending is not None:
         actions.append(_cancel_action(st, st.rest_pending))
@@ -987,6 +1015,7 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
         emitted_cancel = False
         if st.rest_live is not None and not st.cancel_in_flight:
             actions.append(_cancel_action(st, st.rest_live))
+            st = _remember_cancel_ctx(st, st.rest_live)   # B1: attributable after the eager clear
             emitted_cancel = True
         if st.rest_pending is not None:
             actions.append(_cancel_action(st, st.rest_pending))
@@ -1113,7 +1142,14 @@ def book_late_rest_fill(
     the wings price off that bucket's strikes even after the live spot moved on (the exact F-1 failure).
     Idempotent: once any rest fill is booked (``rest_fill`` set), this is a no-op — a fill reported
     twice (fill channel + status poll) never double-books. Emits no order-bearing action in shakedown
-    (the wing take downgrades to its WOULD_* twin like every other action)."""
+    (the wing take downgrades to its WOULD_* twin like every other action).
+
+    N2 (contracts>1): this ``rest_fill is not None`` guard is COARSER than per-lot — a genuinely distinct
+    SECOND late lot on a replaced order would be dropped here. That case is defended by the cancel path,
+    NOT by this hook: every replaced/eagerly-cancelled order is cancelled and the executor's cancel
+    confirm reports the venue-CUMULATIVE fill, which ``_apply_cancelled`` books via ``cancel_ctx`` (B1);
+    the late-WS copy that then reaches here is a genuine duplicate this guard correctly drops. Pinned by
+    ``tests/test_v32_partial_fill.py::test_book_late_second_lot_caught_by_cancel_path``."""
     if st.rest_fill is not None:
         return st, []
     spot_Sd = bucket_Sd if bucket_Sd is not None else st.spot_Sd
