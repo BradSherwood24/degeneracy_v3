@@ -157,3 +157,88 @@ in the data-file files present in the builder's tree).
 ## Cleanup
 Throwaway worktree `C:\Users\Brads\Python_stuff\dv3_wt_review_pr66` created for the suite run + ledger
 analysis and removed after this review.
+
+---
+
+# Round 2 — N1 fix + n_min gate delta re-check (new head `8dc4399`)
+
+Verdict: **APPROVE — N1 RESOLVED.** The capture-ratio numerator is now a bounded per-window fraction
+(N1 fixed and my round-1 failing test passes), and a new n_min gate correctly excludes the one
+below-min shadow fill (09-19 23:00Z) that was never a live-reachable counterfactual, restoring 7/12 =
+58.3%. Falsifier/pins integrity intact; report diff vs main is exactly the intended change. No remaining
+blocking or must-fix items. Delta since `73ad5fc`: `report.py` (per-window numerator + n_min exclusion),
+`core.py`/`actions.py`/`run_v32.py`/`ledger.py` (the SHADOW_FILL_BELOW_MIN gate + counter),
+`v32_falsifier.md` (Registration 3 refined — its own unmerged entry), and tests
+(`test_v32_report_scoreboard.py`, `test_v32_core.py`). `test_v32_falsifier_pins.py` untouched this round.
+
+## 1. N1 fixed — bounded per-window fraction (verified)
+`report.py` now counts, per row: `if capture_window and shadow_valid: capture_shadow_fills += 1; if
+row_has_set: capture_live_sets += 1`. Numerator = armed+bucket windows with BOTH a valid shadow fill AND
+>= 1 completed live set; denominator = armed+bucket windows with a valid shadow fill; both 0/1 per window,
+so the ratio is bounded to [0, 1]. `n` for the economic gates still counts every set (the `n += 1` is
+inside the per-event loop, independent of `capture_window`/`shadow_valid`).
+- **My round-1 failing test now PASSES** (probe): a single window with `wing_batch_sets` of two completed
+  sets + one shadow fill -> `capture_shadow_fills` = 1, `capture_live_sets` = 1, `capture_ratio` = 1
+  (<= 1), and `n` = 2. A live-set-without-shadow window contributes 0/0 (neither), so the ratio can never
+  exceed 1. The builder added equivalent coverage in `test_v32_report_scoreboard.py`.
+
+## 2. n_min gate (verified)
+- **(a) core suppression.** `core._shadow_on_trade` inserts, before the fill, `if sub.n < params.n_min:
+  emit SHADOW_FILL_BELOW_MIN; continue` (strict `<`). Probe confirms the boundary: an offer 0.95
+  (n = 0.05 == n_min) FILLS (not excluded); offer 0.96/0.97 (n 0.04/0.03) is suppressed. `run_v32`
+  journals `shadow_fill_below_min`; `ledger` counts `shadow_fills_below_min` (additive, `.get` default 0);
+  the scoreboard renders `shadow fills below n_min (suppressed, live n_below_min) = N`.
+- **(b) report exclusion for existing rows.** `_shadow_below_min(sub, n_min)` derives n = `1 - offer`
+  from the shadow record's stored `offer` and excludes below-min fills from the capture DENOMINATOR and
+  from the shadow mean-lock / exec-gap stats. Verified the record shape carries `offer` (top-level `n` is
+  `null`, as the code comment states): e.g. the 23:00Z record is
+  `{"filled": true, "offer": "0.96", "print": "0.9700", "lock": "0.1072", "n": null, "count": "16.00"}`.
+  No rounding trap: `_dec` uses `Decimal(str(v))` (exact), and Decimal compares by value
+  (`0.05` == `0.0500`); the boundary is `<`, so n == n_min fills.
+- **Does NOT drop a live set.** Probe: a row with a live completed set AND a below-min shadow keeps the
+  live set in `n` (=1) and the live-lock stats, and only excludes the shadow side (`capture_shadow_fills`
+  0, `shadow_mean_lock_c` None for that fill, `shadow_fills_below_min` 1). The live economics are never
+  touched by the shadow n_min exclusion.
+- **The 23:00Z 09-19 row is the one excluded** (verified on a fresh read-only 125-row ledger copy):
+  bucket B81250, shadow filled at offer 0.96 (n = 0.04 < 0.05) on a 16-lot 0.97 print, NO live set. It
+  was in the denominator (13) and is now excluded -> 12 valid shadow windows; numerator 7 unchanged ->
+  **7/12 = 58.3%** (matches the builder). New-row upstream counter and existing-row derived exclusion are
+  mutually exclusive per window (a suppressed new row has no filled shadow record), so no double-count.
+
+## 3. Falsifier + pins integrity (verified)
+`v32_falsifier.md` vs `origin/main`: **9 added, 0 deleted** — the entire Registration 3 (2026-09-19)
+entry is appended; the in-place refinements this round (bounded-fraction DEFINITION wording + the new
+N_MIN GATE bullet + the CURRENT VALUE update) are all WITHIN this PR's own not-yet-merged Registration
+entry, so relative to the frozen doc nothing above the Registration section, no prior registered entry,
+no `[pin]`, the params sha `0ac697957c...` (still present), or `STATUS: FROZEN` (line 3) is changed.
+`test_v32_falsifier_pins.py` vs main: **95 added, 0 deleted** (add-only), and **unchanged this round**
+(byte-identical to `73ad5fc`).
+
+## 4. Report diff vs main (verified — expected changes only)
+Fresh read-only ledger copy, PR head vs `origin/main` (pre-#66):
+- TEXT: the fill-rate label (`(info, superseded ...)`), one added `capture ratio = live 7 / shadow 12 =
+  58.3%  (>= 50% [pin] Registration 3)` line, and one added `shadow fills below n_min (suppressed ...) =
+  1` line. Nothing else.
+- JSON: 4 added keys (`capture_live_sets`=7, `capture_shadow_fills`=12, `capture_ratio`=0.5833,
+  `shadow_fills_below_min`=1) PLUS one **intended** CHANGE — `shadow_mean_lock_c` 10.4877 -> 10.4683
+  (+10.49c -> +10.47c), the disclosed effect of excluding the below-min fill (lock +10.72c, above the
+  mean) from the shadow stats (item 2b). `exec_gap_c` is UNCHANGED (-0.60c): the below-min window had no
+  live set, so it never entered the gap. Verdict unchanged (`n<30 pending (n=7)`). All differences are
+  expected and match the builder's round-2 summary.
+
+## 5. Suite (fresh worktree)
+Excluding the 5 corpus-dependent files absent in a fresh checkout: **875 passed, 2 skipped, 0 failures**;
+capture/pins/core files alone: **104 passed**. Consistent with the builder's 935 (= 875 + the ~60 tests
+in the data-file files present in the builder's tree).
+
+## Residual (non-blocking, carried from round 1)
+- The 0.50 pin remains Claude's proposal; the code pins it now and Brad confirms the number at merge
+  (disclosed in the Registration entry, the pins comment, and the build report). The verdict does not
+  fire until n >= 30.
+- Metric sensitivity at low n is unchanged in kind but the n_min gate helps: the current 7/12 = 58.3% is
+  a touch above the pin; each future shadow-available window it misses lowers it, each it captures raises
+  it, and below-min windows no longer dilute the denominator.
+
+**Round-2 verdict: APPROVE — N1 resolved, n_min gate correct, integrity intact.** Merge decision (and the
+0.50 number) remain Brad's. Note: the PR is no longer a clean fast-forward only because `main` gained the
+docs merges (#67, #68) since the branch's base — a trivial rebase, no code conflict; that is Brad's to do.
