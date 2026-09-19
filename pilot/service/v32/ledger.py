@@ -124,6 +124,10 @@ def build_v32_ledger_row(
     cancels_via_status: int = 0,
     cancels_expired: int = 0,
     rest_invariant_violations: int = 0,
+    # read-path-lag phantom invariant counters (2026-09-15 18:00Z fix): phantoms are filtered
+    # resting-list hits (NOT real violations); rechecks count the re-read-before-declare passes.
+    rest_invariant_phantoms: int = 0,
+    rest_invariant_rechecks: int = 0,
     degrade_reason: str | None = None,
     # Last-quoted spot bucket + stand-down bookkeeping, captured WHILE quoting by the driver (see
     # ``run_v32.V32Driver._capture_quote``). These win over the post-quote-end ``state`` so the row
@@ -230,6 +234,8 @@ def build_v32_ledger_row(
         "cancels_via_status": int(cancels_via_status),
         "cancels_expired": int(cancels_expired),
         "rest_invariant_violations": int(rest_invariant_violations),
+        "rest_invariant_phantoms": int(rest_invariant_phantoms),
+        "rest_invariant_rechecks": int(rest_invariant_rechecks),
         # settlement backfill slots (the sweep appends its own backfill row)
         "realized_unsettled": bool(realized_unsettled),
         "unsettled_legs": (held_legs or []) if realized_unsettled else [],

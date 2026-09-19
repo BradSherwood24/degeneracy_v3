@@ -1347,6 +1347,8 @@ def _compute_money_math(state: V32State, executor: Any) -> dict[str, Any]:
         "cancels_via_status": int(getattr(executor, "cancels_via_status", 0)),
         "cancels_expired": int(getattr(executor, "cancels_expired", 0)),
         "rest_invariant_violations": int(getattr(executor, "rest_invariant_violations", 0)),
+        "rest_invariant_phantoms": int(getattr(executor, "rest_invariant_phantoms", 0)),
+        "rest_invariant_rechecks": int(getattr(executor, "rest_invariant_rechecks", 0)),
     }
     fills = list(getattr(executor, "fills", []) or [])
     if not fills or state.rest_fill is None:
