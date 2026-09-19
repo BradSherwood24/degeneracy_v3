@@ -15,3 +15,5 @@ Money math is the pinned law shape (exact taker fee, maker fee 0).
 | `pf_15m_sub1.py` / `.out` | sub-$1 15M box on the tape | 6-13% of minutes under $1 = stale-leg artifacts |
 | `v32_sub1_ms.py` / `.out` | sub-$1 box on ms books (all legs live) | taker never under $1; maker 1-3c flickers |
 | `v32_sub1_grinder.py` / `.out` | maker-bucket grinder with real fills | 9 fills, -6c total, $2 zone 0 of 9 |
+| `pf_dry_spells.py` / `.out` | dry spells between pump-fader fills on the 50-day corpus (fill timing, stale model) | E=15: longest 47 h, 1 run >=36 h; E=20: longest 76 h, 7 runs; pumps/week fell ~3x June -> Sept |
+| `probe_size2_partial.py` | does the pre-#62 core orphan the second lot on a 1-of-2 fill? | yes (rest_live nulled, later fill ignored) -> PR #62 |
