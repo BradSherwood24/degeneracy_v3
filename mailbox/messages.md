@@ -1198,3 +1198,59 @@ Four worktrees: dv3_wt_v11 (builds), dv3_wt_review (reviews/docs), dv3_wt_fix (h
 **Open for Brad:** merge #56 then rebased #59; apply proxy_amend_cap.md + restart proxy; proxy as service + task logon setting + auto-update off;
 Spotify/Steam RAM; falsifier verdict at n=30 (~8 days of uptime); v1.1 back burner; dark-week replay + wide-band re-fetch still queued.
 — Claude
+
+---
+
+## 2026-09-19 ~23:30Z — Claude → house: armed days 4-5 — seven sets (7/7), power-outage naked contract (+44c luck, NOT counted), 42 h drought = tape regime, partial-fill wings + amend-first + phantom fix all merged, capture-ratio gate in PR #66, size-2 step awaits Brad's dated word
+
+**Live (re-arm 09-14 23:00Z -> 09-19 23:30Z):** 7 completed sets, 7 wins, 0 one-legged counted, balance 51.997 -> 53.31.
+Sets 4-7: 09-17 22Z B76350 NO 0.23 + 0.97/0.65 -> +13.2c true; 09-18 00Z B76350 NO 0.10 + 0.88/0.88 -> +12.5c; 09-18 04Z B77350 NO 0.40 + 0.75/0.69 -> +13.2c;
+09-19 22Z B81050 NO 0.32 + 0.87/0.67 -> +11.65c (first set on the fully merged head; shadow identical, gap 0). Scoreboard n=7, ledger mean +11.3c,
+100% positive, exec gap ~-0.6c, fill rate 1.5/day (info), capture ratio 7/12 = 58%.
+
+**INCIDENT 09-17 13:00Z — unhedged bucket, +44c of luck.** Local POWER OUTAGE at Brad's (Brad: "Power outage locally. Nothing the box could've done
+with no messages able to get out"). Wi-Fi dropped 12:48:20Z (Windows network log), both websockets silent, DELETE of rest #53 (B76750 NO 0.56)
+got 502 from the proxy, executor stood down; the order stayed live on Kalshi, filled 12:53:24Z unseen, settled NO -> +44c (risk was -56c).
+Never booked in the ledger. The :40 reconcile-first did not catch it because the contract SETTLED at 13:02:44Z (size 0 by the 13:40Z arming).
+14:00Z window lost, 18:00Z start died. Brad's RULING (verbatim): "Naw, lets leave it at 0 uncovered legs. Poor timing, not a fault of the code
+or strategy. That's what we're counting, this shouldn't be added." -> one-legged stays 0; not registered. Queued proposal (not asked for): a
+settled-positions-vs-ledger diff at arming / in-window positions check.
+
+**Replay lab 09-18 (79 windows):** BASE cell fills EXACTLY the six windows live filled; mean +10.9c vs live +11.3c ledger-basis. Ideal-only misses are
+flap windows (09-15 14Z/15Z, 09-16 16Z, 09-18 14Z replace_rate stand-down). Live churn 123 replaces/window vs sim 77.
+
+**DROUGHT 09-18 04Z -> 09-19 22Z (42 h):** ideal shadow also dry (1 fill in 36 windows, the replace_rate stand-down hour) -> tape, not execution.
+Corpus (pilot/build/mc/pf_dry_spells.py, stale-model FILL TIMING, 50 days 06-23..09-05, holdout excluded): fills/ISO-week at E=15 41,34,32,32,35,28
+(W26-31) -> 4,13 (W35-36); E=20 22,20,15,12,15,7 -> 3,4. Dry runs at E=15: median 2 h, longest 47 h, 1 run >=36 h/50 d; E=20: longest 76 h,
+7 runs >=36 h. The 2.0/day fill-rate pin was calibrated on the lean W36 week. Forward requote sim itself had a 32 h drought.
+
+**Falsifier (FROZEN) — Registration entries this stretch, all on Brad's verbatim words:**
+- 09-18 ~18:30Z MECHANICS + MEASUREMENT (partial fills / sizing step; PR #62): "We should only send orders for the wings on the singal that our maker
+  order filled, for the size it filled at. So if max sizing is 10, a taker fills 8, then we open 8 wings and leave the 2 unfilled..." -> wings per
+  fill event sized to the fill, remainder stays resting; set = rest-fill event with both wings; lock per contract.
+- 09-19 ~22:40Z MEASUREMENT CLARIFICATION 3 (PR #66, OPEN, under review): fill-rate gate -> CAPTURE RATIO = live sets / ideal-shadow E=0.10 fills over
+  armed windows; Brad: "I agree with the second there. Looks like our dry spell has ended". Pin 0.50 is CLAUDE'S PROPOSAL, Brad confirms at merge.
+  Reviewer asked to settle: numerator per WINDOW (0/1) not per set event, so size 2 cannot inflate the ratio.
+- Sizing (Brad, verbatim): "waiting for n to hit 30 before sizing was the play when we were entering roughly half the windows. This strategy is
+  different... Waiting for a specific n should be to answer questions about slippage and edge cases, not proof of a coin flip is weighted on one
+  side... I'd vote to double soon". The Promotion section's n>=60 justification is superseded on his word; the size-2 PR needs his dated sentence.
+
+**Merged (Brad ran `! gh pr merge` himself; the classifier blocks Claude merging code PRs even on his word):** #56 phantom-resting (09-19 00:5xZ),
+#62 partial-fill wings (00:54Z; head eaa634f; review #63: round-1 BLOCK — missed-WS second lot dropped at the T-5 eager-clear cancel — fixed with
+cancel_ctx + delta-aware poll; round-2 APPROVE WITH NITS), #59 amend-first rebased (02:00Z; head 50834b7; reviews #64/#65: N1 partial-amend-cross +
+WS echo double-book at contracts=2 fixed with amend_cross_pending guard; Kalshi Amend V2 response is per-amend and carries no trade ids).
+Live tree pulled to 5f22880 at 02:02Z, 918 tests in the live tree, 02:00Z+ windows clean (0 phantoms). Amends still 403 at the proxy until Brad
+applies pilot/ops/proxy_amend_cap.md + restarts. Nits carried: money-math realized_delta may understate ctx/amend-booked lots at size>1
+(falsifier reads core state) -> hand-reconcile the first size-2 sets; prune cancel_ctx; TTL on amend_cross_pending.
+
+**09-19 22Z sweep anatomy (Brad: "how many orders came after at that price or lower?"):** one taker walked the spot bucket 0.56 -> 0.75 at T-9:17,
+244 lots in one second; at/above our 0.68 level: 39 lots (1 ours, 2 @0.69, 1 @0.70, 1 @0.72, 34 @0.75); nothing >=0.68 traded again in the window;
+384 more lots >=0.68 printed in T-5..T-0 (outside the window by design). Size takes the 39; a ladder takes the extra 7c on the 34.
+
+**Size-2 procedure (agreed with Brad, awaiting his dated go):** (1) Brad's sentence; (2) PR: policy/v32_params.json contracts 2, new canonical sha
+pinned in service/v32/params.py, Registration entry quoting him + superseding the n>=60 Promotion clause, add-only pins test; review; Brad merges;
+pull :02-:33; (3) proxy already allows 2/order, budget 4000, ~$3.80 in flight per set. Proxy amend cap is separate and optional.
+
+**Ops:** never two agents in one worktree (dv3_wt_v11 builds, dv3_wt_review reviews, dv3_wt_fix hotfixes/docs, dv3_wt_amend amend). Brad's box levers
+unchanged: proxy as service, task logon setting, auto-update off, and now the power/network (UPS or wired).
+— Claude
