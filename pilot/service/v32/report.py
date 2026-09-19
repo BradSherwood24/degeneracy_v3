@@ -166,20 +166,58 @@ def _lag_stats_p99(rows: list[dict[str, Any]], conn: str) -> Decimal | None:
     return max(vals) if vals else None
 
 
+def _row_set_events(r: dict[str, Any]) -> list[dict[str, Any]]:
+    """The set (rest-fill) events of one armed ledger row, each ``{lock, completed, one_legged}`` with
+    ``lock`` in CENTS per contract (None for an incomplete/one-legged set).
+
+    PARTIAL-FILL WINGS (Brad 2026-09-18): a row's ``wing_batch_sets`` list carries one entry per rest
+    fill event (a wing batch); each completed batch is one set. A row WITHOUT that list (an older ledger
+    row, or a dry window) falls back to the single-set scalar (``realized_lock`` / ``one_legged`` /
+    ``realized_unsettled``) — so the scoreboard over an existing ledger is byte-identical to the
+    pre-partial report."""
+    batches = r.get("wing_batch_sets")
+    if isinstance(batches, list) and batches:
+        out: list[dict[str, Any]] = []
+        for b in batches:
+            lk = _dec(b.get("realized_lock"))
+            out.append({
+                "lock": (lk * 100) if lk is not None else None,
+                "completed": lk is not None,
+                "one_legged": bool(b.get("one_legged")),
+            })
+        return out
+    # legacy single-set fallback (unchanged semantics)
+    rlock = _dec(r.get("realized_lock"))
+    is_fill = bool(r.get("realized_unsettled")) or rlock is not None or bool(r.get("one_legged"))
+    if not is_fill:
+        return []
+    return [{
+        "lock": (rlock * 100) if rlock is not None else None,
+        "completed": rlock is not None,
+        "one_legged": bool(r.get("one_legged")),
+    }]
+
+
 def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """The pre-registered falsifier scoreboard, computed from the SAME [pin] constants the document
     commits to (``service.v32.falsifier_pins``). Pure; the CLI renders it.
 
-    A *completed set* is an armed window whose ``realized_lock`` is present (both wings taken). A
-    *one-legged set* is an armed window flagged ``one_legged``. The verdict (``ALIVE-so-far`` / ``KILL``
-    / ``n<MIN_N pending``) is decided ONLY once ``n`` completed sets exist and applies every pinned
-    threshold; any miss at n >= MIN_N is a KILL (no re-spec on the same window)."""
+    A *completed set* is one REST-FILL EVENT (a wing batch) whose both wings filled (PARTIAL-FILL WINGS,
+    Brad 2026-09-18); a *one-legged set* is a rest-fill event flagged ``one_legged``. Realized lock is
+    reported PER CONTRACT so per-set stats stay comparable to the size-1 history, and the fill rate is
+    SET EVENTS per armed day. When a row carries the per-set ``wing_batch_sets`` list (contracts>=1
+    windows written by the partial-fill build) the sets are read from it; a row without it (an older
+    ledger row, a dry window) falls back to the single-set scalar (``realized_lock``/``one_legged``), so
+    the scoreboard over an EXISTING ledger is byte-identical to the pre-partial report. The verdict
+    (``ALIVE-so-far`` / ``KILL`` / ``n<MIN_N pending``) is decided ONLY once ``n`` completed sets exist
+    and applies every pinned threshold; any miss at n >= MIN_N is a KILL (no re-spec)."""
     e = V32_FALSIFIER_SHADOW_GAP_E
-    completed: list[dict[str, Any]] = []
+    n = 0                                     # completed sets
     legged = 0
+    fills_total = 0                           # rest-fill events (completed + incomplete + one-legged)
     fill_days: set[str] = set()
     armed_days: set[str] = set()
-    live_locks_c: list[Decimal] = []          # realized lock in cents (completed sets)
+    live_locks_c: list[Decimal] = []          # realized lock in cents (completed sets), per contract
     shadow_locks_c: list[Decimal] = []        # shadow E=0.10 lock in cents (any window it filled)
     gaps_c: list[Decimal] = []                # shadow E=0.10 - live lock in cents (both present)
     replaces: list[Decimal] = []
@@ -190,12 +228,6 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         day = str(r.get("close_time", ""))[:10]
         armed_days.add(day)
-        rlock = _dec(r.get("realized_lock"))
-        is_fill = bool(r.get("realized_unsettled")) or rlock is not None or bool(r.get("one_legged"))
-        if is_fill:
-            fill_days.add(day)
-        if r.get("one_legged"):
-            legged += 1
         rep = _dec(r.get("replaces"))
         if rep is not None:
             replaces.append(rep)
@@ -209,13 +241,19 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
         slock = _dec(sub.get("lock")) if (sub and sub.get("filled")) else None
         if slock is not None:
             shadow_locks_c.append(slock * 100)
-        if rlock is not None:
-            completed.append(r)
-            live_locks_c.append(rlock * 100)
-            if slock is not None:
-                gaps_c.append(slock * 100 - rlock * 100)
+        events = _row_set_events(r)  # one entry per rest-fill event (batch), or the legacy single set
+        if events:
+            fill_days.add(day)
+        for ev in events:
+            fills_total += 1
+            if ev["one_legged"]:
+                legged += 1
+            if ev["lock"] is not None:  # a completed set
+                n += 1
+                live_locks_c.append(ev["lock"])
+                if slock is not None:
+                    gaps_c.append(slock * 100 - ev["lock"])
 
-    n = len(completed)
     n_days = len(armed_days)  # distinct armed UTC calendar days (retained key; NOT the fill-rate denom)
     # armed_windows = number of armed windows the pilot actually RAN (ledger rows whose effective_mode
     # is armed, whatever their stand-down reason). A dark hour (reboot/proxy-down/task-not-started)
@@ -229,12 +267,7 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     # (prints outside the live quoting window the live path could never have taken). Additive: older
     # ledger rows lack the key, so ``.get(...,0)``. Registered clarification 2026-09-15 ~18:10Z / PR #54.
     shadow_fills_outside_window = sum(int(r.get("shadow_fills_outside_window", 0) or 0) for r in rows)
-    # fills_total = number of armed windows with a rest fill (completed + one-legged)
-    fills_total = sum(
-        1 for r in rows if r.get("armed") and (
-            bool(r.get("realized_unsettled")) or _dec(r.get("realized_lock")) is not None
-            or bool(r.get("one_legged")))
-    )
+    # fills_total (rest-fill events = wing batches) is accumulated in the fold above.
     slocks = sorted(live_locks_c)
     mean_lock = (sum(live_locks_c, Decimal(0)) / Decimal(n)) if n else None
     median_lock = _percentile(slocks, Decimal(50)) if n else None

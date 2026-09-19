@@ -117,6 +117,15 @@ def build_v32_ledger_row(
     rests_rejected: int = 0,
     wing_batches: int = 0,
     exec_price_mismatches: list[Any] | None = None,
+    # PARTIAL-FILL WINGS (Brad 2026-09-18) — additive per-set money math. At ``contracts`` = 1 a window
+    # is one set and these carry the single-set values (rest_fills=1, wing_batch_sets=1 entry,
+    # lots_filled 0/1, partials 0); every existing key keeps its exact meaning. ``wing_batch_sets`` (a
+    # list) is named apart from the existing int ``wing_batches`` count to avoid colliding with it.
+    rest_fills: list[Any] | None = None,
+    wing_batch_sets: list[Any] | None = None,
+    lots_filled: int = 0,
+    lots_unfilled_at_quote_end: int = 0,
+    partial_fills: int = 0,
     # cancel / venue-truth counters (2026-09-14 shard fix; 2026-09-15 quote-end-race adds the last two)
     cancels_attempted: int = 0,
     cancels_confirmed: int = 0,
@@ -228,6 +237,12 @@ def build_v32_ledger_row(
         "rests_rejected": int(rests_rejected),
         "wing_batches": int(wing_batches),
         "exec_price_mismatches": exec_price_mismatches or [],
+        # PARTIAL-FILL WINGS additive slots (per-set money math)
+        "rest_fills": rest_fills or [],
+        "wing_batch_sets": wing_batch_sets or [],
+        "lots_filled": int(lots_filled),
+        "lots_unfilled_at_quote_end": int(lots_unfilled_at_quote_end),
+        "partial_fills": int(partial_fills),
         "cancels_attempted": int(cancels_attempted),
         "cancels_confirmed": int(cancels_confirmed),
         "cancel_404s": int(cancel_404s),
