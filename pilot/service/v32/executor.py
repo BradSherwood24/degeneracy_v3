@@ -56,7 +56,7 @@ from service.proxy_auth import REST_PREFIX
 from service.proxy_writer import ProxyWriter
 from service.v32.actions import ActionKind
 from service.v32.core import BUY_NO
-from service.v32.events import Fill, OrderAck, OrderCancelled
+from service.v32.events import Fill, OrderAck, OrderAmended, OrderCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,12 @@ DEFAULT_STP = "taker_at_cross"
 # as "already gone" (that misread stacked 21 live rests in the first armed window) — see _cancel_rest.
 CANCEL_PATH_TMPL = "/portfolio/events/orders/{order_id}?exchange_index={exchange_index}"
 _CANCEL_PATH_NOSHARD_TMPL = "/portfolio/events/orders/{order_id}"  # fallback only when shard unknown
+# AMEND path (Kalshi Amend Order V2, docs.kalshi.com/api-reference/orders/amend-order-v2; amend-first
+# replace, Brad 2026-09-15). POST /portfolio/events/orders/{id}/amend, sharded like the cancel: the
+# ``?exchange_index=`` query routes the order's shard AND exchange_index rides in the body (the proxy
+# signs the query-stripped path). ``ProxyWriter.rest_post`` composes the single /trade-api/v2 prefix.
+AMEND_PATH_TMPL = "/portfolio/events/orders/{order_id}/amend?exchange_index={exchange_index}"
+_AMEND_PATH_NOSHARD_TMPL = "/portfolio/events/orders/{order_id}/amend"  # fallback only when shard unknown
 # Order-status + open-orders READS are GETs (routed to the market-data host by the proxy). The
 # order-status GET works WITHOUT the shard param and returns the full order (incl. exchange_index).
 ORDER_STATUS_PATH_TMPL = "/portfolio/orders/{order_id}"   # VERIFIED docs.kalshi.com/api-reference/orders/get-order
@@ -145,6 +151,14 @@ def cancel_path(order_id: str, exchange_index: int | None) -> str:
     if exchange_index is None:
         return _CANCEL_PATH_NOSHARD_TMPL.format(order_id=order_id)
     return CANCEL_PATH_TMPL.format(order_id=order_id, exchange_index=int(exchange_index))
+
+
+def amend_path(order_id: str, exchange_index: int | None) -> str:
+    """The POST path for an amend, carrying the order's shard (same convention as ``cancel_path``).
+    Falls back to the no-shard path only when the exchange_index is unknown."""
+    if exchange_index is None:
+        return _AMEND_PATH_NOSHARD_TMPL.format(order_id=order_id)
+    return AMEND_PATH_TMPL.format(order_id=order_id, exchange_index=int(exchange_index))
 
 _KXBTC_PREFIX = "KXBTC"  # covers both range (KXBTC-) and strikes (KXBTCD-) via startswith
 _V32_COID_PREFIX = "v32-"  # our client_order_id prefix (core._mint_coid); scopes the startup sweep
@@ -304,6 +318,12 @@ class LiveExecutor:
         self.rest_invariant_phantoms = 0    # resting-list entries filtered as read-path phantoms (not real)
         self.rest_invariant_rechecks = 0    # times the invariant re-read the list before declaring a stray
         self._last_confirmed_gone_oid: str | None = None  # excluded from the pre-PLACE invariant
+        # amend-first replace counters (Brad 2026-09-15) — surfaced on the ledger row next to replaces.
+        self.amends_attempted = 0         # AMEND_REST actions that reached a POST (or the no-oid fallback)
+        self.amends_confirmed = 0         # amends that returned 2xx
+        self.amends_failed = 0            # amends that returned non-2xx/timeout -> fell back to cancel+create
+        self.amend_fallbacks = 0          # amend failures that ran the cancel -> confirm -> create fallback
+        self.fills_on_amend = 0           # contracts filled BY an amend that crossed (taker fill)
 
     # ---- RestBook API (shared with FrozenExecutor; the driver is executor-agnostic) ----
     def attribute(self, coid: str | None = None, order_id: str | None = None) -> RestRecord | None:
@@ -337,10 +357,12 @@ class LiveExecutor:
             return self._place_rest(action, now)
         if k == ActionKind.CANCEL_REST:
             return self._cancel_rest(action, now)
+        if k == ActionKind.AMEND_REST:
+            return self._amend_rest(action, now)
         if k in (ActionKind.TAKE_WINGS, ActionKind.RETRY_WING):
             return self._take_wings(state, now)
         if k in (ActionKind.WOULD_PLACE_REST, ActionKind.WOULD_CANCEL_REST,
-                 ActionKind.WOULD_TAKE_WINGS):
+                 ActionKind.WOULD_AMEND_REST, ActionKind.WOULD_TAKE_WINGS):
             # A WOULD_* twin means shakedown/dry state reached the ARMED executor — a mis-wire. Fail
             # loud rather than send nothing silently or, worse, book a phantom.
             raise AssertionError(
@@ -828,6 +850,143 @@ class LiveExecutor:
             logger.warning("[V32-EXEC] order_status GET failed for %s: %s", order_id, e)
             return OrderStatus(order_id, None, 0, None, available=False)
         return parse_order_status(body if isinstance(body, dict) else {}, order_id)
+
+    # ---- AMEND_REST (amend-first replace; Brad 2026-09-15) ----
+    def _amend_rest(self, action, now: float) -> list[Any]:
+        """POST a Kalshi Amend Order V2 on the resting order (same order_id, new price + new coid). A
+        2xx -> ``OrderAmended`` (the core updates rest_live in place) and, if the amend CROSSED
+        (``fill_count`` > 0), the taker fill is booked into money-math (fee = ``average_fee_paid``) and a
+        rest fill is routed via the same OrderAmended. ANY non-2xx/timeout (or a missing order_id) ->
+        journal ``amend_failed`` and FALL BACK to the sharded cancel -> confirm -> create path (Brad's
+        words: "Use the cancel and recreate flow as a backup if our post to ammend the order fails")."""
+        coid_old = action.client_order_id
+        coid_new = action.updated_client_order_id or coid_old
+        oid = action.order_id
+        rec = self.rest_book.get(coid_old) if coid_old else None
+        if oid is None and rec is not None:
+            oid = rec.order_id
+        ticker = action.ticker or (rec.ticker if rec is not None else "")
+        exch = rec.exchange_index if rec is not None else None
+        if exch is None:
+            exch = self._exch(ticker)
+        self.amends_attempted += 1
+        if oid is None:
+            # no venue order id to amend (a rest still awaiting ack) -> straight to the fallback.
+            self.amends_failed += 1
+            self.journal.append("amend_failed",
+                                {"client_order_id": coid_old, "reason": "no_order_id",
+                                 "fallback": "cancel_create"}, self.clock())
+            return self._amend_fallback(rec, None, exch, coid_old, now)
+        body = self._amend_body(action, oid, exch, coid_old, coid_new)
+        self.journal.append("amend_rest",
+                            {"order_id": oid, "client_order_id": coid_old,
+                             "updated_client_order_id": coid_new, "ticker": ticker,
+                             "n": action.price, "price": body.get("price"),
+                             "exchange_index": exch, "bucket_Sd": self._bucket_sd(ticker)},
+                            self.clock())
+        resp = self.writer.rest_post(amend_path(oid, exch), body)
+        self._bump("amend_post")
+        if not resp.ok:
+            # NON-2xx / transport failure: the amend did NOT land. Journal + fall back to cancel+create
+            # (the cancel is the PR #50 shard-aware/backoff/status-truth path; the create goes through
+            # the pre-PLACE invariant on the core's next place). A POST is never retried in place.
+            self.amends_failed += 1
+            self.journal.append("amend_failed",
+                                {"order_id": oid, "client_order_id": coid_old,
+                                 "status": resp.status_code, "body": resp.body, "error": resp.error,
+                                 "fallback": "cancel_create"}, self.clock())
+            return self._amend_fallback(rec, oid, exch, coid_old, now)
+        # 2xx: parse the amend response (same fields as a create/entry response; NO-space normalize the
+        # price for a NO order). order_id persists; the order now rests under coid_new at the new price.
+        parsed = parse_single_response(resp.body, side=BUY_NO)
+        self.amends_confirmed += 1
+        new_price = action.price if action.price is not None else (
+            rec.price if rec is not None else Decimal(0))
+        new_count = int(action.count) if action.count else (rec.count if rec is not None else 1)
+        # RestBook: record the SAME order_id under the new coid; RETAIN the old coid entry (status
+        # ``amended``) so a late fill on the pre-amend coid is still attributable (F-1).
+        new_rec = RestRecord(
+            client_order_id=coid_new, order_id=oid, price=new_price, count=new_count,
+            ticker=ticker, bucket_Sd=self._bucket_sd(ticker), placed_ts=now, status="live",
+            exchange_index=exch,
+            expiration_epoch=(rec.expiration_epoch if rec is not None
+                              else self._expiration_epoch(action)),
+        )
+        if rec is not None and coid_old is not None and coid_old != coid_new:
+            rec.status = "amended"   # retained for late-fill attribution
+        self.rest_book[coid_new] = new_rec
+        self._by_order_id[oid] = coid_new
+        fill_count = int(parsed.fill_count) if parsed.fill_count is not None else 0
+        avg_price = parsed.average_fill_price       # NO-space (normalized); can only be <= new_price
+        avg_fee = parsed.average_fee_paid
+        if fill_count > 0:
+            # the amend CROSSED and filled (a TAKER fill). Book money-math at the venue's avg fill price
+            # with the REAL taker fee (average_fee_paid), de-duped by order_id; the core routes it into
+            # the wings via the OrderAmended below (with count 1 nothing remains resting).
+            self.fills_on_amend += fill_count
+            booked_price = avg_price if avg_price is not None else new_price
+            new_rec.status = "filled"
+            if oid not in self.booked_rest_oids:
+                self.booked_rest_oids.add(oid)
+                self.fills.append({"leg": "rest", "side": "no", "ticker": ticker,
+                                   "price": booked_price, "exec_price": avg_price,
+                                   "fee": avg_fee if avg_fee is not None else Decimal(0),
+                                   "count": int(fill_count), "bucket_Sd": self._bucket_sd(ticker),
+                                   "path": "amend", "client_order_id": coid_new})
+            self.journal.append("amend_fill",
+                                {"order_id": oid, "client_order_id": coid_new,
+                                 "avg_fill_price": avg_price, "avg_fee": avg_fee,
+                                 "fill_count": fill_count,
+                                 "remaining": str(parsed.remaining_count)}, self.clock())
+        self.journal.append("amend_confirmed",
+                            {"order_id": oid, "client_order_id": coid_new, "price": body.get("price"),
+                             "n": new_price, "remaining_count": str(parsed.remaining_count),
+                             "fill_count": fill_count, "average_fill_price": avg_price,
+                             "average_fee_paid": avg_fee}, self.clock())
+        return [OrderAmended(order_id=oid, client_order_id=coid_new, price=new_price, server_ts=now,
+                             remaining_count=parsed.remaining_count, fill_count=Decimal(fill_count),
+                             average_fill_price=(avg_price if fill_count > 0 else None))]
+
+    def _amend_body(self, action, oid: str, exch: int | None, coid_old, coid_new) -> dict[str, Any]:
+        """The Amend Order V2 wire body. ``side`` is the resting order's book side ('ask' for a bucket-NO
+        buy — the SAME value ``to_v2_order`` yields for a create); ``price`` is the full-precision 4-dp
+        YES-space price (1 - n), the same convention as the create. ``count`` fixed-point "1.00".
+        ``exchange_index`` rides in the body too (the proxy signs the query-stripped path)."""
+        n = action.price if action.price is not None else Decimal(0)
+        body: dict[str, Any] = {
+            "ticker": action.ticker,
+            "side": "ask",                     # buy NO == sell/ask YES (translate's buy-no book side)
+            "price": _wire_price_no(n),        # YES-space 4-dp (1 - n)
+            "count": f"{int(action.count) if action.count else 1:.2f}",
+            "client_order_id": coid_old,
+            "updated_client_order_id": coid_new,
+        }
+        if exch is not None:
+            body["exchange_index"] = int(exch)
+        return body
+
+    def _amend_fallback(self, rec, oid: str | None, exch: int | None, coid_old, now: float) -> list[Any]:
+        """Brad's fallback when the amend POST fails: cancel -> confirm -> create. Run the EXISTING
+        sharded-cancel path (PR #50 backoff/status-truth) on the same order; the returned OrderCancelled
+        clears the core's rest so the next tick re-places through ``_pre_place_invariant`` (the create).
+        A cancel-race fill discovered here is routed into the wings exactly as any fill-before-cancel."""
+        self.amend_fallbacks += 1
+        if oid is None:
+            # nothing on the venue to cancel (amend had no order id) -> tell the core the slot is clear
+            # so it re-places on the next tick.
+            self._bump("amend_fallback_noop")
+            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+        self.cancels_attempted += 1
+        self.journal.append("cancel_rest",
+                            {"order_id": oid, "client_order_id": coid_old, "exchange_index": exch,
+                             "via": "amend_fallback"}, self.clock())
+        wr = self.writer.rest_delete(cancel_path(oid, exch))  # shard-aware
+        self._bump("cancel_delete")
+        if wr.status_code == 404:
+            self.cancel_404s += 1
+        if wr.ok:
+            return self._resolve_cancel_success(wr, rec, oid, now)
+        return self._cancel_nonok(wr, rec, oid, exch, coid_old, now)
 
     # ---- TAKE_WINGS / RETRY_WING ----
     def _take_wings(self, state, now: float) -> list[Any]:

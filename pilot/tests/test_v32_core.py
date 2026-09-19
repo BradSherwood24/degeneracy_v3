@@ -28,6 +28,7 @@ from service.v32 import (
     ClockTick,
     Fill,
     OrderAck,
+    OrderAmended,
     OrderCancelled,
     Trade,
     V32Params,
@@ -291,30 +292,41 @@ def test_requote_below_tol_does_not_replace():
     assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.CANCEL_REST)]
 
 
-def test_requote_above_tol_and_debounce_replaces():
-    # R-OVERLAP ruling: a replace is STRICTLY SEQUENTIAL — CANCEL the old, wait for OrderCancelled,
-    # then PLACE the new. Never CANCEL+PLACE in the same tick; never a new rest in flight beside the old.
+def test_requote_above_tol_and_debounce_amends_in_place():
+    # AMEND-FIRST replace (Brad 2026-09-15): a same-bucket requote AMENDS the resting order in place
+    # (Kalshi Amend Order V2) — one AMEND_REST, no CANCEL, no PLACE, exactly one order the whole time.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
     st, coid = _bring_up_live_rest(p, st, now)
     oid = st.rest_live.order_id
-    # move the wing a lot -> desired n shifts >= tol -> CANCEL only, no PLACE yet (keep Su fresh).
+    old_price = st.rest_live.price
+    # move the wing a lot -> desired n shifts >= tol -> AMEND only, no CANCEL, no PLACE (keep Su fresh).
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
     kinds = [a.kind for a in acts]
-    assert ActionKind.CANCEL_REST in kinds and ActionKind.PLACE_REST not in kinds
-    assert st.rest_live is not None            # kept populated so a fill during cancel books at n
+    amends = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert amends and ActionKind.CANCEL_REST not in kinds and ActionKind.PLACE_REST not in kinds
+    am = amends[-1]
+    assert am.order_id == oid and am.client_order_id == coid and am.updated_client_order_id
+    assert am.price == st.desired_n and am.price != old_price
+    assert st.rest_live is not None            # kept populated so a fill during amend books at n
     assert st.rest_pending is None             # NO new rest in flight
-    assert st.cancel_in_flight and st.awaiting_replace
-    # confirm the cancel (no fill), then a fresh book (both wings fresh) -> PLACE the new at re-solved n.
-    st, _ = _feed(p, st, OrderCancelled(oid, now + 1.2))
-    assert st.rest_live is None and not st.cancel_in_flight
-    acts = []
-    st, a = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.3)); acts += a
-    st, a = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1.3)); acts += a
-    assert [a for a in acts if a.kind == ActionKind.PLACE_REST]
-    assert st.rest_pending is not None
+    assert st.amend_in_flight and not st.cancel_in_flight
+    # while the amend is in flight, a further big move does NOT emit a second amend/place/cancel.
+    st, held = _feed(p, st, BookUpdate(STK_SD, _top("0.50", "0.51"), now + 1.05))
+    assert not [a for a in held if a.kind in (ActionKind.AMEND_REST, ActionKind.PLACE_REST,
+                                              ActionKind.CANCEL_REST)]
+    # confirm the amend: the SAME order_id now rests at the new price + new coid; exactly one order.
+    st, _ = _feed(p, st, OrderAmended(oid, am.updated_client_order_id, am.price, now + 1.2))
+    assert st.rest_live is not None and not st.amend_in_flight
+    assert st.rest_live.order_id == oid                       # order_id persists
+    assert st.rest_live.client_order_id == am.updated_client_order_id
+    assert st.rest_live.price == am.price
+    assert st.rest_pending is None                            # never two live rests
+    # replace_count counts order-establishing ops (the initial place = 1) exactly as the cancel+create
+    # path did; an amend IS a replace, counted on confirm -> 2 after the first amend.
+    assert st.replace_count == 2
 
 
 def test_requote_debounce_blocks_until_elapsed():
@@ -330,13 +342,13 @@ def test_requote_debounce_blocks_until_elapsed():
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.5))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1.5))
     assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.CANCEL_REST)]
-    # +2.1s: debounce elapsed -> the SEQUENTIAL replace fires its CANCEL only (place follows on confirm).
+    # +2.1s: debounce elapsed -> the AMEND-FIRST replace fires a single AMEND_REST (no cancel, no place).
     acts = []
     st, a = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 2.1)); acts += a
     st, a = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 2.1)); acts += a
-    assert [x for x in acts if x.kind == ActionKind.CANCEL_REST]
-    assert not [x for x in acts if x.kind == ActionKind.PLACE_REST]
-    assert st.cancel_in_flight and st.awaiting_replace
+    assert [x for x in acts if x.kind == ActionKind.AMEND_REST]
+    assert not [x for x in acts if x.kind in (ActionKind.CANCEL_REST, ActionKind.PLACE_REST)]
+    assert st.amend_in_flight and not st.cancel_in_flight
 
 
 def test_requote_holds_while_place_pending():
@@ -375,43 +387,154 @@ def test_bucket_change_cancels_then_places_after_confirm():
     assert st.rest_pending is not None and st.rest_pending.bucket_Sd == 79700
 
 
-def test_replace_no_live_fill_on_trade_while_cancel_in_flight():
-    # R-OVERLAP ruling: after CANCEL_REST is emitted (cancel_in_flight) but before OrderCancelled, a
-    # public Trade through the old rest's price must NOT book a live rest fill (the live fill truth comes
-    # ONLY from OrderCancelled/Fill events; a Trade only ever moves the SHADOW), and NO PLACE_REST fires
-    # while the cancel is in flight.
+def test_replace_no_live_fill_on_trade_while_amend_in_flight():
+    # R-OVERLAP ruling under amend-first: after AMEND_REST is emitted (amend_in_flight) but before
+    # OrderAmended, a public Trade through the rest's price must NOT book a live rest fill (the live fill
+    # truth comes ONLY from OrderAmended/OrderCancelled/Fill events; a Trade only ever moves the SHADOW),
+    # and NO PLACE_REST/AMEND_REST fires while the amend is in flight.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
     st, coid = _bring_up_live_rest(p, st, now)   # rest at n=0.45 -> offer 0.55
-    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))  # -> sequential CANCEL
-    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
-    assert st.cancel_in_flight and st.rest_live is not None and st.rest_pending is None
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))  # -> AMEND_REST
+    assert [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert st.amend_in_flight and st.rest_live is not None and st.rest_pending is None
     # a YES print on the spot bucket ABOVE the old offer -> shadow only, never a live fill.
     st, acts = _feed(p, st, Trade(B_SD, Decimal("0.62"), "yes", Decimal(5), now + 1.05))
     assert st.rest_fill is None                                   # no live fill from a Trade
-    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
-    assert st.cancel_in_flight                                    # still awaiting the cancel confirm
+    assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.AMEND_REST)]
+    assert st.amend_in_flight                                     # still awaiting the amend confirm
 
 
-def test_fill_during_replace_cancel_takes_wings_not_place():
-    # R-OVERLAP ruling: a Fill for the cancelling order (it filled during the cancel) -> TAKE_WINGS at
-    # the resting price, and NEVER a PLACE_REST (the one-set latch holds).
+def test_fill_during_amend_takes_wings_not_place():
+    # A Fill for the order while an amend is in flight (it filled before/at the amend) -> TAKE_WINGS at
+    # the resting price, and NEVER a PLACE_REST (the one-set latch holds); amend_in_flight is cleared.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
     st, coid = _bring_up_live_rest(p, st, now)   # rest at n=0.45
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))     # keep Su fresh
-    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))  # -> sequential CANCEL
-    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
-    assert st.cancel_in_flight and st.rest_live is not None
-    # the old order fills during the cancel -> TAKE_WINGS (bounded pin), no PLACE.
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))  # -> AMEND_REST
+    assert [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert st.amend_in_flight and st.rest_live is not None
+    # the order fills during the amend -> TAKE_WINGS (bounded pin), no PLACE.
     st, acts = _feed(p, st, Fill(st.rest_live.order_id, coid, Decimal(1), Decimal("0.45"), "no",
                                  now + 1.05))
     assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
     assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
     assert st.rest_fill is not None and st.rest_fill.price == Decimal("0.45")
-    assert not st.cancel_in_flight and st.rest_live is None and st.rest_pending is None
+    assert not st.cancel_in_flight and not st.amend_in_flight
+    assert st.rest_live is None and st.rest_pending is None
+
+
+def test_amend_confirm_with_cross_fill_takes_wings_once_no_second_rest():
+    # OrderAmended.fill_count > 0 (the amend crossed) -> book the rest fill at the venue's average fill
+    # price (NO-space) and TAKE the wings ONCE; amend_in_flight cleared; no second rest ever placed.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    oid = st.rest_live.order_id
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))     # keep Su fresh
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))  # -> AMEND_REST
+    am = [a for a in acts if a.kind == ActionKind.AMEND_REST][-1]
+    assert st.amend_in_flight
+    # the amend confirms WITH a cross fill of 1 at a NO-space average fill price of 0.47.
+    st, acts = _feed(p, st, OrderAmended(oid, am.updated_client_order_id, am.price, now + 1.1,
+                                         remaining_count=Decimal(0), fill_count=Decimal(1),
+                                         average_fill_price=Decimal("0.47")))
+    assert len([a for a in acts if a.kind == ActionKind.TAKE_WINGS]) == 1
+    assert st.rest_fill is not None and st.rest_fill.price == Decimal("0.47")  # booked at avg fill price
+    assert not st.amend_in_flight and st.rest_live is None and st.rest_pending is None
+    # one set per hour latched at the fill: no PLACE and no AMEND on a later tick.
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1.3))
+    assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.AMEND_REST)]
+
+
+def test_confirmed_amend_counts_as_a_replace():
+    # An amend IS a replace: replace_count + replace_times (the A_REPLACE alarm's input) increment on
+    # CONFIRM (OrderAmended) — the same convention as the cancel+create path, which counts at the create.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)   # the initial place counts as 1
+    assert st.replace_count == 1 and len(st.replace_times) == 1
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
+    am = [a for a in acts if a.kind == ActionKind.AMEND_REST][-1]
+    assert st.replace_count == 1                  # NOT yet counted at the request (counted on confirm)
+    st, _ = _feed(p, st, OrderAmended(st.rest_live.order_id, am.updated_client_order_id, am.price,
+                                      now + 1.1))
+    assert st.replace_count == 2 and len(st.replace_times) == 2
+
+
+def test_amends_trip_the_replace_rate_alarm():
+    # The A_REPLACE (replace_rate) alarm counts confirmed amends: with the alarm at 2/min, three
+    # confirmed amends (plus the initial place) in a trailing 60 s stand the hour down with reason
+    # `replace_rate` and cancel the rest.
+    p = _params(tol=Decimal("0.01"), deb_ms=0, replace_rate_alarm_per_min=2)
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    all_acts: list = []
+    yasks = ["0.60", "0.75", "0.55"]   # each move shifts desired n >= tol from the last resting n
+    for i, ya in enumerate(yasks):
+        t = now + 1 + i * 0.1
+        st, a = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), t)); all_acts += a
+        st, a = _feed(p, st, BookUpdate(STK_SD, _top(ya, str(Decimal(ya) + Decimal("0.01"))), t))
+        all_acts += a
+        am = [x for x in a if x.kind == ActionKind.AMEND_REST]
+        if am and st.rest_live is not None:
+            st, a2 = _feed(p, st, OrderAmended(st.rest_live.order_id, am[-1].updated_client_order_id,
+                                               am[-1].price, t + 0.01))
+            all_acts += a2
+    # once >2 confirmed replaces (amends) sit in the trailing 60 s the alarm stands the hour down and
+    # cancels the rest — the reason may surface on any of the ticks above, so scan them all.
+    st, a = _feed(p, st, ClockTick(now + 2)); all_acts += a
+    assert st.stood_down
+    reasons = [x.reason for x in all_acts if x.kind == ActionKind.STAND_DOWN]
+    assert "replace_rate" in reasons
+    assert [x for x in all_acts if x.kind == ActionKind.CANCEL_REST]
+    assert st.replace_count >= 3
+
+
+def test_quote_end_cancels_not_amends():
+    # The quote-end window close still CANCELS the rest (never AMEND) — amend-first only replaces a
+    # LIVE quote inside the window.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    st, acts = _feed(p, st, ClockTick(T - 250))   # t_to_close = 250 < quote_end_s (300)
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert not [a for a in acts if a.kind == ActionKind.AMEND_REST]
+
+
+def test_bucket_change_cancels_not_amends():
+    # A bucket change (different ticker) keeps the cancel -> confirm -> place path (an amend cannot change
+    # the ticker); never an AMEND_REST.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.9))
+    st, _ = _feed(p, st, BookUpdate(STK_SU2, _top("0.20", "0.21"), now + 0.9))
+    st, acts = _feed(p, st, BookUpdate(B_SU, _top("0.55", "0.57"), now + 0.9))  # higher bucket -> spot
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert not [a for a in acts if a.kind == ActionKind.AMEND_REST]
+
+
+def test_shakedown_emits_would_amend_twin():
+    # In shakedown a same-bucket replace downgrades to the WOULD_AMEND_REST twin (no order-emitting kind).
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p, shakedown=True)
+    now = T - 600
+    st, coid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
+    kinds = [a.kind for a in acts]
+    assert ActionKind.WOULD_AMEND_REST in kinds
+    assert ActionKind.AMEND_REST not in kinds and ActionKind.CANCEL_REST not in kinds
     # a later book tick must NOT place a second rest (one set per hour latched at the fill).
     st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1.2))
     assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]

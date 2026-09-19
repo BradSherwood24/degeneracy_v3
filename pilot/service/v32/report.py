@@ -75,6 +75,12 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     tot_invariant_violations = 0
     tot_invariant_phantoms = 0
     tot_invariant_rechecks = 0
+    # amend-first replace totals (Brad 2026-09-15) — additive; older rows lack the keys -> .get default 0.
+    tot_amends = 0
+    tot_amends_confirmed = 0
+    tot_amends_failed = 0
+    tot_amend_fallbacks = 0
+    tot_fills_on_amend = 0
     shadow_fills: dict[str, int] = {k: 0 for k in e_keys}
     shadow_locks: dict[str, list[Decimal]] = {k: [] for k in e_keys}
     lags: list[Decimal] = []
@@ -97,6 +103,11 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         tot_invariant_violations += int(r.get("rest_invariant_violations", 0) or 0)
         tot_invariant_phantoms += int(r.get("rest_invariant_phantoms", 0) or 0)
         tot_invariant_rechecks += int(r.get("rest_invariant_rechecks", 0) or 0)
+        tot_amends += int(r.get("amends_attempted", 0) or 0)
+        tot_amends_confirmed += int(r.get("amends_confirmed", 0) or 0)
+        tot_amends_failed += int(r.get("amends_failed", 0) or 0)
+        tot_amend_fallbacks += int(r.get("amend_fallbacks", 0) or 0)
+        tot_fills_on_amend += int(r.get("fills_on_amend", 0) or 0)
         if r.get("stand_down"):
             tot_stand_downs += 1
         windows.append(
@@ -128,6 +139,11 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "windows": len(rows),
             "would_places": tot_would_places,
             "replaces": tot_replaces,
+            "amends": tot_amends,
+            "amends_confirmed": tot_amends_confirmed,
+            "amends_failed": tot_amends_failed,
+            "amend_fallbacks": tot_amend_fallbacks,
+            "fills_on_amend": tot_fills_on_amend,
             "stand_downs": tot_stand_downs,
             "late_fills": tot_late_fills,
             "rest_invariant_violations": tot_invariant_violations,
@@ -413,6 +429,13 @@ def _render(report: dict[str, Any]) -> str:
         f"  rest_invariant: violations={t.get('rest_invariant_violations', 0)}  "
         f"phantoms={t.get('rest_invariant_phantoms', 0)}  "
         f"rechecks={t.get('rest_invariant_rechecks', 0)} (read-path lag, no stand-down)"
+    )
+    # amend-first replace totals (Brad 2026-09-15): amends attempted/confirmed/failed, cancel+create
+    # fallbacks, and fills booked by an amend that crossed. Shown next to replaces.
+    lines.append(
+        f"  amends={t.get('amends', 0)}  confirmed={t.get('amends_confirmed', 0)}  "
+        f"failed={t.get('amends_failed', 0)}  fallbacks(cancel+create)={t.get('amend_fallbacks', 0)}  "
+        f"fills_on_amend={t.get('fills_on_amend', 0)}"
     )
     for k in e_keys:
         ml = t["shadow_mean_lock"].get(k)

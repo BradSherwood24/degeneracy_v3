@@ -19,6 +19,11 @@ class ActionKind(str, enum.Enum):
 
     PLACE_REST = "PLACE_REST"
     CANCEL_REST = "CANCEL_REST"
+    # AMEND-FIRST replace (Brad 2026-09-15): a same-bucket requote amends the resting order in place
+    # (Kalshi Amend Order V2) instead of cancel->confirm->create. The order_id persists; a price change
+    # forfeits queue position exactly as cancel+create did; never two live rests. The executor falls
+    # back to CANCEL_REST -> confirm -> PLACE_REST on any amend failure.
+    AMEND_REST = "AMEND_REST"
     TAKE_WINGS = "TAKE_WINGS"
     RETRY_WING = "RETRY_WING"
     STAND_DOWN = "STAND_DOWN"
@@ -29,6 +34,7 @@ class ActionKind(str, enum.Enum):
     # shakedown twins
     WOULD_PLACE_REST = "WOULD_PLACE_REST"
     WOULD_CANCEL_REST = "WOULD_CANCEL_REST"
+    WOULD_AMEND_REST = "WOULD_AMEND_REST"
     WOULD_TAKE_WINGS = "WOULD_TAKE_WINGS"
 
 
@@ -36,6 +42,7 @@ class ActionKind(str, enum.Enum):
 _WOULD_TWIN: dict[ActionKind, ActionKind] = {
     ActionKind.PLACE_REST: ActionKind.WOULD_PLACE_REST,
     ActionKind.CANCEL_REST: ActionKind.WOULD_CANCEL_REST,
+    ActionKind.AMEND_REST: ActionKind.WOULD_AMEND_REST,
     ActionKind.TAKE_WINGS: ActionKind.WOULD_TAKE_WINGS,
     ActionKind.RETRY_WING: ActionKind.WOULD_TAKE_WINGS,
 }
@@ -68,6 +75,9 @@ class V32Action:
       * PLACE_REST / WOULD_PLACE_REST: ticker, side="no", action="buy", count, price=n,
         expiration_epoch, client_order_id.
       * CANCEL_REST / WOULD_CANCEL_REST: order_id (if known) or client_order_id.
+      * AMEND_REST / WOULD_AMEND_REST: order_id (the resting order, persists), ticker, side="no",
+        action="buy", count, price=new n, client_order_id (the ORIGINAL coid),
+        updated_client_order_id (the NEW coid), expiration_epoch.
       * TAKE_WINGS / WOULD_TAKE_WINGS: legs (2), count.
       * RETRY_WING: legs (1), count.
       * STAND_DOWN: reason.
@@ -84,6 +94,7 @@ class V32Action:
     expiration_epoch: int | None = None
     client_order_id: str | None = None
     order_id: str | None = None
+    updated_client_order_id: str | None = None   # AMEND_REST: the new coid (queue position forfeited)
     legs: tuple[LegOrder, ...] = ()
     reason: str | None = None
     # informational (carried for the journal/report; never load-bearing for execution)

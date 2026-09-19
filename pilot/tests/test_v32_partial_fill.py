@@ -23,6 +23,7 @@ from service.v32 import (
     ClockTick,
     Fill,
     OrderAck,
+    OrderAmended,
     OrderCancelled,
     V32Params,
     V32State,
@@ -114,17 +115,23 @@ def test_partial_fill_wings_sized_to_fill_remainder_stays_resting():
     assert st.rest_remaining == 1 and not st.rest_allotment_done
     assert len(st.rest_fills) == 1 and st.rest_fills[0].count == 1
     assert len(st.wing_batches) == 1 and st.partial_fills == 1
-    # the remainder keeps being requoted at count 1: a wing move re-solves n and replaces with count 1.
+    # the remainder keeps being requoted at count 1, now via AMEND-FIRST (rest_live carries an order_id,
+    # so a same-bucket replace amends the order in place rather than cancel+create). The amend body carries
+    # the still-resting REMAINDER count (1), NOT params.contracts (amend-first rebase, task point 5).
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))     # keep Su fresh
     st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))  # dn drifts -> replace
-    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
-    st, _ = _feed(p, st, OrderCancelled(oid, now + 1.05, Decimal(0)))           # cancel confirmed
-    st, acts = _feed_all(p, st, [
-        BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.1),
-        BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1.1),
-    ])
-    place = [a for a in acts if a.kind == ActionKind.PLACE_REST]
-    assert place and place[-1].count == 1   # remainder re-quoted at the reduced size
+    amend = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert amend and amend[-1].count == 1   # remainder amended at the reduced size, never contracts=2
+    assert st.amend_in_flight
+    new_coid = amend[-1].updated_client_order_id
+    st, _ = _feed(p, st, OrderAmended(order_id=oid, client_order_id=new_coid, price=amend[-1].price,
+                                      server_ts=now + 1.05, remaining_count=Decimal(1),
+                                      fill_count=Decimal(0), average_fill_price=None))
+    assert not st.amend_in_flight
+    # one order still resting (the same order_id) at count 1; the pre-amend lot is not re-booked.
+    assert st.rest_live is not None and st.rest_live.order_id == oid and st.rest_live.count == 1
+    assert st.rest_remaining == 1 and not st.rest_allotment_done
+    assert len(st.rest_fills) == 1 and st.rest_booked_by_coid.get(new_coid) == 1
 
 
 def test_second_fill_spawns_second_batch_and_allotment_done_stops_quoting():
@@ -452,6 +459,153 @@ def test_bucket_change_cancel_books_missed_second_lot():
     assert len(st.rest_fills) == 2
     assert st.rest_fills[1].price == Decimal("0.45")   # original resting price, not desired_n
     assert st.rest_allotment_done
+
+
+# ===========================================================================
+# AMEND-FIRST x PARTIAL-FILL interplay (amend-first rebase 2026-09-19): an amend rotates the coid while
+# the order_id persists, so rest_booked_by_coid must follow the order across the amend (carry-forward),
+# and an amend that crosses books its per-amend fill delta (Kalshi Amend Order V2: fill_count is the
+# fills FROM THE AMEND, not cumulative).
+# ===========================================================================
+def test_amend_then_quote_end_cancel_books_missed_second_lot():
+    """Task point 6: contracts=2, lot 1 fills on ws, the remainder is AMENDED (coid rotates coid_a->coid_b,
+    order_id persists), then lot 2 fills at the venue but its ws fill is MISSED. The T-5 quote-end cancel
+    eager-clears the amended order and its OrderCancelled reports the CUMULATIVE filled=2. Because
+    ``_apply_amended`` carries ``rest_booked_by_coid`` FORWARD to the new coid, ``_apply_cancelled`` books
+    EXACTLY ONE more lot (delta = 2 - 1) and hedges it -- never re-booking the pre-amend lot (which the
+    old, un-carried arithmetic would: delta would read 2 and over-fill), never dropping lot 2 naked."""
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid_a, oid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, Fill(oid, coid_a, Decimal(1), Decimal("0.45"), "no", now + 0.1))  # lot 1 (ws)
+    assert st.rest_booked_by_coid.get(coid_a) == 1 and st.rest_live.count == 1
+    # drift -> AMEND the remainder (amend-first); coid rotates to coid_b, order_id persists.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
+    amend = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert amend and amend[-1].count == 1
+    coid_b = amend[-1].updated_client_order_id
+    st, _ = _feed(p, st, OrderAmended(order_id=oid, client_order_id=coid_b, price=amend[-1].price,
+                                      server_ts=now + 1.05, remaining_count=Decimal(1),
+                                      fill_count=Decimal(0), average_fill_price=None))
+    # the pre-amend booking followed the order to the new coid (carry-forward); coid_a is gone.
+    assert st.rest_booked_by_coid.get(coid_b) == 1 and coid_a not in st.rest_booked_by_coid
+    # T-5 quote-end: the amended remainder is cancelled (rest_live eagerly nulled), cancel_ctx remembers it.
+    st, acts = _feed(p, st, ClockTick(T - 200))
+    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert st.rest_live is None and oid in st.cancel_ctx
+    # keep the wing books fresh at the cancel instant so the delta lot's wings can be taken.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), T - 199))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), T - 199))
+    # the cancel confirm carries venue truth: both lots filled (cumulative 2).
+    st, acts = _feed(p, st, OrderCancelled(oid, T - 199, filled_count_before_cancel=Decimal(2)))
+    assert len(st.rest_fills) == 2, "exactly one more lot booked from the cumulative cancel (delta=1)"
+    assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS], "lot 2 must get wings"
+    assert st.rest_allotment_done
+    money = R._compute_money_math(st, _stub_executor(st), contracts=p.contracts)
+    assert money["lots_filled"] == 2 and money["lots_unfilled_at_quote_end"] == 0
+
+
+def test_amend_cross_books_per_amend_delta_and_latches_allotment():
+    """Task point 7: an amend whose price crosses the book fills at the venue. Kalshi Amend Order V2
+    reports fill_count / average_fill_price for the fills FROM THE AMEND ONLY (per-amend, verified against
+    docs.kalshi.com), so that count IS the newly-filled delta. After a 1-of-2 ws fill, an amend that
+    crosses and fills the remaining lot books ONE more batch at the amend's average_fill_price and latches
+    ``rest_allotment_done`` -- total 2 lots, booked once (carried-forward 1 + amend delta 1), never doubled."""
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid_a, oid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, Fill(oid, coid_a, Decimal(1), Decimal("0.45"), "no", now + 0.1))  # lot 1 (ws)
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
+    amend = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert amend and amend[-1].count == 1
+    coid_b = amend[-1].updated_client_order_id
+    # keep strike books fresh so the amend-cross wings can be taken (t_to_close far above the T-1 s cutoff).
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.04))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 1.04))
+    # the amend crossed and filled the remaining 1 lot (per-amend fill_count=1 at avg 0.44, remaining 0).
+    st, acts = _feed(p, st, OrderAmended(order_id=oid, client_order_id=coid_b, price=amend[-1].price,
+                                         server_ts=now + 1.05, remaining_count=Decimal(0),
+                                         fill_count=Decimal(1), average_fill_price=Decimal("0.44")))
+    assert len(st.rest_fills) == 2                      # lot1 (ws) + lot2 (amend cross)
+    assert st.rest_fills[1].price == Decimal("0.44") and st.rest_fills[1].count == 1
+    assert st.rest_booked_by_coid.get(coid_b) == 2     # carried-forward 1 + amend delta 1 (no double-book)
+    assert st.rest_allotment_done and st.rest_live is None
+    assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS], "the amend-cross lot must get wings"
+
+
+def test_partial_amend_cross_ws_echo_not_double_booked():
+    """N1 (rebase review, must-fix before contracts=2 + proxy cap): a PARTIAL amend cross leaves the
+    remainder resting under the new coid, so the venue may ALSO echo that crossed lot on the WS fill
+    channel. The Amend V2 response carries NO trade_id, so the driver's trade-id dedup can't catch the
+    echo; the core's amend_cross_pending guard must skip it so rest_fills / wing batches / booked do NOT
+    double. A genuinely NEW WS fill of the last lot afterwards must still book (guard already consumed)."""
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid_a, oid = _bring_up_live_rest(p, st, now)      # full 2-lot allotment resting, no fill yet
+    assert st.rest_live.count == 2 and st.rest_remaining is None
+    # drift -> AMEND the full allotment (count 2, no fill yet); coid rotates to coid_b.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
+    amend = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert amend and amend[-1].count == 2
+    coid_b = amend[-1].updated_client_order_id
+    # keep strike books fresh so the cross's wings can be taken.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.04))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 1.04))
+    # the amend crosses PARTIALLY: fills 1 of the 2 resting lots -> remaining 1, rest_live RETAINED.
+    st, acts = _feed(p, st, OrderAmended(order_id=oid, client_order_id=coid_b, price=amend[-1].price,
+                                         server_ts=now + 1.05, remaining_count=Decimal(1),
+                                         fill_count=Decimal(1), average_fill_price=Decimal("0.44")))
+    assert len(st.rest_fills) == 1 and len(st.wing_batches) == 1
+    assert st.rest_booked_by_coid.get(coid_b) == 1 and st.rest_remaining == 1
+    assert not st.rest_allotment_done and st.rest_live is not None
+    assert st.amend_cross_pending.get(oid) == 1        # the echo guard armed for exactly this crossed lot
+    # the venue ECHOES the crossed lot on the WS fill channel -> must be SKIPPED (no double-book, no batch).
+    st, echo_acts = _feed(p, st, Fill(oid, coid_b, Decimal(1), Decimal("0.44"), "no", now + 1.1))
+    assert len(st.rest_fills) == 1 and len(st.wing_batches) == 1, "the ws echo must not book again"
+    assert st.rest_booked_by_coid.get(coid_b) == 1
+    assert not [a for a in echo_acts if a.kind == ActionKind.TAKE_WINGS], "no wing batch for the echo"
+    assert oid not in st.amend_cross_pending             # guard consumed
+    # a GENUINELY NEW ws fill of the last resting lot must now book (guard already spent) + latch allotment.
+    st, new_acts = _feed(p, st, Fill(oid, coid_b, Decimal(1), Decimal("0.45"), "no", now + 2.0))
+    assert len(st.rest_fills) == 2 and len(st.wing_batches) == 2
+    assert st.rest_booked_by_coid.get(coid_b) == 2 and st.rest_allotment_done and st.rest_live is None
+    assert [a for a in new_acts if a.kind == ActionKind.TAKE_WINGS], "the real last lot must get wings"
+
+
+def test_full_amend_cross_ws_echoes_book_nothing_extra():
+    """N1 full-cross variant: an amend that crosses the FULL resting allotment (fill_count=2) books one
+    batch of 2 and nulls rest_live (allotment done), so subsequent WS echoes of those lots find no tracked
+    order and book nothing extra -- no pending guard is even needed (rest_live is None)."""
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid_a, oid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
+    amend = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert amend and amend[-1].count == 2
+    coid_b = amend[-1].updated_client_order_id
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.04))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 1.04))
+    # the amend crosses the FULL 2 lots at once.
+    st, acts = _feed(p, st, OrderAmended(order_id=oid, client_order_id=coid_b, price=amend[-1].price,
+                                         server_ts=now + 1.05, remaining_count=Decimal(0),
+                                         fill_count=Decimal(2), average_fill_price=Decimal("0.44")))
+    assert len(st.rest_fills) == 1 and st.rest_fills[0].count == 2
+    assert st.rest_booked_by_coid.get(coid_b) == 2 and st.rest_allotment_done and st.rest_live is None
+    assert not st.amend_cross_pending             # a full cross needs no echo guard (rest_live nulled)
+    # two WS echoes of the crossed lots -> nothing extra (no tracked order to match).
+    st, e1 = _feed(p, st, Fill(oid, coid_b, Decimal(1), Decimal("0.44"), "no", now + 1.1))
+    st, e2 = _feed(p, st, Fill(oid, coid_b, Decimal(1), Decimal("0.44"), "no", now + 1.2))
+    assert len(st.rest_fills) == 1 and len(st.wing_batches) == 1
+    assert st.rest_booked_by_coid.get(coid_b) == 2
+    assert not [a for a in (e1 + e2) if a.kind == ActionKind.TAKE_WINGS]
 
 
 # ===========================================================================

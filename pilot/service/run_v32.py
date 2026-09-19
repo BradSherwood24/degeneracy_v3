@@ -89,6 +89,7 @@ from service.v32 import (
     ClockTick,
     Fill,
     OrderAck,
+    OrderAmended,
     OrderCancelled,
     Trade,
     V32Params,
@@ -500,7 +501,7 @@ class FrozenExecutor:
     # selected by ``effective_mode`` in exactly one place (``build_executor``); a real kind reaching a
     # FrozenExecutor is a mis-wire, so we fail loud rather than silently synth-fill.
     _REAL_KINDS = (
-        ActionKind.PLACE_REST, ActionKind.CANCEL_REST,
+        ActionKind.PLACE_REST, ActionKind.CANCEL_REST, ActionKind.AMEND_REST,
         ActionKind.TAKE_WINGS, ActionKind.RETRY_WING,
     )
 
@@ -545,6 +546,33 @@ class FrozenExecutor:
                 oid = rec.order_id
             self.counts["synth_cancelled"] += 1
             return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0))]
+
+        if k == ActionKind.WOULD_AMEND_REST:
+            # amend-first replace (dry/shakedown twin): simulate the venue's amend so the requote state
+            # machine cycles without sending anything. The order_id persists; the RestBook entry moves to
+            # the new coid + price (the old coid RETAINED for late-fill attribution, F-1). No dry fill.
+            coid_old = action.client_order_id
+            coid_new = action.updated_client_order_id or coid_old
+            oid = action.order_id
+            rec = self.rest_book.get(coid_old) if coid_old else None
+            if oid is None and rec is not None:
+                oid = rec.order_id
+            new_price = action.price if action.price is not None else (
+                rec.price if rec is not None else Decimal(0))
+            if rec is not None:
+                self.rest_book[coid_new] = RestRecord(
+                    client_order_id=coid_new, order_id=oid, price=new_price, count=rec.count,
+                    ticker=rec.ticker, bucket_Sd=rec.bucket_Sd, placed_ts=now, status="live",
+                )
+                if coid_old is not None and coid_old != coid_new:
+                    rec.status = "amended"  # RETAINED for late-fill attribution (F-1)
+                if oid is not None:
+                    self._by_order_id[oid] = coid_new
+            self.counts["synth_amended"] += 1
+            return [OrderAmended(order_id=oid or f"dry-{coid_old}", client_order_id=coid_new,
+                                 price=new_price, server_ts=now,
+                                 remaining_count=Decimal(int(action.count or 1)),
+                                 fill_count=Decimal(0), average_fill_price=None)]
 
         if k in (ActionKind.WOULD_TAKE_WINGS, ActionKind.TAKE_WINGS, ActionKind.RETRY_WING):
             out: list[Any] = []
@@ -990,6 +1018,14 @@ class V32Driver:
         elif k in (ActionKind.WOULD_CANCEL_REST, ActionKind.CANCEL_REST):
             rk = "would_cancel_rest" if k == ActionKind.WOULD_CANCEL_REST else "cancel_rest"
             payload = {"order_id": a.order_id, "client_order_id": a.client_order_id}
+        elif k in (ActionKind.WOULD_AMEND_REST, ActionKind.AMEND_REST):
+            rk = "would_amend_rest" if k == ActionKind.WOULD_AMEND_REST else "amend_rest"
+            payload = {
+                "order_id": a.order_id, "ticker": a.ticker, "side": a.side, "action": a.action,
+                "count": a.count, "price": a.price, "client_order_id": a.client_order_id,
+                "updated_client_order_id": a.updated_client_order_id,
+            }
+            self._capture_quote(a)
         elif k in (ActionKind.WOULD_TAKE_WINGS, ActionKind.TAKE_WINGS, ActionKind.RETRY_WING):
             legs = [
                 {"ticker": lg.ticker, "side": lg.side, "action": lg.action, "count": lg.count,
@@ -1399,6 +1435,12 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
         "rest_invariant_violations": int(getattr(executor, "rest_invariant_violations", 0)),
         "rest_invariant_phantoms": int(getattr(executor, "rest_invariant_phantoms", 0)),
         "rest_invariant_rechecks": int(getattr(executor, "rest_invariant_rechecks", 0)),
+        # amend-first replace counters (Brad 2026-09-15)
+        "amends_attempted": int(getattr(executor, "amends_attempted", 0)),
+        "amends_confirmed": int(getattr(executor, "amends_confirmed", 0)),
+        "amends_failed": int(getattr(executor, "amends_failed", 0)),
+        "amend_fallbacks": int(getattr(executor, "amend_fallbacks", 0)),
+        "fills_on_amend": int(getattr(executor, "fills_on_amend", 0)),
     }
     fills = list(getattr(executor, "fills", []) or [])
     if not fills or state.rest_fill is None:
