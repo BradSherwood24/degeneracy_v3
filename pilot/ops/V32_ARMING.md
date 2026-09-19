@@ -176,7 +176,10 @@ The falsifier's "FIRST ARMED WINDOW MUST CONFIRM" list, and where each item appe
    (ideal-shadow E=0.10 fills inside the T-15..T-5 quoting window), both over armed windows carrying a
    spot bucket. At n >= 30 the VERDICT gates on `capture ratio >= 50%` IN PLACE OF the old
    `fill rate >= 2.0/day`; the fill rate is still printed but labelled "(info, superseded as a gate by
-   Registration 3)". Confirm both lines are present.
+   Registration 3)". Confirm both lines are present. The scoreboard also prints
+   `shadow fills below n_min (suppressed, live n_below_min) = N` -- would-be shadow fills at a solved
+   n < params.n_min the live path stood down (n_below_min) and could not have taken (excluded from the
+   capture denominator, same class as the T-15..T-5 window gate).
 
 Also watch: no `A_REPLACE` (replaces/min under 60 -- an amend counts as a replace), no `A_STALE` bursts
 (strike/bucket data-age under 1.0 s), and the ledger row's `realized_lock` positive and near the shadow

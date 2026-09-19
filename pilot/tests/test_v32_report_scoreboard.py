@@ -335,3 +335,109 @@ def test_scoreboard_shadow_fills_outside_window_defaults_zero():
     # A ledger with no row carrying the counter (pre-PR#54 rows) reports 0, never a KeyError.
     sb = build_falsifier_scoreboard(_thirty_sets("0.09", "0.10"))
     assert sb["shadow_fills_outside_window"] == 0
+
+
+# ===========================================================================
+# N1 (PR #66 review): the capture ratio is a bounded per-WINDOW fraction (numerator counts windows,
+# not set events) -- a two-set window counts once and a live-set-without-shadow window never pushes the
+# ratio above 1.
+# ===========================================================================
+def test_capture_ratio_does_not_double_count_two_sets_in_one_window():
+    """A single armed+bucket window that completed TWO rest-fill sets (contracts=2 partial fills) vs one
+    shadow fill must count as ONE captured window, not two -- else the ratio inflates above the true
+    per-window capture and can exceed 1."""
+    row = {
+        "armed": True, "effective_mode": "armed",
+        "spot_bucket_ticker": "KXBTC-TWOSET-B0",
+        "close_time": "2026-09-20T16:00:00Z",
+        "shadow": {"0.10": {"filled": True, "lock": "0.10"}},
+        "wing_batch_sets": [  # two completed sets in one window (per PR #62 schema)
+            {"realized_lock": "0.09", "one_legged": False},
+            {"realized_lock": "0.09", "one_legged": False},
+        ],
+        "realized_unsettled": True,
+    }
+    sb = build_falsifier_scoreboard([row])
+    assert sb["n"] == 2                       # both sets still count for the other gates
+    assert sb["capture_shadow_fills"] == 1
+    assert sb["capture_live_sets"] == 1       # per-window, not per-set
+    assert sb["capture_ratio"] == Decimal(1)
+    assert sb["capture_ratio"] <= Decimal(1)
+
+
+def test_capture_ratio_live_set_without_shadow_never_exceeds_one():
+    # a window with a completed live set but NO shadow fill adds to neither capture count (a capture
+    # ratio > 1 is conceptually impossible: you cannot capture more pumps than the shadow proved).
+    rows = [
+        _set_row(1, 16, "0.09", "0.10"),   # shadow + set -> 1/1
+        _set_row(1, 17, "0.09", None),     # live set, NO shadow fill -> excluded from both
+    ]
+    sb = build_falsifier_scoreboard(rows)
+    assert sb["n"] == 2                     # both sets count for the other gates
+    assert sb["capture_shadow_fills"] == 1 and sb["capture_live_sets"] == 1
+    assert sb["capture_ratio"] == Decimal(1)
+
+
+# ===========================================================================
+# n_min gate (Registration 3 nit): a shadow fill whose derived n (1 - offer) is below n_min is not
+# live-reachable and is excluded from the capture denominator AND the shadow lock / exec-gap stats.
+# ===========================================================================
+def _shadow_row(day: int, hour: int, offer: str, lock: str, has_set: bool,
+                set_lock: str = "0.09") -> dict:
+    """An armed+bucket window whose shadow E=0.10 filled at ``offer`` (derived n = 1 - offer), with or
+    without a completed live set."""
+    row = {
+        "armed": True, "effective_mode": "armed",
+        "spot_bucket_ticker": f"KXBTC-T{day:02d}{hour:02d}-B0",
+        "close_time": f"2026-09-{day:02d}T{hour:02d}:00:00Z",
+        "shadow": {"0.10": {"filled": True, "offer": offer, "lock": lock}},
+        "realized_unsettled": True,
+    }
+    row["realized_lock"] = set_lock if has_set else None
+    row["one_legged"] = False
+    return row
+
+
+def test_capture_ratio_excludes_below_min_shadow_fill():
+    # a shadow fill at offer 0.96 (derived n = 0.04 < n_min 0.05) is NOT a live-reachable counterfactual
+    # -> excluded from the denominator and the shadow lock/exec-gap stats, and surfaced as a below-min
+    # suppression (from the existing row via the derived-n exclusion). The 2026-09-19 23:00Z window.
+    rows = [
+        _shadow_row(19, 22, offer="0.68", lock="0.10", has_set=True),   # valid capture -> 1/1
+        _shadow_row(19, 23, offer="0.96", lock="0.1072", has_set=False),  # below-min -> excluded
+    ]
+    sb = build_falsifier_scoreboard(rows)
+    assert sb["capture_shadow_fills"] == 1          # the below-min window is NOT in the denominator
+    assert sb["capture_live_sets"] == 1
+    assert sb["capture_ratio"] == Decimal(1)
+    assert sb["shadow_fills_below_min"] == 1         # derived-from-offer exclusion, surfaced
+    # shadow mean lock excludes the below-min 0.1072: only the 0.10 fill remains -> +10.0c
+    assert sb["shadow_mean_lock_c"] == Decimal(10)
+
+
+def test_capture_ratio_below_min_boundary_at_n_min_counts():
+    # a shadow fill at offer 0.95 (derived n = 0.05 == n_min) is live-reachable (strict `<`) -> counts.
+    rows = [_shadow_row(1, 16, offer="0.95", lock="0.10", has_set=True)]
+    sb = build_falsifier_scoreboard(rows)
+    assert sb["capture_shadow_fills"] == 1
+    assert sb["capture_live_sets"] == 1
+    assert sb["shadow_fills_below_min"] == 0
+
+
+def test_scoreboard_counts_upstream_shadow_fills_below_min():
+    # a NEW row (shadow suppressed upstream, so no filled shadow record) carries the counter directly;
+    # it is summed and surfaced without a filled shadow record present.
+    rows = _thirty_sets("0.09", "0.10")
+    rows[0]["shadow_fills_below_min"] = 1
+    rows[1]["shadow_fills_below_min"] = 2
+    sb = build_falsifier_scoreboard(rows)
+    assert sb["shadow_fills_below_min"] == 3
+    from service.v32.report import _render_scoreboard
+    line = [l for l in _render_scoreboard(sb) if "below n_min" in l]
+    assert line and "= 3" in line[0]
+
+
+def test_scoreboard_shadow_fills_below_min_defaults_zero():
+    # a ledger whose shadow fills are all at/above n_min and whose rows carry no counter -> 0.
+    sb = build_falsifier_scoreboard(_thirty_sets("0.09", "0.10"))
+    assert sb["shadow_fills_below_min"] == 0

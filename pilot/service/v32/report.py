@@ -26,6 +26,9 @@ from service.v32.falsifier_pins import (
     V32_FALSIFIER_SHADOW_GAP_E,
 )
 from service.v32.ledger import DEFAULT_V32_LEDGER_PATH, load_v32_rows
+from service.v32.params import load_v32_params
+
+_ONE = Decimal("1")
 
 
 def _dec(v: Any) -> Decimal | None:
@@ -35,6 +38,18 @@ def _dec(v: Any) -> Decimal | None:
         return Decimal(str(v))
     except (InvalidOperation, TypeError, ValueError):
         return None
+
+
+def _shadow_below_min(sub: dict[str, Any], n_min: Decimal) -> bool:
+    """True when a shadow fill record's derived n (1 - offer) is below ``n_min`` -- the live path
+    stands down (``n_below_min``) at such an n and would never have rested there, so the shadow fill is
+    not a live-reachable counterfactual (Registration 3 nit, 2026-09-19). The record's top-level ``n``
+    is the end-of-window resolved n (usually None), so n is derived from the fill's stored ``offer``; a
+    record without an ``offer`` (pre-offer shape) is NOT excluded."""
+    offer = _dec(sub.get("offer"))
+    if offer is None:
+        return False
+    return (_ONE - offer) < n_min
 
 
 def _recent_days(rows: list[dict[str, Any]], days: int | None) -> list[dict[str, Any]]:
@@ -240,13 +255,23 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     replaces: list[Decimal] = []
     strike_lags: list[Decimal] = []
     bucket_lags: list[Decimal] = []
-    # CAPTURE RATIO (MEASUREMENT CLARIFICATION 3, 2026-09-19): live completed sets / ideal-shadow E=0.10
-    # fills, BOTH counted over ARMED windows carrying a spot bucket (effective_mode == "armed" AND a
-    # spot_bucket_ticker). The shadow fills at most once per window by construction, so the denominator
-    # counts each qualifying window at most once. A window the live path stood down (for any pilot-side
-    # reason) yields 0 completed sets and so counts as a MISS -- that is what the gate should catch.
-    capture_live_sets = 0                     # completed set events in armed+bucket windows (numerator)
-    capture_shadow_fills = 0                  # armed+bucket windows the shadow E=0.10 filled (denom)
+    # CAPTURE RATIO (MEASUREMENT CLARIFICATION 3, 2026-09-19): a bounded per-WINDOW fraction --
+    # numerator = armed+bucket windows with BOTH a shadow E=0.10 fill AND >= 1 completed live set;
+    # denominator = armed+bucket windows with a shadow E=0.10 fill. Both count each window 0/1, so a
+    # two-set window (contracts>=2) counts once and a live-set-without-shadow window never pushes the
+    # ratio above 1 (N1 fix, PR #66 review). A window the live path stood down (for any pilot-side
+    # reason) has no completed set and so counts as a MISS -- that is what the gate should catch. A
+    # below-n_min shadow fill is NOT live-reachable and is excluded from the denominator (see below).
+    capture_live_sets = 0                     # armed+bucket windows with a shadow fill AND a live set
+    capture_shadow_fills = 0                  # armed+bucket windows the shadow E=0.10 (validly) filled
+    # n_min gate (Registration 3 nit): the live path stands down (n_below_min) when the solved n <
+    # params.n_min, so a shadow fill whose derived n (1 - offer) is below n_min is not a live-reachable
+    # counterfactual (same class as the T-15..T-5 window gate). Exclude it from the capture denominator
+    # AND the shadow lock / exec-gap stats, deriving n from the fill's stored ``offer`` (the record's
+    # top-level ``n`` is the end-of-window resolved n, usually None). New rows suppress it upstream
+    # (``shadow_fills_below_min``); this excludes it from EXISTING rows too so history reads the same.
+    n_min = load_v32_params().n_min
+    derived_shadow_below_min = 0
     for r in rows:
         if not r.get("armed"):
             continue
@@ -264,25 +289,35 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 bucket.append(lg)
         shadow = r.get("shadow") or {}
         sub = shadow.get(e)
-        slock = _dec(sub.get("lock")) if (sub and sub.get("filled")) else None
+        shadow_filled = bool(sub and sub.get("filled"))
+        below_min = shadow_filled and _shadow_below_min(sub, n_min)
+        if below_min:
+            derived_shadow_below_min += 1
+        # a VALID shadow fill is filled AND at/above n_min (live-reachable); below-min is excluded from
+        # the denominator and the lock/exec-gap stats.
+        shadow_valid = shadow_filled and not below_min
+        slock = _dec(sub.get("lock")) if shadow_valid else None
         if slock is not None:
             shadow_locks_c.append(slock * 100)
-        if capture_window and slock is not None:  # shadow filled this armed+bucket window (once/window)
-            capture_shadow_fills += 1
         events = _row_set_events(r)  # one entry per rest-fill event (batch), or the legacy single set
         if events:
             fill_days.add(day)
+        row_has_set = False
         for ev in events:
             fills_total += 1
             if ev["one_legged"]:
                 legged += 1
             if ev["lock"] is not None:  # a completed set
                 n += 1
+                row_has_set = True
                 live_locks_c.append(ev["lock"])
-                if capture_window:
-                    capture_live_sets += 1
                 if slock is not None:
                     gaps_c.append(slock * 100 - ev["lock"])
+        # bounded per-window capture: one shadow-filled window, +1 to the numerator iff it also had a set
+        if capture_window and shadow_valid:
+            capture_shadow_fills += 1
+            if row_has_set:
+                capture_live_sets += 1
 
     n_days = len(armed_days)  # distinct armed UTC calendar days (retained key; NOT the fill-rate denom)
     # armed_windows = number of armed windows the pilot actually RAN (ledger rows whose effective_mode
@@ -297,6 +332,12 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     # (prints outside the live quoting window the live path could never have taken). Additive: older
     # ledger rows lack the key, so ``.get(...,0)``. Registered clarification 2026-09-15 ~18:10Z / PR #54.
     shadow_fills_outside_window = sum(int(r.get("shadow_fills_outside_window", 0) or 0) for r in rows)
+    # would-be shadow fills SUPPRESSED because the solved n < n_min (the live path stands down
+    # n_below_min). New rows carry the upstream counter ``shadow_fills_below_min``; existing rows are
+    # caught by the fold's derived-from-offer exclusion. Sum both for the honest total (a suppressed
+    # new row has no filled shadow record, so the two never double-count the same window).
+    shadow_fills_below_min = (sum(int(r.get("shadow_fills_below_min", 0) or 0) for r in rows)
+                              + derived_shadow_below_min)
     # fills_total (rest-fill events = wing batches) is accumulated in the fold above.
     slocks = sorted(live_locks_c)
     mean_lock = (sum(live_locks_c, Decimal(0)) / Decimal(n)) if n else None
@@ -369,6 +410,7 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "strike_lag_stats_p99_s": strike_stats_p99,
         "bucket_lag_stats_p99_s": bucket_stats_p99,
         "shadow_fills_outside_window": shadow_fills_outside_window,
+        "shadow_fills_below_min": shadow_fills_below_min,
         "verdict": verdict,
     }
 
@@ -421,6 +463,8 @@ def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
         f"bucket {_num(bucket_age, 2, 's')}",
         f"  shadow fills outside window (suppressed, T-15..T-5 gate) = "
         f"{sb.get('shadow_fills_outside_window', 0)}",
+        f"  shadow fills below n_min (suppressed, live n_below_min) = "
+        f"{sb.get('shadow_fills_below_min', 0)}",
         f"  VERDICT: {sb['verdict']}",
     ]
 

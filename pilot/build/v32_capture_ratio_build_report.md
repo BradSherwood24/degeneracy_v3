@@ -93,3 +93,66 @@ Current CAPTURE RATIO = 7/12 = 58.3% (>= the 0.50 pin). The 5 misses of the 12 s
 windows: 1 pre-PR#54 counting artifact (09-15 04Z), 2 rest-absent-at-print during replace churn
 (09-15 14Z/15Z), 1 phantom-resting stand-down (09-15 18Z, PR #56), 1 replace-rate alarm stand-down
 (09-18 14Z). Verdict stays `n<30 pending`; the ratio does not decide until n>=30.
+
+---
+
+## Round 2 -- PR #66 review fixes (APPROVE WITH NITS)
+
+Two fixes on the same branch after the adversarial review (`v32_capture_ratio_review.md`). Do not merge.
+
+### N1 -- capture ratio is now a bounded per-WINDOW fraction
+
+Before, the numerator counted set EVENTS while the denominator counted WINDOWS -- harmless at
+`contracts` = 1 but inflates ~2x at `contracts` = 2 (a two-set window counted 2 against a 1-per-window
+denominator) and permitted a ratio > 1. Fixed in `service/v32/report.py::build_falsifier_scoreboard`:
+numerator = armed+bucket windows with BOTH a completed live set AND a shadow E=0.10 fill (0/1 per
+window); denominator = armed+bucket windows with a shadow fill. Bounded to [0, 1]. `n` still counts
+every set for the other gates. The reviewer's failing `contracts` = 2 test is added and passes
+(`test_capture_ratio_does_not_double_count_two_sets_in_one_window`), plus a live-set-without-shadow test.
+
+### N2 (new, found on the live ledger) -- the shadow honours `params.n_min`
+
+The 2026-09-19 23:00Z window (bucket B81250): the shadow filled at offer 0.96 (n = 0.04) on a 16-lot
+print at 0.97 while live stood down `n_below_min` the whole hour (`params.n_min` = 0.05). That fill is
+not a live-reachable counterfactual -- same class as MEASUREMENT CLARIFICATION 2 / PR #54. Fixed in two
+places:
+- `service/v32/core.py::_shadow_on_trade`: does not fill when the solved n < `params.n_min`; emits
+  `ActionKind.SHADOW_FILL_BELOW_MIN`; `service/run_v32.py` journals `shadow_fill_below_min` and
+  `service/v32/ledger.py` counts `shadow_fills_below_min` (additive; mirrors the PR #54 pattern).
+- `service/v32/report.py`: for EXISTING rows (shadow record filled, top-level `n` is None) the derived
+  shadow n = `1 - offer`; below-`n_min` fills are excluded from BOTH the capture-ratio denominator and
+  the shadow mean-lock / execution-gap stats, and the count is surfaced on the scoreboard
+  (`shadow fills below n_min (suppressed, live n_below_min)`).
+
+Files touched this round: `service/v32/actions.py` (new ActionKind), `service/v32/core.py`,
+`service/run_v32.py`, `service/v32/ledger.py`, `service/v32/report.py`, `ceremony/v32_falsifier.md`
+(Registration 3 entry edited in place -- it is this PR's own unmerged entry -- with the per-window
+definition + the n_min gate), tests `test_v32_core.py` (+3), `test_v32_report_scoreboard.py` (+6).
+
+### Suite
+
+`cd pilot && python -m pytest -q` -> **935 passed** (round 1 was 926; +9). ~27s.
+
+### Before/after on a FRESH read-only ledger copy (125 rows, 2026-09-19)
+
+BEFORE (PR head 73ad5fc, this-round fixes stashed):
+```
+  capture ratio = live 7 / shadow 13 = 53.8%
+  shadow E=0.10: mean lock +10.49c   execution gap (shadow-live) -0.60c
+  (no below-n_min line)
+```
+
+AFTER (both fixes):
+```
+  completed sets n = 7   (rest fills total = 7, one-legged = 0)   armed windows = 113   armed days = 113/24 = 4.71
+  %positive = 100.0   fill rate = 1.49/day (info, superseded as a gate by Registration 3; pin was 2.0/day)
+  capture ratio = live 7 / shadow 12 = 58.3%  (>= 50% [pin] Registration 3)
+  shadow E=0.10: mean lock +10.47c   execution gap (shadow-live) -0.60c
+  shadow fills below n_min (suppressed, live n_below_min) = 1
+  VERDICT: n<30 pending (n=7)
+```
+
+The n_min exclusion of the 23:00Z below-min window drops the denominator 13 -> 12, restoring capture
+**7/12 = 58.3%** (>= the 0.50 pin). The execution gap is unchanged (-0.60c) because the excluded window
+had no live set and so never contributed to the gap; the shadow mean lock ticks down slightly
+(+10.49c -> +10.47c) as the excluded fill's +10.72c lock leaves the pool. Verdict stays `n<30 pending`.

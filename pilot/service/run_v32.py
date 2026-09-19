@@ -1059,6 +1059,15 @@ class V32Driver:
                 "E": a.shadow_E, "offer": a.offer, "print": a.print_price,
                 "count": a.count, "t_to_close": a.t_to_close,
             }
+        elif k == ActionKind.SHADOW_FILL_BELOW_MIN:
+            # A would-be shadow fill at a solved n < n_min the live path would never have rested at
+            # (it stands down n_below_min). Observability only: journal the suppressed fill; the tally
+            # below counts it under ``shadow_fill_below_min`` (ledger: ``shadow_fills_below_min``).
+            rk = "shadow_fill_below_min"
+            payload = {
+                "E": a.shadow_E, "offer": a.offer, "print": a.print_price,
+                "count": a.count, "t_to_close": a.t_to_close,
+            }
         else:
             rk = "v32_action"
             payload = {"kind": str(k)}

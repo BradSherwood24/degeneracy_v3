@@ -31,6 +31,11 @@ class ActionKind(str, enum.Enum):
     # could NOT have taken because it printed outside the T-15..T-5 quoting window. Emitted by
     # ``_shadow_on_trade`` so the driver can journal + count it; carries no order.
     SHADOW_FILL_OUTSIDE_WINDOW = "SHADOW_FILL_OUTSIDE_WINDOW"
+    # Observability-only (order-free, no WOULD_* twin): a would-be shadow fill whose solved n is below
+    # params.n_min -- the live path stands down (``n_below_min``) at such an n and would NEVER have
+    # rested there, so the shadow's fill is not a live-reachable counterfactual (same class as
+    # SHADOW_FILL_OUTSIDE_WINDOW; Registration 3 nit, 2026-09-19). Emitted by ``_shadow_on_trade``.
+    SHADOW_FILL_BELOW_MIN = "SHADOW_FILL_BELOW_MIN"
     # shakedown twins
     WOULD_PLACE_REST = "WOULD_PLACE_REST"
     WOULD_CANCEL_REST = "WOULD_CANCEL_REST"
@@ -83,6 +88,8 @@ class V32Action:
       * STAND_DOWN: reason.
       * SHADOW_FILL_OUTSIDE_WINDOW: shadow_E, offer, print_price, count, t_to_close (all
         informational; observability of a shadow print the live window would not have taken).
+      * SHADOW_FILL_BELOW_MIN: shadow_E, offer, print_price, count, t_to_close (all informational;
+        observability of a shadow fill at a solved n < n_min the live path would never have rested).
     """
 
     kind: ActionKind
