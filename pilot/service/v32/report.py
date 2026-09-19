@@ -16,6 +16,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from service.v32.falsifier_pins import (
+    V32_CAPTURE_RATIO_MIN,
     V32_FALSIFIER_MAX_EXEC_GAP_CENTS,
     V32_FALSIFIER_MAX_ONE_LEGGED,
     V32_FALSIFIER_MIN_FILL_RATE_PER_DAY,
@@ -239,9 +240,18 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     replaces: list[Decimal] = []
     strike_lags: list[Decimal] = []
     bucket_lags: list[Decimal] = []
+    # CAPTURE RATIO (MEASUREMENT CLARIFICATION 3, 2026-09-19): live completed sets / ideal-shadow E=0.10
+    # fills, BOTH counted over ARMED windows carrying a spot bucket (effective_mode == "armed" AND a
+    # spot_bucket_ticker). The shadow fills at most once per window by construction, so the denominator
+    # counts each qualifying window at most once. A window the live path stood down (for any pilot-side
+    # reason) yields 0 completed sets and so counts as a MISS -- that is what the gate should catch.
+    capture_live_sets = 0                     # completed set events in armed+bucket windows (numerator)
+    capture_shadow_fills = 0                  # armed+bucket windows the shadow E=0.10 filled (denom)
     for r in rows:
         if not r.get("armed"):
             continue
+        # armed+bucket gate for the capture ratio (effective_mode is the registered arming mark).
+        capture_window = r.get("effective_mode") == "armed" and bool(r.get("spot_bucket_ticker"))
         day = str(r.get("close_time", ""))[:10]
         armed_days.add(day)
         rep = _dec(r.get("replaces"))
@@ -257,6 +267,8 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
         slock = _dec(sub.get("lock")) if (sub and sub.get("filled")) else None
         if slock is not None:
             shadow_locks_c.append(slock * 100)
+        if capture_window and slock is not None:  # shadow filled this armed+bucket window (once/window)
+            capture_shadow_fills += 1
         events = _row_set_events(r)  # one entry per rest-fill event (batch), or the legacy single set
         if events:
             fill_days.add(day)
@@ -267,6 +279,8 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if ev["lock"] is not None:  # a completed set
                 n += 1
                 live_locks_c.append(ev["lock"])
+                if capture_window:
+                    capture_live_sets += 1
                 if slock is not None:
                     gaps_c.append(slock * 100 - ev["lock"])
 
@@ -292,6 +306,11 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     pos = sum(1 for x in live_locks_c if x > 0)
     pct_positive = (Decimal(pos) * 100 / Decimal(n)) if n else None
     fill_rate = (Decimal(fills_total) / armed_days) if armed_windows else None
+    # CAPTURE RATIO (Registration 3): what fraction of the pumps the shadow proved were available did
+    # the live path actually capture. None when the shadow never filled an armed+bucket window (no
+    # availability to measure execution against).
+    capture_ratio = (Decimal(capture_live_sets) / Decimal(capture_shadow_fills)
+                     if capture_shadow_fills else None)
     shadow_mean = ((sum(shadow_locks_c, Decimal(0)) / Decimal(len(shadow_locks_c)))
                    if shadow_locks_c else None)
     exec_gap = (sum(gaps_c, Decimal(0)) / Decimal(len(gaps_c))) if gaps_c else None
@@ -313,8 +332,12 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
             fails.append(f"mean lock {mean_lock}c < +{V32_FALSIFIER_MIN_MEAN_LOCK_CENTS}c")
         if pct_positive is None or pct_positive < V32_FALSIFIER_MIN_PCT_POSITIVE:
             fails.append(f"%positive {pct_positive} < {V32_FALSIFIER_MIN_PCT_POSITIVE}")
-        if fill_rate is None or fill_rate < V32_FALSIFIER_MIN_FILL_RATE_PER_DAY:
-            fails.append(f"fill rate {fill_rate}/day < {V32_FALSIFIER_MIN_FILL_RATE_PER_DAY}")
+        # MEASUREMENT CLARIFICATION 3 (2026-09-19): the fill-rate gate is SUPERSEDED here by the
+        # capture ratio (fill rate stays computed above and printed as info). A missing ratio (the
+        # shadow never filled an armed+bucket window) is a fail -- there is availability we cannot show
+        # we captured.
+        if capture_ratio is None or capture_ratio < V32_CAPTURE_RATIO_MIN:
+            fails.append(f"capture ratio {capture_ratio} < {V32_CAPTURE_RATIO_MIN}")
         if exec_gap is None or exec_gap > V32_FALSIFIER_MAX_EXEC_GAP_CENTS:
             fails.append(f"exec gap {exec_gap}c > {V32_FALSIFIER_MAX_EXEC_GAP_CENTS}c")
         if legged > V32_FALSIFIER_MAX_ONE_LEGGED:
@@ -335,6 +358,9 @@ def build_falsifier_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "min_lock_c": min_lock,
         "pct_positive": pct_positive,
         "fill_rate_per_day": fill_rate,
+        "capture_live_sets": capture_live_sets,
+        "capture_shadow_fills": capture_shadow_fills,
+        "capture_ratio": capture_ratio,
         "shadow_mean_lock_c": shadow_mean,
         "exec_gap_c": exec_gap,
         "replaces_per_hour_mean": replaces_mean,
@@ -353,6 +379,11 @@ def _c(v: Decimal | None, prec: int = 1) -> str:
 
 def _num(v: Decimal | None, prec: int, suffix: str = "") -> str:
     return f"{v:.{prec}f}{suffix}" if v is not None else "n/a"
+
+
+def _pct(ratio: Decimal | None, prec: int = 1) -> str:
+    """A capture-ratio fraction rendered as a percent (None -> 'n/a' when the shadow never filled)."""
+    return f"{ratio * 100:.{prec}f}%" if ratio is not None else "n/a"
 
 
 def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
@@ -377,7 +408,12 @@ def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
         f"  realized lock: mean {_c(sb['mean_lock_c'])}  median {_c(sb['median_lock_c'])}  "
         f"p10 {_c(sb['p10_lock_c'])}  min {_c(sb['min_lock_c'])}",
         f"  %positive = {_num(pct, 1) if pct is not None else 'n/a'}   "
-        f"fill rate = {_num(rate, 2, '/day') if rate is not None else 'n/a'}",
+        f"fill rate = {_num(rate, 2, '/day') if rate is not None else 'n/a'} "
+        f"(info, superseded as a gate by Registration 3; pin was "
+        f"{V32_FALSIFIER_MIN_FILL_RATE_PER_DAY}/day)",
+        f"  capture ratio = live {sb.get('capture_live_sets', 0)} / shadow "
+        f"{sb.get('capture_shadow_fills', 0)} = {_pct(sb.get('capture_ratio'))}  "
+        f"(>= {V32_CAPTURE_RATIO_MIN * 100:.0f}% [pin] Registration 3)",
         f"  shadow E={e}: mean lock {_c(sb['shadow_mean_lock_c'])}   "
         f"execution gap (shadow-live) {_c(sb['exec_gap_c'])}",
         f"  replaces/hour mean = {_num(sb['replaces_per_hour_mean'], 1)}   "

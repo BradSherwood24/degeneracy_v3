@@ -46,8 +46,9 @@ the banded S4 is not `latch`/`pending`. Any miss => the window runs DRY (orders 
    python -m service.run_v32 --mode dry
    python -m service.v32.report --days 1
    ```
-   The report's FALSIFIER SCOREBOARD will show `n<30 pending` (no live sets yet) and the dry-run shadow
-   locks -- that is expected.
+   The report's FALSIFIER SCOREBOARD will show `n<30 pending` (no live sets yet), the dry-run shadow
+   locks, and the `capture ratio = live X / shadow Y = Z%` line (MEASUREMENT CLARIFICATION 3) -- that is
+   expected.
 6. **Confirm the roster sha** matches the pinned constant
    `c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92`:
    ```
@@ -168,6 +169,14 @@ The falsifier's "FIRST ARMED WINDOW MUST CONFIRM" list, and where each item appe
    `test_amend_failure_falls_back_to_cancel_create`) so an amend outage degrades to the proven sequential
    cancel -> confirm -> create, never to a naked or doubled rest. If `amends_failed` spikes or an
    `amend_confirmed` shows a CHANGED `order_id`, the amend semantics are wrong at the venue -- STOP.
+
+9. **capture ratio printed on the scoreboard (MEASUREMENT CLARIFICATION 3, Brad 2026-09-19).** The
+   FALSIFIER SCOREBOARD block of `python -m service.v32.report` prints a line
+   `capture ratio = live X / shadow Y = Z%  (>= 50% [pin] Registration 3)` -- (live completed sets) /
+   (ideal-shadow E=0.10 fills inside the T-15..T-5 quoting window), both over armed windows carrying a
+   spot bucket. At n >= 30 the VERDICT gates on `capture ratio >= 50%` IN PLACE OF the old
+   `fill rate >= 2.0/day`; the fill rate is still printed but labelled "(info, superseded as a gate by
+   Registration 3)". Confirm both lines are present.
 
 Also watch: no `A_REPLACE` (replaces/min under 60 -- an amend counts as a replace), no `A_STALE` bursts
 (strike/bucket data-age under 1.0 s), and the ledger row's `realized_lock` positive and near the shadow
