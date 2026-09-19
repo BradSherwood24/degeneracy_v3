@@ -161,3 +161,88 @@ until the cap is applied.
 ## Cleanup
 Throwaway worktree `C:\Users\Brads\Python_stuff\dv3_wt_review_pr59` created for the suite run + probes and
 removed after this review.
+
+---
+
+# Round 3 — N1 fix delta re-check (new head `50834b7`, rebased onto `main 7f4bb7e`)
+
+Verdict: **APPROVE WITH NITS — N1 RESOLVED.** The partial-amend-cross WS-echo double-book is fixed
+correctly; the fix is inert at `contracts` = 1 (report byte-identity preserved); the over-skip failure
+mode is bounded and self-reconciling in the safe direction. The only remaining nits are the pre-existing,
+non-blocking N2/N3 from round 2, plus one minor residual on the over-skip (below). Delta since `cfbf10a`:
+`core.py` (+34, the guard) and `test_v32_partial_fill.py` (+2 tests) only, plus the build report.
+
+## Docs claim re-verified
+The Amend Order V2 success response carries **no trade_id / execution id / per-trade identifier** — only
+aggregate fields (`order_id`, `client_order_id`, `remaining_count`, `fill_count`, `average_fill_price`,
+`average_fee_paid`, `ts_ms`). So the driver's trade-id dedup genuinely cannot catch a WS echo of an amend
+cross, and a state guard (option b) is the right mechanism, not a trade-id dedup (option a).
+Source: https://docs.kalshi.com/api-reference/orders/amend-order-v2
+
+## The fix
+`V32State.amend_cross_pending` (order_id -> lots). `_apply_amended` arms it (`+= delta`) **only when the
+cross is PARTIAL** (`rest_live is not None` after `_book_rest_delta`, i.e. `contracts` >= 2). `_apply_fill`
+consumes it for a matched tracked-order rest `Fill` (`skip = min(pending, delta)`, book only `delta - skip`).
+A full cross nulls `rest_live` inside `_book_rest_delta`, so it never arms.
+
+## Checks
+
+1. **N1 reproduction re-run vs `50834b7` (Probe R3-A).** contracts=2, full-allotment amend, partial cross
+   (fill 1 of 2) arms `amend_cross_pending[oid]=1`; the venue's WS echo of that lot is **SKIPPED** —
+   `rest_fills` stays 1, `wing_batches` stays 1, no `TAKE_WINGS`, guard consumed. A genuinely new WS fill
+   of the last lot afterwards books normally (`rest_fills`=2, allotment latches). **Double-book gone.**
+   (Round-2 Probe on `cfbf10a` was `*** CORE DOUBLE-BOOKS ***`.)
+
+2. **Over-skip failure mode (Probe R3-B) — bounded and self-reconciling.** With the guard armed and the
+   echo NEVER arriving (the likely case if amends are maker-only / the venue does not echo crosses), a
+   GENUINELY new WS fill of the next lot is wrongly skipped (guard consumed, lot unbooked). Reconciliation:
+   - The delta-aware 1 s status poll reads cumulative `filled=2`, `delta = 2 - booked(1) = 1`, and
+     **books the lot** via `_book_rest_delta` (verified: `rest_fills` 1 -> 2, `rest_allotment_done`).
+   - Wings: `_book_rest_delta` calls `_wing_step`, which takes the wings when the strike books are fresh;
+     if they are stale at the booking instant the batch stays untaken and gets its wings on the **next**
+     `BookUpdate`/`ClockTick` (`_wing_step` is re-invoked on every one — `core.py:532`, `:569`). The
+     cancel-confirm reconcile path was verified end-to-end WITH fresh books: `rest_fills`=2 **and**
+     `TAKE_WINGS` fired.
+   - **Worst-case naked interval:** ~1 s (until the next poll tick) to BOOK the wrongly-skipped lot, plus
+     sub-second to the next fresh strike tick to take its WINGS (the strike feed ticks continuously in an
+     armed window); bounded by the T-5 quote-end cancel if the poll is down. The guard therefore errs
+     toward a brief, recoverable UNDER-book (reconciled to venue truth), never a double-book (which would
+     corrupt the falsifier scoreboard) — the correct safety direction.
+
+3. **Guard lifetime (no cross-order / cross-window survival).** Keyed by `order_id` (venue-unique, never
+   reused within a window); a fresh `V32State.new` per window starts it empty, so it cannot leak across
+   windows. It is consumed in `_apply_fill`; it is not explicitly cleared on allotment-done/quote-end, but
+   a stale entry is harmless — after allotment-done `rest_live` is None, so `_apply_fill` never matches and
+   the skip branch (inside `if matched is not None`) is unreachable; and a different order (different oid)
+   cannot consume another order's pending. (Minor: an explicit `acp.pop(oid)` on allotment-done/quote-end
+   would be tidier — see residual nit.)
+
+4. **contracts=1 (Probe R3-C + read).** A cross at count 1 always fully fills -> `_book_rest_delta` sets
+   `rest_allotment_done` and nulls `rest_live` -> `if st.rest_live is not None` is false -> the guard NEVER
+   arms; `amend_cross_pending` stays empty. Report byte-identity RE-VERIFIED on a fresh read-only ledger
+   copy (102 rows) vs `origin/main`: the full-JSON structured diff is **exactly the same 5 additive
+   `totals.amend_*` keys (all 0)** as round 2 — the N1 core change adds nothing at `contracts` = 1.
+
+5. **Suite (fresh worktree).** `856`/`858 passed, 2 skipped` excluding the 5 corpus-dependent files
+   (`test_parity`/`test_shakedown`/`test_quintile`/`test_review_probes2`/`reference_impl_review` —
+   `sim/out/census_train.csv` / `historical-data/15-minute/...` absent in a fresh checkout); the two new
+   N1 tests (`test_partial_amend_cross_ws_echo_not_double_booked`,
+   `test_full_amend_cross_ws_echoes_book_nothing_extra`) pass. Consistent with the builder's 914 (= 858 +
+   the ~56 tests in the data-file files present in the builder's tree).
+
+## Residual nits (non-blocking)
+- **R3-N (minor, over-skip tidiness):** when amends cross partially AND the venue does not echo on WS, the
+  guard causes a ~1 s under-book of the next genuine lot (reconciled by the poll/cancel, as above). Only
+  relevant at `contracts` = 2 with the proxy cap applied. Acceptable as-is (safe direction); a belt-and-
+  braces improvement would be to clear the pending entry after a short TTL or on the first non-echo
+  reconcile so it cannot skip a genuine fill at all. Optional.
+- **N2 / N3 (carried over from round 2, unchanged, non-blocking):** N2 — the executor amend money-math
+  de-dup by `order_id` can understate `realized_delta` at `contracts` > 1 (falsifier reads core state, so
+  the verdict is unaffected; track with #62 N4). N3 — `post_only`-on-amend, amend rate limits, and
+  `average_fill_price` units remain undocumented but guarded; behaviour-neutral until the proxy cap is
+  applied.
+
+**Round-3 verdict: APPROVE WITH NITS — N1 RESOLVED.** No double-book on any amend-cross path checked; the
+fix is inert at `contracts` = 1 (byte-identity preserved); the over-skip is bounded, self-reconciling, and
+errs safe. Behaviour remains fully neutral live today (proxy 403s every amend). Merge decision remains
+Brad's.
