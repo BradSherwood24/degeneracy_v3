@@ -192,9 +192,36 @@ The proxy still REFUSES every non-create order-write POST, so every amend 403s a
 proven cancel+create; armed behaviour is identical to the pre-#59 sequential replace until Brad applies
 `pilot/ops/proxy_amend_cap.md` and restarts. The amend-cross + carry-forward paths added here therefore
 change nothing live today; they are exercised only by the tests and by the amend path once the proxy cap
-is applied. Two live-confirm items remain (both behaviour-neutral now): (a) the executor's amend money-math
-de-dups by `order_id` (all-or-nothing), so at `contracts` > 1 an amend cross whose order already booked a
-lot would skip the executor `fills` append — the CORE booking (strategy state) is correct via
-`_book_rest_delta`; and (b) a partial (not full) amend cross at `contracts` > 2 that also echoes on the WS
-`fill` channel could double the core batch — unreachable at `contracts` <= 2 (a cross that leaves 0
-remaining nulls `rest_live`, so the WS echo no-ops). Both are documented for the first live amend window.
+is applied. One live-confirm item remains, plus the N1 fix below (all behaviour-neutral now): (N2, same
+class as #62 N4) the executor's amend money-math de-dups by `order_id` (all-or-nothing), so at
+`contracts` > 1 an amend cross whose order already booked a lot would skip the executor `fills` append —
+the CORE booking (strategy state, which the falsifier reads) is correct via `_book_rest_delta`; only the
+ledger's `realized_delta`/`cost` reconciliation could understate that lot's taker cost. Tracked with #62 N4
+for a reconciliation pass when `contracts` is actually raised; non-blocking at `contracts` = 1. (N3) the
+unknowns — `post_only`-on-amend, amend rate limits, `average_fill_price` units — are acknowledged and
+guarded (the `exec_price_mismatch` alarm + first `amend_fill` journal are the live check; a maker-only
+amend simply never crosses; amend 429s route to the safe fallback), behaviour-neutral until the cap.
+
+### N1 FIX (rebase review, 2026-09-19) — partial amend cross double-book via WS echo
+
+CORRECTION to the earlier item (b): a partial (not full) amend cross that also echoes on the WS `fill`
+channel is **unreachable only at `contracts` = 1; REACHABLE at `contracts` >= 2** (the earlier
+"unreachable at `contracts` <= 2" was wrong — the reviewer reproduced it at `contracts` = 2/3). At
+`contracts` >= 2 a partial amend cross (fill_count < the resting count) leaves `rest_live` RETAINED under
+the new coid, and a later WS `Fill` for that same crossed lot would be booked AGAIN — the Amend Order V2
+response carries NO trade_id (verified against docs.kalshi.com), so the driver's trade-id dedup cannot
+recognize the echo. Fix (b) chosen (a — seeding `_seen_trade_ids` — is impossible: no trade id in the
+response): a core-level per-order echo guard `V32State.amend_cross_pending` (order_id -> lots an amend
+cross already booked). `_apply_amended` sets it ONLY on a partial cross (a full cross nulls `rest_live`, so
+the echo can't match); `_apply_fill` consumes it, skipping up to that many lots for the order before
+booking a tracked-order rest Fill. Self-healing: if the guard ever over-skips (an echo that never arrives),
+the cumulative cancel/poll paths (`_apply_cancelled` / `on_poll_fill`, both delta-over-`rest_booked_by_coid`)
+still reconcile to venue truth, so no lot is lost. `contracts` = 1 is byte-identical (a cross always fully
+fills there, so the guard is never set; the fix touches only `core.py` — `ledger.py`/`report.py`/`run_v32.py`
+untouched, so the report byte-identity the reviewer recorded stands: on a fresh read-only copy of the live
+ledger only the 5 additive amend counters differ, all 0). Tests (`tests/test_v32_partial_fill.py`):
+`test_partial_amend_cross_ws_echo_not_double_booked` (partial cross + WS echo -> rest_fills stays 1, one
+batch, `booked[new_coid]` unchanged, guard consumed; then a genuinely NEW WS fill of the last lot books it,
+rest_fills=2, allotment latches) and `test_full_amend_cross_ws_echoes_book_nothing_extra` (full cross
+fill_count=2 then two WS echoes -> nothing extra). Suite after the fix: **914 passed, 2 skipped, 2 errors**
+(the same pre-existing `test_quintile.py` corpus-absence).

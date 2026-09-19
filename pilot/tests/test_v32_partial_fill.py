@@ -537,6 +537,77 @@ def test_amend_cross_books_per_amend_delta_and_latches_allotment():
     assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS], "the amend-cross lot must get wings"
 
 
+def test_partial_amend_cross_ws_echo_not_double_booked():
+    """N1 (rebase review, must-fix before contracts=2 + proxy cap): a PARTIAL amend cross leaves the
+    remainder resting under the new coid, so the venue may ALSO echo that crossed lot on the WS fill
+    channel. The Amend V2 response carries NO trade_id, so the driver's trade-id dedup can't catch the
+    echo; the core's amend_cross_pending guard must skip it so rest_fills / wing batches / booked do NOT
+    double. A genuinely NEW WS fill of the last lot afterwards must still book (guard already consumed)."""
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid_a, oid = _bring_up_live_rest(p, st, now)      # full 2-lot allotment resting, no fill yet
+    assert st.rest_live.count == 2 and st.rest_remaining is None
+    # drift -> AMEND the full allotment (count 2, no fill yet); coid rotates to coid_b.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
+    amend = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert amend and amend[-1].count == 2
+    coid_b = amend[-1].updated_client_order_id
+    # keep strike books fresh so the cross's wings can be taken.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.04))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 1.04))
+    # the amend crosses PARTIALLY: fills 1 of the 2 resting lots -> remaining 1, rest_live RETAINED.
+    st, acts = _feed(p, st, OrderAmended(order_id=oid, client_order_id=coid_b, price=amend[-1].price,
+                                         server_ts=now + 1.05, remaining_count=Decimal(1),
+                                         fill_count=Decimal(1), average_fill_price=Decimal("0.44")))
+    assert len(st.rest_fills) == 1 and len(st.wing_batches) == 1
+    assert st.rest_booked_by_coid.get(coid_b) == 1 and st.rest_remaining == 1
+    assert not st.rest_allotment_done and st.rest_live is not None
+    assert st.amend_cross_pending.get(oid) == 1        # the echo guard armed for exactly this crossed lot
+    # the venue ECHOES the crossed lot on the WS fill channel -> must be SKIPPED (no double-book, no batch).
+    st, echo_acts = _feed(p, st, Fill(oid, coid_b, Decimal(1), Decimal("0.44"), "no", now + 1.1))
+    assert len(st.rest_fills) == 1 and len(st.wing_batches) == 1, "the ws echo must not book again"
+    assert st.rest_booked_by_coid.get(coid_b) == 1
+    assert not [a for a in echo_acts if a.kind == ActionKind.TAKE_WINGS], "no wing batch for the echo"
+    assert oid not in st.amend_cross_pending             # guard consumed
+    # a GENUINELY NEW ws fill of the last resting lot must now book (guard already spent) + latch allotment.
+    st, new_acts = _feed(p, st, Fill(oid, coid_b, Decimal(1), Decimal("0.45"), "no", now + 2.0))
+    assert len(st.rest_fills) == 2 and len(st.wing_batches) == 2
+    assert st.rest_booked_by_coid.get(coid_b) == 2 and st.rest_allotment_done and st.rest_live is None
+    assert [a for a in new_acts if a.kind == ActionKind.TAKE_WINGS], "the real last lot must get wings"
+
+
+def test_full_amend_cross_ws_echoes_book_nothing_extra():
+    """N1 full-cross variant: an amend that crosses the FULL resting allotment (fill_count=2) books one
+    batch of 2 and nulls rest_live (allotment done), so subsequent WS echoes of those lots find no tracked
+    order and book nothing extra -- no pending guard is even needed (rest_live is None)."""
+    p = _params(contracts=2, tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, coid_a, oid = _bring_up_live_rest(p, st, now)
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _top("0.60", "0.61"), now + 1))
+    amend = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert amend and amend[-1].count == 2
+    coid_b = amend[-1].updated_client_order_id
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1.04))
+    st, _ = _feed(p, st, BookUpdate(STK_SD, _top("0.75", "0.76"), now + 1.04))
+    # the amend crosses the FULL 2 lots at once.
+    st, acts = _feed(p, st, OrderAmended(order_id=oid, client_order_id=coid_b, price=amend[-1].price,
+                                         server_ts=now + 1.05, remaining_count=Decimal(0),
+                                         fill_count=Decimal(2), average_fill_price=Decimal("0.44")))
+    assert len(st.rest_fills) == 1 and st.rest_fills[0].count == 2
+    assert st.rest_booked_by_coid.get(coid_b) == 2 and st.rest_allotment_done and st.rest_live is None
+    assert not st.amend_cross_pending             # a full cross needs no echo guard (rest_live nulled)
+    # two WS echoes of the crossed lots -> nothing extra (no tracked order to match).
+    st, e1 = _feed(p, st, Fill(oid, coid_b, Decimal(1), Decimal("0.44"), "no", now + 1.1))
+    st, e2 = _feed(p, st, Fill(oid, coid_b, Decimal(1), Decimal("0.44"), "no", now + 1.2))
+    assert len(st.rest_fills) == 1 and len(st.wing_batches) == 1
+    assert st.rest_booked_by_coid.get(coid_b) == 2
+    assert not [a for a in (e1 + e2) if a.kind == ActionKind.TAKE_WINGS]
+
+
 # ===========================================================================
 # N1: the 1 s status poll backstops the missed 2nd lot at contracts>1 (delta-aware), and is a no-op at
 # contracts=1 / for a duplicate cumulative report.

@@ -295,6 +295,15 @@ class V32State:
     # later OrderCancelled(filled=cumulative) whose slot is already None, so a missed-WS lot caught only
     # by the eager-clear cancel is booked + hedged, never dropped naked to settlement.
     cancel_ctx: Mapping[str, tuple[str, Decimal]] = field(default_factory=dict)
+    # N1 fix (amend-first rebase 2026-09-19): order_id -> lots an amend CROSS already booked (via
+    # ``_apply_amended``) that the venue may STILL echo on the WS ``fill`` channel. The Amend Order V2
+    # response carries NO trade_id (docs.kalshi.com), so the driver's trade-id dedup cannot catch that
+    # echo; ``_apply_fill`` skips up to this many lots for the order before booking a tracked-order Fill,
+    # so a PARTIAL amend cross (which leaves ``rest_live`` retained at contracts>=2) is not double-booked.
+    # Only a PARTIAL cross sets it (a full cross nulls rest_live -> the echo can't match); at contracts=1 a
+    # cross always fully fills, so this stays empty and behaviour is byte-identical. If it ever over-skips
+    # (an echo that never arrives), the cumulative cancel/poll paths still reconcile to venue truth.
+    amend_cross_pending: Mapping[str, int] = field(default_factory=dict)
 
     # shadow (keyed by str(E))
     shadows: Mapping[str, ShadowSub] = field(default_factory=dict)
@@ -733,6 +742,22 @@ def _apply_fill(
         matched = st.rest_pending
     if matched is not None:
         delta = int(event.count)
+        # N1: skip lots this order's amend CROSS already booked (``_apply_amended``) — the venue echoes
+        # that crossed taker fill on the WS ``fill`` channel with a fresh trade_id, which the driver's
+        # trade-id dedup cannot catch (the Amend V2 response has no trade_id). Consume the echo guard for
+        # the order before booking, so a partial amend cross is not double-booked. If the guard over-skips
+        # (an echo that never arrives), the cumulative cancel/poll paths still book the true lot.
+        oid = matched.order_id if matched.order_id is not None else event.order_id
+        if delta > 0 and oid is not None and st.amend_cross_pending.get(oid, 0) > 0:
+            pending = st.amend_cross_pending.get(oid, 0)
+            skip = min(pending, delta)
+            acp = dict(st.amend_cross_pending)
+            if pending - skip > 0:
+                acp[oid] = pending - skip
+            else:
+                acp.pop(oid, None)
+            st = replace(st, amend_cross_pending=acp)
+            delta -= skip
         if delta > 0:
             n = event.price if event.price is not None else matched.price
             st, wa = _book_rest_delta(params, st, matched.client_order_id, n, delta, now)
@@ -798,6 +823,15 @@ def _apply_amended(
         n = event.average_fill_price if event.average_fill_price is not None else updated.price
         st, wa = _book_rest_delta(params, st, new_coid, n, delta, now)
         actions += wa
+        # N1: a PARTIAL cross leaves the remainder resting under new_coid, so the venue may ALSO echo this
+        # crossed lot on the WS ``fill`` channel (no trade_id to dedup on). Record the crossed lots so
+        # ``_apply_fill`` skips the echo instead of booking it again. A FULL cross nulls rest_live inside
+        # ``_book_rest_delta`` (rest_allotment_done) -> the echo can't match -> no pending needed (and
+        # contracts=1 always fully fills, so this stays empty there).
+        if st.rest_live is not None and event.order_id is not None:
+            acp = dict(st.amend_cross_pending)
+            acp[event.order_id] = acp.get(event.order_id, 0) + delta
+            st = replace(st, amend_cross_pending=acp)
     return st, actions
 
 
