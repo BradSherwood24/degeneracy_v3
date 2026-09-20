@@ -22,6 +22,14 @@ V32_FALSIFIER_MIN_N = 30                                # [pin] live completed s
 V32_FALSIFIER_MIN_MEAN_LOCK_CENTS = Decimal("4.0")     # [pin] mean realized lock >= +4.0c
 V32_FALSIFIER_MIN_PCT_POSITIVE = Decimal("80")         # [pin] % of sets with positive realized lock
 V32_FALSIFIER_MIN_FILL_RATE_PER_DAY = Decimal("2.0")   # [pin] live fills (sets) per UTC day
+# MEASUREMENT CLARIFICATION 3 (2026-09-19 ~22:40Z, Brad's verbatim go): the >= 2.0 sets/day gate above
+# measured the TAPE REGIME (June-July had ~3x September's pump traffic), not our execution. It is kept
+# DEFINED (add-only law) but the VERDICT no longer gates on it; the report still prints sets/day as
+# INFO. The gate is now the CAPTURE RATIO = (live completed sets) / (ideal-shadow E=0.10 fills inside
+# the quoting window), both counted over ARMED windows carrying a spot bucket -- how much of the pump
+# availability the shadow proves was there did we actually capture. Pin proposed by Claude at n=6;
+# Brad confirms the 0.50 number at merge (Registration 3).
+V32_CAPTURE_RATIO_MIN = Decimal("0.50")                # [pin] live completed sets / ideal-shadow fills
 V32_FALSIFIER_MAX_EXEC_GAP_CENTS = Decimal("3.0")      # [pin] mean (shadow E=0.10 lock - live lock)
 V32_FALSIFIER_MAX_ONE_LEGGED = 2                       # [pin] one-legged sets tolerated of the first 30
 

@@ -1248,6 +1248,21 @@ def _shadow_on_trade(
             continue
         offer = _ONE - sub.n
         if event.yes_price > offer:
+            # N_MIN GATE (Registration 3 nit, 2026-09-19): the live path stands down (``n_below_min``)
+            # when the solved n < ``params.n_min`` and would NEVER have rested there, so a print that
+            # only clears a sub-n_min offer is not a live-reachable counterfactual. Do not fill; emit
+            # the observability action so the driver journals + counts it (mirrors the window gate).
+            # Evidence: 2026-09-19 23:00Z window (offer 0.96, n 0.04 < 0.05) filled the shadow while
+            # live stood down n_below_min the whole hour.
+            if sub.n < params.n_min:
+                actions.append(
+                    V32Action(
+                        kind=ActionKind.SHADOW_FILL_BELOW_MIN,
+                        shadow_E=sub.E, offer=offer, print_price=event.yes_price,
+                        count=int(event.count), t_to_close=Decimal(str(round(t_to_close, 3))),
+                    )
+                )
+                continue
             if not in_window:
                 actions.append(
                     V32Action(

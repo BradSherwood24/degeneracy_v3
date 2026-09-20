@@ -1140,3 +1140,57 @@ def test_shadow_completion_after_t5_for_in_window_fill_still_completes():
     sub = st.shadows["0.10"]
     assert not sub.awaiting_completion and sub.fill.lock == Decimal("0.1036"), \
         "an in-window shadow fill still completes after T-5"
+
+
+# ---------------------------------------------------------------------------
+# Shadow n_min gate (Registration 3 nit, 2026-09-19): the shadow may only take a print at a solved n at
+# or above params.n_min. The live path stands down (n_below_min) below n_min and would never have
+# rested there, so a below-n_min print is not a live-reachable counterfactual (same class as the
+# T-15..T-5 window gate) -- it emits SHADOW_FILL_BELOW_MIN and leaves the sub open. Evidence: the live
+# 2026-09-19 23:00Z window (shadow offer 0.96, n 0.04 < 0.05; a 16-lot print at 0.97 filled the shadow
+# while live stood down n_below_min the whole hour).
+# ---------------------------------------------------------------------------
+def _below_min_actions(acts):
+    return [a for a in acts if a.kind == ActionKind.SHADOW_FILL_BELOW_MIN]
+
+
+def test_shadow_print_below_n_min_is_suppressed_not_filled():
+    # force below-min by raising n_min above the golden solved n (0.45): an in-window qualifying print
+    # must NOT fill the shadow and must emit the observability record.
+    p = _params(n_min=Decimal("0.50"))
+    st = _state(p)
+    now = T - 600  # in window
+    st, _ = _feed_all(p, st, _fresh_books(now))
+    assert st.shadows["0.10"].n == Decimal("0.45")  # solved, but below the raised n_min
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.56"), "yes", Decimal(80), now + 0.01))
+    assert not st.shadows["0.10"].filled, "a below-n_min print must not fill the shadow"
+    assert st.shadows["0.10"].fill is None
+    below = _below_min_actions(acts)
+    a10 = [a for a in below if a.shadow_E == Decimal("0.10")]
+    assert a10, "expected a SHADOW_FILL_BELOW_MIN record for E=0.10"
+    assert a10[0].offer == Decimal("0.55") and a10[0].print_price == Decimal("0.56")
+    # no OUTSIDE_WINDOW record (this print is inside the window) -- the below-min gate is the sole cause
+    assert not _outside_window_actions(acts)
+
+
+def test_shadow_print_at_n_min_boundary_fills():
+    # n exactly AT n_min is live-reachable (the gate is strict `<`): n_min = 0.45 == the solved n fills.
+    p = _params(n_min=Decimal("0.45"))
+    st = _state(p)
+    now = T - 600
+    st, _ = _feed_all(p, st, _fresh_books(now))
+    assert st.shadows["0.10"].n == Decimal("0.45")
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.56"), "yes", Decimal(80), now + 0.01))
+    assert st.shadows["0.10"].filled and st.shadows["0.10"].fill is not None
+    assert not _below_min_actions(acts), "n exactly at n_min is not below-min -> fills, no record"
+
+
+def test_shadow_print_above_n_min_fills_no_record():
+    # the frozen n_min (0.05) is well below the golden n (0.45) -> normal fill, no below-min record.
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _feed_all(p, st, _fresh_books(now))
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.56"), "yes", Decimal(80), now + 0.01))
+    assert st.shadows["0.10"].filled
+    assert not _below_min_actions(acts)

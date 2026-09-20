@@ -174,3 +174,98 @@ def test_bucket_freshness_pin_matches_params_and_doc():
     assert p.bucket_freshness_max_age_s == 30.0
     assert f"bucket_freshness_max_age_s {p.bucket_freshness_max_age_s} [pin]" in doc  # 30.0 [pin]
     assert p.sha256 == FROZEN_V32_PARAMS_SHA256 and FROZEN_V32_PARAMS_SHA256 in doc
+
+
+# ===========================================================================
+# ADD-ONLY: MEASUREMENT CLARIFICATION 3 (2026-09-19, fill-rate gate -> capture ratio). New assertions
+# only -- no existing assertion above is edited or deleted (the fill-rate pin stays DEFINED as add-only
+# law and every existing test, including test_verdict_pins_match_doc's `>= 2.0 sets/day`, stays green).
+# ===========================================================================
+def test_capture_ratio_pin_value():
+    """The new capture-ratio [pin] (Claude's proposal; Brad confirms 0.50 at merge). The old fill-rate
+    pin stays DEFINED (add-only law)."""
+    from decimal import Decimal
+
+    from service.v32.falsifier_pins import (
+        V32_CAPTURE_RATIO_MIN,
+        V32_FALSIFIER_MIN_FILL_RATE_PER_DAY,
+    )
+    assert V32_CAPTURE_RATIO_MIN == Decimal("0.50")
+    # the superseded fill-rate pin is NOT removed (add-only law)
+    assert V32_FALSIFIER_MIN_FILL_RATE_PER_DAY == Decimal("2.0")
+
+
+def test_registration_carries_2026_09_19_capture_ratio_clarification():
+    """MEASUREMENT CLARIFICATION 3 (2026-09-19 ~22:40Z, Brad's verbatim go): the fill-rate gate becomes
+    a CAPTURE RATIO against pump availability (live fills / ideal-shadow fills at the threshold). A
+    MEASUREMENT DEFINITION registered at n=7 BEFORE the n>=30 verdict -- the STATUS line and the frozen
+    params sha are untouched (asserted elsewhere in this file)."""
+    doc = _doc()
+    reg = doc.split("## Registration", 1)[1].split("## Pre-registered shadow observations", 1)[0]
+    assert "MEASUREMENT CLARIFICATION 3" in reg
+    # Brad's verbatim go is quoted
+    assert "I agree with the second there" in reg
+    assert "Looks like our dry spell has ended" in reg
+    # the definition + the superseded gate + the proposed pin (Brad confirms the number at merge)
+    assert "capture ratio" in reg.lower()
+    assert "0.50" in reg
+    assert "confirmed by Brad at merge" in reg or "number to be confirmed by Brad at merge" in reg
+    # STATUS line + frozen params sha untouched by this MEASUREMENT entry
+    assert doc.splitlines()[2].strip() == "STATUS: FROZEN"
+    assert FROZEN_V32_PARAMS_SHA256 in doc
+
+
+def test_verdict_uses_capture_ratio_not_fill_rate():
+    """The scoreboard verdict at n >= 30 now gates on the capture ratio, NOT the fill rate: a low fill
+    rate whose shadow availability was all captured is ALIVE, and a capture ratio below the pin is a
+    KILL naming 'capture ratio' (never 'fill rate')."""
+    from decimal import Decimal
+
+    from service.v32.falsifier_pins import V32_CAPTURE_RATIO_MIN
+    from service.v32.report import build_falsifier_scoreboard
+
+    def _set(day: int, hour: int, lock: str | None, shadow: str | None, bucket: bool = True) -> dict:
+        row = {
+            "armed": True, "effective_mode": "armed",
+            "close_time": f"2026-09-{day:02d}T{hour:02d}:00:00Z",
+            "realized_lock": lock, "one_legged": False, "realized_unsettled": True,
+            "shadow": {"0.10": {"filled": True, "lock": shadow}} if shadow is not None else {},
+        }
+        if bucket:
+            row["spot_bucket_ticker"] = f"KXBTC-T{day:02d}{hour:02d}-B0"
+        return row
+
+    def _miss(day: int, hour: int, shadow: str) -> dict:
+        return {
+            "armed": True, "effective_mode": "armed",
+            "spot_bucket_ticker": f"KXBTC-M{day:02d}{hour:02d}-B0",
+            "close_time": f"2026-09-{day:02d}T{hour:02d}:00:00Z",
+            "realized_lock": None, "one_legged": False, "realized_unsettled": False,
+            "shadow": {"0.10": {"filled": True, "lock": shadow}},
+        }
+
+    # (1) 30 clean sets across only 3 armed days (10/day span) -> fill rate is HIGH here, but the point
+    # is the verdict no longer references it; capture 30/30 = 100% -> ALIVE.
+    alive = [_set(d, h, "0.09", "0.10") for d in range(1, 4) for h in range(10)]
+    sb_alive = build_falsifier_scoreboard(alive)
+    assert sb_alive["n"] == 30
+    assert sb_alive["capture_ratio"] == Decimal(1)
+    assert sb_alive["verdict"] == "ALIVE-so-far"
+    assert "fill rate" not in sb_alive["verdict"]
+
+    # (2) same 30 clean sets, but the shadow also filled 40 windows the live path missed -> capture
+    # 30/70 = 42.8% < the pin -> KILL naming capture ratio, not fill rate.
+    kill = list(alive)
+    m = 0
+    d, h = 20, 0
+    while m < 40:
+        kill.append(_miss(d, h, "0.10"))
+        m += 1
+        h += 1
+        if h == 24:
+            h, d = 0, d + 1
+    sb_kill = build_falsifier_scoreboard(kill)
+    assert sb_kill["capture_ratio"] == Decimal(30) / Decimal(70)
+    assert sb_kill["capture_ratio"] < V32_CAPTURE_RATIO_MIN
+    assert sb_kill["verdict"].startswith("KILL")
+    assert "capture ratio" in sb_kill["verdict"] and "fill rate" not in sb_kill["verdict"]

@@ -218,6 +218,9 @@ def build_v32_ledger_row(
         # would-be shadow fills SUPPRESSED by the quoting-window gate (print outside T-15..T-5, which
         # the live path could never have taken). Additive: ``.get``/default 0 so older rows still parse.
         "shadow_fills_outside_window": int(driver_counts.get("shadow_fill_outside_window", 0)),
+        # would-be shadow fills SUPPRESSED because the solved n < n_min (the live path stands down
+        # n_below_min and would never rest there). Additive (Registration 3 nit, 2026-09-19).
+        "shadow_fills_below_min": int(driver_counts.get("shadow_fill_below_min", 0)),
         # shadow (the ideal fill rule running live) — per E, with locks
         "shadow": _shadow_summary(state),
         # alarms
