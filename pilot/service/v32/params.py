@@ -29,7 +29,12 @@ DEFAULT_V32_PARAMS_PATH = os.path.join(
 
 # The canonical sha256 of the shipped policy/v32_params.json (sha of json.dumps(sort_keys=True,
 # separators=(",",":")).encode("utf-8")). Recompute + re-pin only when INTENTIONALLY re-freezing.
-FROZEN_V32_PARAMS_SHA256 = "0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc"
+# AMENDMENT 1 (2026-09-20, Brad's dated go): contracts 1 -> 2; the ONLY value changed is contracts.
+FROZEN_V32_PARAMS_SHA256 = "a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c"
+
+# History (add-only law): the freeze 2026-09-14 sha, contracts = 1, superseded by AMENDMENT 1
+# (2026-09-20, contracts 1 -> 2). Kept DEFINED so the prior regime's ledger rows remain identifiable.
+PREVIOUS_V32_PARAMS_SHA256_2026_09_14 = "0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc"
 
 
 class V32ParamsShaMismatch(Exception):
@@ -59,7 +64,7 @@ class V32Params:
       * ``tol``          requote tolerance: replace only when |n_desired - n_resting| >= tol.
       * ``deb_ms``       requote debounce: and at least this many ms since the last replace.
       * ``quote_start_s``/``quote_end_s`` the quoting window T-900..T-300 (place only inside it).
-      * ``contracts``    order size (1; proxy cap 2 stands).
+      * ``contracts``    order size (2; proxy cap 2 stands -- AMENDMENT 1 2026-09-20, was 1).
       * ``wing_margin``  taker-completion limit margin over the observed ask.
       * ``lock_floor``   gates ONLY the RETRY of a single missing leg (ruling F-2): never pay for the
                          last leg if it would push the set's lock below this. The INITIAL both-wings

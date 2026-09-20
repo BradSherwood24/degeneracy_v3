@@ -114,10 +114,13 @@ def test_registration_carries_2026_09_18_partial_fill_clarification():
 
 
 def test_partial_fill_contracts_lever_unchanged_at_one():
-    """The partial-fill clarification does NOT change ``contracts`` -- the frozen policy still rests 1
-    lot (any raise is a separate amendment with its own pinned sha)."""
+    """SUPERSEDED by AMENDMENT 1 (2026-09-20): ``params.contracts`` is Brad's lever and he raised it
+    1 -> 2 on his dated go. The function name is kept for history (add-only law); it now asserts the
+    amendment -- the frozen policy rests 2 lots and self-verifies the new pinned sha. (The 2026-09-18
+    Registration text -- "``params.contracts`` remains BRAD'S lever and stays 1 here" -- is unchanged in
+    the doc as the record of the pre-amendment state; the AMENDMENT 1 Registration entry supersedes it.)"""
     p = load_v32_params()
-    assert p.contracts == 1
+    assert p.contracts == 2   # AMENDMENT 1 (was 1)
     assert p.sha256 == FROZEN_V32_PARAMS_SHA256
 
 
@@ -269,3 +272,94 @@ def test_verdict_uses_capture_ratio_not_fill_rate():
     assert sb_kill["capture_ratio"] < V32_CAPTURE_RATIO_MIN
     assert sb_kill["verdict"].startswith("KILL")
     assert "capture ratio" in sb_kill["verdict"] and "fill rate" not in sb_kill["verdict"]
+
+
+# ===========================================================================
+# ADD-ONLY: AMENDMENT 1 (2026-09-20, Brad's dated go). params.contracts 1 -> 2; the params sha is
+# re-pinned; the previous freeze sha stays DEFINED in code as history. New assertions only -- no
+# assertion above is edited or deleted (add-only law). The ONLY policy value changed is contracts.
+# ===========================================================================
+_NEW_SHA_AMENDMENT_1 = "a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c"
+_OLD_SHA_FREEZE_2026_09_14 = "0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc"
+
+
+def test_amendment1_params_sha_repinned_and_previous_defined():
+    """The new params sha is the pinned literal; the 2026-09-14 freeze sha stays DEFINED in code as
+    history (add-only law). Hard-coded literals so any future drift is caught."""
+    from service.v32.params import (
+        FROZEN_V32_PARAMS_SHA256 as PIN,
+        PREVIOUS_V32_PARAMS_SHA256_2026_09_14 as PREV,
+    )
+    assert PIN == _NEW_SHA_AMENDMENT_1
+    assert PREV == _OLD_SHA_FREEZE_2026_09_14
+    assert PIN != PREV
+
+
+def test_amendment1_loader_self_verifies_contracts_two():
+    """The shipped policy loads at contracts=2 and self-verifies the new pinned sha (plain call)."""
+    p = load_v32_params()
+    assert p.contracts == 2
+    assert p.sha256 == FROZEN_V32_PARAMS_SHA256 == _NEW_SHA_AMENDMENT_1
+
+
+def test_amendment1_registration_entry_present():
+    """The Registration section carries the AMENDMENT 1 entry: the title, BOTH shas, and Brad's exact
+    words. Placed after MEASUREMENT CLARIFICATION 3 and before the shadow observations section."""
+    doc = _doc()
+    reg = doc.split("## Registration", 1)[1].split("## Pre-registered shadow observations", 1)[0]
+    assert "AMENDMENT 1" in reg
+    assert "contracts 1 -> 2" in reg
+    # both shas recorded (old -> new)
+    assert _OLD_SHA_FREEZE_2026_09_14 in reg
+    assert _NEW_SHA_AMENDMENT_1 in reg
+    # Brad's exact words (2026-09-20 go, and the 2026-09-18 reasoning)
+    assert "You have my go to build the multi-contract. Lets size up!" in reg
+    assert "not proof of a coin flip is weighted on one side" in reg
+    # the STATUS line is untouched by the amendment
+    assert doc.splitlines()[2].strip() == "STATUS: FROZEN"
+    # the entry sits between Registration 3 and the shadow observations section
+    assert reg.index("MEASUREMENT CLARIFICATION 3") < reg.index("AMENDMENT 1")
+
+
+def test_amendment1_promotion_pins_still_defined_and_in_doc():
+    """The Promotion section text and its pins are NOT edited (add-only law): n >= 60 and 10 lots still
+    appear in the doc and the code constants are unchanged. The AMENDMENT 1 entry supersedes the
+    Promotion CLAUSE by pointer (Brad's 2026-09-18 re-frame), it does not delete the pins."""
+    doc = _doc()
+    assert f"n >= {V32_PROMOTION_MIN_N}" in doc   # n >= 60
+    assert f"{V32_PROMOTION_MIN_DEPTH_LOTS} lots" in doc  # 10 lots
+    assert V32_PROMOTION_MIN_N == 60
+    assert V32_PROMOTION_MIN_DEPTH_LOTS == 10
+
+
+def _health_shape(*, maxc=2, prefixes=("KXBTC", "KXBTC15M"), enabled=True, remaining=4000):
+    return {"orders_enabled": enabled,
+            "caps": {"max_contracts_per_order": maxc, "ticker_prefixes": list(prefixes),
+                     "daily_order_budget": 4000},
+            "orders_remaining_today": remaining}
+
+
+def test_amendment1_caps_agree_at_two_refuses_above():
+    """The proxy cap MAX_CONTRACTS_PER_ORDER = 2 stands: params.contracts=2 agrees at proxy max 2;
+    contracts=2 with proxy max 1 refuses; a params.contracts of 3 is refused (exceeds proxy max, and
+    exceeds the V3.2 ceiling when the proxy would even allow it)."""
+    from service.v32.stops import v32_caps_agree, V32_MAX_CONTRACTS_PER_ORDER
+    assert V32_MAX_CONTRACTS_PER_ORDER == 2
+    ok, _ = v32_caps_agree(_health_shape(maxc=2), contracts=2)
+    assert ok
+    ok, why = v32_caps_agree(_health_shape(maxc=1), contracts=2)
+    assert not ok and "max_contracts_per_order" in why
+    # params.contracts 3 against a real proxy (max 2): refused (proxy max < params.contracts)
+    ok, why = v32_caps_agree(_health_shape(maxc=2), contracts=3)
+    assert not ok and "params.contracts" in why
+    # and if the proxy itself advertised max 3, the V3.2 ceiling refuses it
+    ok, why = v32_caps_agree(_health_shape(maxc=3), contracts=3)
+    assert not ok and "ceiling" in why
+
+
+def test_amendment1_arming_check_passes_at_contracts_two():
+    """S5 arms at contracts=2 with the real frozen doc + a healthy /health shape (mirrors
+    test_v32_stops.py::test_arming_ok_when_all_pass at the new size)."""
+    from service.v32.stops import v32_arming_check
+    d = v32_arming_check(_DOC, _health_shape(maxc=2), params_verified=True, contracts=2)
+    assert d.armed and d.reasons == ()

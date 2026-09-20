@@ -209,6 +209,77 @@ showing >= 10 lots [pin] available at every completion (`V32_PROMOTION_MIN_DEPTH
   - GATE-LIST POINTER: the "Proposed pre-registered thresholds" fill-rate bullet is NOT edited in place. The document's own freeze rule ("From the freeze line down, nothing in this document may change except appended verdicts in Registration") forbids editing the threshold text above this Registration section, so -- following the precedent of MEASUREMENT CLARIFICATION 1, which likewise left the fill-rate bullet untouched and registered the change here -- this Registration entry is the authoritative pointer: at n >= 30 the fill-rate bullet is READ AS SUPERSEDED by the capture ratio defined above.
   - Mirrored in code: `service.v32.falsifier_pins.V32_CAPTURE_RATIO_MIN` (new [pin]); `service.v32.report.build_falsifier_scoreboard` computes `capture_live_sets`/`capture_shadow_fills`/`capture_ratio` as a bounded per-window fraction (N1) and the verdict gates on the ratio (fill rate stays computed + printed as info); the below-`n_min` gate lives in `service.v32.core._shadow_on_trade` (action `SHADOW_FILL_BELOW_MIN`, journaled `shadow_fill_below_min` by `service.run_v32`, counted `shadow_fills_below_min` by `service.v32.ledger`) and in the report's derived-`n` exclusion; the FALSIFIER SCOREBOARD prints `capture ratio = live X / shadow Y = Z%` with the [pin] plus a `shadow fills below n_min (suppressed)` line; asserted in `tests/test_v32_falsifier_pins.py` (add-only), `tests/test_v32_report_scoreboard.py`, and `tests/test_v32_core.py`.
 
+- 2026-09-20 ~00:21Z -- AMENDMENT 1 (params sha; contracts 1 -> 2; Brad's dated go). The FIRST amendment
+  of the frozen V3.2 policy. The ONLY value that changes is `contracts` (1 -> 2). Every other param, every
+  verdict gate, the STATUS line, and the proxy cap stay exactly as they are.
+  - Brad, verbatim (2026-09-20 ~00:21Z, his first message after a context compaction):
+    "Hey! Welcome back after the compact! All memory of whats next carry over>? You have my go to build the multi-contract. Lets size up!"
+  - Brad's reasoning two days earlier, verbatim (2026-09-18): "Yea, I think waiting for n to hit 30
+    before sizing was the play when we were entering roughly half the windows. This strategy is different
+    and should be judged differently. It's not "Do we win in profitable rates" anymore, we in theory
+    never lose, right? Waiting for a specific n should be to answer questions about slippage and edge
+    cases, not proof of a coin flip is weighted on one side. Make sense? I'd vote to double soon, but
+    want your insight too"
+  - SHA RE-PIN: old sha `0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc` (freeze
+    2026-09-14, contracts 1) -> new sha `a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c`
+    (contracts 2). The only value change is `contracts` 1 -> 2. The loader (`load_v32_params`)
+    self-verifies the NEW pin (`service.v32.params.FROZEN_V32_PARAMS_SHA256`); the previous sha stays
+    DEFINED in code as history (`PREVIOUS_V32_PARAMS_SHA256_2026_09_14`, add-only law). This entry, per
+    the "## Amendment" precedent (Brad's dated verbatim go, a full Opus 4.8 review + agent build, a new
+    pinned sha the loader self-verifies, an appended Registration line), IS that amendment.
+  - PROMOTION SUPERSEDED FOR THIS STEP: the `## Promotion` clause (nothing promotes past 1 contract
+    automatically; 2 contracts would be JUSTIFIED by ALIVE at `n >= 60` [pin] AND a thinner-wing depth
+    `>= 10 lots` [pin]) was written when the strategy entered roughly half the windows and the open
+    question was WIN-RATE. Brad's 2026-09-18 ruling re-frames the size step: the lock is STRUCTURAL (every
+    completed set pays $2.00 at settlement -- 7/7 positive live), so `n` is for answering slippage /
+    edge-case questions, NOT for proving a weighted coin. The pins `V32_PROMOTION_MIN_N` (60) and
+    `V32_PROMOTION_MIN_DEPTH_LOTS` (10) stay DEFINED in code (add-only law) and the Promotion section text
+    is NOT edited; this dated entry is the word the Promotion section itself said would be required ("What
+    would JUSTIFY 2 contracts (Brad's word, dated)"). The depth check is met at registration anyway (see
+    EVIDENCE below): thinner wing median 409 lots, p10 26, min 19 -> 2 contracts never bind.
+  - UNCHANGED: every other param value (E 0.10, tol 0.02, deb_ms 5000, quote_start_s 900, quote_end_s 300,
+    wing_margin 0.02, lock_floor -0.10, no_orders_after_s_to_settle 1, freshness_max_age_s 1.0,
+    bucket_freshness_max_age_s 30.0, max_sets_per_hour 1, n_min 0.05, replace_rate_alarm_per_min 60,
+    bucket_width 100, shadow_Es {0.08,0.10,0.12}); the five verdict gates at `n >= 30` (mean lock
+    `>= +4.0c`, `% positive >= 80%`, capture ratio `>= 0.50` [Registration 3], exec gap `<= 3.0c`,
+    one-legged `<= 2`); the STATUS line; and the proxy cap `MAX_CONTRACTS_PER_ORDER` = 2. `params.contracts`
+    now EQUALS the proxy cap: `v32_caps_agree` passes at proxy max 2 and contracts 2, and would REFUSE any
+    `params.contracts` of 3 (both because proxy max 2 < 3 and because 3 exceeds the V3.2 ceiling
+    `V32_MAX_CONTRACTS_PER_ORDER` = 2). The /health read at 00:21Z: `max_contracts_per_order` 2,
+    `ticker_prefixes` [KXBTC15M, KXBTCD, KXBTC], `daily_order_budget` 4000.
+  - MEASUREMENT CONTINUITY: per the 2026-09-18 Registration, a completed SET is one rest-fill EVENT with
+    BOTH wings filled and the lock is reported PER CONTRACT, so the live history (n=7 at size 1) and the
+    size-2 sets POOL into ONE `n` toward the `n >= 30` verdict. The scoreboard/ledger do NOT filter by
+    `params_sha` (verified: `service.v32.report` has no `params_sha` reference and pools every armed row;
+    `service.v32.ledger.build_v32_ledger_row` records `params_sha = params.sha256` on each row so the two
+    regimes stay separable after the fact). Partial fills are EXPECTED at size 2 (71-83% of prints at our
+    fills are exactly 1 lot in the replay lab; all 6 live rest fills to date were 1-lot) and are handled
+    per fill event (PR #62): each fill event takes both wings sized to the fill, the remainder keeps
+    resting/requoting, with the amend-cross double-book guard (PR #59) in place.
+  - EVIDENCE AT REGISTRATION (live ledger snapshot 2026-09-20 00:17Z, main 8543ad4, 935 tests): n=7, 7/7
+    positive, mean lock +11.1c ledger (true ~+12.3c; the ledger reserves a taker fee on the fee-free maker
+    leg), exec gap -0.6c, one-legged 0 (the 2026-09-17 13:00Z power-outage naked contract is NOT counted,
+    Brad's ruling), capture ratio 7/12 = 58.3%, balance $53.31. Wing depth at completion (sim): thinner
+    wing median 409 lots, p10 26, min 19 -> 2 contracts never bind. Capital in flight per set at size 2
+    ~ $0.7 rest + ~$3.1 wings vs the $53 balance.
+  - MUST CONFIRM ON THE FIRST SIZE-2 WINDOWS (mirrored in `pilot/ops/V32_ARMING.md` item 10):
+    (a) `place_rest` with count 2 accepted (201) by the proxy at cap 2;
+    (b) on a 1-of-2 fill: one `wing_batch` sized 1, the remaining 1 keeps resting/requoting, and the
+    quote-end cancel pulls the remainder at T-5;
+    (c) the first size-2 sets are HAND-RECONCILED against venue fills (`GET /portfolio/fills`) because the
+    money-math `realized_delta` may understate ctx/amend-booked lots (review nits N2/N4 of PRs #62/#59; the
+    falsifier reads CORE state, not the money-math);
+    (d) the ledger rows' `params_sha` equals the new sha
+    `a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c` from the first wake after the live
+    tree is pulled;
+    (e) the report POOLS the size-1 and size-2 rows into one `n`.
+  - Mirrored in code: `service.v32.params.FROZEN_V32_PARAMS_SHA256` (new pin) +
+    `PREVIOUS_V32_PARAMS_SHA256_2026_09_14`; `policy/v32_params.json` (`contracts` 2, canonical sha the new
+    pin); asserted in `tests/test_v32_falsifier_pins.py` (add-only section AMENDMENT 1). The size-1
+    regression suites (`tests/test_v32_partial_fill.py`, `tests/test_v32_core.py`, `tests/test_v32_amend.py`,
+    `tests/test_v32_executor.py`) keep testing size 1 byte-identically via explicit `contracts=1` overrides;
+    the golden reference (+10.36c at 1 contract) still reproduces exactly at contracts=1.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), registered with this draft

@@ -235,8 +235,11 @@ def _run_core(fix, E: Decimal, tol: Decimal, deb_ms: int):
     # the fill ECONOMICS reproduce the reference; the freshness gate itself is covered by dedicated unit
     # tests (test_v32_core). So we relax ONLY the bucket bound here (well above the 60 s candle cadence),
     # restoring the pre-gate bucket behavior; the 1.0 s STRIKE gate still binds unchanged.
+    # contracts=1: this golden is the SIZE-1 economic reference (+10.36c at 1 contract). AMENDMENT 1
+    # (2026-09-20) raised the real file to contracts=2, but the per-contract lock is size-invariant, so
+    # pinning contracts=1 here keeps the reference byte-identical to the pre-amendment build.
     params = dreplace(
-        load_v32_params(), E=E, tol=tol, deb_ms=deb_ms, bucket_freshness_max_age_s=3600.0
+        load_v32_params(), E=E, tol=tol, deb_ms=deb_ms, bucket_freshness_max_age_s=3600.0, contracts=1
     )
     st = V32State.new(fix["close_time"], cts, bucket_map, params)
 

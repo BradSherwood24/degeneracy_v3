@@ -386,8 +386,13 @@ def test_startup_cancel_skips_foreign_coid_but_clears_our_and_coidless():
 # ---------------------------------------------------------------------------
 # P3-4 exec-price mismatch + fill de-dup (ws + poll) — through the driver
 # ---------------------------------------------------------------------------
-def _armed_driver(tmp_path):
+def _armed_driver(tmp_path, contracts: int | None = None):
+    # ``contracts`` overrides the real params size (AMENDMENT 1 2026-09-20 raised the real file to 2);
+    # a size-1 regression test passes contracts=1 to keep its single-lot semantics byte-identical.
+    from dataclasses import replace as _dreplace
     p = load_v32_params()
+    if contracts is not None:
+        p = _dreplace(p, contracts=contracts)
     j = StreamJournal(os.path.join(tmp_path, "w.jsonl"), flush_every=1)
     j.open()
     st = V32State.new(CLOSE, CTS, BUCKET_MAP, p, shakedown=False)
@@ -452,7 +457,10 @@ def test_driver_applies_executor_standdown(tmp_path):
 
 
 def test_fill_dedup_poll_first_then_ws(tmp_path):
-    drv, ex, j = _armed_driver(tmp_path)
+    # SIZE-1 regression (explicit contracts=1 after AMENDMENT 1): a poll then a ws echo of the SAME single
+    # lot de-dups. The size-2 poll/ws interplay (poll backstops a genuinely missed 2nd lot; a duplicate
+    # cumulative poll is a no-op) is covered in test_v32_partial_fill.py.
+    drv, ex, j = _armed_driver(tmp_path, contracts=1)
     rest = _seed_live_rest(drv, ex)
     coid, oid = rest.client_order_id, rest.order_id
     drv.on_poll_fill(oid, 1, CTS - 590)          # poll sees it first

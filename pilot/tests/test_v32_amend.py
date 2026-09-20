@@ -183,9 +183,11 @@ def test_amend_2xx_cross_books_taker_fill_and_routes():
 
 def test_core_routes_amend_cross_fill_into_wings():
     # the core-side of the cross: OrderAmended.fill_count>0 -> rest fill at avg price + TAKE_WINGS once.
+    # SIZE-1 regression (explicit contracts=1 after AMENDMENT 1 2026-09-20 raised the real file to 2); the
+    # size-2 amend-cross delta booking is covered in test_v32_partial_fill.py.
     from service.v32.core import decide_v32, RestOrder
     from dataclasses import replace as dreplace
-    p = load_v32_params()
+    p = dreplace(load_v32_params(), contracts=1)
     st = _st()
     # a live rest + a fresh spot context (both strikes) so the wings can price.
     live = RestOrder("c1", "oid-1", Decimal("0.50"), 1, CTS - 600, True, False, 78850)

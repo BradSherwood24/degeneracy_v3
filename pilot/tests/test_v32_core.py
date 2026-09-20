@@ -409,7 +409,9 @@ def test_replace_no_live_fill_on_trade_while_amend_in_flight():
 def test_fill_during_amend_takes_wings_not_place():
     # A Fill for the order while an amend is in flight (it filled before/at the amend) -> TAKE_WINGS at
     # the resting price, and NEVER a PLACE_REST (the one-set latch holds); amend_in_flight is cleared.
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    # SIZE-1 regression (explicit contracts=1 after AMENDMENT 1 raised the real file to 2); the size-2
+    # fill-during/after-amend behaviour is covered in test_v32_partial_fill.py.
+    p = _params(tol=Decimal("0.01"), deb_ms=0, contracts=1)
     st = _state(p)
     now = T - 600
     st, coid = _bring_up_live_rest(p, st, now)   # rest at n=0.45
@@ -430,7 +432,9 @@ def test_fill_during_amend_takes_wings_not_place():
 def test_amend_confirm_with_cross_fill_takes_wings_once_no_second_rest():
     # OrderAmended.fill_count > 0 (the amend crossed) -> book the rest fill at the venue's average fill
     # price (NO-space) and TAKE the wings ONCE; amend_in_flight cleared; no second rest ever placed.
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    # SIZE-1 regression (explicit contracts=1 after AMENDMENT 1); the size-2 amend-cross delta booking is
+    # covered in test_v32_partial_fill.py::test_amend_cross_books_per_amend_delta_and_latches_allotment.
+    p = _params(tol=Decimal("0.01"), deb_ms=0, contracts=1)
     st = _state(p)
     now = T - 600
     st, coid = _bring_up_live_rest(p, st, now)
