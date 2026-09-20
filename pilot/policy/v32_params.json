@@ -4,7 +4,7 @@
   "deb_ms": 5000,
   "quote_start_s": 900,
   "quote_end_s": 300,
-  "contracts": 1,
+  "contracts": 2,
   "wing_margin": "0.02",
   "lock_floor": "-0.10",
   "no_orders_after_s_to_settle": 1,

@@ -12,7 +12,8 @@ The S5 gate (`service.v32.stops.v32_arming_check` + `decide_v32_arming`, wired i
 what actually enforces this. For V3.2 it checks, in one place: this file's falsifier
 (`ceremony/v32_falsifier.md`) carries a line exactly `STATUS: FROZEN`; the params sha is verified
 (`load_v32_params` self-checks `FROZEN_V32_PARAMS_SHA256`); proxy `/health` shows `orders_enabled: true`
-with caps that allow `params.contracts` (1) and no more than 2 per order, cover BOTH `KXBTC-` (buckets)
+with caps that allow `params.contracts` (2 since AMENDMENT 1 2026-09-20; was 1) and no more than 2 per
+order -- `params.contracts` now EQUALS the proxy cap, so a params.contracts of 3 would refuse -- cover BOTH `KXBTC-` (buckets)
 and `KXBTCD-` (strikes) via startswith, and leave >= 200 creates in today's budget; reconcile-first sees
 no inherited un-settled KXBTC* position; the SEPARATE v32 day guard is neither corrupt nor latched; and
 the banded S4 is not `latch`/`pending`. Any miss => the window runs DRY (orders frozen) and journals
@@ -49,8 +50,11 @@ the banded S4 is not `latch`/`pending`. Any miss => the window runs DRY (orders 
    The report's FALSIFIER SCOREBOARD will show `n<30 pending` (no live sets yet), the dry-run shadow
    locks, and the `capture ratio = live X / shadow Y = Z%` line (MEASUREMENT CLARIFICATION 3) -- that is
    expected.
-6. **Confirm the roster sha** matches the pinned constant
-   `c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92`:
+6. **Confirm the roster sha.** The command below must print the NEW params sha
+   `a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c` (AMENDMENT 1 2026-09-20,
+   `contracts` 2; was `0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc` at the
+   2026-09-14 freeze, `contracts` 1). It must equal `service.v32.params.FROZEN_V32_PARAMS_SHA256`
+   (`load_v32_params` self-verifies it, and S5 refuses to arm if it drifts):
    ```
    python -c "import json,hashlib; o=json.load(open('policy/v32_params.json')); print(hashlib.sha256(json.dumps(o,sort_keys=True,separators=(',',':')).encode()).hexdigest())"
    ```
@@ -180,6 +184,27 @@ The falsifier's "FIRST ARMED WINDOW MUST CONFIRM" list, and where each item appe
    `shadow fills below n_min (suppressed, live n_below_min) = N` -- would-be shadow fills at a solved
    n < params.n_min the live path stood down (n_below_min) and could not have taken (excluded from the
    capture denominator, same class as the T-15..T-5 window gate).
+
+10. **first size-2 windows (AMENDMENT 1, Brad 2026-09-20).** After the live tree pulls the new params sha
+    (`a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c`, `contracts` 2), confirm on the
+    first size-2 windows:
+    (a) **rest count 2 accepted.** The `place_rest` record carries `count` 2 and the proxy returns 201 at
+    cap 2 (no `contract_cap` 4xx). If it 4xx's on the count, the proxy cap is below 2 -- STOP.
+    (b) **partial-fill wings + resting remainder.** On a 1-of-2 fill: exactly one `wing_batch` / `take_wings`
+    record sized `count` 1 fires, the `rest_fill` shows the remainder (1) still resting (a later
+    `place_rest`/`amend_rest` at count 1 requotes it), and the T-5 `cancel_rest` pulls the remainder if it
+    never fills. A second fill spawns a SECOND `wing_batch`; both completing = two SETS that hour.
+    (c) **hand-reconcile the first size-2 sets against venue fills** (`GET /portfolio/fills`): the money-math
+    `realized_delta` may understate ctx/amend-booked lots (review nits N2/N4 of PRs #62/#59). The falsifier
+    reads CORE state (`rest_fills`/`wing_batch_sets`), not the money-math, so a money-math undercount does
+    NOT mis-score the verdict -- but confirm the two agree by hand for the first size-2 sets.
+    (d) **ledger `params_sha`.** Every ledger row from the first wake after the pull carries
+    `params_sha = a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c`. The size-1 history
+    rows keep their old `params_sha` (`0ac6979...`), so the two regimes stay separable.
+    (e) **the report pools size-1 and size-2 into one n.** `python -m service.v32.report` counts the n=7
+    size-1 sets AND the new size-2 sets in ONE `n` toward the `n >= 30` verdict (the scoreboard does not
+    filter by `params_sha`); each SET is one rest-fill event with both wings filled, lock reported per
+    contract.
 
 Also watch: no `A_REPLACE` (replaces/min under 60 -- an amend counts as a replace), no `A_STALE` bursts
 (strike/bucket data-age under 1.0 s), and the ledger row's `realized_lock` positive and near the shadow

@@ -59,6 +59,14 @@ def _params(**over) -> V32Params:
     return replace(p, **over) if over else p
 
 
+def _params1(**over) -> V32Params:
+    """The REAL frozen params with ``contracts`` forced to 1 -- the SIZE-1 REGRESSION suite must keep
+    testing size 1 byte-identically even after AMENDMENT 1 (2026-09-20) raised the real file to
+    ``contracts`` = 2. Add-only: the size-1 tests below route through this; the size-2 tests use the
+    real value (``_params(contracts=2, ...)`` == the real file)."""
+    return replace(load_v32_params(), contracts=1, **over)
+
+
 def _state(params: V32Params) -> V32State:
     return V32State.new(CLOSE, T, BK, params)
 
@@ -158,7 +166,9 @@ def test_second_fill_spawns_second_batch_and_allotment_done_stops_quoting():
 
 
 def test_both_batches_complete_counts_two_sets():
-    p = _params(contracts=2)
+    # runs against the REAL frozen params -- after AMENDMENT 1 (2026-09-20) the shipped file IS contracts=2.
+    p = _params()
+    assert p.contracts == 2 and p.sha256 == load_v32_params().sha256
     st = _state(p)
     now = T - 600
     st, coid, oid = _bring_up_live_rest(p, st, now)
@@ -269,7 +279,7 @@ def test_per_batch_one_legged_at_cutoff():
 # CONTRACTS=1 REGRESSION: single batch, mirrors byte-identical to the pre-partial build
 # ===========================================================================
 def test_contracts1_single_batch_mirrors():
-    p = _params()  # contracts = 1
+    p = _params1()  # contracts = 1 (forced; real file is 2 after AMENDMENT 1)
     assert p.contracts == 1
     st = _state(p)
     now = T - 600
@@ -366,7 +376,7 @@ def test_contracts2_two_sets_money_math_and_scoreboard():
 def test_contracts1_ledger_row_additive_keys_single_set():
     # contracts=1: the new keys carry the single-set values; the scoreboard counts one set; and the
     # scalar realized_lock stays present (backward compatible), equal to the one set's per-contract lock.
-    p = _params()  # contracts = 1
+    p = _params1()  # contracts = 1 (forced; real file is 2 after AMENDMENT 1)
     st = _completed_state(p, fills=[1])
     assert st.sets_done == 1
     money = R._compute_money_math(st, _stub_executor(st), contracts=p.contracts)
@@ -655,7 +665,7 @@ def test_poll_backstops_missed_second_lot_contracts2():
 def test_poll_noop_at_contracts1_after_ws_fill():
     # contracts=1 byte-identical: after the ws lot fully fills, a poll reporting the same total does
     # nothing (delta 0) -- no rest_fill_poll, no extra booking.
-    p = _params()  # contracts = 1
+    p = _params1()  # contracts = 1 (forced; real file is 2 after AMENDMENT 1)
     drv, j = _shakedown_driver(p)
     now = T - 600
     coid, oid = _place_rest_via_driver(drv, now)
@@ -670,7 +680,7 @@ def test_poll_noop_at_contracts1_after_ws_fill():
 
 def test_poll_first_when_ws_missed_books_the_lot():
     # if the ws fill is missed entirely, the poll (delta over 0 booked) books the lot -- same as before.
-    p = _params()  # contracts = 1
+    p = _params1()  # contracts = 1 (forced; real file is 2 after AMENDMENT 1)
     drv, j = _shakedown_driver(p)
     now = T - 600
     coid, oid = _place_rest_via_driver(drv, now)
