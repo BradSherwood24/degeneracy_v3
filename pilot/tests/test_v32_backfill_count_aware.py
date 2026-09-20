@@ -35,6 +35,7 @@ from service.v32 import (
 )
 from service.v32.core import RestFill, WingBatch, WingLeg
 from service.v32.ledger import (
+    _v32_floor_booked_for_entry,
     build_v32_backfill_row,
     build_v32_ledger_row,
     v32_pending_credit,
@@ -434,3 +435,104 @@ def test_round2_two_bucket_settled_in_A_correction_zero():
     out = v32_settlement_backfill_sweep([row], lambda tk: results[tk], now=2.0)
     assert Decimal(out[0]["settlement_payoff"]) == Decimal("4")
     assert Decimal(out[0]["realized_delta"]) == Decimal("0")
+
+
+# ===========================================================================
+# ROUND 3 (PR #74 review APPROVE WITH NITS -- tests only): edge cases of the per-batch resolver and
+# the N2 min() fail-closed direction.
+# ===========================================================================
+def _same_bucket_state(params, batch_counts):
+    """A contracts>=N completed window with ``len(batch_counts)`` batches ALL on the one bucket B_SD
+    (each batch's wings filled). spot_Sd nulled (close reset). ``state.rest_fills`` is 1:1 with the
+    batches (each fill delta spawns a batch); the EXECUTOR rest records are supplied separately so a
+    test can model the order-id dedup collapse."""
+    st = V32State.new(CLOSE, T, BK, params)
+    rest_fills = tuple(RestFill(Decimal("0.30"), int(c), T - 500.0 + i)
+                       for i, c in enumerate(batch_counts))
+    batches = tuple(
+        WingBatch(index=i, fill_price=Decimal("0.30"), fill_count=int(c), server_ts=T - 500.0 + i,
+                  taken=True, completed=True)
+        for i, c in enumerate(batch_counts))
+    legs = []
+    for i, c in enumerate(batch_counts):
+        legs.append(WingLeg(STK_SD, BUY_YES, int(c), Decimal("0.82"), f"wy{i}", status="filled",
+                            fill_price=Decimal("0.80"), batch=i))
+        legs.append(WingLeg(STK_SU, BUY_NO, int(c), Decimal("0.82"), f"wn{i}", status="filled",
+                            fill_price=Decimal("0.80"), batch=i))
+    return replace(
+        st, rest_fills=rest_fills, rest_fill=rest_fills[-1], wing_batches=batches,
+        wing_legs=tuple(legs), bucket_tickers={80400: B_SD}, spot_Sd=None, rest_bucket_Sd=None,
+    )
+
+
+def _explicit_executor(state, rest_records):
+    """A stub executor whose REST records are supplied verbatim (to model the order-id dedup collapse:
+    fewer rest records than batches) plus the wing fills read off the state."""
+    fills = list(rest_records)
+    for lg in state.wing_legs:
+        if lg.status == "filled" and lg.fill_price is not None:
+            fills.append({"leg": "wing", "side": lg.side, "ticker": lg.ticker, "price": lg.fill_price,
+                          "count": int(lg.count), "fee": _sfee(lg.fill_price)})
+    return SimpleNamespace(fills=fills, counts={})
+
+
+def test_round3_same_order_collapse_one_record_count2_two_batches():
+    # order-id dedup collapsed two same-order 1-lot fills into ONE rest record (count 2), but the core
+    # booked TWO batches. The consume-in-order walk gives batch 0 and batch 1 the SAME (correct) ticker.
+    p = _params(contracts=2)
+    st = _same_bucket_state(p, [1, 1])
+    rec = [{"leg": "rest", "side": "no", "ticker": B_SD, "price": Decimal("0.30"), "count": 2,
+            "fee": Decimal(0), "bucket_Sd": 80400}]
+    money = R._compute_money_math(st, _explicit_executor(st, rec), contracts=p.contracts)
+    bucket_legs = [h for h in money["held_legs"] if h["ticker"] == B_SD]
+    assert len(bucket_legs) == 2
+    assert all(b["side"] == "no" and b["count"] == 1 for b in bucket_legs)   # counts 1 and 1
+    assert money["floor_booked"] == Decimal("4")                             # 2 + 2
+
+
+def test_round3_records_exhausted_one_record_two_batches_no_foreign_ticker():
+    # only ONE rest record (count 1) but TWO batches: batch 1 exhausts the records and falls back to
+    # the single recovered ticker (recovered from that same record) -> no foreign ticker, no over-count.
+    p = _params(contracts=2)
+    st = _same_bucket_state(p, [1, 1])
+    rec = [{"leg": "rest", "side": "no", "ticker": B_SD, "price": Decimal("0.30"), "count": 1,
+            "fee": Decimal(0), "bucket_Sd": 80400}]
+    money = R._compute_money_math(st, _explicit_executor(st, rec), contracts=p.contracts)
+    bucket_legs = [h for h in money["held_legs"] if h["ticker"].startswith("KXBTC-RANGE-B")]
+    assert len(bucket_legs) == 2
+    # both bucket-NO legs are the one correct bucket (batch 1 fell back to the recovered ticker) ...
+    assert {b["ticker"] for b in bucket_legs} == {B_SD}
+    # ... no held leg carries a FOREIGN ticker (only this window's bucket + its two strikes) ...
+    assert {h["ticker"] for h in money["held_legs"]} <= {B_SD, STK_SD, STK_SU}
+    # ... and no held-leg count exceeds what its batch actually filled (1 each)
+    assert all(int(h["count"]) <= 1 for h in money["held_legs"])
+
+
+def test_round3_n2_min_direction_floor_and_pending_credit():
+    # a malformed mixed-count row (legs counts 2 and 1, no floor_booked, no wing_batch_sets): both the
+    # floor reconstruction and the pending-credit band use MIN(counts)=1, never MAX=2. Written so a
+    # min -> max mutation FAILS (equals the min number AND strictly less than the max number).
+    legs = [{"ticker": B_SD, "side": "no", "count": 2},
+            {"ticker": STK_SD, "side": "yes", "count": 1}]
+    entry = {"close_time": CT, "realized_unsettled": True, "unsettled_legs": legs}
+
+    # _v32_floor_booked_for_entry: min -> v32_set_floor_dollars(2, 1) = 1; max would be (2, 2) = 2
+    floor_min = v32_set_floor_dollars(len(legs), 1)   # 1
+    floor_max = v32_set_floor_dollars(len(legs), 2)   # 2
+    got_floor = _v32_floor_booked_for_entry(entry, legs)
+    assert got_floor == floor_min == Decimal("1")
+    assert got_floor < floor_max
+
+    # v32_pending_credit: pessimistic = floor(2, min=1) = 1 (< max 2); optimistic = min(2,2)*1 = 2 (< max 4)
+    pess, opt = v32_pending_credit([entry], UTC)
+    assert pess == Decimal("1") and pess < Decimal("2")   # min beats max on the guaranteed floor
+    assert opt == Decimal("2") and opt < Decimal("4")     # min beats max on the best-case payoff
+
+
+# NOTE (Round 3, #4 skipped): a cancel_ctx-booked rest lot's money-math record is NOT reachable cheaply
+# from the state-builder fixtures. This codebase has NO executor ``_finish_cancel`` and NO cancel-path
+# ``_record_fill`` -- the only ``_record_fill`` call sites are the two WS paths and the poll path
+# (service/run_v32.py lines 857/885/965). A genuine cancel-caught lot with its own money-math rest
+# record would require driving the full driver+executor+OrderCancelled flow with new fixtures, which is
+# out of the tests-only scope. The fallback such a (record-less) batch would take IS already covered by
+# ``test_round3_records_exhausted_...`` (batch exhausts the records -> single recovered ticker).

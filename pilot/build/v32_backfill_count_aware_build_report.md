@@ -145,3 +145,35 @@ under-credits the floor — the fail-safe direction for both the backfill and S4
 
 Suite after Round 2: `python -m pytest -q` → **958 passed**, zero failures. `ceremony/v32_falsifier.md`
 FROZEN/untouched; `stops.py` untouched; scope held to the same file set.
+
+## Round 3 (tests only — PR #74 APPROVE WITH NITS)
+
+Add-only edge-case tests for the per-batch resolver and the N2 `min()` fail-closed direction. NO
+production code changed. New tests in `tests/test_v32_backfill_count_aware.py` (+3 → 17 in the file):
+- `test_round3_same_order_collapse_one_record_count2_two_batches` — one rest record (count 2), two
+  batches (1+1): both bucket-NO legs carry the one ticker, counts 1 and 1, `floor_booked == 4`.
+- `test_round3_records_exhausted_one_record_two_batches_no_foreign_ticker` — one rest record (count 1),
+  two batches: batch 1 exhausts the records and falls back to the single recovered (correct) ticker; no
+  held leg carries a foreign ticker and no leg count exceeds what filled.
+- `test_round3_n2_min_direction_floor_and_pending_credit` — malformed mixed-count row (leg counts 2 and
+  1, no `floor_booked`, no `wing_batch_sets`): `_v32_floor_booked_for_entry` == 1 (min) and `< 2` (max);
+  `v32_pending_credit` pessimistic == 1 (`< 2`), optimistic == 2 (`< 4`) — a `min → max` mutation fails.
+
+**#4 skipped (documented in-file).** A `cancel_ctx`-booked lot's money-math rest record is not reachable
+cheaply from the state-builder fixtures: this codebase has no executor `_finish_cancel` and no
+cancel-path `_record_fill` (the only `_record_fill` call sites are the two WS paths and the poll path,
+`service/run_v32.py` 857/885/965). Reaching a genuine cancel-caught lot with its own rest record needs
+the full driver+executor+`OrderCancelled` flow (new fixtures) — out of the tests-only scope. The
+fallback such a record-less batch takes is already covered by the records-exhausted test above.
+
+Suite after Round 3: `python -m pytest -q` → **961 passed**, zero failures.
+
+## QUEUED follow-up (NIT-1, durable fix — NOT implemented here)
+
+The per-batch bucket ticker is currently reconstructed in `_compute_money_math` by consuming the
+rest-fill records in order. The durable fix (reviewer NIT-1) is to bind each batch's bucket ticker at
+SPAWN time on the `WingBatch` record in `service/v32/core.py` (`_book_rest_delta` knows the coid /
+`bucket_Sd` when it creates the batch), so money-math reads `batch.bucket_ticker` directly instead of
+re-deriving it — eliminating the dedup/exhaustion edge entirely and the coupling to record ordering.
+This is a core-schema change (new `WingBatch` field + `_book_rest_delta` wiring + ledger read) outside
+this PR's ledger/report/tests scope; queued for a follow-up PR. Not implemented in this branch.
