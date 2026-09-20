@@ -35,6 +35,9 @@ import loader as _loader            # noqa: E402
 
 # --- fee / hole / sigma-hat (census, A3.2) ---
 fee = _census.fee
+# The frozen taker-fee coefficient (0.07), re-exported (NOT reimplemented) so a count-aware venue
+# per-FILL total fee can be derived from the SAME constant as the per-contract law ``fee`` above.
+fee_rate = _census.FEE_RATE
 hole_G = _census.hole_G
 sigma_hat = _census.sigma_hat
 InsufficientTape = _census.InsufficientTape

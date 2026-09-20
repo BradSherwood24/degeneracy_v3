@@ -711,3 +711,82 @@ def test_book_late_second_lot_caught_by_cancel_path():
     st2, acts = book_late_rest_fill(p, st, price=Decimal("0.45"), count=1, server_ts=T - 198,
                                     bucket_Sd=79600)
     assert len(st2.rest_fills) == 2 and acts == []
+
+
+# ===========================================================================
+# MONEY-MATH FEE SCALING (2026-09-20 fix). The venue charges the taker fee ONCE PER FILL
+# (ceil(0.07*p*(1-p)*count)); the per-contract ``fee`` on a fill record must be scaled by count in
+# ``realized_delta``'s cost, not added once. Reproduced on the first live size-2 set (04:00Z).
+# ===========================================================================
+from service.v32.ledger import v32_set_floor_dollars  # noqa: E402
+from service._simlaw import fee as _law_fee            # noqa: E402
+
+
+def test_size2_0400z_realized_delta_uses_total_fees():
+    """REGRESSION — live ledger row close_time 2026-09-20T04:00:00Z (first size-2 set).
+
+    rest NO 2@0.27 fee 0 (maker), wings YES 2@0.82 (per-contract fee 0.0103) + NO 2@0.77 (0.0124).
+    The venue charged the per-FILL total fee (ceil(0.07*p*(1-p)*2)): YES 0.0207, NO 0.0248. So
+    total cost = 2*(0.27+0.82+0.77) + 0.0207 + 0.0248 = 3.7655, floor = $4.00 (complete 3-leg pin x2),
+    realized_delta = +0.2345 -- matching the live balance move 53.3069 -> 53.5414. The pre-fix cost
+    added each per-contract fee ONCE (0.0103 + 0.0124), over-stating realized_delta by $0.0228 (the
+    second lot's wing fees) to 0.2573."""
+    p = _params(contracts=2)
+    st = _completed_state(p, fills=[2])
+    assert v32_set_floor_dollars(3, 2) == Decimal("4.00")  # geometry: 3 legs held x 2 lots -> $4 floor
+    exec_stub = SimpleNamespace(counts={}, fills=[
+        {"leg": "rest", "side": "no", "ticker": B_SD, "price": Decimal("0.27"), "count": 2,
+         "fee": Decimal("0.000000")},
+        {"leg": "wing", "side": BUY_YES, "ticker": "KXBTCD-26SEP2000-T80399.99",
+         "price": Decimal("0.82"), "count": 2, "fee": Decimal("0.0103")},
+        {"leg": "wing", "side": BUY_NO, "ticker": "KXBTCD-26SEP2000-T80499.99",
+         "price": Decimal("0.77"), "count": 2, "fee": Decimal("0.0124")},
+    ])
+    money = R._compute_money_math(st, exec_stub, contracts=p.contracts)
+    assert money["realized_delta"] == Decimal("0.2345")
+    # unambiguous fee keys on every fill record: fee (per contract) + fee_total (all lots) + fee_source
+    wf = {f["side"]: f for f in money["wing_fills"]}
+    assert wf[BUY_YES]["fee"] == Decimal("0.0103")
+    assert wf[BUY_YES]["fee_total"] == Decimal("0.0207") and wf[BUY_YES]["fee_source"] == "law_total"
+    assert wf[BUY_NO]["fee"] == Decimal("0.0124")
+    assert wf[BUY_NO]["fee_total"] == Decimal("0.0248") and wf[BUY_NO]["fee_source"] == "law_total"
+    rest = money["fills"][0]
+    assert rest["fee_total"] == Decimal(0) and rest["fee_source"] == "maker_zero"
+
+
+def test_size1_single_lot_realized_delta_byte_identical_to_pre_fix():
+    """At contracts=1 with a 1-lot set the fix is a NO-OP: at count 1 the per-contract fee already IS
+    the venue per-fill total, so the cost (and thus realized_delta) is byte-identical to the pre-fix
+    'per-contract fee added once' arithmetic. Guards the 7 size-1 history rows."""
+    p = _params1()  # contracts = 1
+    st = _completed_state(p, fills=[1])
+    money = R._compute_money_math(st, _stub_executor(st), contracts=p.contracts)
+    # reproduce the EXACT pre-fix cost: sum(price*count) + per-contract fee added ONCE per fill.
+    fills = _stub_executor(st).fills
+    pre_fix_cost = sum(
+        (Decimal(str(f["price"])) * Decimal(int(f["count"]))) + Decimal(str(f.get("fee") or 0))
+        for f in fills
+    )
+    held = 3  # bucket-NO + both wings
+    pre_fix_delta = v32_set_floor_dollars(held, 1) - pre_fix_cost
+    assert money["realized_delta"] == pre_fix_delta
+    # and every fee_total at count 1 equals its per-contract fee (source per_contract / maker_zero).
+    for f in list(money["fills"]) + list(money["wing_fills"]):
+        assert Decimal(str(f["fee_total"])) == Decimal(str(f.get("fee") or 0))
+        assert f["fee_source"] in ("per_contract", "maker_zero")
+
+
+def test_fill_total_fee_helper_scale_and_source():
+    """``_fill_total_fee`` unit contract: maker (fee 0) -> (0, maker_zero); taker count 1 -> the
+    per-contract fee itself (per_contract), which equals the frozen per-contract law; taker count>=2 ->
+    the venue per-fill ceiling ``_fee_total`` (law_total), NOT per-contract*count."""
+    # maker leg
+    assert R._fill_total_fee({"price": Decimal("0.27"), "count": 2, "fee": Decimal(0)}) == (Decimal(0), "maker_zero")
+    # taker count 1: per-contract fee IS the total, and equals the frozen law at count 1
+    tot1, src1 = R._fill_total_fee({"price": Decimal("0.82"), "count": 1, "fee": Decimal("0.0104")})
+    assert src1 == "per_contract" and tot1 == Decimal("0.0104")
+    assert R._fee_total(Decimal("0.82"), 1) == _law_fee(Decimal("0.82"))
+    # taker count 2: venue per-fill ceiling (ceil applied ONCE to the whole fill)
+    tot2, src2 = R._fill_total_fee({"price": Decimal("0.82"), "count": 2, "fee": Decimal("0.0103")})
+    assert src2 == "law_total" and tot2 == Decimal("0.0207")
+    assert R._fee_total(Decimal("0.77"), 2) == Decimal("0.0248")
