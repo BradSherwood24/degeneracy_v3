@@ -1467,7 +1467,13 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
     """Fold the completed window's fills into the ledger's money-math slots. Returns the kwargs for
     ``build_v32_ledger_row`` (all empty/None when nothing filled — dry/shakedown windows). ``held_legs``
     are the bucket-NO + each FILLED wing leg (side/ticker/count), marked ``realized_unsettled`` so the
-    settlement backfill sweep corrects the conservative floor booked here.
+    settlement backfill sweep corrects the conservative floor booked here. ``floor_booked`` is the
+    count-aware guaranteed floor actually netted into ``realized_delta`` (Σ per batch
+    ``v32_set_floor_dollars(held_this, fill_count)``); the backfill nets THIS, never a count-blind $1.
+
+    BUCKET-LEG DROP FIX (Fable 2026-09-20): ``state.spot_Sd`` is nulled at close, so
+    ``bucket_tickers.get(spot_Sd)`` was None here and the bucket-NO leg was dropped from ``held``
+    (backfill priced wings only, netted $1) — recovered from the rest fill record's own ticker.
 
     PARTIAL-FILL WINGS (Brad 2026-09-18): the money math is derived PER BATCH (each rest fill event is
     its own set), so a partial-fill window books one held bucket-NO + wings per fill and one per-contract
@@ -1510,6 +1516,20 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
     rest_fills_mm = [_annotate_fee(f) for f in fills if f.get("leg") == "rest"]
     wing_fills = [_annotate_fee(f) for f in fills if f.get("leg") == "wing"]
     bt = state.bucket_tickers.get(state.spot_Sd) if state.spot_Sd is not None else None
+    if bt is None:
+        # BUCKET-LEG DROP FIX (Fable 2026-09-20): the reset-at-close nulls ``state.spot_Sd``, so
+        # ``bucket_tickers.get(spot_Sd)`` returns None at _finalize time and the guaranteed bucket-NO
+        # leg was silently dropped from ``held``/``unsettled_legs`` (the backfill then priced only the
+        # wings and netted a count-blind $1 floor -> every complete set's backfill correction was
+        # wrong by $1 x contracts). Recover the bucket-NO ticker from the REST FILL RECORD itself,
+        # which captured ``ticker`` at fill time (the 04:00Z row carries KXBTC-26SEP2000-B80450),
+        # else from the rested bucket Sd.
+        for f in fills:
+            if f.get("leg") == "rest" and f.get("ticker"):
+                bt = f["ticker"]
+                break
+        if bt is None and getattr(state, "rest_bucket_Sd", None) is not None:
+            bt = state.bucket_tickers.get(state.rest_bucket_Sd)
     # Per-batch held legs, floor and first-completed-set lock (PARTIAL-FILL WINGS). At contracts=1 the
     # single batch reproduces the pre-partial held list, floor and realized_lock exactly.
     held: list[dict[str, Any]] = []
@@ -1517,8 +1537,13 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
     realized_lock: Decimal | None = None
     for b in getattr(state, "wing_batches", ()):  # type: ignore[attr-defined]
         legs = [lg for lg in state.wing_legs if lg.batch == b.index]
-        held_this = 1
+        # The bucket-NO lot is held the moment the rest fills; list it (with the batch's fill_count)
+        # and count it into this batch's floor. ``held_this`` counts ONLY legs actually listed, so an
+        # (essentially impossible) unrecoverable bucket ticker fails closed to the wings alone rather
+        # than claiming a floor for a leg it cannot name.
+        held_this = 0
         if bt:
+            held_this += 1
             held.append({"ticker": bt, "side": "no", "count": int(b.fill_count)})
         w_paid = Decimal(0)
         completed = bool(legs) and all(lg.status == "filled" for lg in legs)
@@ -1558,6 +1583,9 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
         "one_legged": bool(state.one_legged),
         "realized_unsettled": bool(held),
         "realized_delta": realized_delta,
+        # count-aware floor actually netted into realized_delta (Σ per batch
+        # v32_set_floor_dollars(held_this, fill_count)); the backfill nets THIS exact floor.
+        "floor_booked": floor,
         # PARTIAL-FILL WINGS additive slots
         "rest_fills": rest_fills_events,
         "wing_batch_sets": _batch_set_records(state),

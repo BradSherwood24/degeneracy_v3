@@ -134,6 +134,23 @@ pilot/ops/v32_stops_2026-09-13.json
 Never delete a guard that carries a real latch to "get past" a halt -- that is the one move the whole
 day-scoped design exists to prevent.
 
+### S4 pending-credit band / floor netting (count-aware, 2026-09-20, Brad's go "go ahead and build it")
+
+The banded S4 nets the GUARANTEED settlement floor of any position still pending settlement back into
+the day-balance loss, so a complete-but-unsettled pin's cash dip never spuriously latches a day loss
+(fail-safe: it can only make the loss look larger, never smaller). As of 2026-09-20 that band is
+COUNT-AWARE and BUCKET-AWARE: `v32_pending_credit` scales the floor by the set size (contracts) and
+reads the per-batch held-leg count from the row's `wing_batch_sets`, so a complete size-2 pin is
+credited its true guaranteed $4.00 (band `(4.00, 4.00)`), not the count-blind `(1.00, 2.00)` the old
+arithmetic returned. The same fix lists the guaranteed **bucket-NO** leg in the window row's
+held/unsettled legs (it was dropped because `spot_Sd` is nulled at close -- recovered from the rest
+fill's own ticker) and stamps `floor_booked` = the count-aware floor actually netted, which the
+settlement backfill then nets exactly. Net effect on S4: a late settlement past the :40 wake for a
+complete size-2 set no longer shows a false ~$2.74 loss against the $3.00 S4 cap. The
+`V32_S4_DAY_LOSS_CAP_DOLLARS = 3.00` **[pin]** and the `v32_s4_decision` signature are UNCHANGED; the
+falsifier (`ceremony/v32_falsifier.md`) stays FROZEN -- this is a mechanics fix in the band arithmetic,
+not a pin change.
+
 ---
 
 ## D. What to watch in the first armed window (the MUST CONFIRM list -> where it shows up)
