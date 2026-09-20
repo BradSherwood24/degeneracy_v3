@@ -109,6 +109,39 @@ set or lower balance would drive across the $3.00 S4 cap spuriously (fail-safe d
 
 ## Suite
 
-`cd pilot && python -m pytest -q` → **955 passed** (baseline 944 + 11 new). Zero failures.
-Report verified on a read-only copy of the live ledger: FALSIFIER SCOREBOARD byte-identical
-before/after; reconciliation prints the corrected per-set totals above; `--json` path OK.
+`cd pilot && python -m pytest -q` → **955 passed** (baseline 944 + 11 new; Round 2 raised it to 958).
+Zero failures. Report verified on a read-only copy of the live ledger: FALSIFIER SCOREBOARD
+byte-identical before/after; reconciliation prints the corrected per-set totals above; `--json` OK.
+
+## Round 2 (PR #74 review — BLOCK finding + 2 nits)
+
+**FINDING #1 (BLOCK, over-credit path).** `_compute_money_math` recovered the bucket ticker ONCE
+(from the first rest fill) and applied it to EVERY batch. In a mid-hour **bucket change** (partial
+fill on bucket A, spot crosses, the core cancels A and places a NEW order on B, B fills — two batches
+on two buckets), batch 1's bucket-NO leg was mislabeled with A's ticker. If spot settled in B, market
+A resolves `no`, so the mislabeled bucket-NO(A) leg "wins" $1 the true B leg loses →
+`settlement_payoff` overstated → backfill books **+$1.00/contract** instead of $0. It does NOT fail
+closed (A is a real settled market). Live exposure was zero (no live window has had >1 batch, and at
+the `contracts=2` cap a bucket change yields exactly the clean A-then-B two-order case).
+
+**Fix.** Resolve the bucket ticker **per batch**: walk the rest-fill records in order and consume each
+record's lot count as batches are assigned (a bucket change places a distinct order → a distinct rest
+record, 1:1 with batches). If records are exhausted (the executor's order-id dedup collapses
+SAME-ORDER refills into one record — necessarily the same bucket), the remaining batches fall back to
+the single recovered ticker. Byte-identical for any single-bucket window and at `contracts=1` (verified:
+955→958 with all prior tests green; live reconciliation targets and the FALSIFIER SCOREBOARD unchanged).
+
+**Nits.** N1 `report.py` set-size fallback: replaced the integer-divide with `lots_filled` else the
+**min** held-leg count (fail-closed, never over-credits the corrected payoff). N2 `_v32_floor_booked_for_entry`
+and `v32_pending_credit` legs fallback: `max(counts)` → `min(counts)` (a malformed mixed-count row now
+under-credits the floor — the fail-safe direction for both the backfill and S4).
+
+**New tests** (`tests/test_v32_backfill_count_aware.py`, +3 → 14 in the file):
+- `test_round2_two_bucket_each_leg_its_own_ticker_and_count` — two batches on buckets A/B; asserts the
+  two bucket-NO legs carry `{A, B}` (not both A) and `floor_booked == 4`.
+- `test_round2_two_bucket_settled_in_B_correction_zero` — spot settles in B; `legs_priced == 6`,
+  payoff $4, floor $4, correction **$0** (old single-ticker code booked +$1).
+- `test_round2_two_bucket_settled_in_A_correction_zero` — symmetric case; correction **$0**.
+
+Suite after Round 2: `python -m pytest -q` → **958 passed**, zero failures. `ceremony/v32_falsifier.md`
+FROZEN/untouched; `stops.py` untouched; scope held to the same file set.

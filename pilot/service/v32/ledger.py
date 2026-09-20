@@ -333,7 +333,10 @@ def _v32_floor_booked_for_entry(
             counts.append(int(c))
         except (TypeError, ValueError):
             counts.append(1)
-    cnt = max(counts) if counts else 1
+    # Fail closed on a malformed mixed-count legs list: take the SMALLER count (never the optimistic
+    # larger one) so a reconstructed floor can only UNDER-credit, never over-credit. A well-formed set
+    # has one count across its legs, so this is exact for every real row.
+    cnt = min(counts) if counts else 1
     return v32_set_floor_dollars(len(legs), cnt)
 
 
@@ -389,7 +392,10 @@ def v32_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> tuple[Decima
                 counts.append(int(c))
             except (TypeError, ValueError):
                 counts.append(1)
-        cnt = max(counts) if counts else 1
+        # Fail closed on a malformed mixed-count legs list: the SMALLER count. For the pessimistic
+        # (guaranteed floor) bound an under-stated floor only makes the day loss look larger (fail-safe
+        # for S4); a well-formed set has one count across its legs, so this is exact for every real row.
+        cnt = min(counts) if counts else 1
         pessimistic += v32_set_floor_dollars(n_legs, cnt)   # guaranteed floor (count-aware)
         optimistic += Decimal(min(n_legs, 2)) * Decimal(cnt)  # best-case payoff (count-aware)
     return pessimistic, optimistic

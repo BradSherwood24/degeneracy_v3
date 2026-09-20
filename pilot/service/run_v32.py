@@ -1515,21 +1515,50 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
         return {"fills": fills, **counters}
     rest_fills_mm = [_annotate_fee(f) for f in fills if f.get("leg") == "rest"]
     wing_fills = [_annotate_fee(f) for f in fills if f.get("leg") == "wing"]
-    bt = state.bucket_tickers.get(state.spot_Sd) if state.spot_Sd is not None else None
-    if bt is None:
-        # BUCKET-LEG DROP FIX (Fable 2026-09-20): the reset-at-close nulls ``state.spot_Sd``, so
-        # ``bucket_tickers.get(spot_Sd)`` returns None at _finalize time and the guaranteed bucket-NO
-        # leg was silently dropped from ``held``/``unsettled_legs`` (the backfill then priced only the
-        # wings and netted a count-blind $1 floor -> every complete set's backfill correction was
-        # wrong by $1 x contracts). Recover the bucket-NO ticker from the REST FILL RECORD itself,
-        # which captured ``ticker`` at fill time (the 04:00Z row carries KXBTC-26SEP2000-B80450),
-        # else from the rested bucket Sd.
-        for f in fills:
-            if f.get("leg") == "rest" and f.get("ticker"):
-                bt = f["ticker"]
+    rest_records = [f for f in fills if f.get("leg") == "rest"]
+    # BUCKET-LEG DROP FIX (Fable 2026-09-20): the reset-at-close nulls ``state.spot_Sd``, so
+    # ``bucket_tickers.get(spot_Sd)`` returns None at _finalize time and the guaranteed bucket-NO leg
+    # was silently dropped from ``held``/``unsettled_legs`` (the backfill then priced only the wings
+    # and netted a count-blind $1 floor -> every complete set's backfill correction was wrong by
+    # $1 x contracts). Recover the bucket-NO ticker from the REST FILL RECORD itself, which captured
+    # ``ticker`` at fill time (the 04:00Z row carries KXBTC-26SEP2000-B80450); a single fallback for a
+    # batch we can't otherwise place.
+    fallback_bt = state.bucket_tickers.get(state.spot_Sd) if state.spot_Sd is not None else None
+    if fallback_bt is None:
+        for rec in rest_records:
+            if rec.get("ticker"):
+                fallback_bt = rec["ticker"]
                 break
-        if bt is None and getattr(state, "rest_bucket_Sd", None) is not None:
-            bt = state.bucket_tickers.get(state.rest_bucket_Sd)
+        if fallback_bt is None and getattr(state, "rest_bucket_Sd", None) is not None:
+            fallback_bt = state.bucket_tickers.get(state.rest_bucket_Sd)
+
+    # PER-BATCH bucket ticker (Round-2 fix, reviewer PR #74 FINDING #1): a mid-hour bucket change
+    # rests+fills on TWO different buckets in one hour (partial fill on A, spot crosses, core cancels A
+    # and places a NEW order on B, B fills -> two batches on two buckets). The old single recovered
+    # ticker mislabeled batch 1's bucket-NO leg with bucket A's ticker -> an over-credit if A settled
+    # ``no`` (mislabeled leg "wins" $1 the true B leg loses). The bucket change places a DISTINCT order
+    # (distinct order_id -> distinct rest-fill record), so we walk the rest-fill records in order and
+    # consume each record's lot count as we assign batches (rest fills spawn batches 1:1 in order). If
+    # the records are exhausted (the executor's order-id dedup collapsed SAME-ORDER refills into one
+    # record -- necessarily the SAME bucket), the remaining batches fall back to ``fallback_bt``.
+    # Single-bucket windows and contracts=1 are byte-identical (every record carries the one ticker).
+    batch_bt: dict[int, str | None] = {}
+    _ri = 0
+    _rem = int(rest_records[0].get("count", 0) or 0) if rest_records else 0
+    for b in getattr(state, "wing_batches", ()):  # type: ignore[attr-defined]
+        while _ri < len(rest_records) and _rem <= 0:
+            _ri += 1
+            _rem = int(rest_records[_ri].get("count", 0) or 0) if _ri < len(rest_records) else 0
+        if _ri < len(rest_records):
+            rec = rest_records[_ri]
+            tk = rec.get("ticker")
+            if not tk and rec.get("bucket_Sd") is not None:
+                tk = state.bucket_tickers.get(rec["bucket_Sd"])
+            batch_bt[b.index] = tk or fallback_bt
+            _rem -= int(b.fill_count)
+        else:
+            batch_bt[b.index] = fallback_bt
+
     # Per-batch held legs, floor and first-completed-set lock (PARTIAL-FILL WINGS). At contracts=1 the
     # single batch reproduces the pre-partial held list, floor and realized_lock exactly.
     held: list[dict[str, Any]] = []
@@ -1537,10 +1566,11 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
     realized_lock: Decimal | None = None
     for b in getattr(state, "wing_batches", ()):  # type: ignore[attr-defined]
         legs = [lg for lg in state.wing_legs if lg.batch == b.index]
-        # The bucket-NO lot is held the moment the rest fills; list it (with the batch's fill_count)
-        # and count it into this batch's floor. ``held_this`` counts ONLY legs actually listed, so an
-        # (essentially impossible) unrecoverable bucket ticker fails closed to the wings alone rather
-        # than claiming a floor for a leg it cannot name.
+        # The bucket-NO lot is held the moment the rest fills; list it (with the batch's fill_count and
+        # THIS batch's own bucket ticker) and count it into this batch's floor. ``held_this`` counts
+        # ONLY legs actually listed, so an (essentially impossible) unrecoverable bucket ticker fails
+        # closed to the wings alone rather than claiming a floor for a leg it cannot name.
+        bt = batch_bt.get(b.index)
         held_this = 0
         if bt:
             held_this += 1

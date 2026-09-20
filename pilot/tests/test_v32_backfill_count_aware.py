@@ -21,6 +21,7 @@ import service.run_v32 as R
 from service._simlaw import fee as _sfee
 from service.book import TopOfBook
 from service.v32 import (
+    BUY_NO,
     BUY_YES,
     ActionKind,
     BookUpdate,
@@ -32,6 +33,7 @@ from service.v32 import (
     decide_v32,
     load_v32_params,
 )
+from service.v32.core import RestFill, WingBatch, WingLeg
 from service.v32.ledger import (
     build_v32_backfill_row,
     build_v32_ledger_row,
@@ -317,3 +319,118 @@ def test_build_backfill_row_additive_keys_present():
                                  legs_priced=1, backfill_note="floor_booked (explicit)")
     assert row["legs_priced"] == 1 and row["backfill_note"] == "floor_booked (explicit)"
     assert Decimal(row["realized_delta"]) == Decimal("2")
+
+
+# ===========================================================================
+# ROUND 2 (PR #74 FINDING #1, BLOCK): a mid-hour BUCKET CHANGE fills two batches on two different
+# buckets in one hour. The bucket-NO leg of each batch must carry ITS OWN bucket ticker -- the old
+# single recovered ticker mislabeled batch 1's leg with bucket A, an over-credit if A settled `no`.
+# ===========================================================================
+# bucket A (batch 0) and bucket B (batch 1), non-adjacent so all four strikes are distinct
+A_B = "KXBTC-RANGE-B80400"
+A_SD, A_SU = 80400, 80500
+A_YES = "KXBTCD-26SEP2000-T80399.99"   # YES@Sd_A
+A_NO = "KXBTCD-26SEP2000-T80499.99"    # NO@Su_A
+B_B = "KXBTC-RANGE-B80600"
+B_SD_, B_SU = 80600, 80700
+B_YES = "KXBTCD-26SEP2000-T80599.99"   # YES@Sd_B
+B_NO = "KXBTCD-26SEP2000-T80699.99"    # NO@Su_B
+
+
+def _two_bucket_state(params):
+    """A completed contracts=2 window that rested/filled 1 lot on bucket A (batch 0) then, after a spot
+    cross, 1 lot on bucket B (batch 1) -- both batches' wings filled. spot_Sd is nulled (close reset)
+    so the fix must place each bucket-NO leg from its OWN rest-fill record."""
+    bmap = {A_B: (float(A_SD), float(A_SU - 1)), B_B: (float(B_SD_), float(B_SU - 1))}
+    st = V32State.new(CLOSE, T, bmap, params)
+    rest_fills = (RestFill(Decimal("0.30"), 1, T - 500.0), RestFill(Decimal("0.25"), 1, T - 300.0))
+    wing_batches = (
+        WingBatch(index=0, fill_price=Decimal("0.30"), fill_count=1, server_ts=T - 500.0,
+                  taken=True, completed=True),
+        WingBatch(index=1, fill_price=Decimal("0.25"), fill_count=1, server_ts=T - 300.0,
+                  taken=True, completed=True),
+    )
+    wing_legs = (
+        WingLeg(A_YES, BUY_YES, 1, Decimal("0.82"), "wy0", status="filled",
+                fill_price=Decimal("0.80"), batch=0),
+        WingLeg(A_NO, BUY_NO, 1, Decimal("0.82"), "wn0", status="filled",
+                fill_price=Decimal("0.80"), batch=0),
+        WingLeg(B_YES, BUY_YES, 1, Decimal("0.82"), "wy1", status="filled",
+                fill_price=Decimal("0.80"), batch=1),
+        WingLeg(B_NO, BUY_NO, 1, Decimal("0.82"), "wn1", status="filled",
+                fill_price=Decimal("0.80"), batch=1),
+    )
+    return replace(
+        st, rest_fills=rest_fills, rest_fill=rest_fills[-1], wing_batches=wing_batches,
+        wing_legs=wing_legs, bucket_tickers={A_SD: A_B, B_SD_: B_B}, spot_Sd=None,
+        rest_bucket_Sd=None,
+    )
+
+
+def _two_bucket_executor(state):
+    """Executor fills: TWO rest records with DISTINCT tickers/bucket_Sd (a bucket change places a new
+    order -> distinct order_id -> distinct rest record), then the four wing fills."""
+    fills = [
+        {"leg": "rest", "side": "no", "ticker": A_B, "price": Decimal("0.30"), "count": 1,
+         "fee": Decimal(0), "bucket_Sd": A_SD},
+        {"leg": "rest", "side": "no", "ticker": B_B, "price": Decimal("0.25"), "count": 1,
+         "fee": Decimal(0), "bucket_Sd": B_SD_},
+    ]
+    for lg in state.wing_legs:
+        fills.append({"leg": "wing", "side": lg.side, "ticker": lg.ticker, "price": lg.fill_price,
+                      "count": int(lg.count), "fee": _sfee(lg.fill_price)})
+    return SimpleNamespace(fills=fills, counts={})
+
+
+def test_round2_two_bucket_each_leg_its_own_ticker_and_count():
+    p = _params(contracts=2)
+    st = _two_bucket_state(p)
+    money = R._compute_money_math(st, _two_bucket_executor(st), contracts=p.contracts)
+    held = money["held_legs"]
+    bucket_legs = [h for h in held if h["ticker"].startswith("KXBTC-RANGE-B")]
+    # exactly one bucket-NO leg per batch, EACH with its own bucket ticker (not both = A) -- the fix
+    assert {b["ticker"] for b in bucket_legs} == {A_B, B_B}
+    assert all(b["side"] == "no" and b["count"] == 1 for b in bucket_legs)
+    assert money["floor_booked"] == Decimal("4")   # two complete batches: 2 + 2
+    assert len(held) == 6                            # 2 bucket-NO + 4 wings
+
+
+def test_round2_two_bucket_settled_in_B_correction_zero():
+    p = _params(contracts=2)
+    st = _two_bucket_state(p)
+    money = R._compute_money_math(st, _two_bucket_executor(st), contracts=p.contracts)
+    row = _row(st, p, money)
+    # spot settles IN bucket B (~80600): A not hit (no), B hit (yes); strikes resolve accordingly.
+    results = {
+        A_B: "no", B_B: "yes",
+        A_YES: "yes",   # spot 80600 >= 80400
+        A_NO: "yes",    # spot 80600 >= 80500 -> NO@Su_A market resolves yes (our "no" side loses)
+        B_YES: "yes",   # spot 80600 >= 80600
+        B_NO: "no",     # spot 80600 <  80700 -> our "no" side wins
+    }
+    out = v32_settlement_backfill_sweep([row], lambda tk: results[tk], now=2.0)
+    assert len(out) == 1
+    assert out[0]["legs_priced"] == 6
+    # each complete pin pays exactly $2 x count -> $4 total nets the $4 floor -> correction $0 (the old
+    # single-ticker code booked +$1: batch 1's mislabeled bucket-NO(A) would "win" $1 that B loses).
+    assert Decimal(out[0]["settlement_payoff"]) == Decimal("4")
+    assert Decimal(out[0]["floor_netted"]) == Decimal("4")
+    assert Decimal(out[0]["realized_delta"]) == Decimal("0")
+
+
+def test_round2_two_bucket_settled_in_A_correction_zero():
+    p = _params(contracts=2)
+    st = _two_bucket_state(p)
+    money = R._compute_money_math(st, _two_bucket_executor(st), contracts=p.contracts)
+    row = _row(st, p, money)
+    # spot settles IN bucket A (~80450): A hit (yes), B not hit (no).
+    results = {
+        A_B: "yes", B_B: "no",
+        A_YES: "yes",   # 80450 >= 80400
+        A_NO: "no",     # 80450 <  80500 -> our "no" side wins
+        B_YES: "no",    # 80450 <  80600 -> our "yes" side loses
+        B_NO: "no",     # 80450 <  80700 -> our "no" side wins
+    }
+    out = v32_settlement_backfill_sweep([row], lambda tk: results[tk], now=2.0)
+    assert Decimal(out[0]["settlement_payoff"]) == Decimal("4")
+    assert Decimal(out[0]["realized_delta"]) == Decimal("0")

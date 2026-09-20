@@ -538,8 +538,12 @@ def build_ledger_reconciliation(rows: list[dict[str, Any]]) -> list[dict[str, An
             total_count = sum(int(b.get("fill_count", 0) or 0) for b in batches)
             complete = all(b.get("completed") for b in batches)
         else:
-            total_count = int(r.get("lots_filled") or 0) or sum(
-                int(lg["count"]) if isinstance(lg, dict) else int(lg[2]) for lg in legs) // max(1, len(legs))
+            # No per-batch sets (an old ledger row): the set size is ``lots_filled`` when the row
+            # carries it, else the SMALLEST held-leg count (all legs of one set share a count; the
+            # min fails closed -- a smaller size can only UNDER-state the corrected payoff, never
+            # over-credit). Never the old integer-divide, which silently truncated a mixed-count row.
+            leg_counts = [int(lg["count"]) if isinstance(lg, dict) else int(lg[2]) for lg in legs]
+            total_count = int(r.get("lots_filled") or 0) or (min(leg_counts) if leg_counts else 0)
             complete = (_dec(r.get("realized_lock")) is not None) and not bool(r.get("one_legged"))
         bf = bfmap.get(ct)
         if complete and total_count:
