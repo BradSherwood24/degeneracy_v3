@@ -922,7 +922,9 @@ class LiveExecutor:
         if fill_count > 0:
             # the amend CROSSED and filled (a TAKER fill). Book money-math at the venue's avg fill price
             # with the REAL taker fee (average_fee_paid), de-duped by order_id; the core routes it into
-            # the wings via the OrderAmended below (with count 1 nothing remains resting).
+            # the wings via the OrderAmended below; whatever of ``action.count`` did not cross stays
+            # resting (parsed.remaining_count), so at a full cross nothing remains and at a partial
+            # cross the remainder keeps working.
             self.fills_on_amend += fill_count
             booked_price = avg_price if avg_price is not None else new_price
             new_rec.status = "filled"
@@ -950,7 +952,9 @@ class LiveExecutor:
     def _amend_body(self, action, oid: str, exch: int | None, coid_old, coid_new) -> dict[str, Any]:
         """The Amend Order V2 wire body. ``side`` is the resting order's book side ('ask' for a bucket-NO
         buy — the SAME value ``to_v2_order`` yields for a create); ``price`` is the full-precision 4-dp
-        YES-space price (1 - n), the same convention as the create. ``count`` fixed-point "1.00".
+        YES-space price (1 - n), the same convention as the create. ``count`` is ``action.count`` as a
+        fixed-point string (e.g. "2.00" at contracts=2), defaulting to "1.00" when the action carries
+        no count -- the amend keeps the resting order at its remaining lot count.
         ``exchange_index`` rides in the body too (the proxy signs the query-stripped path)."""
         n = action.price if action.price is not None else Decimal(0)
         body: dict[str, Any] = {

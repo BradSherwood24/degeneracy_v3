@@ -51,7 +51,7 @@ Through-prints land 1 tick above our offer in most fills. Train (06-22..08-01) h
   shadow fill rule, with a frozen executor that logs every would-be create/cancel; `armed` sends them.
 * **Builders/reviewers on Opus 4.8**, disclosed branches `v32/phase<N>-<name>`, code PRs merged only after an Opus 4.8
   review pass; `python` only.
-* **Size**: 1 contract (proxy cap 2 per order stands). E = 0.10 to start.
+* **Size**: 2 contracts (AMENDMENT 1, Brad's dated go 2026-09-20; was 1 at the 2026-09-14 freeze; proxy cap 2 per order stands). E = 0.10 to start.
 
 ## Reuse (do not reinvent) — see the 2026-09-13 architecture survey in `pilot/build/v32_survey.md`
 
@@ -207,8 +207,9 @@ Phases 1-4 built on Opus 4.8, disclosed branches, reviewed.
   15M market journals `m15_missing` and continues (not a stand-down); ledger/report carry
   `m15_tickers` + `m15_frames`. See `build/v32_m15_build_report.md`.
 
-Params sha (roster `DegeneracyV3_2`): `c6715fc7fd8339e0cc8877bd39bb78b04239eda9c490bde71a53333a48bdfb92`
-(E=0.10, tol=0.02, deb_ms=5000).
+Params sha (roster `DegeneracyV3_2`): `a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c`
+(E=0.10, tol=0.02, deb_ms=5000) (AMENDMENT 1, 2026-09-20, contracts 2; previously
+`0ac697957c69a004e45d49505cce1084aaeb2e50bbaea45fe60bfbe0911c80dc` at the 2026-09-14 freeze).
 
 **What remains before a live arm** (all Brad's levers, none an agent may do):
 1. Proxy `.env`: `ORDER_TICKER_PREFIXES` includes `KXBTC`; `DAILY_ORDER_BUDGET` >= 4000; restart proxy;

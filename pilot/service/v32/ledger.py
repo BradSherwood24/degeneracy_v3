@@ -29,6 +29,14 @@ def _json_default(obj: object) -> str:
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+# Human-readable gloss stamped on every armed money-math row so a reader never mis-reads ``realized_delta``.
+REALIZED_DELTA_NOTE = (
+    "floor - total cost incl. all fees x count (venue per-fill fee ceil(0.07*p*(1-p)*count)); "
+    "per-set truth = balance delta at settlement; falsifier reads realized_lock (per contract, core "
+    "state), not this field. Each fill carries fee (per contract) + fee_total (all lots) + fee_source."
+)
+
+
 def append_v32_ledger_row(row: dict[str, Any], path: str = DEFAULT_V32_LEDGER_PATH) -> None:
     """Append one window row as a single JSON line (Decimals rendered as strings)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -271,6 +279,7 @@ def build_v32_ledger_row(
         "unsettled_legs": (held_legs or []) if realized_unsettled else [],
         "settlement": settlement,
         "realized_delta": (str(realized_delta) if realized_delta is not None else None),
+        "realized_delta_note": (REALIZED_DELTA_NOTE if realized_delta is not None else None),
         "flushed_at": now,
     }
     return row

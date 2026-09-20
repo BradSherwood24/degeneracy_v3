@@ -117,6 +117,7 @@ from service.v32.ledger import (
     v32_settlement_backfill_sweep,
 )
 from service._simlaw import fee as _fee
+from service._simlaw import fee_rate as _FEE_RATE
 from service.v32.stops import (
     V32_S1_LEGGED_LATCH_THRESHOLD,
     decide_v32_arming,
@@ -1417,6 +1418,51 @@ def _batch_set_records(state: V32State) -> list[dict[str, Any]]:
     return out
 
 
+def _fee_total(price: Any, count: int) -> Decimal:
+    """Venue per-FILL taker fee in dollars: ``ceil(0.07*p*(1-p)*count, $0.0001)`` -- the $0.0001
+    ceiling applied ONCE to the whole fill, which is how Kalshi charges (MEMORY kalshi-fee-exact;
+    169 live fills). This EQUALS the frozen per-contract law ``_fee(price)`` at ``count`` == 1, so a
+    1-lot fill is unchanged; a size-N taker fill's true fee is THIS, never ``_fee(price) * N`` (the
+    per-contract fee already rounded up once, so multiplying by N over-counts the rounding). Built on
+    the SAME frozen ``_FEE_RATE`` as ``_fee`` -- no reimplementation of the coefficient."""
+    p = price if isinstance(price, Decimal) else Decimal(str(price))
+    raw = _FEE_RATE * p * (Decimal(1) - p) * Decimal(int(count)) * Decimal(10000)
+    return Decimal(math.ceil(raw)) / Decimal(10000)
+
+
+def _fill_total_fee(f: Mapping[str, Any]) -> tuple[Decimal, str]:
+    """The (total_fee_dollars, fee_source) actually charged for ONE fill record.
+
+    A fill record's ``fee`` key is PER CONTRACT (Kalshi's ``average_fee_paid``); the maker rest leg is
+    fee-free on crypto (``fee`` 0). The TOTAL charged is:
+      * ``fee`` 0            -> 0                      (maker leg; source "maker_zero")
+      * taker, count 1       -> the per-contract ``fee`` itself IS the venue total (source
+        "per_contract") -- keeps every pre-existing size-1 row byte-for-byte identical
+      * taker, count >= 2    -> ``_fee_total(price, count)`` = the venue per-fill charge (source
+        "law_total"); NOT ``fee * count`` (which under/over-counts the once-applied ceiling)."""
+    per = f.get("fee")
+    per_d = Decimal(str(per)) if per is not None else Decimal(0)
+    if per_d == 0:
+        return Decimal(0), "maker_zero"
+    count = int(f.get("count", 0) or 0)
+    if count <= 1:
+        return per_d, "per_contract"
+    return _fee_total(f.get("price", 0), count), "law_total"
+
+
+def _annotate_fee(f: Mapping[str, Any]) -> dict[str, Any]:
+    """A COPY of a fill record with two explicit, unambiguous fee keys added so a reader never has to
+    guess the ``fee`` field's scale: ``fee`` stays PER CONTRACT (Kalshi ``average_fee_paid``; 0 on the
+    maker rest leg), ``fee_total`` is the dollars actually charged for ALL lots of the fill (the venue
+    per-fill ceiling; see ``_fill_total_fee``), and ``fee_source`` records how ``fee_total`` was
+    derived (maker_zero / per_contract / law_total)."""
+    total, src = _fill_total_fee(f)
+    g = dict(f)
+    g["fee_total"] = total
+    g["fee_source"] = src
+    return g
+
+
 def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> dict[str, Any]:
     """Fold the completed window's fills into the ledger's money-math slots. Returns the kwargs for
     ``build_v32_ledger_row`` (all empty/None when nothing filled — dry/shakedown windows). ``held_legs``
@@ -1427,7 +1473,14 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
     its own set), so a partial-fill window books one held bucket-NO + wings per fill and one per-contract
     realized lock per completed set. At ``contracts`` = 1 there is one batch and every existing key keeps
     its exact value (the hard acceptance test); the new keys (``rest_fills``, ``wing_batch_sets``,
-    ``lots_filled``, ``lots_unfilled_at_quote_end``, ``partial_fills``) are additive."""
+    ``lots_filled``, ``lots_unfilled_at_quote_end``, ``partial_fills``) are additive.
+
+    FEES (2026-09-20): the ``realized_delta`` cost sums the TOTAL fee per fill (venue per-fill
+    ceiling ``ceil(0.07*p*(1-p)*count)`` via ``_fill_total_fee``), NOT the per-contract ``fee``
+    added once -- the size-2 04:00Z set over-stated realized_delta by $0.0228 the old way. Every
+    ``fills``/``wing_fills`` record now also carries ``fee_total`` + ``fee_source`` (``fee`` stays
+    per contract). At ``count`` == 1 the total equals the per-contract fee, so size-1 rows are
+    byte-identical."""
     # Operational counters ALWAYS travel to the row — even when nothing filled. The 2026-09-14 20:00Z
     # armed row read 0/0 rests despite 3 rejected creates because the no-fill early-return below dropped
     # these; they now ride both exits. Cancel/venue-truth counters added with the shard fix.
@@ -1454,8 +1507,8 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
     fills = list(getattr(executor, "fills", []) or [])
     if not fills or state.rest_fill is None:
         return {"fills": fills, **counters}
-    rest_fills_mm = [f for f in fills if f.get("leg") == "rest"]
-    wing_fills = [f for f in fills if f.get("leg") == "wing"]
+    rest_fills_mm = [_annotate_fee(f) for f in fills if f.get("leg") == "rest"]
+    wing_fills = [_annotate_fee(f) for f in fills if f.get("leg") == "wing"]
     bt = state.bucket_tickers.get(state.spot_Sd) if state.spot_Sd is not None else None
     # Per-batch held legs, floor and first-completed-set lock (PARTIAL-FILL WINGS). At contracts=1 the
     # single batch reproduces the pre-partial held list, floor and realized_lock exactly.
@@ -1483,8 +1536,11 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
     for f in fills:
         try:
             cost += Decimal(str(f.get("price", 0))) * Decimal(int(f.get("count", 0)))
-            if f.get("fee") is not None:
-                cost += Decimal(str(f.get("fee")))
+            # TOTAL fee for ALL lots of this fill. The venue charges ceil(0.07*p*(1-p)*count)
+            # ONCE per fill, so the per-contract ``fee`` must be scaled by count (not added
+            # once). Adding it once dropped every lot past the first -- the 2026-09-20 04:00Z
+            # size-2 set over-stated realized_delta by $0.0228 (the 2nd lot's wing fees).
+            cost += _fill_total_fee(f)[0]
         except (ArithmeticError, ValueError, TypeError):
             continue
     realized_delta = floor - cost
