@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from service._simlaw import fee_rate as _FEE_RATE
 from service.v32.falsifier_pins import (
     V32_CAPTURE_RATIO_MIN,
     V32_FALSIFIER_MAX_EXEC_GAP_CENTS,
@@ -25,7 +27,12 @@ from service.v32.falsifier_pins import (
     V32_FALSIFIER_MIN_PCT_POSITIVE,
     V32_FALSIFIER_SHADOW_GAP_E,
 )
-from service.v32.ledger import DEFAULT_V32_LEDGER_PATH, load_v32_rows
+from service.v32.ledger import (
+    DEFAULT_V32_LEDGER_PATH,
+    _v32_floor_booked_for_entry,
+    load_v32_rows,
+    v32_set_floor_dollars,
+)
 from service.v32.params import load_v32_params
 
 _ONE = Decimal("1")
@@ -151,6 +158,7 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "e_keys": e_keys,
         "windows": windows,
         "falsifier": build_falsifier_scoreboard(rows),
+        "reconciliation": build_ledger_reconciliation(rows),
         "totals": {
             "windows": len(rows),
             "would_places": tot_would_places,
@@ -469,6 +477,140 @@ def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
     ]
 
 
+def _recon_fill_fee(f: dict[str, Any]) -> Decimal:
+    """The TOTAL venue fee actually charged for one fill record, read-only: ``fee_total`` when the
+    row carries it (new rows), else the frozen law ``ceil(0.07*p*(1-p)*count, $0.0001)`` — the maker
+    rest leg (``fee`` 0) is fee-free, and a count-1 taker fill's per-contract ``fee`` IS the venue
+    total (keeps size-1 rows byte-identical). Mirrors ``run_v32._fill_total_fee`` without importing it."""
+    ft = f.get("fee_total")
+    if ft is not None:
+        return _dec(ft) or Decimal(0)
+    per = f.get("fee")
+    per_d = _dec(per) or Decimal(0)
+    if per_d == 0:
+        return Decimal(0)
+    count = int(f.get("count", 0) or 0)
+    if count <= 1:
+        return per_d
+    p = _dec(f.get("price", 0)) or Decimal(0)
+    raw = _FEE_RATE * p * (Decimal(1) - p) * Decimal(count) * Decimal(10000)
+    return Decimal(math.ceil(raw)) / Decimal(10000)
+
+
+def _recon_row_cost(row: dict[str, Any]) -> Decimal:
+    """Σ over the row's rest + wing fills of ``price x count + total_fee`` (the cash actually paid),
+    recomputing each fee count-aware via ``_recon_fill_fee``."""
+    cost = Decimal(0)
+    for f in list(row.get("fills") or []) + list(row.get("wing_fills") or []):
+        p = _dec(f.get("price", 0)) or Decimal(0)
+        c = Decimal(int(f.get("count", 0) or 0))
+        cost += p * c + _recon_fill_fee(f)
+    return cost
+
+
+def build_ledger_reconciliation(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per completed/partial SET, the STORED (window + backfill) realized_delta vs the CORRECTED
+    count-aware number (read-only; the historical over/under-credit stays in the append-only ledger).
+
+    Corrected floor = ``_v32_floor_booked_for_entry`` (count-aware, bucket leg included via
+    ``wing_batch_sets`` or the explicit ``floor_booked``). Corrected cost = ``_recon_row_cost`` (total
+    fees x count). Corrected window delta = floor - cost. A COMPLETE set pays exactly $2 x count at
+    settlement, so its corrected payoff = $2 x count and its corrected backfill correction = payoff -
+    floor = $0; the corrected per-set total is then floor - cost + 0 = the venue balance move. An
+    incomplete/one-legged set with a backfill row keeps that row's payoff (priced over the legs it
+    held). Only set-bearing armed windows (``realized_delta`` present) appear."""
+    bfmap: dict[str, dict[str, Any]] = {
+        str(r.get("backfill_of")): r for r in rows if r.get("mode") == "backfill" and r.get("backfill_of")
+    }
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if r.get("mode") == "backfill":
+            continue
+        if r.get("realized_delta") is None:
+            continue
+        ct = str(r.get("close_time"))
+        legs = r.get("unsettled_legs") or r.get("held_legs") or []
+        floor = _v32_floor_booked_for_entry(r, legs)
+        cost = _recon_row_cost(r)
+        corr_window = floor - cost
+        batches = r.get("wing_batch_sets")
+        if isinstance(batches, list) and batches:
+            total_count = sum(int(b.get("fill_count", 0) or 0) for b in batches)
+            complete = all(b.get("completed") for b in batches)
+        else:
+            # No per-batch sets (an old ledger row): the set size is ``lots_filled`` when the row
+            # carries it, else the SMALLEST held-leg count (all legs of one set share a count; the
+            # min fails closed -- a smaller size can only UNDER-state the corrected payoff, never
+            # over-credit). Never the old integer-divide, which silently truncated a mixed-count row.
+            leg_counts = [int(lg["count"]) if isinstance(lg, dict) else int(lg[2]) for lg in legs]
+            total_count = int(r.get("lots_filled") or 0) or (min(leg_counts) if leg_counts else 0)
+            complete = (_dec(r.get("realized_lock")) is not None) and not bool(r.get("one_legged"))
+        bf = bfmap.get(ct)
+        if complete and total_count:
+            corr_payoff = Decimal(2) * Decimal(total_count)
+            corr_backfill: Decimal | None = corr_payoff - floor
+        elif bf is not None:
+            corr_backfill = (_dec(bf.get("settlement_payoff")) or Decimal(0)) - floor
+        else:
+            corr_backfill = None  # still pending -> no correction booked yet
+        corr_total = corr_window + (corr_backfill if corr_backfill is not None else Decimal(0))
+        stored_window = _dec(r.get("realized_delta")) or Decimal(0)
+        stored_backfill = _dec(bf.get("realized_delta")) if bf is not None else None
+        stored_total = stored_window + (stored_backfill if stored_backfill is not None else Decimal(0))
+        out.append({
+            "close_time": ct,
+            "size": total_count,
+            "complete": complete,
+            "backfilled": bf is not None,
+            "stored_window": stored_window,
+            "stored_backfill": stored_backfill,
+            "stored_total": stored_total,
+            "corr_window": corr_window,
+            "corr_backfill": corr_backfill,
+            "corr_total": corr_total,
+        })
+    return out
+
+
+def _render_reconciliation(recon: list[dict[str, Any]]) -> list[str]:
+    if not recon:
+        return []
+    lines = [
+        "",
+        "LEDGER RECONCILIATION (count-aware settlement backfill, read-only; ledger unchanged)",
+        "-" * 92,
+        "  " + "close_time".ljust(22) + "sz".rjust(3) + "cmpl".rjust(6)
+        + "stored_win".rjust(12) + "stored_bf".rjust(11) + "stored_tot".rjust(12)
+        + "corr_win".rjust(12) + "corr_bf".rjust(10) + "corr_tot".rjust(11),
+    ]
+
+    def d(v: Decimal | None, w: int) -> str:
+        return ("-" if v is None else f"{v:+.4f}").rjust(w)
+
+    tot_stored = Decimal(0)
+    tot_corr = Decimal(0)
+    for e in recon:
+        tot_stored += e["stored_total"]
+        tot_corr += e["corr_total"]
+        lines.append(
+            "  " + str(e["close_time"]).ljust(22)
+            + str(e["size"]).rjust(3)
+            + ("Y" if e["complete"] else "n").rjust(6)
+            + d(e["stored_window"], 12) + d(e["stored_backfill"], 11) + d(e["stored_total"], 12)
+            + d(e["corr_window"], 12) + d(e["corr_backfill"], 10) + d(e["corr_total"], 11)
+        )
+    lines.append("-" * 92)
+    lines.append(
+        f"  sets = {len(recon)}   stored_total = {tot_stored:+.4f}   "
+        f"corrected_total = {tot_corr:+.4f}   delta(stored-corr) = {tot_stored - tot_corr:+.4f}"
+    )
+    lines.append(
+        "  corr_tot = the venue balance move per set (complete set: $2 x size settlement nets the "
+        "count-aware floor -> corr_bf 0)"
+    )
+    return lines
+
+
 def _render(report: dict[str, Any]) -> str:
     e_keys = report["e_keys"]
     lines: list[str] = []
@@ -526,6 +668,8 @@ def _render(report: dict[str, Any]) -> str:
                  else "  mean data-age (lag) = n/a")
     if report.get("falsifier") is not None:
         lines.extend(_render_scoreboard(report["falsifier"]))
+    if report.get("reconciliation"):
+        lines.extend(_render_reconciliation(report["reconciliation"]))
     return "\n".join(lines)
 
 
