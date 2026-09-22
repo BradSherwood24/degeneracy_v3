@@ -9,7 +9,8 @@ untouched here.
 
 | suite | before | after |
 |---|---|---|
-| pilot (`cd pilot && python -m pytest -q`) | 957 passed, 2 skipped, **2 errors** (961 collected) | **964 passed, 4 skipped, 0 errors** (968 collected) |
+| pilot on the BOX (`cd pilot && python -m pytest -q`, corpora present) | 957 passed, 2 skipped, **2 errors** (961 collected) | **964 passed, 4 skipped, 0 errors** (968 collected) |
+| pilot on a CLEAN CLONE (CI-equivalent, corpora absent) | would ERROR (5 collection errors + 2 quintile) | **900 passed, 10 skipped, 0 errors** |
 | proxy scratchpad copy (`python -m pytest -q`) | 101 passed (existing) | **132 passed** (101 + 31 Phase H) |
 
 - The 2 pre-existing pilot **errors** were `test_quintile.py::test_quintile_reproduction_exact` and
@@ -23,12 +24,25 @@ untouched here.
   gitignored, so it too skips via the `edges` fixture guard (verified by clean-checkout simulation
   below).
 
-## Clean-checkout (CI-equivalent) simulation
+## Clean-checkout (CI-equivalent) simulation — GREEN
 
-`git archive` of the branch HEAD into a fresh dir (tracked files only → no `historical-data/`, no
-`sim/out/`) + a fresh venv with `pip install -r requirements.txt -r requirements-dev.txt`, then
-`cd pilot && python -m pytest -q -rs`: **see the run receipts at the end of this report.** This is the
-exact command sequence the GitHub Action runs; it proves the suite is green with BOTH corpora absent.
+A local `git clone` of the branch into a fresh dir (a REAL git repo, so the `git check-ignore` test in
+`test_run_v32.py` works; corpora `historical-data/` + `sim/out/` and the separate `degeneracy-proxy/`
+tree are all absent because they are gitignored/untracked — exactly the CI condition) + a fresh venv from
+`pip install -r requirements.txt -r requirements-dev.txt`, then the EXACT Action steps:
+
+```
+python -m compileall pilot            -> OK
+cd pilot && python -m pytest -q -rs   -> 900 passed, 10 skipped, 0 failed, 0 errors
+```
+
+The 10 skips (all with reason strings): 5 census-import modules (`reference_impl_review.py`,
+`test_parity.py`, `test_review_probes2.py`, `test_shakedown.py`, plus `test_quintile.py`'s edges test),
+`test_orders_proxy_compat.py` (proxy source absent), `test_box_golden.py` ×2 and `test_quintile.py` ×2
+(historical-data absent). Note: an earlier `git archive` attempt (no `.git`) falsely failed only the
+`git check-ignore` mode-file test — that test needs a git repo, which `actions/checkout` provides, so the
+`git clone` run above is the faithful CI simulation (and `git check-ignore pilot/ops/v32_mode.txt`
+returns 0 in the real repo).
 
 ## What changed — files
 
@@ -44,6 +58,12 @@ Repo (in git, merges normally; Brad merges the PR):
 - `pilot/tests/test_quintile.py` — fixture guards: `market_inputs` skips on absent `historical-data/`,
   `edges` skips on absent `sim/out/census_train.csv`. The 3 pure `test_live_pairing_*` tests use neither
   fixture and always run. Minimal, reason strings included.
+- `pilot/tests/{reference_impl_review,test_parity,test_review_probes2,test_shakedown}.py` — module-level
+  `pytest.skip(..., allow_module_level=True)` when `sim/out/census_train.csv` is absent (these call
+  `load_ev_curve()` at IMPORT, so a fixture cannot save them — they errored at collection on the clean
+  clone). No assertion or behaviour weakened.
+- `pilot/tests/test_orders_proxy_compat.py` — module-level skip when `degeneracy-proxy/proxy.py` (the
+  separate, non-git service tree) is absent, e.g. on CI. The cross-check still runs on the box.
 - `pilot/service/proxy_writer.py` — client-side shared secret: `_dv3_token_headers()` reads
   `DV3_PROXY_TOKEN` and returns `{"X-DV3-Token": <tok>}` or `{}`; attached to `_default_post` and
   `_default_delete` (WRITES ONLY — GETs stay unauthenticated to match the proxy). Absent env var → no
