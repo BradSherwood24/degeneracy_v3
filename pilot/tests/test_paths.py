@@ -86,3 +86,65 @@ def test_proxy_base_from_env(monkeypatch):
 def test_proxy_base_blank_falls_back(monkeypatch):
     monkeypatch.setenv(paths.PROXY_BASE_ENV, "  ")
     assert paths.default_proxy_base() == "http://127.0.0.1:8642"
+
+
+# ---------------------------------------------------------------------------
+# Day-guard mid-cutover fallback (PR #83 review Finding 1b) -- run_v32._resolve_v32_guard_path
+# ---------------------------------------------------------------------------
+def _guard_name(day):
+    return f"v32_stops_{day}.json"
+
+
+def test_guard_no_env_uses_ops_dir(monkeypatch, tmp_path):
+    import service.run_v32 as r
+    ops = str(tmp_path / "ops")
+    monkeypatch.setattr(r, "data_dir", lambda: None)
+    monkeypatch.setattr(r, "ops_dir_v32", lambda: ops)
+    day = "2026-09-22"
+    # No env -> the historic ops-dir guard path, whether or not the file exists (byte-identical path).
+    assert r._resolve_v32_guard_path(day) == os.path.join(ops, _guard_name(day))
+
+
+def test_guard_fallback_to_checkout_when_data_missing(monkeypatch, tmp_path):
+    import service.run_v32 as r
+    data_ops = tmp_path / "data" / "ops"
+    checkout_ops = tmp_path / "checkout" / "ops"
+    data_ops.mkdir(parents=True)
+    checkout_ops.mkdir(parents=True)
+    monkeypatch.setattr(r, "data_dir", lambda: str(tmp_path / "data"))
+    monkeypatch.setattr(r, "ops_dir_v32", lambda: str(data_ops))
+    monkeypatch.setattr(r, "checkout_ops_dir", lambda: str(checkout_ops))
+    day = "2026-09-22"
+    (checkout_ops / _guard_name(day)).write_text("{}", encoding="utf-8")  # latched earlier today
+    # data-dir guard absent, checkout guard present -> use the CHECKOUT guard (preserve the latch).
+    assert r._resolve_v32_guard_path(day) == os.path.join(str(checkout_ops), _guard_name(day))
+
+
+def test_guard_uses_data_when_data_guard_present(monkeypatch, tmp_path):
+    import service.run_v32 as r
+    data_ops = tmp_path / "data" / "ops"
+    checkout_ops = tmp_path / "checkout" / "ops"
+    data_ops.mkdir(parents=True)
+    checkout_ops.mkdir(parents=True)
+    monkeypatch.setattr(r, "data_dir", lambda: str(tmp_path / "data"))
+    monkeypatch.setattr(r, "ops_dir_v32", lambda: str(data_ops))
+    monkeypatch.setattr(r, "checkout_ops_dir", lambda: str(checkout_ops))
+    day = "2026-09-22"
+    (data_ops / _guard_name(day)).write_text("{}", encoding="utf-8")
+    (checkout_ops / _guard_name(day)).write_text("{}", encoding="utf-8")
+    # data-dir guard exists -> use it, no fallback even though a checkout guard also exists.
+    assert r._resolve_v32_guard_path(day) == os.path.join(str(data_ops), _guard_name(day))
+
+
+def test_guard_fresh_day_uses_data(monkeypatch, tmp_path):
+    import service.run_v32 as r
+    data_ops = tmp_path / "data" / "ops"
+    checkout_ops = tmp_path / "checkout" / "ops"
+    data_ops.mkdir(parents=True)
+    checkout_ops.mkdir(parents=True)
+    monkeypatch.setattr(r, "data_dir", lambda: str(tmp_path / "data"))
+    monkeypatch.setattr(r, "ops_dir_v32", lambda: str(data_ops))
+    monkeypatch.setattr(r, "checkout_ops_dir", lambda: str(checkout_ops))
+    day = "2026-09-23"
+    # neither exists (a fresh UTC day after cutover) -> the data-dir guard is authoritative.
+    assert r._resolve_v32_guard_path(day) == os.path.join(str(data_ops), _guard_name(day))

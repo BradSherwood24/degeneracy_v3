@@ -16,7 +16,13 @@ import sys
 import pytest
 
 from service import paths, supervisor
-from service.supervisor import PopenChild, Supervisor, in_launch_band, next_forty
+from service.supervisor import (
+    PopenChild,
+    Supervisor,
+    _boot_sweep_wait_ready,
+    in_launch_band,
+    next_forty,
+)
 
 
 def _epoch(iso: str) -> float:
@@ -347,3 +353,87 @@ def test_supervisor_log_lands_in_data_dir_only(monkeypatch, tmp_path):
     with open(log, "r", encoding="utf-8") as f:
         body = f.read()
     assert '"event": "window"' in body
+
+
+# ===========================================================================
+# Per-window watchdog (Finding 2)
+# ===========================================================================
+def test_child_watchdog_kills_hung_child_and_continues():
+    """A child still running past window close + watchdog grace is forwarded/killed, logged, and the
+    supervisor moves on (here --once -> returns 0 after the one killed window)."""
+    clk = _Clock(_epoch("2026-09-22T00:45:00Z"))
+
+    def on_wait(_n):
+        # every wait sees the clock already far past close(01:00) + grace(120s)
+        clk.t = _epoch("2026-09-22T01:00:00Z") + 10_000
+
+    child = FakeChild([None, None, None], on_wait=on_wait)  # never exits on its own
+    events = []
+    sup = Supervisor(**_quiet_fakes(
+        once=True, run_now=True, clock=clk,
+        spawn=lambda args: child,
+        on_event=events.append,
+    ))
+    rc = sup.run()
+    assert rc == 0
+    assert child.forwarded == [signal.SIGTERM]
+    assert child.killed is True
+    kinds = [e["event"] for e in events]
+    assert "child_watchdog_killed" in kinds
+    window = [e for e in events if e["event"] == "window"][0]
+    assert window["status"] == "watchdog_killed"
+    assert window["signaled"] is False
+
+
+def test_healthy_child_never_trips_watchdog():
+    """A child that exits promptly reports status 'exited' and no watchdog kill."""
+    events = []
+    sup = Supervisor(**_quiet_fakes(
+        once=True, run_now=True,
+        clock=lambda: _epoch("2026-09-22T00:45:00Z"),
+        spawn=lambda args: FakeChild([0]),
+        on_event=events.append,
+    ))
+    assert sup.run() == 0
+    window = [e for e in events if e["event"] == "window"][0]
+    assert window["status"] == "exited"
+    assert "child_watchdog_killed" not in [e["event"] for e in events]
+
+
+# ===========================================================================
+# Boot-sweep proxy-readiness retry (Finding 3)
+# ===========================================================================
+def test_boot_sweep_wait_ready_stops_when_ready():
+    logs, sleeps = [], []
+    seq = iter([False, False, True])
+    ready = _boot_sweep_wait_ready(
+        "http://p:8642", max_attempts=4, retry_interval_s=2.0,
+        ready_fn=lambda _b: next(seq), sleep=sleeps.append, log=logs.append,
+    )
+    assert ready is True
+    assert len(logs) == 3            # one log line per attempt, until ready
+    assert sleeps == [2.0, 2.0]      # slept between the two not-ready attempts, not after success
+
+
+def test_boot_sweep_wait_ready_gives_up_after_max_attempts():
+    logs, sleeps = [], []
+    ready = _boot_sweep_wait_ready(
+        "http://p:8642", max_attempts=3, retry_interval_s=1.5,
+        ready_fn=lambda _b: False, sleep=sleeps.append, log=logs.append,
+    )
+    assert ready is False
+    assert len(logs) == 3            # one per attempt
+    assert sleeps == [1.5, 1.5]      # no sleep after the final attempt
+
+
+def test_boot_sweep_skips_readiness_and_proxy_when_not_armed(monkeypatch):
+    """dry/shakedown (and not --dry-sweep): a logged no-op -- readiness never probed, proxy untouched."""
+    monkeypatch.setattr(supervisor, "_read_mode_safe", lambda: "dry")
+    probed = []
+    logs = []
+    result = supervisor._default_boot_sweep(
+        "http://p:8642", dry_sweep=False, clock=lambda: 0.0, log=logs.append,
+        ready_fn=lambda b: probed.append(b) or True, sleep=lambda s: None,
+    )
+    assert result["skipped"] is True and result["mode"] == "dry"
+    assert probed == []              # no readiness probe when the sweep touches no proxy

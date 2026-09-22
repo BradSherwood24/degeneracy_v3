@@ -125,6 +125,8 @@ from service.v32.stops import (
     v32_s4_decision,
 )
 from service.paths import (
+    checkout_ops_dir,
+    data_dir,
     default_proxy_base,
     journal_dir_v32,
     ledger_path_v32,
@@ -195,6 +197,31 @@ def resolve_v32_mode(cli_mode: str | None, mode_txt_path: str) -> str:
     raw = cli_mode if cli_mode else read_v32_mode_file(mode_txt_path)
     m = (raw or "").strip().lower()
     return m if m in VALID_MODES_V32 else "shakedown"
+
+
+def _resolve_v32_guard_path(utc_day: str) -> str:
+    """The V3.2 day-guard/stops file for ``utc_day``. Normally under ``ops_dir_v32()``.
+
+    Mid-day-cutover safety (PR #83 review Finding #1): if ``DV3_DATA_DIR`` is set but the data-dir guard
+    for today does NOT yet exist while the CHECKOUT ``ops/v32_stops_<day>.json`` DOES, use the CHECKOUT
+    guard as authoritative for that day and log loudly -- so a latched S1/S2/S4 stop (or legged count)
+    from earlier in the same UTC day is never silently dropped by opting into a data dir mid-day. This
+    is a read-only-style fallback for the GUARD ONLY -- NEVER for the mode file (which has no fallback,
+    by decision). With ``DV3_DATA_DIR`` unset this is byte-identical to the historic
+    ``v32_day_guard_path(os.path.join(_PILOT_DIR, "ops"), utc_day)``.
+    """
+    primary = v32_day_guard_path(ops_dir_v32(), utc_day)
+    if data_dir() is None:
+        return primary
+    checkout = v32_day_guard_path(checkout_ops_dir(), utc_day)
+    if primary != checkout and not os.path.exists(primary) and os.path.exists(checkout):
+        logger.warning(
+            "[V32] DV3_DATA_DIR set but data-dir day-guard %s is missing while the checkout guard %s "
+            "exists -> using the CHECKOUT guard as authoritative for %s. Copy today's "
+            "v32_stops_*.json into the data dir at cutover (see V33_RUNBOOK). Latched stops preserved.",
+            primary, checkout, utc_day)
+        return checkout
+    return primary
 
 
 def effective_mode_and_degrade(resolved_mode: str) -> tuple[str, str | None]:
@@ -1889,9 +1916,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001
             positions = None
             logger.warning("[V32] positions read failed: %s", e)
-        ops_dir = ops_dir_v32()
         utc_day = close_iso[:10]
-        guard_path = v32_day_guard_path(ops_dir, utc_day)
+        guard_path = _resolve_v32_guard_path(utc_day)
         day_guard = read_day_guard(guard_path, utc_day)
         s4 = None
         try:
@@ -1975,9 +2001,8 @@ def main(argv: list[str] | None = None) -> int:
         # hour down (core); the DAY latches at the threshold (recorded in the SEPARATE v32 day guard).
         if armed and driver.state.one_legged:
             try:
-                ops_dir = ops_dir_v32()
                 utc_day = close_iso[:10]
-                n = record_legged_occurrence(v32_day_guard_path(ops_dir, utc_day), utc_day,
+                n = record_legged_occurrence(_resolve_v32_guard_path(utc_day), utc_day,
                                              close_iso, "set left one-legged below lock floor",
                                              clock())
                 journal.append("s1_legged_occurrence",

@@ -18,7 +18,9 @@ The loop, once per UTC hour:
      ``run_v32`` never inherited, so orphan raw journals accumulate today.
   4. spawn ``python -m service.run_v32`` (same cwd/argv as the scheduled task; mode + paths come from
      the mode file / env, not baked-in flags), wait for it, and emit one structured JSON line
-     (wake time, child pid, exit code, duration).
+     (wake time, child pid, exit code, duration). A per-window WATCHDOG kills a child still running at
+     its window close + a grace (default 120 s; run_v32's own deadline is close + 10 s) and moves on,
+     so one wedged window can never take the strategy offline for hours.
   5. repeat (``--once`` runs exactly one window then exits).
 
 SIGTERM / SIGINT / (Windows) SIGBREAK: while idle it exits 0 promptly; while a child runs it forwards
@@ -68,8 +70,18 @@ LAUNCH_SEC = 40 * 60  # 2400
 # deploy still risks a leaked rest until T-4 expiry (hence the :02-:33 deploy rule + the boot sweep).
 SIGTERM_GRACE_S = 240.0
 
-# How often the child-wait loop wakes to re-check the stop flag while the window runs.
+# How often the child-wait loop wakes to re-check the stop flag / watchdog deadline while a window runs.
 CHILD_POLL_S = 1.0
+
+# Per-window watchdog: if the child is STILL running this long after its window close (:00), the
+# supervisor forwards a signal, waits the SIGTERM grace, hard-kills, logs child_watchdog_killed, and
+# moves on to the next :40 -- one wedged window can never silently take the strategy offline for hours.
+# run_v32's OWN deadline is close + 10 s (GRACE_SECONDS), so a healthy child always returns well before.
+WATCHDOG_GRACE_S = 120.0
+
+# Boot-sweep proxy-readiness retry: a fresh host boot may start the supervisor before the proxy is up.
+BOOT_SWEEP_MAX_ATTEMPTS = 4
+BOOT_SWEEP_RETRY_INTERVAL_S = 2.0
 
 
 # ===========================================================================
@@ -104,6 +116,12 @@ def _next_top_of_hour_iso(now: float) -> str:
     dt = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc)
     top = dt.replace(minute=0, second=0, microsecond=0) + _dt.timedelta(hours=1)
     return top.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _next_top_of_hour_epoch(now: float) -> float:
+    """The next :00:00 UTC strictly after ``now`` (epoch) -- the child's window close, for the
+    watchdog deadline."""
+    return (math.floor(now / 3600.0) + 1) * 3600
 
 
 def _current_window_journal_basename(now: float) -> str:
@@ -205,40 +223,94 @@ class _DryDeleteWriter:
         return WriteResponse(status_code=200, body={}, ok=True, error=None)
 
 
+def _proxy_ready(proxy_base: str, timeout: float = 2.0) -> bool:
+    """A cheap boot-time readiness probe: GET ``{base}/health``; ready iff it answers < 500.
+
+    A not-yet-started proxy (connection refused / timeout) -> not ready. Read-only, no key material.
+    """
+    import requests
+
+    try:
+        resp = requests.get(proxy_base.rstrip("/") + "/health", timeout=timeout)
+        return int(getattr(resp, "status_code", 500)) < 500
+    except Exception:  # noqa: BLE001 - any transport error means "not ready yet"
+        return False
+
+
+def _boot_sweep_wait_ready(
+    proxy_base: str,
+    *,
+    max_attempts: int,
+    retry_interval_s: float,
+    ready_fn: Callable[[str], bool],
+    sleep: Callable[[float], None],
+    log: Callable[[str], None],
+) -> bool:
+    """Poll the proxy for readiness up to ``max_attempts`` times, ``retry_interval_s`` apart, logging
+    ONE line per attempt. Returns True as soon as it is ready, else False after the last attempt.
+
+    Boot-only (a fresh host may start the supervisor before the proxy). This wraps -- does NOT replace
+    -- the bounded retry already inside ``cancel_stale_open_orders`` -> ``ProxyAuth.rest_get``.
+    """
+    for attempt in range(1, max_attempts + 1):
+        ready = ready_fn(proxy_base)
+        log(f"boot_sweep proxy readiness attempt {attempt}/{max_attempts}: ready={ready} "
+            f"base={proxy_base}")
+        if ready:
+            return True
+        if attempt < max_attempts:
+            sleep(retry_interval_s)
+    return False
+
+
 def _default_boot_sweep(
     proxy_base: str,
     *,
     dry_sweep: bool,
     clock: Callable[[], float],
     log: Callable[[str], None],
+    max_attempts: int = BOOT_SWEEP_MAX_ATTEMPTS,
+    retry_interval_s: float = BOOT_SWEEP_RETRY_INTERVAL_S,
+    ready_fn: Callable[[str], bool] = _proxy_ready,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Cancel stray resting ``v32-*`` KXBTC orders via the proxy (crash-recovery on boot).
 
     - ``--dry-sweep``: list what WOULD be cancelled (read-only), issue no DELETE. Independent of mode.
     - mode != ``armed`` (from the mode file): a no-op with a log line (nothing is placed in dry, so
       nothing of ours should be resting to cancel; if a prior armed run left rests, ``--dry-sweep`` or
-      an armed boot clears them).
+      an armed boot clears them). No proxy is touched -> no readiness wait.
     - mode == ``armed``: the real sweep. Fail-closed: an unreachable proxy just cancels nothing
       (``cancel_stale_open_orders`` swallows the read error and returns zeros).
+
+    Before any proxy-touching sweep it waits (bounded, explicit ``max_attempts`` / ``retry_interval_s``,
+    one log line per attempt) for the proxy to answer ``/health`` -- a fresh host boot may start the
+    supervisor before the proxy is up. It proceeds regardless once the attempts are spent (the sweep is
+    already fail-closed).
     """
     from service.proxy_writer import ProxyWriter
     from service.v32.executor import cancel_stale_open_orders
 
     mode = _read_mode_safe()
     journal = _LogJournal(log)
-    if dry_sweep:
-        writer = _DryDeleteWriter(ProxyWriter(base_url=proxy_base), log)
-        result = cancel_stale_open_orders(writer, journal, clock)
-        result = {**result, "dry_sweep": True, "mode": mode}
-        log(f"boot_sweep dry_sweep result={result}")
-        return result
-    if mode != "armed":
+    if not dry_sweep and mode != "armed":
         result = {"skipped": True, "mode": mode, "found": 0, "cancelled": 0, "errors": 0}
         log(f"boot_sweep skipped (mode={mode}, not armed)")
         return result
+
+    ready = _boot_sweep_wait_ready(
+        proxy_base, max_attempts=max_attempts, retry_interval_s=retry_interval_s,
+        ready_fn=ready_fn, sleep=sleep, log=log,
+    )
+    if dry_sweep:
+        writer: Any = _DryDeleteWriter(ProxyWriter(base_url=proxy_base), log)
+        result = cancel_stale_open_orders(writer, journal, clock)
+        result = {**result, "dry_sweep": True, "mode": mode, "proxy_ready": ready}
+        log(f"boot_sweep dry_sweep result={result}")
+        return result
     writer = ProxyWriter(base_url=proxy_base)
     result = cancel_stale_open_orders(writer, journal, clock)
-    result = {**result, "mode": mode}
+    result = {**result, "mode": mode, "proxy_ready": ready}
     log(f"boot_sweep result={result}")
     return result
 
@@ -299,6 +371,9 @@ class Supervisor:
         dry_sweep: bool = False,
         grace_s: float = SIGTERM_GRACE_S,
         child_poll_s: float = CHILD_POLL_S,
+        watchdog_grace_s: float = WATCHDOG_GRACE_S,
+        boot_sweep_max_attempts: int = BOOT_SWEEP_MAX_ATTEMPTS,
+        boot_sweep_retry_interval_s: float = BOOT_SWEEP_RETRY_INTERVAL_S,
         clock: Callable[[], float] = time.time,
         spawn: Callable[[list[str]], Any] | None = None,
         sweep: Callable[[str], dict[str, Any]] | None = None,
@@ -315,11 +390,16 @@ class Supervisor:
         self._dry_sweep = dry_sweep
         self._grace_s = grace_s
         self._child_poll_s = child_poll_s
+        self._watchdog_grace_s = watchdog_grace_s
+        self._boot_sweep_max_attempts = boot_sweep_max_attempts
+        self._boot_sweep_retry_interval_s = boot_sweep_retry_interval_s
         self._clock = clock
         self._spawn = spawn or _default_spawn
         self._sweep = sweep or (
             lambda base: _default_boot_sweep(
-                base, dry_sweep=self._dry_sweep, clock=self._clock, log=logger.info
+                base, dry_sweep=self._dry_sweep, clock=self._clock, log=logger.info,
+                max_attempts=self._boot_sweep_max_attempts,
+                retry_interval_s=self._boot_sweep_retry_interval_s,
             )
         )
         self._rotate = rotate or (lambda jd: _default_rotate(jd, clock=self._clock))
@@ -382,21 +462,35 @@ class Supervisor:
             self._on_event(record)
 
     # --- child wait ---
-    def _wait_child(self, child: Any) -> tuple[int | None, bool]:
-        """Wait for the child. Returns ``(exit_code, signaled)``. On stop: forward the signal, wait
-        up to the grace, hard-kill if it overstays, and return ``(code, True)``."""
+    def _reap_after_signal(self, child: Any) -> int | None:
+        """Forward the current signal to the child, wait the grace, hard-kill if it overstays, and
+        return the child's final exit code (or None if it never reports one)."""
+        sig = self._sig if self._sig is not None else signal.SIGTERM
+        child.forward_signal(sig)
+        rc = child.wait(self._grace_s)
+        if rc is None:
+            child.kill()
+            rc = child.wait(self._child_poll_s)
+        return rc
+
+    def _wait_child(self, child: Any, watchdog_deadline: float) -> tuple[int | None, str]:
+        """Wait for the child. Returns ``(exit_code, status)`` where status is:
+          - ``"exited"``     -- the child returned on its own;
+          - ``"signaled"``   -- a shutdown signal arrived; forward + grace + kill, exit the supervisor;
+          - ``"watchdog_killed"`` -- the child overran ``watchdog_deadline`` (close + watchdog grace);
+            forward + grace + kill, then the supervisor CONTINUES to the next :40.
+        A shutdown signal takes priority over the watchdog deadline.
+        """
         while True:
             rc = child.wait(self._child_poll_s)
             if rc is not None:
-                return rc, False
+                return rc, "exited"
             if self._stop_requested:
-                sig = self._sig if self._sig is not None else signal.SIGTERM
-                child.forward_signal(sig)
-                rc = child.wait(self._grace_s)
-                if rc is None:
-                    child.kill()
-                    rc = child.wait(self._child_poll_s)
-                return rc, True
+                return self._reap_after_signal(child), "signaled"
+            if self._clock() >= watchdog_deadline:
+                logger.warning("[SUPERVISOR] child watchdog: window overran close + %.0fs; killing "
+                               "child", self._watchdog_grace_s)
+                return self._reap_after_signal(child), "watchdog_killed"
 
     # --- main loop ---
     def run(self) -> int:
@@ -447,8 +541,9 @@ class Supervisor:
 
             wake_iso = _iso(self._clock())
             start = self._clock()
+            watchdog_deadline = _next_top_of_hour_epoch(start) + self._watchdog_grace_s
             child = self._spawn(self._child_args)
-            rc, signaled = self._wait_child(child)
+            rc, status = self._wait_child(child, watchdog_deadline)
             duration = self._clock() - start
             self._emit({
                 "event": "window",
@@ -456,14 +551,18 @@ class Supervisor:
                 "pid": getattr(child, "pid", None),
                 "exit_code": rc,
                 "duration_s": round(duration, 3),
-                "signaled": signaled,
+                "status": status,
+                "signaled": status == "signaled",
                 "rotated": rot.get("count") if isinstance(rot, dict) else None,
             })
+            if status == "watchdog_killed":
+                self._emit({"event": "child_watchdog_killed", "wake": wake_iso, "exit_code": rc})
 
-            if signaled:
+            if status == "signaled":
                 return rc if isinstance(rc, int) else 0
             if self._once:
                 return 0
+            # "exited" or "watchdog_killed" -> continue to the next :40
 
 
 # ===========================================================================
