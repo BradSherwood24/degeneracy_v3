@@ -1254,3 +1254,37 @@ pull :02-:33; (3) proxy already allows 2/order, budget 4000, ~$3.80 in flight pe
 **Ops:** never two agents in one worktree (dv3_wt_v11 builds, dv3_wt_review reviews, dv3_wt_fix hotfixes/docs, dv3_wt_amend amend). Brad's box levers
 unchanged: proxy as service, task logon setting, auto-update off, and now the power/network (UPS or wired).
 — Claude
+
+---
+
+## 2026-09-22 ~22:10Z -- Claude -> house: armed days 6-8 at size 2, the battery day, the scans, and the V3.3 plan (pre-compact)
+
+**Live (re-arm 2026-09-14 23:00Z -> 2026-09-22 22:00Z):** n = 12 sets, 12/12 positive, one-legged 0, mean lock +11.2c per contract
+(ledger convention; true ~+12.6c), capture ratio 12/19 = 63%, execution gap -0.6c (live beats shadow). Balance $51.997 -> $54.56.
+Size 2 since 09-20 01:03Z (AMENDMENT 1, PR #70): five size-2 sets, every one a full 2-lot fill in a single sweep, every one hand-reconciled
+to the cent against /portfolio/fills + settlements. Dry tape since 09-20 13Z (shadow dry too). Live tree main c015339, 961 tests.
+
+**Merged this segment:** #70 contracts 2 + sha re-pin; #72 money-math total fees x count (+fee_total on fill records; the size-2 04:00Z row
+overstated realized_delta by 2.28c); #74 count-aware settlement backfill + S4 pending-credit band (bucket-NO leg now listed; complete set
+corrects $0; the old band under-credited a pending size-2 set by $3 = false-latch risk) after a round-1 BLOCK (multi-bucket over-credit) fixed
+per batch; docs #71/#73/#75(closed)/#76/#77/#78/#79/#80.
+
+**Battery day 09-22:** unplugged 15:00:53Z, critical-battery shutdown 17:23Z, boot 17:42Z; the 15:00Z window finished quoting and died after
+quote end with NOTHING on the book (no ledger row; raw 632 MB journal gzipped by hand); 16Z/17Z lost, 18Z ran late; proxy (plain process)
+did not return -> restarted detached 17:45Z. Venue clean throughout. Phase 0 hardening (UPS/plugged, never-sleep on battery, task "run whether
+logged on", proxy as a service) is Brad's and now urgent.
+
+**Scans (docs on main):** RENDER plan `pilot/ops/RENDER_MIGRATION_PLAN.md` (Ohio; private-service proxy + background worker with disk; cron jobs
+cannot hold a disk; deploys kill a window -> :02-:33 rule; $19-37/mo vs ~$13/mo current PnL). MULTI-SERIES `pilot/ops/MULTI_SERIES_DATA_PLAN.md`:
+only 7 co-settling hourly range+strike pairs exist, all crypto; no index/commodity/FX range series; spot-bucket flow vs BTC: ETH 10.7%
+(marginal), everything else ~1% or less (dead); wings liquid everywhere, bucket taker flow is the wall. Polymarket: directional up/down only, no
+strikes/buckets -> no home for the fader. LADDER `pilot/build/mc/v33_ladder_ideal`: 1 lot per rung 5..15c ideal on 167 armed windows = 1806c vs
+310c today (x5.8) but only 1.17x a flat 10 lots at 10c; pumps bimodal (shallow 5-8c or full sweeps to E_max median 22c); every live set was a
+full sweep; first prints 1-2 lots.
+
+**V3.3 PLAN (`pilot/PLAN_V33.md`, Brad agreed 22:00Z):** rolling ladder (K=11 one-lot rungs; a 1c W move ROLLS one order end-to-end, K-1
+keep queue -- Brad's design) + host-shaped runtime run locally first (supervisor per UTC :40, DV3_DATA_DIR, proxy by env, requirements, Linux
+CI). Decisions: coalesced wings (150 ms), no refills in-window, S4 $3 stays, Brad applies the amend cap + budget 8,000, observation ladder
+16..25c, and **V3.2 keeps running armed through the build** (n grows) -- closed only when V3.3 arms. Order: amend cap -> Phase H -> L1 -> L2
+-> L3 -> V3.3 dry -> freeze -> arm. Build starts after the compact on Brad's go.
+-- Claude
