@@ -60,7 +60,9 @@ per rung is the right unit. Ladder over flat-10 is only 1.17x; its case is entri
 position, and the deep rungs -- not raw size. Deeper rungs (to 20-25c) look profitable but need capital
 ($40 in flight at 5..25 vs $54 balance) and their absorption is inferred, not counted.
 
-## 3. Decisions to take before building (Brad; the plan assumes the first option of each)
+## 3. Decisions (Brad, 2026-09-22 ~22:00Z, verbatim: "Agree on all, including the observation-only
+ladder, except one small tweak to 4." -- every [assumed] answer below is therefore DECIDED; Q4 carries
+the tweak)
 
 - **Q1 rung range.** 5..15c (K = 11, ~$21 in flight per full sweep) [assumed] -- or 5..20c (K = 16,
   ~$30) given sweep depth. Any range is a params value; the sha pins it.
@@ -69,10 +71,13 @@ position, and the deep rungs -- not raw size. Deeper rungs (to 20-25c) look prof
   2K taker orders in a burst) [assumed] -- or strictly one wing pair per rung fill (2K orders). Either way
   the count taken always equals the count filled (the 2026-09-18 ruling).
 - **Q3 refills.** A filled rung is NOT re-placed inside the same window (max K lots per window; the risk
-  cap is the ladder size) [assumed] -- or refill holes once the sweep is over (adds a second set per
-  rung; more orders, more one-legged exposure).
-- **Q4 V3.2's record.** When V3.3 arms, the V3.2 roster stops (one armed roster per bucket) and its
-  falsifier is closed with a dated Registration line: "superseded at n = 12, 12/12, mean +11.2c, verdict
+  cap is the ladder size) - **Q4 V3.2's record.** V3.2 KEEPS RUNNING ARMED through the whole V3.3 build (Brad, 2026-09-22
+  ~22:00Z, verbatim: "Lets keep V3.2 running during this build out, so n=>12. Hopefully capture another").
+  Its n keeps growing; the V3.3 dry shadow runs alongside it. Only when V3.3 arms does the V3.2 roster
+  stop (one armed roster per bucket) and its falsifier close with a dated Registration line quoting the
+  n, the record and "verdict not reached / superseded by V3.3". V3.3's 10c rung is NOT pooled into
+  V3.2's n (different mechanics).
+, 12/12, mean +11.2c, verdict
   not reached" [assumed]. V3.3's 10c rung is NOT pooled into V3.2's n (different mechanics).
 - **Q5 stops.** S4 day-loss cap: $3.00 was sized for 1-2 lots; a one-legged rung costs ~$0.35 worst
   case, so a bad K-rung sweep could breach it in one window. Proposal: S4 = max($3.00, 0.5 x K x $0.35)
