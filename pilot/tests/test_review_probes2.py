@@ -9,11 +9,12 @@ FLAGGED (not fixed) latent bin-5 empty-deltas honesty bug handed to Phase 3.
 from __future__ import annotations
 
 import csv
+import os
 from decimal import Decimal
 
 import pytest
 
-from service._simlaw import WINDOW_S, close_epoch, fee, load_ev_curve
+from service._simlaw import DEFAULT_CENSUS_CSV, WINDOW_S, close_epoch, fee, load_ev_curve
 from service.book import TopOfBook
 from service.journal import Journal
 from service.parity import (
@@ -43,6 +44,14 @@ from service.signal import (
     decide,
 )
 from service.wake import LadderCheck, Leg, WakeResult
+
+# The EV curve reads sim/out/census_train.csv, a gitignored TRAIN artifact absent on
+# a fresh CI checkout. Skip this whole module cleanly there (never a collection error).
+if not os.path.exists(DEFAULT_CENSUS_CSV):
+    pytest.skip(
+        "census_train.csv corpus absent (sim/out/ gitignored; not in CI checkout)",
+        allow_module_level=True,
+    )
 
 P = load_policy()
 EV = load_ev_curve()

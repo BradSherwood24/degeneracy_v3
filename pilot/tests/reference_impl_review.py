@@ -26,11 +26,14 @@ No network, no clock, no sealed-day read. Seeded RNG => deterministic scenario c
 
 from __future__ import annotations
 
+import os
 import random
 from dataclasses import dataclass
 from decimal import Decimal
 
-from service._simlaw import WINDOW_S, fee, load_ev_curve
+import pytest
+
+from service._simlaw import DEFAULT_CENSUS_CSV, WINDOW_S, fee, load_ev_curve
 from service.book import TopOfBook
 from service.ledger import (
     PURPOSE_REBALANCE_BUY,
@@ -61,6 +64,14 @@ from service.signal import (
     WindowState,
     decide,
 )
+
+# The EV curve reads sim/out/census_train.csv, a gitignored TRAIN artifact absent on
+# a fresh CI checkout. Skip this whole module cleanly there (never a collection error).
+if not os.path.exists(DEFAULT_CENSUS_CSV):
+    pytest.skip(
+        "census_train.csv corpus absent (sim/out/ gitignored; not in CI checkout)",
+        allow_module_level=True,
+    )
 
 P = load_policy()
 CURVE = load_ev_curve()

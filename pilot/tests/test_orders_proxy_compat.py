@@ -61,6 +61,15 @@ def _load_proxy_parser():
     return ns
 
 
+# The proxy source lives in the separate (non-git) degeneracy-proxy/ tree, absent on a
+# fresh CI checkout. Skip cleanly there rather than erroring at collection; on the box
+# the file is present and this cross-check runs.
+if not os.path.exists(_PROXY):
+    pytest.skip(
+        "degeneracy-proxy/proxy.py not present (separate service tree; not in CI checkout)",
+        allow_module_level=True,
+    )
+
 PROXY = _load_proxy_parser()
 
 MAX_CONTRACTS = 2
