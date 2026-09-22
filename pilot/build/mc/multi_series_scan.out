@@ -1,0 +1,85 @@
+# multi_series_scan.py — inventory + volume scan output (2026-09-22)
+# Read-only proxy GETs; cache re-used. Pacing lines elided. Total unique GETs this session: 933 (budget 2000).
+# Volume unit = contracts (Kalshi volume_fp), whole-market lifetime; spotT15T5 = spot-bucket candle volume T-15..T-5.
+
+[A] INXI           class=OTHER(other) alive=False n_mkts=0 width=None spacing=None ct=None
+[A] KXBNB          class=RANGE    alive=True n_mkts=75 width=5.0 spacing=364.99 ct=2026-09-22T02:00:00Z
+[A] KXBNBD         class=STRIKE   alive=True n_mkts=75 width=None spacing=5.0 ct=2026-09-22T02:00:00Z
+[A] KXBTC          class=RANGE    alive=True n_mkts=188 width=100.0 spacing=18599.99 ct=2026-09-22T02:00:00Z
+[A] KXBTCD         class=STRIKE   alive=True n_mkts=188 width=None spacing=100.0 ct=2026-09-22T02:00:00Z
+[A] KXDJI          class=STRIKE   alive=True n_mkts=57 width=None spacing=25.0 ct=2026-09-21T20:00:00Z
+[A] KXDOGE         class=RANGE    alive=True n_mkts=53 width=0.005 spacing=0.255 ct=2026-09-22T02:00:00Z
+[A] KXDOGED        class=STRIKE   alive=True n_mkts=53 width=None spacing=0.005 ct=2026-09-22T02:00:00Z
+[A] KXETH          class=RANGE    alive=True n_mkts=300 width=5.0 spacing=1489.99 ct=2026-09-22T02:00:00Z
+[A] KXETHD         class=STRIKE   alive=True n_mkts=300 width=None spacing=5.0 ct=2026-09-22T02:00:00Z
+[A] KXGOLDH        class=STRIKE   alive=True n_mkts=40 width=None spacing=2.0 ct=2026-09-22T01:00:00Z
+[A] KXHYPE         class=RANGE    alive=True n_mkts=300 width=0.25 spacing=74.4999 ct=2026-09-22T02:00:00Z
+[A] KXHYPED        class=STRIKE   alive=True n_mkts=300 width=None spacing=0.25 ct=2026-09-22T02:00:00Z
+[A] KXINXI         class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXINXU         class=STRIKE   alive=True n_mkts=70 width=None spacing=5.0 ct=2026-09-21T20:00:00Z
+[A] KXKR200        class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXNASDAQ100U   class=STRIKE   alive=True n_mkts=400 width=None spacing=10.0 ct=2026-09-21T20:00:00Z
+[A] KXNEAR         class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXNEARD        class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXNEARH        class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXNKY          class=STRIKE   alive=False n_mkts=60 width=None spacing=5.0 ct=2026-09-18T06:30:00Z
+[A] KXPALLADIUMH   class=STRIKE   alive=True n_mkts=40 width=None spacing=0.5 ct=2026-09-22T01:00:00Z
+[A] KXRIPPLE       class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXSILVERH      class=STRIKE   alive=True n_mkts=40 width=None spacing=0.05 ct=2026-09-22T01:00:00Z
+[A] KXSOL          class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXSOLD         class=STRIKE   alive=True n_mkts=300 width=None spacing=0.25 ct=2026-09-22T02:00:00Z
+[A] KXSOLE         class=RANGE    alive=True n_mkts=300 width=0.25 spacing=74.4999 ct=2026-09-22T02:00:00Z
+[A] KXTON          class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXTOND         class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXTONH         class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXWTIH         class=STRIKE   alive=True n_mkts=40 width=None spacing=0.1 ct=2026-09-22T01:00:00Z
+[A] KXXRP          class=RANGE    alive=True n_mkts=75 width=0.02 spacing=1.4599 ct=2026-09-22T02:00:00Z
+[A] KXXRPD         class=STRIKE   alive=True n_mkts=75 width=None spacing=0.02 ct=2026-09-22T02:00:00Z
+[A] KXZEC          class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXZECD         class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] KXZECH         class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[A] NASDAQ100I     class=STRIKE   alive=False n_mkts=100 width=None spacing=10.0 ct=2025-02-12T20:00:00Z
+[A] WTIH           class=NO_SETTLED_EVENT alive=False n_mkts=None width=None spacing=None ct=None
+[B] BTC        range=KXBTC strike=KXBTCD both_alive=True width=100.0 spacing=100.0
+[B] ETH        range=KXETH strike=KXETHD both_alive=True width=5.0 spacing=5.0
+[B] SOL        range=KXSOLE strike=KXSOLD both_alive=True width=0.25 spacing=0.25
+[B] DOGE       range=KXDOGE strike=KXDOGED both_alive=True width=0.005 spacing=0.005
+[B] XRP        range=KXXRP strike=KXXRPD both_alive=True width=0.02 spacing=0.02
+[B] BNB        range=KXBNB strike=KXBNBD both_alive=True width=5.0 spacing=5.0
+[B] NEAR       range=None strike=None both_alive=False width=None spacing=None
+[B] TON        range=None strike=None both_alive=False width=None spacing=None
+[B] ZEC        range=None strike=None both_alive=False width=None spacing=None
+[B] HYPE       range=KXHYPE strike=KXHYPED both_alive=True width=0.25 spacing=0.25
+[B] SP500      range=None strike=KXINXU both_alive=False width=None spacing=5.0
+[B] NASDAQ     range=None strike=KXNASDAQ100U both_alive=False width=None spacing=10.0
+[B] DJI        range=None strike=KXDJI both_alive=False width=None spacing=25.0
+[B] NKY        range=None strike=KXNKY both_alive=False width=None spacing=5.0
+[B] KOSPI      range=None strike=None both_alive=False width=None spacing=None
+[B] GOLD       range=None strike=KXGOLDH both_alive=False width=None spacing=2.0
+[B] SILVER     range=None strike=KXSILVERH both_alive=False width=None spacing=0.05
+[B] WTI        range=None strike=KXWTIH both_alive=False width=None spacing=0.1
+[B] PALLADIUM  range=None strike=KXPALLADIUMH both_alive=False width=None spacing=0.5
+[C] KXBTC          hours=246 (2026-09-11..2026-09-22) mean/h=38493 med/h=34322 p90=59383 anyvol=100% spot_share=0.30210467199620616 total=9469349
+[C] KXBTCD         hours=246 (2026-09-11..2026-09-22) mean/h=1686385 med/h=1547505 p90=2541284 anyvol=100% spot_share=0.5275324687167444 total=414850815
+[C2] BTC        wings_found=96% bkt_T15T5_med=1567 lo2s=100% hi2s=96% sweeps_med=22
+[C] KXETH          hours=157 (2026-09-15..2026-09-22) mean/h=8407 med/h=4489 p90=11396 anyvol=99% spot_share=0.31699534658617595 total=1319944
+[C] KXETHD         hours=157 (2026-09-15..2026-09-22) mean/h=63070 med/h=41470 p90=92989 anyvol=99% spot_share=0.5316239787372458 total=9902052
+[C2] ETH        wings_found=92% bkt_T15T5_med=168 lo2s=92% hi2s=92% sweeps_med=2
+[C] KXSOLE         hours=156 (2026-09-15..2026-09-22) mean/h=516 med/h=335 p90=812 anyvol=99% spot_share=0.28448275862068967 total=80465
+[C] KXSOLD         hours=156 (2026-09-15..2026-09-22) mean/h=9822 med/h=7184 p90=14800 anyvol=100% spot_share=0.5582402485548522 total=1532251
+[C2] SOL        wings_found=92% bkt_T15T5_med=4 lo2s=100% hi2s=92% sweeps_med=0
+[C] KXDOGE         hours=327 (2026-09-08..2026-09-22) mean/h=629 med/h=123 p90=992 anyvol=98% spot_share=0.6150234741784038 total=205635
+[C] KXDOGED        hours=327 (2026-09-08..2026-09-22) mean/h=960 med/h=442 p90=2205 anyvol=96% spot_share=0.2615319657999367 total=314050
+[C2] DOGE       wings_found=100% bkt_T15T5_med=15 lo2s=100% hi2s=100% sweeps_med=0
+[C] KXXRP          hours=327 (2026-09-08..2026-09-22) mean/h=1126 med/h=546 p90=2044 anyvol=100% spot_share=0.45642201834862384 total=368235
+[C] KXXRPD         hours=327 (2026-09-08..2026-09-22) mean/h=4947 med/h=2523 p90=6095 anyvol=100% spot_share=0.32892370673819304 total=1617616
+[C2] XRP        wings_found=100% bkt_T15T5_med=45 lo2s=100% hi2s=100% sweeps_med=0
+[C] KXBNB          hours=328 (2026-09-08..2026-09-22) mean/h=344 med/h=101 p90=247 anyvol=100% spot_share=0.5706729595573277 total=112799
+[C] KXBNBD         hours=328 (2026-09-08..2026-09-22) mean/h=355 med/h=207 p90=741 anyvol=100% spot_share=0.5807669789227166 total=116312
+[C2] BNB        wings_found=100% bkt_T15T5_med=1 lo2s=100% hi2s=100% sweeps_med=0
+[C] KXHYPE         hours=286 (2026-09-08..2026-09-22) mean/h=505 med/h=354 p90=942 anyvol=100% spot_share=0.45668709523188594 total=144322
+[C] KXHYPED        hours=276 (2026-09-10..2026-09-22) mean/h=2689 med/h=2122 p90=4667 anyvol=100% spot_share=0.5582632375437288 total=742237
+[C2] HYPE       wings_found=92% bkt_T15T5_med=18 lo2s=100% hi2s=92% sweeps_med=0
+[dump] wrote C:\Users\Brads\Python_stuff\dv3_wt_review\pilot\build\mc\multi_series_scan.json
+
+TOTAL GETs this run: 528
