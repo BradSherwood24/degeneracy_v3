@@ -27,9 +27,17 @@ _CENSUS = os.path.join(_SIM, "out", "census_train.csv")
 _LOAD_DATES = [f"2026-06-{d:02d}" for d in range(11, 22)]  # 06-11..06-21 (trailing tape included)
 _TEST_DATES = {f"2026-06-{d:02d}" for d in range(13, 21)}  # windows tested: 06-13..06-20
 
+# Both corpora are gitignored (historical-data/, sim/out/) and so are ABSENT on a
+# fresh CI checkout. Skip (never error) when either is missing; the pure pairing
+# tests below need neither and always run. On the laptop both are present -> no skip.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_HISTORICAL_DATA = os.path.join(_REPO_ROOT, "historical-data")
+
 
 @pytest.fixture(scope="module")
 def market_inputs():
+    if not os.path.isdir(_HISTORICAL_DATA):
+        pytest.skip("historical-data corpus absent (gitignored; not in CI checkout)")
     m15, _ = loader.load_markets("15-minute", _LOAD_DATES)
     m1h, _ = loader.load_markets("1-hour", _LOAD_DATES)
     return m15, m1h
@@ -37,6 +45,8 @@ def market_inputs():
 
 @pytest.fixture(scope="module")
 def edges():
+    if not os.path.exists(_CENSUS):
+        pytest.skip("census_train.csv corpus absent (sim/out/ gitignored; not in CI checkout)")
     return quintile.edges_from_census()
 
 
