@@ -108,7 +108,6 @@ from service.v32.executor import (
 )
 from service.v32.core import lock_value
 from service.v32.ledger import (
-    DEFAULT_V32_LEDGER_PATH,
     append_v32_ledger_row,
     build_v32_ledger_row,
     load_v32_rows,
@@ -124,6 +123,14 @@ from service.v32.stops import (
     record_legged_occurrence,
     v32_day_guard_path,
     v32_s4_decision,
+)
+from service.paths import (
+    default_proxy_base,
+    journal_dir_v32,
+    ledger_path_v32,
+    log_dir_v32,
+    mode_path_v32,
+    ops_dir_v32,
 )
 from service.stops import (
     ensure_balance_start,
@@ -161,9 +168,13 @@ _PUMP_GUARD = 100000  # hard cap on synthetic-event fan-out per pump (loop prote
 _HEARTBEAT_S = 10.0
 
 _PILOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_JOURNAL_DIR = os.path.join(_PILOT_DIR, "journals_v32")
-DEFAULT_LOG_DIR = os.path.join(_PILOT_DIR, "logs_v32")
-DEFAULT_MODE_PATH = os.path.join(_PILOT_DIR, "ops", "v32_mode.txt")
+# Writable paths route through service.paths so DV3_DATA_DIR (the host-shaped runtime / Render disk)
+# can relocate them; with DV3_DATA_DIR unset every value below is byte-identical to the historic
+# _PILOT_DIR-relative literal (behaviour-neutral for the live V3.2). The falsifier is a READ-ONLY
+# input and always stays in the checkout.
+DEFAULT_JOURNAL_DIR = journal_dir_v32()
+DEFAULT_LOG_DIR = log_dir_v32()
+DEFAULT_MODE_PATH = mode_path_v32()
 DEFAULT_FALSIFIER_PATH = os.path.join(_PILOT_DIR, "ceremony", "v32_falsifier.md")
 
 
@@ -1744,10 +1755,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--close", default=None, help="Target close ISO (UTC). Default: next :00.")
     parser.add_argument("--mode", default=None, choices=list(VALID_MODES_V32),
                         help="Override the mode (else read ops/v32_mode.txt; unknown -> shakedown).")
-    parser.add_argument("--journal-dir", default=DEFAULT_JOURNAL_DIR)
-    parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
-    parser.add_argument("--ledger", default=DEFAULT_V32_LEDGER_PATH)
-    parser.add_argument("--mode-file", default=DEFAULT_MODE_PATH)
+    # Resolve writable-path defaults at parse time so DV3_DATA_DIR set by the supervisor/host is
+    # honoured; unset -> the historic _PILOT_DIR-relative default (behaviour-neutral).
+    parser.add_argument("--journal-dir", default=journal_dir_v32())
+    parser.add_argument("--log-dir", default=log_dir_v32())
+    parser.add_argument("--ledger", default=ledger_path_v32())
+    parser.add_argument("--mode-file", default=mode_path_v32())
     parser.add_argument("--falsifier", default=DEFAULT_FALSIFIER_PATH,
                         help="V3.2 falsifier (S5: must carry STATUS: FROZEN to arm).")
     parser.add_argument("--proxy-base", default=None, help="Override the proxy base URL.")
@@ -1757,13 +1770,13 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     clock = time.time
-    proxy = ProxyAuth(base_url=args.proxy_base) if args.proxy_base else ProxyAuth()
+    # --proxy-base wins; else DV3_PROXY_BASE; else http://127.0.0.1:8642 (unchanged default).
+    proxy_base_url = args.proxy_base or default_proxy_base()
+    proxy = ProxyAuth(base_url=proxy_base_url)
     close_iso = args.close or next_top_of_hour_iso(clock())
     summary_path = os.path.join(args.journal_dir, "summary.jsonl")
 
     resolved_mode = resolve_v32_mode(args.mode, args.mode_file)
-
-    proxy_base_url = args.proxy_base or "http://127.0.0.1:8642"
 
     # Load + sha-verify the frozen policy; any drift -> clean stand-down (fail-closed, S5 discipline).
     try:
@@ -1876,7 +1889,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001
             positions = None
             logger.warning("[V32] positions read failed: %s", e)
-        ops_dir = os.path.join(_PILOT_DIR, "ops")
+        ops_dir = ops_dir_v32()
         utc_day = close_iso[:10]
         guard_path = v32_day_guard_path(ops_dir, utc_day)
         day_guard = read_day_guard(guard_path, utc_day)
@@ -1962,7 +1975,7 @@ def main(argv: list[str] | None = None) -> int:
         # hour down (core); the DAY latches at the threshold (recorded in the SEPARATE v32 day guard).
         if armed and driver.state.one_legged:
             try:
-                ops_dir = os.path.join(_PILOT_DIR, "ops")
+                ops_dir = ops_dir_v32()
                 utc_day = close_iso[:10]
                 n = record_legged_occurrence(v32_day_guard_path(ops_dir, utc_day), utc_day,
                                              close_iso, "set left one-legged below lock floor",
