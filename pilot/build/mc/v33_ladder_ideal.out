@@ -1,0 +1,45 @@
+armed+bucket windows in ledger: 167
+  10/167 windows, 13s
+  20/167 windows, 28s
+  30/167 windows, 36s
+  40/167 windows, 49s
+  50/167 windows, 57s
+  60/167 windows, 69s
+  70/167 windows, 78s
+  80/167 windows, 93s
+  90/167 windows, 101s
+  100/167 windows, 109s
+  110/167 windows, 117s
+  120/167 windows, 123s
+  130/167 windows, 133s
+  140/167 windows, 145s
+  150/167 windows, 160s
+  160/167 windows, 172s
+
+== V3.3 LADDER IDEAL FILLS: 167 armed+bucket windows replayed (0 missing journals) ==
+  sanity E=8c: ideal-ladder fills 17 windows | live shadow 22 | both 15
+  sanity E=10c: ideal-ladder fills 15 windows | live shadow 20 | both 15
+  sanity E=12c: ideal-ladder fills 14 windows | live shadow 18 | both 14
+
+  rung  windows_filled  incremental_vs_next_deeper  mean_lock_c  median_first_print_lots  mean_t_minus_s
+  E= 5c      28               4                   5.44            2.0               487
+  E= 6c      24               3                   6.45            2.0               477
+  E= 7c      21               4                   7.41            2.0               481
+  E= 8c      17               2                   8.45            1.0               491
+  E= 9c      15               0                   9.45            2.0               489
+  E=10c      15               0                  10.33            2.0               489
+  E=11c      15               1                  11.35            1.0               488
+  E=12c      14               0                  12.40            1.0               464
+  E=13c      14               1                  13.43            1.0               462
+  E=14c      13               1                  14.39            2.0               464
+  E=15c      12              12                  15.35            2.0               455
+
+  pump windows (any rung filled): 28 / 167
+  windows filling E=10 (today's single rung): 15  -> ladder adds 13 windows from shallow rungs only
+  contracts per pump window: mean 6.7  median 8  distribution [(11, 12), (3, 4), (1, 4), (2, 3), (4, 2), (10, 1), (7, 1), (9, 1)]
+  ladder lock per pump window (sum over filled rungs, 1 contract each): mean 64.5c  median 69.9c  total 1806c
+  vs single rung E=10 x1 contract: total 155c over the same windows  (x2 contracts today = 310c)
+  windows where the sweep walked ALL 11 rungs: 12; deepest rung filled distribution: [(15, 12), (7, 4), (5, 4), (6, 3), (8, 2), (14, 1), (11, 1), (13, 1)]
+  shallowest rung filled distribution: [(5, 28)]
+
+DONE in 181s -> C:\Users\Brads\AppData\Local\Temp\claude\C--Users-Brads-Python-stuff-degeneracy-v3\e7acb14c-8903-4c04-ae00-7d39ed05e898\scratchpad\v33_ladder_ideal.json
