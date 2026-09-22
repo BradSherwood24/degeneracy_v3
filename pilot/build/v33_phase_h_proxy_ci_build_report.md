@@ -9,9 +9,9 @@ untouched here.
 
 | suite | before | after |
 |---|---|---|
-| pilot on the BOX (`cd pilot && python -m pytest -q`, corpora present) | 957 passed, 2 skipped, **2 errors** (961 collected) | **964 passed, 4 skipped, 0 errors** (968 collected) |
-| pilot on a CLEAN CLONE (CI-equivalent, corpora absent) | would ERROR (5 collection errors + 2 quintile) | **900 passed, 10 skipped, 0 errors** |
-| proxy scratchpad copy (`python -m pytest -q`) | 101 passed (existing) | **132 passed** (101 + 31 Phase H) |
+| pilot on the BOX (`cd pilot && python -m pytest -q`; builder worktree had `sim/out/` present but `historical-data/` ABSENT) | 957 passed, 2 skipped, **2 errors** (961 collected) | **964 passed, 4 skipped, 0 errors** (968 collected) |
+| pilot on a CLEAN CLONE (CI-equivalent, both corpora + proxy tree absent) | would ERROR (5 collection errors + 2 quintile) | **900 passed, 10 skipped, 0 errors** |
+| proxy scratchpad copy (`python -m pytest -q`) | 111 passed (existing = 86 `test_proxy` + 25 `test_review_probes`) | **133 passed** (111 existing + 22 `test_phase_h`, incl. the wrong-length-token case) |
 
 - The 2 pre-existing pilot **errors** were `test_quintile.py::test_quintile_reproduction_exact` and
   `::test_head_of_corpus_insufficient_tape_is_noquintile`, which raised `FileNotFoundError` on the
@@ -75,8 +75,9 @@ Proxy (NOT in git; delivered only as the patch doc — Brad applies to the live 
 - `proxy.py`: `PROXY_HOST`, `PROXY_BUDGET_PATH`, `.env` optional, `PROXY_TOKEN` (+`X-DV3-Token` non-GET
   gate returning 401), `/health` gains `host`/`budget_path`/`token_required`, `main()` binds
   `CONFIG.host`, and the upstream header filter now strips `X-DV3-Token` so the internal secret never
-  reaches Kalshi. `tests/test_proxy.py` + `tests/test_review_probes.py`: `_fake_config` gains
-  `host`/`budget_path`/`proxy_token`. New `tests/test_phase_h.py` (31 tests).
+  reaches Kalshi. The token compare uses `hmac.compare_digest` on utf-8 bytes (constant-time; Round 2).
+  `tests/test_proxy.py` + `tests/test_review_probes.py`: `_fake_config` gains
+  `host`/`budget_path`/`proxy_token`. New `tests/test_phase_h.py` (22 tests).
 
 ## Proxy diff summary (full unified diffs live in `pilot/ops/proxy_phase_h.md`)
 
@@ -112,3 +113,29 @@ Proxy (NOT in git; delivered only as the patch doc — Brad applies to the live 
   `proxy_amend_cap.md` regardless of apply order (documented in the patch doc).
 - README update for `0.0.0.0`/Secret Files/`PROXY_TOKEN` is a real `README.md` diff in the patch doc (a
   new "Hosting / env configuration (Phase H)" section), alongside the `proxy.py` module-docstring update.
+
+## Round 2 (2026-09-22) — review PR #84 APPROVE WITH NITS
+
+Addressed the nits from `pilot/build/v33_phase_h_proxy_ci_review.md`:
+
+- **NIT 1 (CI triggers):** `.github/workflows/pilot-tests.yml` `on.push.branches` is now `[main]` (post-
+  merge signal only) + `pull_request` (pre-merge). No more run on every push of every branch.
+- **NIT 2 (concurrency + timeout):** added `concurrency: {group: pilot-tests-${{ github.ref }},
+  cancel-in-progress: true}` and `timeout-minutes: 20` on the job. YAML re-validated (PyYAML).
+- **NIT 3 (constant-time compare):** the proxy token check now uses `hmac.compare_digest` on utf-8 bytes
+  (missing header → `b""`, rejected without raising). Regenerated the `proxy.py` diff in
+  `pilot/ops/proxy_phase_h.md` (adds `import hmac`); added `test_token_wrong_length_header_401`. Proxy
+  copy suite: **133 passed** (was 132).
+- **NIT 5 (count labels):** corrected the split everywhere — pristine proxy copy is **111** (86
+  `test_proxy` + 25 `test_review_probes`), `test_phase_h.py` adds **22**, total **133**. Also fixed the
+  "corpora present" imprecision: the builder worktree had `sim/out/` present but `historical-data/` ABSENT
+  (that is what produced the two quintile errors).
+- **NIT 4 (box path):** added a "Known gaps" note in `proxy_phase_h.md` — `executor.py:95` `_default_post`
+  does not attach `X-DV3-Token`; the V3.2 `run_v32` path (Render target) IS covered; the box path is out
+  of scope and would 401 against a token-gated proxy.
+- **QUESTION 1 / NITs not code-changed:** the reviewer already confirmed composition with
+  `proxy_amend_cap.md` in both orders; no change needed there.
+
+Round 2 test receipts: pilot suite on the box (corpora present) **964 passed, 4 skipped, 0 errors**
+(unchanged — only the workflow, the scratchpad proxy copy, and docs changed; no pilot runtime code
+touched in Round 2). Proxy scratchpad copy **133 passed**. Workflow YAML valid.

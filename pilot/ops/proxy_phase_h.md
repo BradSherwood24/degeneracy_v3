@@ -64,7 +64,7 @@ the `/trade-api/` 404 guard; amend cap = the non-create refusal + after the crea
 
 ```diff
 --- a/proxy.py	2026-08-21 02:00:22.777101600 -0400
-+++ b/proxy.py	2026-09-22 19:15:55.404104400 -0400
++++ b/proxy.py	2026-09-22 19:45:56.059304500 -0400
 @@ -20,12 +20,21 @@
  api.elections.kalshi.com; order WRITES (create/cancel/amend/batch) must go to
  external-api.kalshi.com. Demo is single-host.
@@ -89,7 +89,15 @@ the `/trade-api/` 404 guard; amend cap = the non-create refusal + after the crea
  
  Run:  python proxy.py
  """
-@@ -307,6 +316,9 @@
+@@ -34,6 +43,7 @@
+ 
+ import base64
+ import hashlib
++import hmac
+ import json
+ import os
+ import sys
+@@ -307,6 +317,9 @@
          "signed": config.signer is not None,
          "orders_enabled": config.allow_orders,
          "key_fingerprint": config.signer.fingerprint if config.signer else None,
@@ -99,7 +107,7 @@ the `/trade-api/` 404 guard; amend cap = the non-create refusal + after the crea
          "caps": {
              "max_contracts_per_order": config.max_contracts_per_order,
              "ticker_prefixes": list(config.ticker_prefixes),
-@@ -372,16 +384,31 @@
+@@ -372,16 +385,31 @@
  
  class Config:
      def __init__(self) -> None:
@@ -132,7 +140,7 @@ the `/trade-api/` 404 guard; amend cap = the non-create refusal + after the crea
  
          # Defense-in-depth order caps (startup-read; only the budget COUNTER is
          # dynamic state — no hot reload). See module docstring / PLAN Phase 0.
-@@ -396,9 +423,12 @@
+@@ -396,9 +424,12 @@
          self.daily_order_budget = int(
              os.getenv("DAILY_ORDER_BUDGET", _DEFAULT_DAILY_BUDGET)
          )
@@ -148,7 +156,7 @@ the `/trade-api/` 404 guard; amend cap = the non-create refusal + after the crea
  
  
  CONFIG = Config()
-@@ -440,6 +470,20 @@
+@@ -440,6 +471,23 @@
              self._respond_json(404, {"error": "only /trade-api/... paths are proxied"})
              return
  
@@ -158,7 +166,10 @@ the `/trade-api/` 404 guard; amend cap = the non-create refusal + after the crea
 +        # token -> this block is a no-op and behaviour is identical to today. The
 +        # comparison result is never logged with the token value.
 +        if method != "GET" and CONFIG.proxy_token is not None:
-+            if self.headers.get("X-DV3-Token") != CONFIG.proxy_token:
++            supplied = self.headers.get("X-DV3-Token") or ""
++            if not hmac.compare_digest(
++                supplied.encode("utf-8"), CONFIG.proxy_token.encode("utf-8")
++            ):
 +                self._respond_json(401, {
 +                    "error": "unauthorized: missing or invalid X-DV3-Token",
 +                    "cap": "proxy_token",
@@ -169,7 +180,7 @@ the `/trade-api/` 404 guard; amend cap = the non-create refusal + after the crea
          if method != "GET" and not CONFIG.allow_orders:
              self._respond_json(403, {
                  "error": "proxy is read-only: non-GET requests are disabled",
-@@ -524,7 +568,9 @@
+@@ -524,7 +572,9 @@
  
          headers = {
              k: v for k, v in self.headers.items()
@@ -180,7 +191,7 @@ the `/trade-api/` 404 guard; amend cap = the non-create refusal + after the crea
          }
          headers.setdefault("Content-Type", "application/json")
          if CONFIG.signer is not None:
-@@ -562,9 +608,10 @@
+@@ -562,9 +612,10 @@
      mode = "SIGNED" if CONFIG.signer else "UNSIGNED (public endpoints only)"
      orders = "ENABLED" if CONFIG.allow_orders else "read-only"
      fingerprint = f", key fp {CONFIG.signer.fingerprint}" if CONFIG.signer else ""
@@ -504,6 +515,21 @@ def test_token_post_with_wrong_header_401(token_proxy):
     assert captured == {}
 
 
+def test_token_wrong_length_header_401(token_proxy):
+    """A token of the WRONG LENGTH is rejected — exercises the hmac.compare_digest
+    length-mismatch path (a plain `==` would also reject it, but this pins that the
+    constant-time compare returns False, not raises, on unequal-length inputs)."""
+    base, _, captured = token_proxy
+    r = requests.post(
+        f"{base}/trade-api/v2/portfolio/events/orders",
+        json={"ticker": "KXBTC15M-A", "count": "1"},
+        headers={"X-DV3-Token": TOKEN[:-1]}, timeout=5,  # one char short of the real token
+    )
+    assert r.status_code == 401
+    assert r.json()["cap"] == "proxy_token"
+    assert captured == {}
+
+
 def test_token_delete_without_header_401(token_proxy):
     """The gate covers every non-GET verb, cancels (DELETE) included."""
     base, _, captured = token_proxy
@@ -632,7 +658,8 @@ requests==2.34.2
    from the verbatim block above.
 3. **Test in place** BEFORE restarting anything:
    `cd degeneracy-proxy; python -m pytest -q`
-   Expect **132 passed** (101 existing + 31 Phase H). If the copy's `_fake_config` edits did not land,
+   Expect **133 passed** (111 existing = 86 `test_proxy` + 25 `test_review_probes`; + 22 `test_phase_h`).
+   If the copy's `_fake_config` edits did not land,
    the health/handler tests will `AttributeError` on `host`/`budget_path`/`proxy_token` — re-check the
    two `_fake_config` diffs.
 4. **Restart** the proxy (`.\run.ps1`, or however the service is managed) so the new code loads. On the
@@ -652,9 +679,20 @@ no new env vars set the old and new code are behaviourally identical, so rollbac
 
 ## What was verified (and what was not)
 
-- The scratchpad copy's full suite is **green: 132 passed** (`python -m pytest -q` in the copy dir).
+- The scratchpad copy's full suite is **green: 133 passed** (`python -m pytest -q` in the copy dir;
+  111 existing + 22 `test_phase_h`, the 22nd being the wrong-length-token 401 case).
+- The token compare is **constant-time** (`hmac.compare_digest` on utf-8 bytes; a missing header becomes
+  `b""` and is rejected without raising).
 - The token header is **stripped before upstream forwarding** (a test asserts `X-DV3-Token` is absent
   from the headers handed to `SESSION.request`).
 - **Not verified here:** the LIVE proxy is untouched (read-only). The apply + restart is Brad's; the
   Render-side `0.0.0.0` bind and Secret File path are exercised only by config-unit assertions, not by a
   real datacenter deploy.
+
+## Known gaps
+
+- The box (wide-box) runner's own `pilot/service/executor.py:95` `_default_post` does NOT attach
+  `X-DV3-Token` (it bypasses `ProxyWriter`). The V3.2 `run_v32` path — the Render migration target — IS
+  covered (creates/amends via `rest_post`, cancels via `rest_delete`, all through
+  `_default_post`/`_default_delete` → the token). The box path is out of scope for Render; if it is ever
+  pointed at a token-gated proxy its creates/cancels would silently 401.

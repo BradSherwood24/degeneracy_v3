@@ -9,16 +9,22 @@ name: pilot-tests
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Cancel a superseded run on the same ref (a new push to a PR branch supersedes the old).
+concurrency:
+  group: pilot-tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pilot-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
