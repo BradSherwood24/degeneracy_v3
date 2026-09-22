@@ -1,5 +1,8 @@
 # V3.3 Phase H-A build report -- host-shaped runtime (supervisor + data dir + proxy base + rotation + task scripts + runbook)
 
+> **Round 2 (PR #83 review) is at the bottom of this file** -- Findings 1-4 addressed; suite now
+> `1005 passed, 1 skipped`.
+
 Branch: `feat/v33-phase-h` (worktree `dv3_wt_v11`), based on `origin/main` b5059ee.
 Scope: Phase H-A only. NOT touched (owned by other builders): proxy `.env` changes, `requirements.txt`,
 `.python-version`, the GitHub Action (Phase H-B); `pilot/service/v33/` ladder core (L1). No V3.2 decision
@@ -121,3 +124,60 @@ it once at cutover.
 
 `requirements.txt`, `.python-version`, proxy `.env`/`PROXY_HOST`/budget-path env, GitHub Action (Phase
 H-B); `service/v33/` ladder (L1). No PR opened (orchestrator opens; Brad merges).
+
+---
+
+## Round 2 -- PR #83 review response (APPROVE WITH NITS)
+
+Review at `pilot/build/v33_phase_h_runtime_review.md` (branch `review/v33-phase-h`). All four findings
+addressed. Behaviour-neutrality preserved: `run_v32 --help` still BYTE-IDENTICAL to origin/main; with no
+env set every default path/behaviour is unchanged (the new guard fallback is a no-op when
+`DV3_DATA_DIR` is unset -- `data_dir() is None` returns the historic `ops_dir_v32()` path).
+
+### Finding 1 [must fix] -- day-guard dropped on a mid-day DV3_DATA_DIR cutover
+Fixed BOTH ways.
+- (a) Runbook `V33_RUNBOOK.md` §4 step 2: the cutover copy now includes `copy ops\v32_stops_*.json
+  "%DV3_DATA_DIR%\ops\"`, plus an explicit RULE: cut over to `DV3_DATA_DIR` only on a fresh UTC day or
+  copy today's guard. Rollback §6 already covered copying the guard back.
+- (b) Code safety in `run_v32._resolve_v32_guard_path(utc_day)` (new): when `DV3_DATA_DIR` is set and the
+  data-dir guard for today is MISSING while the CHECKOUT `ops/v32_stops_<day>.json` EXISTS, it uses the
+  checkout guard as authoritative for that day and logs a loud `[V32]` warning. Read-only-style fallback
+  for the GUARD ONLY -- never the mode file. Both guard call sites in `run_v32` (arming gate + S1_LEGGED
+  record) now route through it, so reads and writes stay consistent on the cutover day. With
+  `DV3_DATA_DIR` unset it returns `v32_day_guard_path(ops_dir_v32(), utc_day)` == the historic
+  `os.path.join(_PILOT_DIR,"ops")` path (byte-identical). Tests:
+  `test_paths.py::test_guard_no_env_uses_ops_dir`, `::test_guard_fallback_to_checkout_when_data_missing`,
+  `::test_guard_uses_data_when_data_guard_present`, `::test_guard_fresh_day_uses_data`.
+
+### Finding 2 -- per-window watchdog for a hung child
+`supervisor._wait_child` now takes a `watchdog_deadline` (= the child's window close `:00` +
+`WATCHDOG_GRACE_S`, default 120 s; run_v32's own deadline is close + 10 s). If the child is still running
+past it, the supervisor forwards SIGTERM/CTRL_BREAK, waits the SIGTERM grace, hard-kills, emits a
+`child_watchdog_killed` event with the exit code, and CONTINUES to the next :40 (a shutdown signal still
+takes priority and exits). `_wait_child` returns `(rc, status)` where status is `exited|signaled|
+watchdog_killed`; the window record carries `status` (and keeps `signaled` for back-compat). Tests:
+`test_supervisor.py::test_child_watchdog_kills_hung_child_and_continues` (stub child that never exits +
+an injected clock advanced past the deadline), `::test_healthy_child_never_trips_watchdog`.
+
+### Finding 3 -- boot-sweep proxy-readiness retry made explicit
+New `supervisor._boot_sweep_wait_ready(proxy_base, *, max_attempts, retry_interval_s, ready_fn, sleep,
+log)`: polls `GET /health` up to `BOOT_SWEEP_MAX_ATTEMPTS` (4) times `BOOT_SWEEP_RETRY_INTERVAL_S` (2 s)
+apart, logging ONE line per attempt, returning as soon as ready. `_default_boot_sweep` calls it before
+any proxy-touching sweep (skipped entirely when mode != armed and not `--dry-sweep` -> no proxy probed).
+Params are exposed on `Supervisor` (`boot_sweep_max_attempts`, `boot_sweep_retry_interval_s`). This WRAPS
+-- does not replace -- the existing bounded retry inside `cancel_stale_open_orders` -> `ProxyAuth.rest_get`.
+Tests: `::test_boot_sweep_wait_ready_stops_when_ready`, `::test_boot_sweep_wait_ready_gives_up_after_max_attempts`,
+`::test_boot_sweep_skips_readiness_and_proxy_when_not_armed`.
+
+### Finding 4 -- runbook sentence on child stderr
+`V33_RUNBOOK.md` §5: child stdout AND stderr are redirected by the task into
+`logs_v32\supervisor.scheduler.out` (run_v32 writes no per-window log of its own), so a child
+crash/traceback is found there, not in the JSON-only `supervisor.out`. `--log-dir`/`DEFAULT_LOG_DIR`
+left as-is per the review (pre-existing, dead; not this PR's cleanup).
+
+### Round 2 receipts
+- Full suite: `1005 passed, 1 skipped in 28.86s` (Round 1 was 996 + 1; +9 tests). The 1 skip remains the
+  POSIX-only real-SIGTERM test on Windows.
+- `python -m compileall service tests`: clean. `run_v32 --help`: byte-identical to before (re-diffed).
+- No forbidden files touched; no V3.2 params/falsifier/mode/decision changes; supervisor still dormant
+  until Brad registers/runs it.

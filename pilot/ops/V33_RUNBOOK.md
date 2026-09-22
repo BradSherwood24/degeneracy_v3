@@ -86,13 +86,20 @@ Do this ONLY between :02 and :33 UTC so no window is mid-flight. **Never two win
    powershell -ExecutionPolicy Bypass -File ops\register_supervisor_tasks.ps1 -DryRun
    ```
 2. **Decide the data dir** (optional). If you want writable state off the checkout, set a machine/user
-   env var `DV3_DATA_DIR` (System Properties -> Environment Variables) so BOTH tasks inherit it, then:
+   env var `DV3_DATA_DIR` (System Properties -> Environment Variables) so BOTH tasks inherit it, then
+   copy the current mode file AND today's day-guard/stops JSON into the data dir ONCE:
    ```
-   # copy the current mode + day-guards into the data dir ONCE (mode file has no checkout fallback)
    mkdir "%DV3_DATA_DIR%\ops"
    copy ops\v32_mode.txt "%DV3_DATA_DIR%\ops\v32_mode.txt"
+   copy ops\v32_stops_*.json "%DV3_DATA_DIR%\ops\"
    ```
-   If you skip `DV3_DATA_DIR`, everything stays under the checkout exactly as today.
+   **RULE: cut over to `DV3_DATA_DIR` only on a FRESH UTC day, OR copy today's `v32_stops_*.json` as
+   above.** The day-guard holds the current UTC day's latched S1/S2/S4 stops and legged-occurrence
+   counts; if you point at an empty data dir mid-day WITHOUT copying it, a day that had already STOPPED
+   could re-arm and fire again. (The mode file has NO checkout fallback and must be copied; the
+   day-guard HAS a one-day safety fallback in code -- `run_v32` will use the checkout guard for today and
+   log a loud line if the data-dir copy is missing -- but copying it is still the clean path.) If you
+   skip `DV3_DATA_DIR` entirely, everything stays under the checkout exactly as today.
 3. **Stop the old driver first** (so it cannot fire while the supervisor also runs):
    ```
    powershell -ExecutionPolicy Bypass -File ops\unregister_v32_task.ps1        # (drop -DryRun to apply)
@@ -118,10 +125,15 @@ dir if `DV3_DATA_DIR` is set, else `ops\v32_mode.txt`).
 ## 5. Verify one window ran
 
 - Supervisor log: `logs_v32\supervisor.out` (or `$DV3_DATA_DIR\logs_v32\supervisor.out`) has one JSON
-  line per window: `{"event":"window","wake":...,"pid":...,"exit_code":0,"duration_s":...}`. A clean
-  window is `exit_code":0`. `"event":"boot_sweep"` shows the boot cancel result; `"event":"skipped_late"`
-  means a wake overshot its window (rare; investigate suspend/clock).
-- The child's own stdout/stderr: `logs_v32\supervisor.scheduler.out`.
+  line per window: `{"event":"window","wake":...,"pid":...,"exit_code":0,"duration_s":...,"status":...}`.
+  A clean window is `exit_code":0`, `status":"exited"`. `"event":"boot_sweep"` shows the boot cancel
+  result (with `boot_sweep proxy readiness attempt N/M` lines if the proxy was not up yet);
+  `"event":"skipped_late"` means a wake overshot its window (rare; investigate suspend/clock);
+  `"event":"child_watchdog_killed"` means a child overran its window close + 120 s and was killed (the
+  supervisor then continued to the next :40).
+- The child's own stdout AND stderr are redirected by the task into
+  `logs_v32\supervisor.scheduler.out` -- run_v32 writes no per-window log file of its own, so a child
+  crash/traceback is found there (not in `supervisor.out`, which carries only the supervisor's JSON).
 - A new window journal appears under `journals_v32\` (or the data dir); old raw journals get `.jsonl.gz`.
 - The V3.2 ledger row lands in `ledger\v32_ledger.jsonl` (or the data dir) as before; the V3.2 report
   and falsifier are unchanged.
