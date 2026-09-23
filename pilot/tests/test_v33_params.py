@@ -39,7 +39,32 @@ def test_params_load_and_sha_pin():
     assert p.replace_rate_alarm_per_min == 120
     assert p.n_min == Decimal("0.05")
     assert p.bucket_width == 100
+    # L2 R2 additions
+    assert p.max_contracts_per_order_hint == 11
+    assert p.write_tokens_per_s == 100
+    assert p.write_bucket_size == 100
+    assert p.order_poll_batched is True
     assert p.shadow_Es == (Decimal("0.08"), Decimal("0.10"), Decimal("0.12"))
+
+
+def test_hint_below_lots_per_rung_fails_closed(tmp_path):
+    with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["max_contracts_per_order_hint"] = 0  # below lots_per_rung (1)
+    q = tmp_path / "v33_params.json"
+    q.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(V33ParamsInvalid):
+        load_v33_params(str(q), expected_sha=None)
+
+
+def test_write_tokens_below_one_fails_closed(tmp_path):
+    with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["write_tokens_per_s"] = 0
+    q = tmp_path / "v33_params.json"
+    q.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(V33ParamsInvalid):
+        load_v33_params(str(q), expected_sha=None)
 
 
 def test_sha_pin_matches_file_on_disk():

@@ -40,10 +40,13 @@
 param(
     [string]$ProxyTaskName      = "DegeneracyProxy",
     [string]$SupervisorTaskName = "DegeneracyV3_Supervisor",
+    [string]$V33TaskName        = "DegeneracyV3_3",
     [string]$PythonExe = "",
     [string]$PilotDir  = "",
     [string]$ProxyDir  = "",
     [string]$LogDir    = "",
+    [string]$V33LogDir = "",
+    [switch]$WithV33,
     [switch]$DryRun
 )
 
@@ -56,6 +59,7 @@ $RepoRoot = Split-Path -Parent $PilotDir
 $RepoParent = Split-Path -Parent $RepoRoot
 if ([string]::IsNullOrEmpty($ProxyDir)) { $ProxyDir = Join-Path $RepoParent "degeneracy-proxy" }
 if ([string]::IsNullOrEmpty($LogDir))   { $LogDir = Join-Path $PilotDir "logs_v32" }
+if ([string]::IsNullOrEmpty($V33LogDir)) { $V33LogDir = Join-Path $PilotDir "logs_v33" }
 if ([string]::IsNullOrEmpty($PythonExe)) {
     $cmd = Get-Command python -ErrorAction SilentlyContinue
     if ($null -ne $cmd) { $PythonExe = $cmd.Source } else { $PythonExe = "python" }
@@ -68,6 +72,11 @@ $proxyLog = Join-Path $ProxyDir "proxy.out.log"
 $superLog = Join-Path $LogDir "supervisor.scheduler.out"
 $proxyArg = '/c "' + '"' + $PythonExe + '"' + ' proxy.py >> "' + $proxyLog + '" 2>&1"'
 $superArg = '/c "' + '"' + $PythonExe + '"' + ' -m service.supervisor >> "' + $superLog + '" 2>&1"'
+# V3.3 dry ladder task (only registered with -WithV33): a THIRD supervisor driving run_v33 (--roster v33)
+# alongside the live V3.2. It starts in dry (v33_mode.txt absent -> dry), sends nothing, and never touches
+# the v32-* rests. Its boot sweep is a no-op in dry and, when armed later (Brad), sweeps ONLY v33-*.
+$v33Log = Join-Path $V33LogDir "supervisor.scheduler.out"
+$v33Arg = '/c "' + '"' + $PythonExe + '"' + ' -m service.supervisor --roster v33 >> "' + $v33Log + '" 2>&1"'
 
 # --- one-line, well-formed descriptions of the two registration commands ---
 $settingsExpr = ("New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries" +
@@ -89,6 +98,13 @@ $superCommandLine = ("Register-ScheduledTask -TaskName '" + $SupervisorTaskName 
     " -Principal (" + $principalExpr + ")" +
     " -Settings (" + $settingsExpr + ")")
 
+$v33CommandLine = ("Register-ScheduledTask -TaskName '" + $V33TaskName + "'" +
+    " -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '" + $v33Arg + "'" +
+    " -WorkingDirectory '" + $PilotDir + "')" +
+    " -Trigger (New-ScheduledTaskTrigger -AtStartup)" +
+    " -Principal (" + $principalExpr + ")" +
+    " -Settings (" + $settingsExpr + ")")
+
 Write-Output ("[register_supervisor] proxy task      : " + $ProxyTaskName)
 Write-Output ("[register_supervisor] supervisor task : " + $SupervisorTaskName)
 Write-Output ("[register_supervisor] python          : " + $PythonExe)
@@ -99,6 +115,12 @@ Write-Output ("[register_supervisor] proxy log       : " + $proxyLog)
 Write-Output ("[register_supervisor] supervisor log  : " + $superLog)
 Write-Output ("[register_supervisor] proxy command   : " + $proxyCommandLine)
 Write-Output ("[register_supervisor] super command   : " + $superCommandLine)
+if ($WithV33) {
+    Write-Output ("[register_supervisor] v33 task        : " + $V33TaskName + " (dry ladder alongside V3.2)")
+    Write-Output ("[register_supervisor] v33 log         : " + $v33Log)
+    Write-Output ("[register_supervisor] v33 command     : " + $v33CommandLine)
+    Write-Output ("[register_supervisor] NOTE: DegeneracyV3_3 starts in DRY (v33_mode.txt absent -> dry); it sends nothing and never touches v32-* rests.")
+}
 Write-Output ("[register_supervisor] WARNING: unregister DegeneracyV3_2 before the supervisor drives windows -- never two.")
 
 if ($DryRun) {
@@ -108,6 +130,7 @@ if ($DryRun) {
 
 # cmd.exe redirects (>> "log") cannot create the parent dir; make both now so the first run launches.
 if (-not (Test-Path $LogDir))   { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
+if ($WithV33 -and -not (Test-Path $V33LogDir)) { New-Item -ItemType Directory -Force -Path $V33LogDir | Out-Null }
 if (-not (Test-Path $ProxyDir)) { throw "proxy dir not found: $ProxyDir" }
 
 $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
@@ -121,4 +144,10 @@ Write-Output ("[register_supervisor] registered '" + $ProxyTaskName + "'.")
 $superAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $superArg -WorkingDirectory $PilotDir
 Register-ScheduledTask -TaskName $SupervisorTaskName -Action $superAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Write-Output ("[register_supervisor] registered '" + $SupervisorTaskName + "'.")
+
+if ($WithV33) {
+    $v33Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $v33Arg -WorkingDirectory $PilotDir
+    Register-ScheduledTask -TaskName $V33TaskName -Action $v33Action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Output ("[register_supervisor] registered '" + $V33TaskName + "' (dry ladder alongside V3.2).")
+}
 Write-Output ("[register_supervisor] REMINDER: run ops\unregister_v32_task.ps1 so DegeneracyV3_2 no longer fires.")

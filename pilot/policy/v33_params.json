@@ -18,5 +18,9 @@
   "n_min": "0.05",
   "replace_rate_alarm_per_min": 120,
   "bucket_width": 100,
+  "max_contracts_per_order_hint": 11,
+  "write_tokens_per_s": 100,
+  "write_bucket_size": 100,
+  "order_poll_batched": true,
   "shadow_Es": ["0.08", "0.10", "0.12"]
 }
