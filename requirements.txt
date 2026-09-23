@@ -1,0 +1,14 @@
+# Runtime third-party dependencies for the degeneracy_v3 pilot + tools.
+# Python 3.12.10 (see .python-version). Pinned to the versions installed and tested
+# on 2026-09-22 (`pip freeze`), so a fresh host / CI checkout reproduces the box.
+#
+# Scope: only what is actually imported at runtime.
+#   pilot/service/*  -> requests, websockets
+#   tools/*.py       -> requests
+#   sim/*.py         -> no third-party runtime imports (stdlib + local modules only)
+#
+# NOT here: the signing proxy (degeneracy-proxy/, a SEPARATE service outside this
+# repo) has its own deps -- cryptography, python-dotenv, requests -- documented in
+# pilot/ops/proxy_phase_h.md. Test-only deps are in requirements-dev.txt.
+requests==2.34.2
+websockets==16.0

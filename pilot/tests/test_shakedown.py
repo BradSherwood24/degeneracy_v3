@@ -3,17 +3,26 @@ composes with the Phase-1 WindowRecorder (book folded + signal evaluated) WITHOU
 
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 
 import pytest
 
-from service._simlaw import close_epoch, load_ev_curve
+from service._simlaw import DEFAULT_CENSUS_CSV, close_epoch, load_ev_curve
 from service.journal import Journal
 from service.policy import SUB_DOLLAR_FLIP, load_policy
 from service.quintile import QuintileResult
 from service.shakedown import ShakedownRecorder, SignalDriver, build_shakedown_state
 from service.signal import WOULD_FIRE, WindowState
 from service.wake import LadderCheck, Leg, WakeResult
+
+# The EV curve reads sim/out/census_train.csv, a gitignored TRAIN artifact absent on
+# a fresh CI checkout. Skip this whole module cleanly there (never a collection error).
+if not os.path.exists(DEFAULT_CENSUS_CSV):
+    pytest.skip(
+        "census_train.csv corpus absent (sim/out/ gitignored; not in CI checkout)",
+        allow_module_level=True,
+    )
 
 PARAMS = load_policy()
 EV = load_ev_curve()

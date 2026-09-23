@@ -1,0 +1,5 @@
+# Development / test dependencies (not needed to RUN the pilot). Install both:
+#   pip install -r requirements.txt -r requirements-dev.txt
+# Pinned to the versions installed and tested on 2026-09-22 (Python 3.12.10).
+-r requirements.txt
+pytest==9.1.1

@@ -25,6 +25,7 @@ context.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -38,6 +39,21 @@ POST_TIMEOUT = 10.0
 DELETE_TIMEOUT = 10.0
 _DELETE_RETRY_ATTEMPTS = 4
 _INITIAL_BACKOFF = 1.0
+
+# Optional shared-secret for the proxy's non-GET gate (Phase H). When the proxy is
+# started with PROXY_TOKEN set (a hosted / shared-network deployment), it 401s any
+# non-GET lacking header X-DV3-Token; the pilot supplies it from DV3_PROXY_TOKEN.
+# GETs are unauthenticated at the proxy, so this header is added to WRITES ONLY
+# (POST create / DELETE cancel). Absent env var -> no header, behaviour identical to
+# today (the laptop proxy runs tokenless). Read at call time so a restart-free env
+# change is picked up; the value is never logged.
+DV3_PROXY_TOKEN_ENV = "DV3_PROXY_TOKEN"
+
+
+def _dv3_token_headers() -> dict[str, str]:
+    """{'X-DV3-Token': <token>} when DV3_PROXY_TOKEN is set in the environment, else {}."""
+    token = os.environ.get(DV3_PROXY_TOKEN_ENV, "").strip()
+    return {"X-DV3-Token": token} if token else {}
 
 # (url, json_body, timeout) -> response-like exposing .status_code, .json(), .text
 HttpPost = Callable[[str, "dict[str, Any]", float], Any]
@@ -148,9 +164,9 @@ class ProxyWriter:
     @staticmethod
     def _default_post(url: str, body: dict[str, Any], timeout: float) -> Any:
         import requests  # local import so importing this module never requires the network
-        return requests.post(url, json=body, timeout=timeout)
+        return requests.post(url, json=body, timeout=timeout, headers=_dv3_token_headers())
 
     @staticmethod
     def _default_delete(url: str, timeout: float) -> Any:
         import requests
-        return requests.delete(url, timeout=timeout)
+        return requests.delete(url, timeout=timeout, headers=_dv3_token_headers())

@@ -5,11 +5,12 @@ book-vs-prints delta flips a fire/no-fire decision."""
 from __future__ import annotations
 
 import csv
+import os
 from decimal import Decimal
 
 import pytest
 
-from service._simlaw import TAPE_FIELDNAMES, close_epoch, load_ev_curve
+from service._simlaw import DEFAULT_CENSUS_CSV, TAPE_FIELDNAMES, close_epoch, load_ev_curve
 from service.parity import (
     BIN_BOTH_DIFF_PRICE,
     BIN_BOTH_MATCH,
@@ -31,6 +32,14 @@ from service.parity import (
 )
 from service.policy import Q1_STRANGLE, SUB_DOLLAR_FLIP, load_policy
 from service.signal import WindowState
+
+# The EV curve reads sim/out/census_train.csv, a gitignored TRAIN artifact absent on
+# a fresh CI checkout. Skip this whole module cleanly there (never a collection error).
+if not os.path.exists(DEFAULT_CENSUS_CSV):
+    pytest.skip(
+        "census_train.csv corpus absent (sim/out/ gitignored; not in CI checkout)",
+        allow_module_level=True,
+    )
 
 PARAMS = load_policy()
 EV = load_ev_curve()
