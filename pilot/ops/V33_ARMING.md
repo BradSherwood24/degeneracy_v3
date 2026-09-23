@@ -50,6 +50,16 @@ dry rather than sizing wings against a guess. Any miss => the window runs DRY an
    the LADDER SCOREBOARD's DRY section shows the ladder's dry_sim per-rung locks, one-order rolls
    (single-order ratio ~100%), and the DEEP END (SO-3) block is populating. "V3.3 is running exactly as
    expected" (Brad's words). Confirm the dry journals sent NOTHING (only `would_*`/`dry_sim_fill`).
+4b. **>= 2 dry ENTRIES seen (Brad's gate, 2026-09-23 ~13:05Z, verbatim: "Lets run it as is for now. I'd
+   like to see atleast a couple entries before flipping to V3.3").** The SIDE-BY-SIDE / LADDER SCOREBOARD
+   DRY section must show at least two windows with dry_sim rung fills before the flip, whatever the
+   calendar says. Dry days alone do not satisfy this.
+4c. **Crypto exchange balance >= $35 (Brad's reminder, same message, verbatim: "we should probably move
+   $10 over ... Should be $25 in both right now, lets get it to $15 and $35 into crypto markets").**
+   Kalshi keeps a separate balance per exchange index; crypto (KXBTC*) settles on exchange_index 2. A full
+   K=11 sweep holds ~$21 of bucket-NO plus the two wing takes, so the crypto-side balance must be ~$35
+   before arming. The transfer is Brad's hand (funds are his lever); confirm with the pilot's balance
+   read (`GET /trade-api/v2/portfolio/balance` via the proxy) that the crypto side shows >= $35.
 5. **Clean tree + green suite.** `cd pilot && python -m pytest -q` green; the V3.3 params sha:
    ```
    python -c "import json,hashlib; o=json.load(open('policy/v33_params.json')); print(hashlib.sha256(json.dumps(o,sort_keys=True,separators=(',',':')).encode()).hexdigest())"
