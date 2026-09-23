@@ -45,13 +45,22 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # L2 R2 (2026-09-23): ADDED ``max_contracts_per_order_hint`` (wing-take chunk cap upper bound),
 # ``write_tokens_per_s`` / ``write_bucket_size`` (Basic-tier write-token pacer) and ``order_poll_batched``
 # (a single /portfolio/orders?ticker= poll vs per-rung GETs) -> re-pinned.
-FROZEN_V33_PARAMS_SHA256 = "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
+# L3 (2026-09-23): ADDED ``write_reserve_tokens`` (the pacer headroom a priority cancel/wing burst always
+# keeps; a non-priority create/amend never draws the bucket below it -- L2 review R2-N1) and
+# ``deep_obs_rungs`` (the SO-3 deep-observation ladder depth below the live ladder, margins
+# E_min_c+rungs .. E_min_c+rungs+deep_obs_rungs-1 = 16..25c; observation only, never placed) -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
 # History (add-only law). Kept DEFINED so prior-regime ledger rows stay identifiable.
 PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
 PREVIOUS_V33_PARAMS_SHA256_L1_R2 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
 PREVIOUS_V33_PARAMS_SHA256_L1_R4 = "6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3ef46ea784e7f8a11a421"
+PREVIOUS_V33_PARAMS_SHA256_L2_R2 = "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
 
 _CENT = Decimal("0.01")
+# The Basic-tier write-token cost of one non-priority create/amend (mirrors executor.COST_CREATE; kept as
+# a literal here to avoid importing the executor into the pure params module). The reserve guard (F3) uses
+# it so a create can always proceed above the reserve.
+_MIN_NONPRIORITY_WRITE_COST = 10
 
 
 class V33ParamsShaMismatch(Exception):
@@ -124,7 +133,11 @@ class V33Params:
     max_contracts_per_order_hint: int  # upper bound on the wing chunk cap; actual cap = min(this, proxy)
     write_tokens_per_s: int            # Basic-tier write-token refill rate (100/s)
     write_bucket_size: int             # write-token bucket capacity (100)
+    write_reserve_tokens: int          # L3 (R2-N1): pacer headroom a priority cancel/wing burst always
+                                       # keeps; a non-priority create/amend never draws below it (30)
     order_poll_batched: bool           # one /portfolio/orders?ticker= poll vs per-rung GETs (default true)
+    deep_obs_rungs: int                # L3 (SO-3): observation-only rungs BELOW the live ladder (margins
+                                       # E_min_c+rungs .. +deep_obs_rungs-1 = 16..25c); never placed (10)
     shadow_Es: tuple[Decimal, ...]
     sha256: str
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
@@ -176,6 +189,21 @@ def load_v33_params(
         raise V33ParamsInvalid(
             f"v33 policy at {path} is invalid: write_tokens_per_s / write_bucket_size must be >= 1"
         )
+    # L3 (R2-N1, F3 cost-aware): the pacer reserve must be non-negative AND leave room for at least one
+    # non-priority write (a create/amend costs COST_CREATE = 10 tokens) ABOVE the reserve, else a
+    # create/amend could never proceed (deadlock). Fail closed: reserve + 10 <= write_bucket_size.
+    reserve = int(raw["write_reserve_tokens"])
+    if reserve < 0 or reserve + _MIN_NONPRIORITY_WRITE_COST > int(raw["write_bucket_size"]):
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: write_reserve_tokens={reserve} + a create's "
+            f"{_MIN_NONPRIORITY_WRITE_COST} tokens must be <= write_bucket_size="
+            f"{raw['write_bucket_size']} (a non-priority write must still fit above the reserve)"
+        )
+    # L3 (SO-3): the deep-observation ladder depth is observation-only; 0 disables it. Must be >= 0.
+    if int(raw["deep_obs_rungs"]) < 0:
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: deep_obs_rungs={raw['deep_obs_rungs']} must be >= 0"
+        )
     shadow_Es = tuple(Decimal(str(x)) for x in raw["shadow_Es"])
     # Fail closed (ruling L-6, generalised for the ladder): every shadow E must lie WITHIN the live
     # ladder's margin range [E_min, E_min + (rungs-1)c], else the in-process shadow tracks a rung the
@@ -210,7 +238,9 @@ def load_v33_params(
         max_contracts_per_order_hint=int(raw["max_contracts_per_order_hint"]),
         write_tokens_per_s=int(raw["write_tokens_per_s"]),
         write_bucket_size=int(raw["write_bucket_size"]),
+        write_reserve_tokens=int(raw["write_reserve_tokens"]),
         order_poll_batched=bool(raw["order_poll_batched"]),
+        deep_obs_rungs=int(raw["deep_obs_rungs"]),
         shadow_Es=shadow_Es,
         sha256=sha,
         raw=raw,

@@ -325,9 +325,11 @@ def build_v33_ledger_row(
     settlement: dict[str, Any] | None = None,
     m15_tickers: list[str] | None = None,
     m15_frames: int = 0,
+    deep_obs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
-    (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row."""
+    (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row.
+    ``deep_obs`` is the SO-3 deep-end observation ladder summary (16..25c; observation only)."""
     money = {
         "rung_fills": rung_fills or [],
         "wing_batch_sets": wing_batch_sets or [],
@@ -385,6 +387,7 @@ def build_v33_ledger_row(
         "unsettled_legs": (held_legs or []) if realized_unsettled else [],
         "settlement": settlement,
         "realized_delta_note": (REALIZED_DELTA_NOTE if realized_delta is not None else None),
+        "deep_obs": deep_obs or {},
         "flushed_at": now,
     }
     return row

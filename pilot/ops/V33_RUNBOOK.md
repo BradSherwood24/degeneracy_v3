@@ -245,7 +245,75 @@ The V3.3 falsifier (`ceremony/v33_falsifier.md`, drafted in L3) MUST carry `STAT
 
 ---
 
-## 9. Brad's levers (nothing here is Claude's to pull)
+## 9. V3.3 report + the dry-period review checklist (Phase L3)
+
+The L3 report extends the L2 side-by-side with the scoreboard, the falsifier gate table, and the deep end:
+```
+python -m service.v33.report --days 3          # table
+python -m service.v33.report --days 3 --json   # machine-readable (report + side_by_side)
+```
+It prints, in order:
+- **per-window LADDER lines + totals** (rungs filled, contracts, ladder lock, rolls);
+- **LADDER SCOREBOARD** -- per margin (5..15c): n, mean solved E, mean realised lock, shortfall,
+  %positive; the DRY (dry_sim) rows are in a SEPARATE section, NEVER pooled with realised; pooled
+  per-contract stats; the **capture ratio @ 10c** (Registration-3 definition, V3.2-comparable);
+- **FALSIFIER GATE TABLE (§6)** computed from REALISED rows only -- each gate value/threshold/status
+  (PASS/FAIL/n-too-small), the n>=30 rung-fill counter, and the verdict (kill: mean < +2.0c at n >= 15,
+  or one-legged > 2);
+- **DEEP END (SO-3, observation only)** -- the deep 16..25c rungs the tape reached, mean ideal lock, and
+  absorption (lots printed at/through each deep rung);
+- **SIDE-BY-SIDE** -- per hour V3.2 vs V3.3, day + running totals, and the windows where V3.3 (dry_sim or
+  realised) ENTERED and V3.2 did not, and vice versa.
+
+### Daily review during the dry period (what to look at before the flip)
+1. **SIDE-BY-SIDE**: every hour both rosters wrote a row; V3.3's dry_sim ladder lock tracks (and, on
+   sweeps, exceeds) V3.2's realised set lock. Check the "V3.3 entered / V3.2 did NOT" list -- these are the
+   shallow-rung windows the ladder adds (the study's +13 windows). A "V3.2 entered / V3.3 did NOT" window
+   is a red flag (the ladder should enter a superset) -- investigate the journal.
+2. **SCOREBOARD DRY section**: the per-rung dry_sim locks should match the study (5c ~+5.9c ... 15c
+   ~+15c, the distinct deepest rung deeper); single-order-roll ratio ~100%; creates/amends/cancels per
+   window sane (no A_REPLACE storm).
+3. **DEEP END (SO-3)**: watch the deep rungs' reached-window counts + absorption grow -- this is the
+   evidence the Promotion clause (2 lots, or rungs past 15c) will read. It is observation only; nothing
+   is sized on it until Brad's dated word.
+4. **Sends nothing**: spot-check a dry journal (`journals_v33\<close>.jsonl.gz`) -- only `would_*` +
+   `dry_sim_fill` records, no `place_rest`/`amend_rest`/`take_wings`; `/health` `orders_remaining_today`
+   unchanged before/after the window.
+
+The GATE TABLE will read `n<30 pending` / `n-too-small` throughout the dry period (dry produces no
+REALISED rung-fills) -- that is expected; the realised gates come alive only after the flip.
+
+### L3 pre-arm hardening (all in code as of this phase; see `ceremony/v33_falsifier.md` + `V33_ARMING.md`)
+- **pacer headroom reserve** (`write_reserve_tokens` = 30): a non-priority create/amend never draws the
+  write bucket below 30, so a priority cancel-all / wing burst always has room (never itself paced).
+- **429 vs business rejection**: a rate-limit (HTTP 429) POST is retried ONCE after a `Retry-After` /
+  pacer wait, journaled `rate_limited`, and does NOT count toward the 3-consecutive-reject stand-down (it
+  executed nothing). A business 4xx is handled as before. **ALARM SIGNAL:** an occasional `rate_limited`
+  record is fine, but SUSTAINED / repeated `rate_limited` records across a window (or windows) are Brad's
+  signal to check the Kalshi rate tier and `DAILY_ORDER_BUDGET` -- the write bucket is being throttled at
+  the venue and the roll may be falling behind.
+- **armed cap belt**: an armed window whose `/health` contract cap is unreadable degrades to dry rather
+  than sizing wings against a guess.
+- **weighted-average wing price** across the original + retry chunks (a leg completed over two takes
+  reports the true blended price).
+- **batched poll covers every bucket** with a live rung (a prior-bucket rung after a mid-window bucket
+  change is polled/cancel-covered, not missed).
+- **stray handling**: a lone unattributable `v33-*` stray with venue truth otherwise matching is
+  CANCELLED + alarmed and the ladder proceeds (not a whole-window stand-down); an overflow/dup still
+  stands the hour down.
+
+---
+
+## 10. Arming V3.3 (the flip) -- see `ops/V33_ARMING.md`
+
+The full mechanical arming runbook -- prerequisites (falsifier FROZEN, proxy levers, task registered,
+>= 2 dry days reviewed), the FLIP (`v33_mode.txt` -> armed, `v32_mode.txt` -> dry in one :02-:33 window,
+Brad's hand), the MUST CONFIRM list, the V3.2 Q4 close-line template, and the rollback -- lives in
+`pilot/ops/V33_ARMING.md`. Nothing there is Claude's to pull.
+
+---
+
+## 11. Brad's levers (nothing here is Claude's to pull)
 
 - Registering / unregistering any scheduled task (`register_supervisor_tasks.ps1`,
   `unregister_v32_task.ps1`, `register_v32_task.ps1`).
