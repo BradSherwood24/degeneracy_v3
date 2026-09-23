@@ -27,17 +27,25 @@ fee-reserve rounding). Default K = 11, E_min = 5 -> rungs at 5..15c. A YES-taker
 from the top: shallow pumps fill 1-4 rungs, full sweeps fill all K (measured: every one of the 12 live
 V3.2 sets was a full sweep; sweep depth median 22c).
 
-**The roll (Brad's requote).** When W moves so that `n_top` changes by one cent, the ladder does NOT
-re-price K orders. It moves ONE order from the end that fell off to the end that opened up:
-- W up (wings dearer) -> every rung must sit 1c lower -> the old TOP order (was E_min) is amended down to
-  `bottom - 1c` and becomes the new deepest rung; the other K-1 orders are untouched and KEEP QUEUE.
-- W down -> the old BOTTOM order is amended up to `top + 1c` and becomes the new shallowest rung.
-- A 2c move = two rolls, strictly sequential. Amend-first (PR #59 path), cancel -> confirm -> create as
-  the fallback. Bucket change (~1 per window): cancel all K, place all K on the new ticker.
-- Order count is the SAME as today: today's replace = 1 cancel + 1 create per >= 2c move (~100/window,
-  ~200 orders); the roll = 1 amend per 1c (or 1 cancel + 1 create without the amend cap). Queue position
-  is the win: today every replace goes to the back of the book at the new price; the roll keeps K-1 rungs
-  in place.
+**The reprice = margin-array convergence (Brad's model, R4).** The desired state is a MARGIN ARRAY in
+profit space, index m = cents of margin at the current `n_top` (m = E_min_c is n_top): 0 = below E_min
+(no order), 1 = open order wanted, 2 = filled (consumed; never re-opened, Q3). The 1-slots are ANONYMOUS
+(no order owns an index); an order's index is always DERIVED from its live price vs n_top, and any live
+order may be paired to any vacant 1-slot. When W moves n_top (a reprice), each order's derived index
+shifts; a CONVERGENCE keeps one live order per placeable 1-slot by pairing OUT orders (index not a
+1-slot) with VACANT 1-slots and AMENDing, moving up to `max_amends_in_flight` orders at a time and
+continuing on each ack "until the prices match E":
+- A 1c n_top move = ONE order moves (the order that fell off an end -> the vacant slot at the other end);
+  the other K-1 keep queue. A Nc move = N orders move, N-at-a-time, the rest keep queue. A cap crash /
+  large jump = the same loop N-at-a-time (NOT a cancel-all — replaces the R2 fast-shift).
+- Extra OUT with no placeable slot -> CANCEL (shrink at n_min/cap); a suppressed slot that becomes
+  placeable is a 1 and IS placed (a create, capped by the K exposure guard), not a refill.
+- Amend-first (PR #59 path); cancel -> confirm -> create per order is the fallback. Bucket change: cancel
+  all live, then place the PLACEABLE OPEN slots on the new ticker (after a partial sweep of margins 5..k,
+  the new ticker gets k+1..15). A 2-slot is tied to its actual fill (`filled_at` -> order_id/coid/W/n_top)
+  for per-margin falsifier accounting. `deb_ms` debounces only the START of a convergence (sign-flip
+  re-debounces). Queue is the win: only the orders that must move rotate coid; the rest keep position.
+  (Built + reviewed L1 R1-R4, 2026-09-22.)
 
 **B. The host-shaped runtime.** Run locally exactly what Render would run (see
 `ops/RENDER_MIGRATION_PLAN.md` section 3): a supervisor process that wakes one window per UTC :40
@@ -118,24 +126,29 @@ the tweak)
 - Leftover-raw journal rotation at wake (the call V3.2 never inherited; today's 632 MB orphan).
 
 ### Phase L1 -- ladder core (pure, `service/v33/core.py` forked from v32 core) -- ~600 lines + tests
-- `V33State.ladder: tuple[RestOrder, ...]` (K rungs, each with coid/order_id/price/filled), replacing
-  `rest_live`/`rest_remaining`; `ladder_top`; `_requote` becomes `_roll` (one amend per cent, strictly
-  sequential, amend-first with cancel/create fallback; bucket change = cancel-all/place-all); fill on rung k
-  -> fill event -> `WingBatch` (coalesced per Q2); `_rest_size` per rung = 1; n_min truncates the ladder
-  from the bottom; the top rung honours the post-only cap. The ladder rests at n_top, n_top-1c ... so its
+- `V33State.ladder: tuple[RestOrder, ...]` (K rungs, each coid/order_id/price; rung/E_rung are a DERIVED
+  label, not identity), replacing `rest_live`/`rest_remaining`; plus a `margin_state` array (profit space:
+  0 no-order / 1 open / 2 filled) and `filled_at` (2-slot -> fill). `_requote` becomes `_converge`
+  (Brad's margin-array model, R4): the 1-slots are anonymous, an order's index is derived from price vs
+  n_top, and the convergence pairs OUT orders (index not a 1-slot) with vacant 1-slots and amends up to
+  `max_amends_in_flight` at a time until prices match the array (a 1c move = one order moves, an Nc move =
+  N at a time, the rest keep queue; amend-first with cancel/create fallback; bucket change = cancel-all
+  then place the placeable open slots). Fill -> `WingBatch` (coalesced per Q2); one lot per rung; n_min
+  truncates the ladder from the bottom; the top rung honours the post-only cap. Window exposure
+  `rungs_filled + live <= K` at every step. The ladder rests at n_top, n_top-1c ... so its
   realised margins span 5..(E_min+K-1)c, and at LOW W -- where the study's two deepest rungs collapse to
   one price -- the ladder's DISTINCT deepest rung realises up to (E_min+K)c (e.g. +16.03c at the golden
   W=1.4737, vs the label 15c). So "5..15c" is the nominal label range; the realised range is W-dependent,
   and L3 must compute each rung's SOLVED E from `lock_value(price, W_at_fill)`, not the integer label
-  (built + reviewed L1 R2, 2026-09-22). Invariant: never more than K live rests, never
-  two rests on one price. Golden tests: (a) a full-sweep replay from the 2026-09-20 04:00Z journal fills
-  all 11 rungs with the ideal locks from the study; (b) a shallow pump fills 3; (c) a 1c W move rolls
-  exactly one order and leaves K-1 order_ids untouched; (d) a 2c move rolls two, in order; (e) bucket
-  change re-places K; (f) a fill during a roll (the moving order fills mid-amend -> `amend_cross_pending`
-  path per rung).
+  (built + reviewed L1 R1-R4, 2026-09-22). Invariants: never more than K live rests, never two rests on one
+  price, `rungs_filled + live <= K`. Golden tests: (a) a full-sweep replay from the 2026-09-20 04:00Z
+  journal fills all 11 rungs with the ideal locks from the study; (b) a shallow pump fills 3; (c) a 1c W
+  move moves exactly one order, K-1 untouched; (d) a 2c move moves two (concurrent, within
+  `max_amends_in_flight`), 9 untouched; (e) bucket change re-places the placeable open slots; (f) a fill
+  during a roll books at the pre-roll price and does not double-place.
 - `policy/v33_params.json` + sha pin: `E_min` 0.05, `rungs` 11, `lots_per_rung` 1, `tol` 0.01,
-  `deb_ms` 5000, `wing_coalesce_ms` 150, `refill_in_window` false, `max_sets_per_hour` 11,
-  `replace_rate_alarm_per_min` (per ladder; propose 120), plus everything V3.2 carries.
+  `deb_ms` 5000, `wing_coalesce_ms` 150, `refill_in_window` false, `max_amends_in_flight` 3,
+  `max_sets_per_hour` 11, `replace_rate_alarm_per_min` 120, plus everything V3.2 carries.
 
 ### Phase L2 -- execution + money math -- ~400 lines
 - Executor: K-order bookkeeping (already generic per order_id); roll = amend of one order (existing
