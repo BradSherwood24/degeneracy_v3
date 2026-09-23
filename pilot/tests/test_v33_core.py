@@ -1094,6 +1094,99 @@ def test_3c_move_still_crawls_not_fast_shift():
     assert not [a for a in acts if a.kind == ActionKind.CANCEL_REST]
 
 
+# ---------------------------------------------------------------------------
+# Round 3 (reviewer 2026-09-22): re-placement must cap at K - filled (BLOCKING #R2-1)
+# ---------------------------------------------------------------------------
+def test_fast_shift_after_partial_sweep_caps_at_k_minus_filled():
+    # (a) partial sweep (3 filled) -> fast-shift 5c -> re-place exactly K-3=8, exposure <= K, and a burst
+    # sweep of the re-placed ladder books exactly K total (never > K). invariants green throughout (_feed).
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_ladder(p, st, now)          # ladder 0.50..0.40
+    for o in sorted(st.ladder, key=lambda o: o.price, reverse=True)[:3]:
+        st, _ = _sweep_fill(p, st, o, now + 0.5)   # fill top 3 -> survivors 8
+    assert st.rungs_filled == 3 and len(st.ladder) == 8
+    st, _ = _refresh(p, st, now + 0.8, sd_ask="0.76")   # keep fresh, anchor 0.50
+    st, acts = _refresh(p, st, now + 1, sd_ask="0.81")   # n_top -> 0.45 (down 5c) -> fast shift
+    cancels = [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert len(cancels) == 8 and st.ladder == () and st.awaiting_replace
+    for i, c in enumerate(cancels):
+        st, acts = _feed(p, st, OrderCancelled(c.order_id, now + 1.1 + i * 0.001))
+    places = [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert len(places) == 8, "must re-place K - filled = 8, not K = 11"
+    for a in places:
+        st, _ = _feed(p, st, OrderAck(a.client_order_id, f"OID2-{a.client_order_id}", now + 1.3))
+    assert st.rungs_filled + len(st.ladder) == 11    # exposure exactly K
+    # burst sweep the re-placed ladder -> total window fills == K (never exceeds).
+    for o in list(st.ladder):
+        st, _ = _feed(p, st, Fill(o.order_id, o.client_order_id, Decimal(1), o.price, "no", now + 1.5))
+    assert st.rungs_filled == 11 and st.rest_allotment_done
+
+
+def test_bucket_change_after_partial_sweep_caps_at_k_minus_filled():
+    # (b) partial sweep (3 filled) -> bucket change -> re-place exactly K-3=8 on the new ticker.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_ladder(p, st, now)          # bucket 79600
+    for o in sorted(st.ladder, key=lambda o: o.price, reverse=True)[:3]:
+        st, _ = _sweep_fill(p, st, o, now + 0.5)
+    assert st.rungs_filled == 3 and len(st.ladder) == 8
+    # 79700 becomes the higher-mid spot.
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.9))
+    st, _ = _feed(p, st, BookUpdate(STK_SU2, _top("0.20", "0.21"), now + 0.9))
+    st, acts = _feed(p, st, BookUpdate(B_SU, _top("0.55", "0.57"), now + 0.9))
+    cancels = [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert len(cancels) == 8 and st.ladder == () and st.outstanding_cancels == 8
+    for i, c in enumerate(cancels):
+        st, acts = _feed(p, st, OrderCancelled(c.order_id, now + 1.0 + i * 0.001))
+    places = [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert len(places) == 8, "bucket change must re-place K - filled = 8"
+    assert all(o.bucket_Sd == 79700 for o in st.ladder)
+    assert st.rungs_filled + len(st.ladder) == 11
+
+
+def test_bucket_change_after_full_sweep_places_nothing():
+    # (c) K filled -> allotment latched -> a bucket change places nothing.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_ladder(p, st, now)
+    for i, o in enumerate(list(st.ladder)):
+        st, _ = _sweep_fill(p, st, o, now + 0.5 + i * 0.001)   # fill all 11
+    assert st.rungs_filled == 11 and st.rest_allotment_done and st.ladder == ()
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.9))
+    st, _ = _feed(p, st, BookUpdate(STK_SU2, _top("0.20", "0.21"), now + 0.9))
+    st, acts = _feed(p, st, BookUpdate(B_SU, _top("0.55", "0.57"), now + 0.9))
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert st.ladder == () and st.rest_allotment_done
+
+
+def test_place_all_budget_zero_latches_allotment():
+    # the defensive budget<=0 branch of _place_all: a re-place request when the allotment is already spent
+    # latches rest_allotment_done and places nothing (belt-and-braces to the reactive max_sets latch).
+    from service.v33.core import _place_all
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, _ = _feed_all(p, st, _books(now))         # sets n_top / spot context
+    st = replace(st, ladder=(), rungs_filled=11, rest_allotment_done=False)
+    st2, acts = _place_all(p, st, now)
+    assert acts == [] and st2.rest_allotment_done and st2.ladder == ()
+
+
+def test_invariant_flags_window_exposure_over_k():
+    # BLOCKING #R2-1 guard: filled + resting must never exceed K (the harness would now catch a regrow).
+    p = _params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_ladder(p, st, now)          # 11 resting
+    bad = replace(st, rungs_filled=3)             # 3 + 11 = 14 > 11
+    with pytest.raises(AssertionError):
+        bad.check_invariants(p)
+
+
 def test_invariant_flags_stale_rung_label():
     p = _params()
     st = _state(p)

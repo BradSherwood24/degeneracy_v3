@@ -248,3 +248,34 @@ c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20` (R1 sha kept a
 - **Shift-UP into the filled region after a partial sweep** stays as built (whole ladder shifts, lot cap
   honoured — `live + filled ≤ K` verified). Noted as Brad's open question (reviewer QUESTION #3).
 - **n_min shrink regrowth** — unchanged (safe direction; documented); confirm at L2/L3.
+
+---
+
+# Round 3 (2026-09-22) — addressing PR #85 Round-2 re-review (one new BLOCKING)
+
+R1 blockers confirmed closed. One new BLOCKING (R2-1) fixed. Suite after R3: **1041 passed, 2 skipped,
+2 errors** (same pre-existing corpus gaps; +5 v33 tests over R2's 79 → **84 v33 tests**). The reviewer's
+adv_r2 probe now shows re-place = K−filled and total window fills = K (no breach); the R1 adv probe stays
+invariant-clean.
+
+## BLOCKING #R2-1 — re-placement capped at K − filled (FIXED)
+`_place_all` was regrowing the ladder to the full K on the fast-shift and bucket-change paths, ignoring
+`rungs_filled` — so after a partial sweep (3 filled, 8 survivors) a fast shift or bucket change cancelled
+8 and re-placed 11, letting the window hold filled(3)+resting(11)=14 > K=11 (a burst sweep books 14 before
+the reactive `max_sets_per_hour` latch can act). This broke DECIDED Q3 (max K lots/window) and undersized
+S4 (Q5).
+
+**Fix (one place, both paths):** `_place_all` now places `min(rungs, max_sets_per_hour - rungs_filled)`
+rungs FROM THE TOP down; if that budget is ≤ 0 it latches `rest_allotment_done` and places nothing. First
+placement (filled 0) is unchanged (budget = K). Fast shift and bucket change after f fills now re-place
+exactly K − f, so total window exposure is always ≤ K.
+
+**Invariant strengthened:** `check_invariants` now asserts `rungs_filled + len(live ladder) <= K` at every
+step — the harness (which runs it after every event) would have caught the regrow.
+
+Tests: `test_fast_shift_after_partial_sweep_caps_at_k_minus_filled` (3 filled → fast-shift 5c → re-place
+8, exposure = K, burst sweep books exactly K), `test_bucket_change_after_partial_sweep_caps_at_k_minus_filled`
+(re-place 8 on the new ticker), `test_bucket_change_after_full_sweep_places_nothing` (K filled → latched,
+nothing placed), `test_place_all_budget_zero_latches_allotment` (defensive budget≤0 branch),
+`test_invariant_flags_window_exposure_over_k`. Existing goldens unchanged (first placement, filled 0,
+still places full K).

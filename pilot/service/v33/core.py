@@ -301,9 +301,14 @@ class V33State:
           while NO rung has filled (fills open gaps that are not refilled, so consecutiveness is only
           asserted pre-fill); * at most one roll in flight, and its moving order is a ladder member unless
           it has already filled (golden f); * a taken wing batch has exactly two legs sized to its total;
-          * ``rungs_filled`` equals the number of booked rung fills."""
+          * ``rungs_filled`` equals the number of booked rung fills; * the WINDOW EXPOSURE
+          ``rungs_filled + live rests <= K`` at every step (BLOCKING #R2-1: a re-placement after a partial
+          sweep must never regrow the ladder past K - filled)."""
         lad = self.ladder
         assert len(lad) <= params.rungs, f"ladder has {len(lad)} > K={params.rungs} rests"
+        assert self.rungs_filled + len(lad) <= params.rungs, (
+            f"window exposure {self.rungs_filled} filled + {len(lad)} resting > K={params.rungs}"
+        )
         prices = [o.price for o in lad]
         assert len(set(prices)) == len(prices), f"two rests on one price: {sorted(prices)}"
         for o in lad:
@@ -988,11 +993,20 @@ def _desired_rungs(params: V33Params, n_top: Decimal) -> list[tuple[Decimal, int
 
 
 def _place_all(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V33Action]]:
-    """Place the whole desired ladder (K_eff rungs). Counts as ONE ladder placement (the debounce anchor
-    for the first roll); the per-rung PLACE_RESTs are emitted together."""
+    """Place the desired ladder, capped at the REMAINING hourly allotment (BLOCKING #R2-1, reviewer
+    2026-09-22): a re-placement after a partial sweep (fast shift or bucket change) must NOT regrow the
+    ladder past ``K - rungs_filled``, or the window could hold more than K lots (a burst sweep would book
+    them before the reactive ``max_sets_per_hour`` latch can act) — breaching DECIDED Q3 and undersizing
+    S4 (Q5). Place ``min(rungs, max_sets_per_hour - rungs_filled)`` rungs FROM THE TOP down; if that is
+    <= 0, latch ``rest_allotment_done`` and place nothing. Counts as ONE ladder placement (the debounce
+    anchor for the first roll); the per-rung PLACE_RESTs are emitted together."""
     assert st.n_top is not None
     actions: list[V33Action] = []
-    for price, rung, E_rung in _desired_rungs(params, st.n_top):
+    budget = min(params.rungs, params.max_sets_per_hour - st.rungs_filled)
+    if budget <= 0:
+        # the hourly allotment is already spent -> place nothing and stop quoting for the window.
+        return replace(st, rest_allotment_done=True), actions
+    for price, rung, E_rung in _desired_rungs(params, st.n_top)[:budget]:
         st, a = _place_one(params, st, price, rung, E_rung, now)
         actions += a
     if actions:
