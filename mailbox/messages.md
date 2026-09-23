@@ -1288,3 +1288,39 @@ CI). Decisions: coalesced wings (150 ms), no refills in-window, S4 $3 stays, Bra
 16..25c, and **V3.2 keeps running armed through the build** (n grows) -- closed only when V3.3 arms. Order: amend cap -> Phase H -> L1 -> L2
 -> L3 -> V3.3 dry -> freeze -> arm. Build starts after the compact on Brad's go.
 -- Claude
+
+## 2026-09-23 ~13:35Z -- Claude -> house: the V3.3 build day -- Phase H, the ladder core, the dry roster, the flap storm, and the first side-by-side hour (pre-compact)
+
+**Built and merged in one sitting (09-22 23:05Z -> 09-23 12:08Z), PRs #83-#91, suite 961 -> 1264, live tree main 87fd59e:**
+Phase H-A runtime (#83: supervisor per UTC :40, DV3_DATA_DIR, DV3_PROXY_BASE, two "run whether logged on" task scripts, runbook, wake-time
+journal rotation; round 2 added the day-guard checkout fallback and a per-window watchdog). Phase H-B (#84: proxy env patch DOC for Brad's hand
+-- PROXY_HOST/PROXY_BUDGET_PATH/.env optional/X-DV3-Token stripped before Kalshi -- requirements.txt, .python-version 3.12.10, Linux CI).
+L1 ladder core (#85, four rounds): Brad's MARGIN-ARRAY model -- E in profit space, 0 no order / 1 open / 2 filled; the 1-slots are anonymous,
+the 2s carry their fill; one CONVERGENCE loop pairs out-of-span orders with vacant slots, up to `max_amends_in_flight` (3) at once; a 1c move
+moves one order, a 5c move moves five and six keep queue; re-place is capped at K-filled; a filled margin never re-opens. L2 (#87, two rounds):
+run_v33.py, v33_mode.txt (missing -> dry, never armed), V33LiveExecutor (v33-* coids, K-aware venue check, chunked wing takes to the proxy cap,
+write-token pacer, batched poll, per-rung bucket on every fill), v33 ledger/stops/report, supervisor --roster v33, -WithV33 task switch.
+L3 (#88, two rounds): LADDER SCOREBOARD, live FALSIFIER GATE TABLE (fail-closed on an unmeasurable capture), SIDE-BY-SIDE, SO-3 deep ladder
+16..25c observation-only, `ceremony/v33_falsifier.md` DRAFT pinned so arming refuses until Brad freezes it, `ops/V33_ARMING.md`, pacer headroom
++ 429 handling. Every PR: Opus 4.8 build + adversarial Opus 4.8 review, Brad merged the code, I merged docs only.
+
+**The dry period found its first bug in hour one.** 07:00Z dry window from a scratch data dir sent NOTHING (proxy counter moved exactly by
+V3.2's 109), but BTC spot straddled the 86,500 boundary and flipped 28 times in sub-second bursts; the core rebuilt the ladder on every flip:
+418 would-be creates in an hour (V3.2 pays 2 per flap, the ladder 22). Hotfix #89: `bucket_switch_deb_ms` 3000 + hysteresis 15$ (implied spot
+= yes-mid centroid) + `bucket_switch_max_pending_ms` 15000 anti-strand cap + `stand_down_hold_ms` 1500 (hold the rests through a sub-second
+stale wing instead of cancel-all). Replay of the same hour: 264 -> 22 creates, 23 -> 1 switches. First production dual hour 13:00Z: 55
+would-be creates, 8 holds resumed, 0 sent.
+
+**V3.3 is RUNNING DRY beside armed V3.2 since 12:28Z** (Brad: "Go ahead and register V3.3 in dry as you did last night"). The S4U task
+registration needs an ADMIN shell -> the supervisor runs detached (`Start-Process python -m service.supervisor --roster v33`, hidden), dies with
+a reboot; `pilot/ops/v33_mode.txt` = dry written explicitly. Both rosters write a row every hour; `python -m service.v33.report --days 3`.
+
+**Brad's gates for the flip (verbatim in V33_ARMING 4b/4c):** ">= a couple entries" seen in the dry side-by-side, and move $10 so the crypto
+exchange balance is ~$35 (K=11 sweep holds ~$21 + wings). Still his: freeze the falsifier, amend cap + budget 8000 + MAX_CONTRACTS_PER_ORDER
+(2 or 11), the admin-shell task registration, then v33 -> armed / v32 -> dry in a :02-:33 window.
+
+**V3.2 meanwhile:** armed at size 2, no fill since 09-21 06Z (~55 h). The 02:00Z miss today is the ladder's whole argument in one window: a
+sweep walked 0.46 -> 0.67, V3.2 rested 2 lots at exactly 0.67 five seconds early and lost the queue to 5.32 lots; the ideal ladder fills 7
+rungs for 62c, and the 0.62 level printed NOTHING -- an empty level, first by price priority. Capture 12/20. Brad also closed the 01:40 console
+by accident (relaunched by hand, no coverage lost) -- the failure mode the supervisor removes.
+-- Claude
