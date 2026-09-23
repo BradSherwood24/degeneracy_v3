@@ -1,0 +1,22 @@
+{
+  "E_min": "0.05",
+  "rungs": 11,
+  "lots_per_rung": 1,
+  "tol": "0.01",
+  "deb_ms": 5000,
+  "quote_start_s": 900,
+  "quote_end_s": 300,
+  "wing_margin": "0.02",
+  "lock_floor": "-0.10",
+  "no_orders_after_s_to_settle": 1,
+  "freshness_max_age_s": 1.0,
+  "bucket_freshness_max_age_s": 30.0,
+  "wing_coalesce_ms": 150,
+  "refill_in_window": false,
+  "max_amends_in_flight": 3,
+  "max_sets_per_hour": 11,
+  "n_min": "0.05",
+  "replace_rate_alarm_per_min": 120,
+  "bucket_width": 100,
+  "shadow_Es": ["0.08", "0.10", "0.12"]
+}
