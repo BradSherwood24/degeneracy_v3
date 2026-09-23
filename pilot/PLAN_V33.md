@@ -122,7 +122,12 @@ the tweak)
   `rest_live`/`rest_remaining`; `ladder_top`; `_requote` becomes `_roll` (one amend per cent, strictly
   sequential, amend-first with cancel/create fallback; bucket change = cancel-all/place-all); fill on rung k
   -> fill event -> `WingBatch` (coalesced per Q2); `_rest_size` per rung = 1; n_min truncates the ladder
-  from the bottom; the top rung honours the post-only cap. Invariant: never more than K live rests, never
+  from the bottom; the top rung honours the post-only cap. The ladder rests at n_top, n_top-1c ... so its
+  realised margins span 5..(E_min+K-1)c, and at LOW W -- where the study's two deepest rungs collapse to
+  one price -- the ladder's DISTINCT deepest rung realises up to (E_min+K)c (e.g. +16.03c at the golden
+  W=1.4737, vs the label 15c). So "5..15c" is the nominal label range; the realised range is W-dependent,
+  and L3 must compute each rung's SOLVED E from `lock_value(price, W_at_fill)`, not the integer label
+  (built + reviewed L1 R2, 2026-09-22). Invariant: never more than K live rests, never
   two rests on one price. Golden tests: (a) a full-sweep replay from the 2026-09-20 04:00Z journal fills
   all 11 rungs with the ideal locks from the study; (b) a shallow pump fills 3; (c) a 1c W move rolls
   exactly one order and leaves K-1 order_ids untouched; (d) a 2c move rolls two, in order; (e) bucket
