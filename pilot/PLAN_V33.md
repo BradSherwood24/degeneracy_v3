@@ -79,14 +79,22 @@ the tweak)
   2K taker orders in a burst) [assumed] -- or strictly one wing pair per rung fill (2K orders). Either way
   the count taken always equals the count filled (the 2026-09-18 ruling).
 - **Q3 refills.** A filled rung is NOT re-placed inside the same window (max K lots per window; the risk
-  cap is the ladder size) - **Q4 V3.2's record.** V3.2 KEEPS RUNNING ARMED through the whole V3.3 build (Brad, 2026-09-22
+  cap is the ladder size). In Brad's margin-array model (2026-09-23, section 1) a filled margin is a 2 and
+  is never re-opened; the convergence only ever targets the 1-slots.
+- **Q4 V3.2's record.** V3.2 KEEPS RUNNING ARMED through the whole V3.3 build (Brad, 2026-09-22
   ~22:00Z, verbatim: "Lets keep V3.2 running during this build out, so n=>12. Hopefully capture another").
-  Its n keeps growing; the V3.3 dry shadow runs alongside it. Only when V3.3 arms does the V3.2 roster
-  stop (one armed roster per bucket) and its falsifier close with a dated Registration line quoting the
-  n, the record and "verdict not reached / superseded by V3.3". V3.3's 10c rung is NOT pooled into
-  V3.2's n (different mechanics).
-, 12/12, mean +11.2c, verdict
-  not reached" [assumed]. V3.3's 10c rung is NOT pooled into V3.2's n (different mechanics).
+  Its n keeps growing; V3.3 runs DRY alongside it. REFINED by Brad 2026-09-23 ~00:20Z (verbatim: "I'd
+  like to run it along side V3.2 without it trading, then flip V3.3 to contracts 10 and V3.2 to 0. Just to
+  watch and compare. Make sure V3.3 is running exactly as expected before $20+ are on the line"): the
+  lever is the MODE FILES, not the params (the params shas are pinned). V3.3 gets `ops/v33_mode.txt`
+  and starts `dry`; both rosters write a ledger row every hour and the report prints them SIDE BY SIDE.
+  At the flip, in a :02-:33 window and by Brad's hand, `v33_mode.txt` -> armed and `v32_mode.txt` ->
+  dry: V3.2 keeps running and reporting with no orders, so the comparison continues in the other
+  direction (one armed roster per bucket). V3.2's falsifier closes with a dated Registration line quoting
+  its n, its record and "verdict not reached / superseded by V3.3". V3.3's 10c rung is NOT pooled into
+  V3.2's n (different mechanics). Dry proves the mechanics (rung prices, one-order rolls, coalesced wings,
+  stops, accounting), NOT venue acceptance or queue position -- the MUST CONFIRM list stays for the first
+  armed windows; an optional smaller first armed step is `rungs` 3 (~$6 in flight), a params amendment.
 - **Q5 stops.** S4 day-loss cap: $3.00 was sized for 1-2 lots; a one-legged rung costs ~$0.35 worst
   case, so a bad K-rung sweep could breach it in one window. Proposal: S4 = max($3.00, 0.5 x K x $0.35)
   [assumed $3.00 stays for K = 11 -> $1.93 < $3.00, so no change needed; revisit at K = 16+]. S1 legged
@@ -158,11 +166,22 @@ the tweak)
   `E_rung` to each fill event; `realized_lock` per contract per rung; ladder summary per row (rungs
   filled, shallowest/deepest, contracts, ladder lock).
 - Stops: S4 per Q5; S1 per contract; replace-rate alarm per ladder.
+- Roster plumbing (Brad 2026-09-23, Q4 refinement): `service/run_v33.py` per-window process, `ops/v33_mode.txt`
+  (missing -> dry, never armed by default), `ledger/v33_ledger.jsonl`, `journals_v33/`, `logs_v33/`,
+  `ops/v33_stops_<day>.json`, all through `service.paths` (DV3_DATA_DIR); `v33-*` client order ids so
+  the two rosters are distinguishable on the venue and in the startup sweep. DRY MODE runs the full core
+  against the live feed every window, journals every action it would send, simulates ladder fills with
+  the ideal rule (spot-bucket YES-taker print at or through the rung price; wings priced from the live
+  book at fill time) and books them into the v33 row as `dry_sim` (never realised). Both rosters launch
+  at :40 (supervisor children or a third task). Proxy amend cap not yet applied -> cancel->create per
+  order is the default path until Brad applies it; amend-first is a params/env value, not code.
 
 ### Phase L3 -- report + shadow + ceremony -- ~300 lines
 - Report: LADDER SCOREBOARD (per-rung n, fills, mean lock vs solved E, shortfall), ladder capture ratio
   at the 10c rung (comparable to V3.2), pooled per-contract stats; the V3.2 blocks keep printing for the
-  V3.2 rows.
+  V3.2 rows; a SIDE-BY-SIDE block (Brad: "watch and compare") -- per hour both rosters wrote a row: V3.2
+  realised (or dry) lock vs V3.3 dry_sim/realised ladder lock, contracts, rungs filled, shallowest/deepest
+  margin, running totals (the minimum version ships in L2).
 - Shadow: the ideal ladder at the same K rungs (the study's fill rule, live), plus one deeper observation
   ladder (16..25c) as SO-3 to measure the deep end before anyone sizes it.
 - `ceremony/v33_falsifier.md` DRAFT (section 6); `ops/V33_ARMING.md`; the V3.2 Registration close line
@@ -191,8 +210,11 @@ Per Brad's sizing philosophy (2026-09-18): n answers slippage and edge-case ques
    >= 2 days -- the runtime is proven before the strategy changes.
 3. Phases L1 -> L2 -> L3, each Opus 4.8 build + review, Brad merges. Live V3.2 untouched throughout
    (V3.3 lives in `service/v33/`, its own params/ledger/mode file).
-4. V3.3 DRY with the K-rung shadow for >= 2 days alongside armed V3.2 (dry sends no orders).
-5. Brad freezes the V3.3 falsifier; V3.2 closed (Q4); V3.3 mode -> armed in a :02-:33 window.
+4. V3.3 DRY (`ops/v33_mode.txt` = dry) alongside armed V3.2 for >= 2 days, both rows every hour, the
+   side-by-side block watched until "V3.3 is running exactly as expected" (Brad's words; dry sends no
+   orders).
+5. Brad freezes the V3.3 falsifier; in ONE :02-:33 window by Brad's hand: `v33_mode.txt` -> armed and
+   `v32_mode.txt` -> dry (Q4 refined; V3.2 keeps running and reporting, no orders).
 6. First armed windows: MUST CONFIRM list (K orders accepted, one-order rolls, coalesced wings sized to
    fills, hand reconciliation of the first full sweep against `/portfolio/fills`).
 
