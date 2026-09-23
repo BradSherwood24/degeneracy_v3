@@ -182,3 +182,69 @@ quantity these need.
 - Coalescing takes wings only when a batch is CLOSED AND the strike books are fresh; under a silent
   strike feed the take defers (same as V3.2's wing gate). L2's driver ticks the clock continuously, so a
   closed batch takes on the next fresh book — verify the driver feeds ClockTicks densely enough.
+
+---
+
+# Round 2 (2026-09-22) — addressing PR #85 review (BLOCK, narrowly)
+
+Reviewer verdict was BLOCK on two label/invariant defects; mechanics were verified correct. All items
+addressed below. Suite after Round 2: **1036 passed, 2 skipped, 2 errors** (the 2 skips/2 errors are the
+same pre-existing corpus gaps; +13 new v33 tests over R1's 66 → **79 v33 tests**). The reviewer's own
+adversarial probe (`scratchpad/adv_test.py`) now runs against this branch with **zero invariant
+violations** in all four scenarios.
+
+## BLOCKING #1 — `rung` refreshed alongside `E_rung` (FIXED)
+`_recompute_context` now refreshes BOTH `rung` (`_rung_of(n_top, price)`) and `E_rung` for every ladder
+order on every context recompute (`core.py` `_recompute_context`), and `_apply_amended` / the
+`_apply_cancelled` fallback derive both from the CURRENT `n_top` (not emit-time). `RungFill.rung` is now
+always the live position, so the §6 per-rung falsifier key is correct after any number of rolls. New
+helper `_rung_of`. Tests: `test_rung_refreshed_with_e_rung_after_roll_down_and_up`,
+`test_rungfill_captures_live_rung_after_rolls`.
+
+## BLOCKING #2 — labels reconciled to current n_top + invariant relaxed for stranded rungs (FIXED)
+(a) `_apply_amended` and the fallback re-place derive `rung`/`E_rung` from `st.n_top` at ACK time (guard
+`None` → the stored target). (b) `check_invariants` no longer asserts `rung >= 0`; it asserts LABEL
+CONSISTENCY (`rung == _rung_of(n_top, price)` AND `E_rung == E_min + (n_top - price)`) and explicitly
+permits a rung ABOVE `n_top` (negative rung = "stranded above the top") as the honest transient during a
+W revert or a cap crash. Tests: `test_w_reverts_during_in_flight_roll_invariants_green`,
+`test_cap_crash_fast_shift_then_converges_invariants_green`, `test_invariant_flags_stale_rung_label`,
+`test_invariant_allows_negative_rung_above_n_top`. The docstring's "safe to run live" claim now holds on
+the fast-market sequences the reviewer demonstrated.
+
+## Pacing (Q4/Q5 + Q-ROLL-DEB) — RESOLVED, param-driven (Brad's params)
+Implemented as instructed: **`deb_ms` debounces only the START of a convergence**; once committed
+(`converging_dir` == the move's sign) each subsequent cent rolls as soon as the prior amend acks (no
+re-debounce) while the sign is unchanged; **a sign flip re-debounces**. Added
+**`fast_shift_min_cents` (default 4)**: when `|n_top − anchor|` ≥ that after the start debounce (e.g. a
+cap crash stranding most of the ladder), the whole ladder is shifted in ONE step (cancel-all/place-all,
+like a bucket change) instead of crawling K rolls — closing the reviewer's ~65 s exposure window
+(QUESTION #4). New state field `converging_dir`. Tests: `test_pacing_2c_one_debounce_then_ack_driven`
+(2c completes in 2 acks with one debounce), `test_pacing_sign_flip_re_debounces`,
+`test_pacing_1c_single_roll_unchanged`, `test_fast_shift_5c_move_cancels_all_places_all` (5c → one-step),
+`test_3c_move_still_crawls_not_fast_shift`.
+**Brad's params (both defaults recorded here):** `deb_ms = 5000` (start-of-convergence debounce),
+`fast_shift_min_cents = 4` (large-jump one-step threshold). Both are params in `v33_params.json`; change
+without code. Params re-pinned: new `FROZEN_V33_PARAMS_SHA256 =
+c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20` (R1 sha kept as
+`PREVIOUS_V33_PARAMS_SHA256_L1_R1`).
+
+## NITs (all done)
+- **NIT #7 (`refill_in_window`)** — now ENFORCED in `load_v33_params`: only `false` is accepted in L1
+  (Q3 no-refill); `true` fails closed (reserved for L2). Test:
+  `test_refill_in_window_true_fails_closed`. Also `fast_shift_min_cents < 2` fails closed.
+- **NIT #8 (stronger `check_invariants`)** — added: `roll_pending` ⇒ at most one ladder order under the
+  moving coid; a taken wing batch has exactly two legs each sized to `total_count`;
+  `rungs_filled == len(rest_fills)`; prices are whole cents.
+- **NIT #9 (fallback cap re-check)** — the `_apply_cancelled` fallback re-place now clamps to `st.cap`
+  (`min(target, cap)`) and drops the rung if that falls below `n_min`.
+- **NIT #6 (5..15c vs 5..16c wording)** — PLAN_V33 §5 L1 updated (separate commit) to "rungs at
+  n_top, n_top−1c … i.e. realised margins span 5..(E_min+K−1)c and, at low W where the study's deepest
+  rungs collapse, the ladder's distinct deepest rung realises up to (E_min+K)c." **L2/L3 contract note:**
+  L3 MUST compute each rung's "solved E" reference as `lock_value(price, W_at_fill)`, NOT the integer
+  `E_rung` label — the label is the rung's nominal position; the true solved margin is the price/W
+  economic value (at the golden W the deepest rung's label is 15c while its realised lock is +16.03c).
+
+## Policy items left as Brad's call (no code change, per the coordinator)
+- **Shift-UP into the filled region after a partial sweep** stays as built (whole ladder shifts, lot cap
+  honoured — `live + filled ≤ K` verified). Noted as Brad's open question (reviewer QUESTION #3).
+- **n_min shrink regrowth** — unchanged (safe direction; documented); confirm at L2/L3.
