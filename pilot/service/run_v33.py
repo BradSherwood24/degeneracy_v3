@@ -70,7 +70,7 @@ from service.v33 import (
 )
 from service.v33.actions import ActionKind
 from service.v33.executor import V33LiveExecutor, cancel_stale_open_orders
-from service.v33.shadow import DeepObservationLadder
+from service.v33.shadow import DeepObservationLadder, ideal_rung_crosses
 from service.v33.ledger import (
     append_v33_ledger_row,
     build_v33_ledger_row,
@@ -334,8 +334,9 @@ class V33Driver:
         bucket_ticker = st.bucket_tickers.get(rest_sd)
         if bucket_ticker is None or market != bucket_ticker:
             return
+        # the SINGLE ideal fill predicate (shared with SO-3): a YES-taker print at/through our NO rung.
         crossed = [o for o in st.ladder if o.live and o.order_id is not None
-                   and trade.yes_price >= (Decimal(1) - o.price)]
+                   and ideal_rung_crosses(trade.yes_price, o.price)]
         if not crossed:
             return
         # cross from the TOP (shallowest) down, deterministically.

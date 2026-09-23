@@ -327,3 +327,72 @@ def test_loader_fails_closed_on_negative_deep_obs(tmp_path):
     p.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(V33ParamsInvalid, match="deep_obs_rungs"):
         load(str(p), expected_sha=None)
+
+
+def test_loader_fails_closed_when_reserve_plus_cost_exceeds_bucket(tmp_path):
+    """F3 cost-aware: reserve 95 < bucket 100, but 95 + a create's 10 tokens > 100 -> fail closed (a
+    create could never proceed above the reserve)."""
+    from service.v33.params import DEFAULT_V33_PARAMS_PATH, V33ParamsInvalid, load_v33_params as load
+    with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
+        raw = json.load(f)
+    assert raw["write_bucket_size"] == 100
+    raw["write_reserve_tokens"] = 95            # 95 < 100 but 95 + 10 > 100
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(V33ParamsInvalid, match="write_reserve_tokens"):
+        load(str(p), expected_sha=None)
+
+
+# ---------------------------------------------------------------------------
+# (F6) amend-in-flight vs the pre-place stray check -- the amended order is NOT a stray
+# ---------------------------------------------------------------------------
+def _place_action(coid, n):
+    return V32Action(kind=ActionKind.PLACE_REST, ticker=B, side="no", action="buy", count=1,
+                     price=Decimal(n), expiration_epoch=CTS - 300, client_order_id=coid)
+
+
+def test_amend_in_flight_order_not_cancelled_as_stray():
+    """F6: an amend rotates coid (v33-a -> v33-b) but KEEPS the order_id. A later pre-place check that sees
+    the amended order (listed under the NEW coid) must NOT flag it as a stray -- it is attributed via the
+    retained new-coid record. The amended order is left resting; the ladder proceeds; no stand-down."""
+    w = FakeWriter()
+    j = FakeJournal()
+    ex = V33LiveExecutor(w, BUCKET_MAP, EXCH, j, CTS, 300, k_rungs=11, clock=lambda: 0.0,
+                         sleep=lambda _s: None)
+    st = V33State.new(CLOSE, CTS, BUCKET_MAP, load_v33_params())
+    ex.on_action(_place_action("v33-a", "0.45"), st, CTS - 600)      # get_map empty -> place proceeds
+    w.post_queue.append(WriteResponse(200, {"order": {"order_id": "oid-1", "client_order_id": "v33-b",
+                                                      "fill_count": "0.00", "remaining_count": "1.00"}},
+                                      True))
+    amend = V32Action(kind=ActionKind.AMEND_REST, order_id="oid-1", ticker=B, side="no", action="buy",
+                      count=1, price=Decimal("0.44"), client_order_id="v33-a",
+                      updated_client_order_id="v33-b")
+    ex.on_action(amend, st, CTS - 590)                               # rest_book[v33-b]=oid-1
+    # POST-AMEND: the venue lists the order under the NEW coid v33-b + the same oid-1
+    w.get_map["/portfolio/orders"] = {"orders": [
+        {"ticker": B, "order_id": "oid-1", "client_order_id": "v33-b", "exchange_index": 2}]}
+    ex._pending_place_price = Decimal("0.43")                        # a fresh rung, none resting there
+    assert ex._pre_place_invariant("v33-c", CTS - 580) is None       # attributed -> proceed
+    assert ex.rest_stray_cancels == 0 and ex.stand_down_reason is None
+    assert "stray_cancel" not in j.kinds() and "rest_stray_cancelled" not in j.kinds()
+
+
+def test_venue_ahead_new_coid_attributed_by_order_id():
+    """The in-flight window: the venue shows the NEW coid while our RestBook still only holds the OLD coid
+    (the amend ack not yet processed). Attribution by the STABLE order_id resolves it (the old-coid record
+    is retained), so it is still NOT a stray."""
+    w = FakeWriter()
+    j = FakeJournal()
+    ex = V33LiveExecutor(w, BUCKET_MAP, EXCH, j, CTS, 300, k_rungs=11, clock=lambda: 0.0,
+                         sleep=lambda _s: None)
+    # seed ONLY the old coid (as if the amend ack has not landed): rest_book[v33-a]=oid-1, by_oid stable.
+    from service.v32.executor import RestRecord
+    ex.rest_book["v33-a"] = RestRecord("v33-a", "oid-1", Decimal("0.45"), 1, B, 80400, CTS - 600,
+                                       "live", exchange_index=2)
+    ex._by_order_id["oid-1"] = "v33-a"
+    # venue is AHEAD: it lists the order under the new coid v33-b (not yet in our RestBook) + oid-1
+    w.get_map["/portfolio/orders"] = {"orders": [
+        {"ticker": B, "order_id": "oid-1", "client_order_id": "v33-b", "exchange_index": 2}]}
+    ex._pending_place_price = Decimal("0.43")
+    assert ex._pre_place_invariant("v33-c", CTS - 580) is None       # order_id -> v33-a -> attributed
+    assert ex.rest_stray_cancels == 0 and ex.stand_down_reason is None

@@ -179,13 +179,21 @@ def test_capture_excludes_below_n_min_shadow_fill():
     assert sb["capture_10c"]["shadow"] == 0 and sb["capture_10c"]["ratio"] is None
 
 
-def test_gate_capture_n_too_small_when_no_shadow():
+def test_gate_capture_none_fails_closed_at_n_over_30():
+    """F1 (fail-closed): at n >= 30 an UNMEASURABLE capture (no valid shadow availability, ratio None) is
+    a FAIL, not a pass -- and the verdict is NOT ALIVE. Below n >= 30 it stays n-too-small."""
     rows = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=8, shadow_10=None) for h in range(3)]
-    gt = build_falsifier_gate_table(rows)                       # n=33 but no shadow -> capture n-too-small
+    gt = build_falsifier_gate_table(rows)                       # n=33, no shadow
     cap_gate = next(g for g in gt["gates"] if g["gate"].startswith("capture ratio"))
-    assert cap_gate["status"] == "n-too-small"                  # unmeasurable, never a spurious FAIL
-    # capture n-too-small is not a FAIL; with every other gate passing the verdict is ALIVE-so-far
-    assert gt["verdict"] == "ALIVE-so-far"
+    assert cap_gate["status"] == "FAIL" and cap_gate["value"] is None
+    assert gt["verdict"] != "ALIVE-so-far" and gt["verdict"].startswith("KILL")
+
+
+def test_gate_capture_none_is_n_too_small_below_min_n():
+    gt = build_falsifier_gate_table([_sweep_row("2026-09-24T04:00:00Z", realised_c=8, shadow_10=None)])
+    cap_gate = next(g for g in gt["gates"] if g["gate"].startswith("capture ratio"))
+    assert gt["n_rung_fills"] == 11                              # < 30
+    assert cap_gate["status"] == "n-too-small"                  # below MIN_N: unmeasured, not yet a FAIL
 
 
 def test_scoreboard_dry_only_leaves_realised_empty():

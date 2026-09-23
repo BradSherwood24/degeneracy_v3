@@ -57,6 +57,10 @@ PREVIOUS_V33_PARAMS_SHA256_L1_R4 = "6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3
 PREVIOUS_V33_PARAMS_SHA256_L2_R2 = "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
 
 _CENT = Decimal("0.01")
+# The Basic-tier write-token cost of one non-priority create/amend (mirrors executor.COST_CREATE; kept as
+# a literal here to avoid importing the executor into the pure params module). The reserve guard (F3) uses
+# it so a create can always proceed above the reserve.
+_MIN_NONPRIORITY_WRITE_COST = 10
 
 
 class V33ParamsShaMismatch(Exception):
@@ -185,13 +189,15 @@ def load_v33_params(
         raise V33ParamsInvalid(
             f"v33 policy at {path} is invalid: write_tokens_per_s / write_bucket_size must be >= 1"
         )
-    # L3 (R2-N1): the pacer reserve must be non-negative AND leave room for at least one non-priority
-    # write in the bucket, else no create/amend could ever proceed (deadlock). Fail closed.
+    # L3 (R2-N1, F3 cost-aware): the pacer reserve must be non-negative AND leave room for at least one
+    # non-priority write (a create/amend costs COST_CREATE = 10 tokens) ABOVE the reserve, else a
+    # create/amend could never proceed (deadlock). Fail closed: reserve + 10 <= write_bucket_size.
     reserve = int(raw["write_reserve_tokens"])
-    if reserve < 0 or reserve >= int(raw["write_bucket_size"]):
+    if reserve < 0 or reserve + _MIN_NONPRIORITY_WRITE_COST > int(raw["write_bucket_size"]):
         raise V33ParamsInvalid(
-            f"v33 policy at {path} is invalid: write_reserve_tokens={reserve} must be in "
-            f"[0, write_bucket_size={raw['write_bucket_size']}) (a non-priority write must still fit)"
+            f"v33 policy at {path} is invalid: write_reserve_tokens={reserve} + a create's "
+            f"{_MIN_NONPRIORITY_WRITE_COST} tokens must be <= write_bucket_size="
+            f"{raw['write_bucket_size']} (a non-priority write must still fit above the reserve)"
         )
     # L3 (SO-3): the deep-observation ladder depth is observation-only; 0 disables it. Must be >= 0.
     if int(raw["deep_obs_rungs"]) < 0:

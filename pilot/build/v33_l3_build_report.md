@@ -30,7 +30,7 @@ Modified:
 - `pilot/service/v33/ledger.py` — `deep_obs` on the window row (`build_v33_ledger_row`).
 - `pilot/service/v33/params.py` + `pilot/policy/v33_params.json` — `write_reserve_tokens` (30) +
   `deep_obs_rungs` (10); sha re-pinned.
-- `pilot/ops/V33_RUNBOOK.md` — sec 10 (report + dry-period review checklist + L3 hardening list), sec 11
+- `pilot/ops/V33_RUNBOOK.md` — sec 9 (report + dry-period review checklist + L3 hardening list), sec 10
   (pointer to V33_ARMING.md).
 - `pilot/tests/test_v33_executor.py` — the stray-handling test updated to the new decision (+1 test).
 
@@ -130,7 +130,7 @@ ledgers. New blocks:
   close line (the template) at the flip.
 - `DV3_DATA_DIR` / `DV3_PROXY_BASE` (where the roster reads/writes).
 
-## Dry-period review checklist (before the flip; full text in V33_RUNBOOK sec 10)
+## Dry-period review checklist (before the flip; full text in V33_RUNBOOK sec 9)
 SIDE-BY-SIDE tracks V3.2 (watch the "V3.3 entered / V3.2 did NOT" set — the shallow-rung windows the
 ladder adds; a "V3.2 entered / V3.3 did NOT" window is a red flag); the SCOREBOARD DRY per-rung locks
 match the study + single-order-roll ratio ~100%; the DEEP END absorption grows (Promotion evidence); the
@@ -149,3 +149,38 @@ TABLE reads `n<30 pending` / `n-too-small` throughout dry (no realised fills) �
   from V3.2's stricter treatment — happy to fail-on-None instead if preferred.
 - SO-3's deep rung price is `n_top - (m - E_min_c)` (the ladder's own geometry off the live `n_top`),
   first-reach anchored; absorption counts every in-window YES print at/through the current deep price.
+
+---
+
+# Round 2 (2026-09-23) — addressing PR #88 review (APPROVE WITH NITS for dry)
+
+All six items closed. Suite after R2: **1253 passed, 1 skipped** (+4 over R1's 1249).
+
+- **F1 (must) — capture None at n>=30 → FAIL (fail-closed).** `build_falsifier_gate_table` now special-cases
+  the capture gate: below `n>=MIN_N` it reads `n-too-small`; AT `n>=MIN_N` a None ratio (no valid shadow
+  availability to measure execution against) is a **FAIL**, matching V3.2's verdict logic and the doc's
+  "ALIVE iff ALL of ..." clause — so the verdict is KILL, not ALIVE. `v33_falsifier.md` now spells the
+  None case out explicitly on the capture bullet. Tests: `test_gate_capture_none_fails_closed_at_n_over_30`
+  (FAIL + verdict KILL) and `test_gate_capture_none_is_n_too_small_below_min_n` (below MIN_N stays
+  n-too-small). The pins stay three-way consistent (constants unchanged; doc + report agreement asserted).
+- **F2 — single source of truth is literal.** `run_v33.V33Driver._simulate_ladder_fills` now calls
+  `shadow.ideal_rung_crosses(trade.yes_price, o.price)` instead of inlining the comparison, so the
+  SHADOW==DRY_SIM equivalence claim is literally one predicate. (The equivalence test already pinned it.)
+- **F3 — cost-aware reserve guard.** The loader now fails closed unless
+  `write_reserve_tokens + COST_CREATE(10) <= write_bucket_size` (a create must fit above the reserve, not
+  merely below the bucket). New `_MIN_NONPRIORITY_WRITE_COST = 10` in params.py. Test:
+  `test_loader_fails_closed_when_reserve_plus_cost_exceeds_bucket` (reserve 95, bucket 100 -> fail).
+- **F4 — runbook numbering.** `V33_RUNBOOK.md` renumbered contiguous 1..11 (was 1..8 then 10,11,12).
+- **F5 — 429 alarm signal (doc only).** Under the runbook's 429 hardening bullet: an occasional
+  `rate_limited` is fine, but SUSTAINED / repeated `rate_limited` records are Brad's signal to check the
+  Kalshi rate tier + `DAILY_ORDER_BUDGET`.
+- **F6 — amend-in-flight vs stray race: NO race found; proven.** An amend rotates the coid (v33-a ->
+  v33-b) but KEEPS the order_id; the executor retains the old-coid record (status `amended`) and remaps
+  `_by_order_id[oid]` to the new coid. So `attribute(order_id, coid)` resolves the amended order whether
+  the venue lists it under the OLD or NEW coid, and whether or not the amend ack has been processed
+  (order_id is the stable key). The pre-place check therefore never flags an amending order as a stray.
+  Tests: `test_amend_in_flight_order_not_cancelled_as_stray` (post-amend, venue under new coid) and
+  `test_venue_ahead_new_coid_attributed_by_order_id` (venue ahead of our RestBook — attributed by the
+  stable order_id). No code change was needed.
+
+The R1 "open note" about the capture-None treatment is now RESOLVED by F1 (fail-closed).

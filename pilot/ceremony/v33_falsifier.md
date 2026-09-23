@@ -68,7 +68,9 @@ counts contracts; a full sweep contributes K); before that the scoreboard prints
   - % positive >= 80% [pin], AND
   - capture ratio at the 10c margin >= 0.50 [pin] (= 50%; same definition as V3.2 Registration 3 --
     live completed 10c-rung sets / ideal-shadow E=0.10 fills inside the quoting window, over armed+bucket
-    windows), AND
+    windows). FAIL-CLOSED: at `n >= 30` an UNMEASURABLE capture (no valid ideal-shadow E=0.10 availability
+    to measure execution against, ratio None) is a MISS, not a pass -- exactly as V3.2's verdict logic
+    treats a None ratio. (Below `n >= 30` the gate reads `n-too-small`.) AND
   - one-legged <= 2 [pin] contracts, AND
   - roll integrity: >= 90% [pin] of rolls move exactly one order (journal-counted).
 - KILL iff ANY of those thresholds is missed at `n >= 30`. No re-spec on the same evaluation window

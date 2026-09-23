@@ -245,7 +245,7 @@ The V3.3 falsifier (`ceremony/v33_falsifier.md`, drafted in L3) MUST carry `STAT
 
 ---
 
-## 10. V3.3 report + the dry-period review checklist (Phase L3)
+## 9. V3.3 report + the dry-period review checklist (Phase L3)
 
 The L3 report extends the L2 side-by-side with the scoreboard, the falsifier gate table, and the deep end:
 ```
@@ -288,7 +288,10 @@ REALISED rung-fills) -- that is expected; the realised gates come alive only aft
   write bucket below 30, so a priority cancel-all / wing burst always has room (never itself paced).
 - **429 vs business rejection**: a rate-limit (HTTP 429) POST is retried ONCE after a `Retry-After` /
   pacer wait, journaled `rate_limited`, and does NOT count toward the 3-consecutive-reject stand-down (it
-  executed nothing). A business 4xx is handled as before.
+  executed nothing). A business 4xx is handled as before. **ALARM SIGNAL:** an occasional `rate_limited`
+  record is fine, but SUSTAINED / repeated `rate_limited` records across a window (or windows) are Brad's
+  signal to check the Kalshi rate tier and `DAILY_ORDER_BUDGET` -- the write bucket is being throttled at
+  the venue and the roll may be falling behind.
 - **armed cap belt**: an armed window whose `/health` contract cap is unreadable degrades to dry rather
   than sizing wings against a guess.
 - **weighted-average wing price** across the original + retry chunks (a leg completed over two takes
@@ -301,7 +304,7 @@ REALISED rung-fills) -- that is expected; the realised gates come alive only aft
 
 ---
 
-## 11. Arming V3.3 (the flip) -- see `ops/V33_ARMING.md`
+## 10. Arming V3.3 (the flip) -- see `ops/V33_ARMING.md`
 
 The full mechanical arming runbook -- prerequisites (falsifier FROZEN, proxy levers, task registered,
 >= 2 dry days reviewed), the FLIP (`v33_mode.txt` -> armed, `v32_mode.txt` -> dry in one :02-:33 window,
@@ -310,7 +313,7 @@ Brad's hand), the MUST CONFIRM list, the V3.2 Q4 close-line template, and the ro
 
 ---
 
-## 12. Brad's levers (nothing here is Claude's to pull)
+## 11. Brad's levers (nothing here is Claude's to pull)
 
 - Registering / unregistering any scheduled task (`register_supervisor_tasks.ps1`,
   `unregister_v32_task.ps1`, `register_v32_task.ps1`).

@@ -345,8 +345,17 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
         judged_rungs > 0)
     add("%positive", pct_pos, f">= {V33_FALSIFIER_MIN_PCT_POSITIVE}%",
         (pct_pos is not None and pct_pos >= V33_FALSIFIER_MIN_PCT_POSITIVE), n_ok)
-    add(f"capture ratio @ {V33_FALSIFIER_CAPTURE_MARGIN_C}c", cap_ratio, f">= {V33_CAPTURE_RATIO_MIN}",
-        (cap_ratio is not None and cap_ratio >= V33_CAPTURE_RATIO_MIN), cap_den > 0)
+    # capture (F1, fail-closed): BELOW n>=MIN_N it is n-too-small; AT n>=MIN_N a None ratio (no valid
+    # shadow availability to measure execution against) is a FAIL, not a pass -- matching the doc's
+    # "ALIVE iff ALL of ..." clause and V3.2's verdict logic (a None capture failed there too).
+    if not n_ok:
+        cap_status = "n-too-small"
+    elif cap_ratio is None:
+        cap_status = "FAIL"
+    else:
+        cap_status = "PASS" if cap_ratio >= V33_CAPTURE_RATIO_MIN else "FAIL"
+    gates.append({"gate": f"capture ratio @ {V33_FALSIFIER_CAPTURE_MARGIN_C}c", "value": cap_ratio,
+                  "threshold": f">= {V33_CAPTURE_RATIO_MIN}", "status": cap_status})
     add("one-legged contracts", Decimal(one_legged), f"<= {V33_FALSIFIER_MAX_ONE_LEGGED}",
         (one_legged <= V33_FALSIFIER_MAX_ONE_LEGGED), True)
     add("single-order-roll ratio", roll_ratio, f">= {V33_FALSIFIER_MIN_SINGLE_ORDER_ROLL_RATIO}",
