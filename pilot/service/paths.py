@@ -86,6 +86,38 @@ def mode_path_v32() -> str:
     return os.path.join(ops_dir_v32(), "v32_mode.txt")
 
 
+# --- V3.3 writable locations (own journals/logs/ledger/mode file; SAME ops dir + DV3_DATA_DIR routing) ---
+# The V3.3 roster runs alongside the live V3.2 (PLAN_V33 Q4), so it keeps its writable state SEPARATE:
+# its own journal dir, log dir, ledger, mode file (``v33_mode.txt``) and day-guard prefix (``v33_stops_``,
+# in the SHARED ops dir). With DV3_DATA_DIR unset each of these resolves under the pilot checkout exactly
+# like the V3.2 equivalents; set, they relocate under the data dir the same way. V3.2's paths are untouched.
+
+
+def journal_dir_v33() -> str:
+    return os.path.join(_writable_base(), "journals_v33")
+
+
+def log_dir_v33() -> str:
+    return os.path.join(_writable_base(), "logs_v33")
+
+
+def ledger_dir_v33() -> str:
+    return os.path.join(_writable_base(), "ledger")
+
+
+def ledger_path_v33() -> str:
+    return os.path.join(ledger_dir_v33(), "v33_ledger.jsonl")
+
+
+def ops_dir_v33() -> str:
+    """Writable ops dir for V3.3 (the same shared ``ops`` dir; the v33 mode file + v33_stops_* guard)."""
+    return os.path.join(_writable_base(), "ops")
+
+
+def mode_path_v33() -> str:
+    return os.path.join(ops_dir_v33(), "v33_mode.txt")
+
+
 def supervisor_log_path() -> str:
     """The supervisor's own structured (JSON-per-window) log -- lives with the other logs."""
     return os.path.join(log_dir_v32(), "supervisor.out")
@@ -107,6 +139,12 @@ def journal_keep_path() -> str:
 def falsifier_path_v32() -> str:
     """The V3.2 falsifier -- a read-only input (S5 reads it), always in the checkout."""
     return os.path.join(_PILOT_DIR, "ceremony", "v32_falsifier.md")
+
+
+def falsifier_path_v33() -> str:
+    """The V3.3 falsifier -- a read-only input (S5 reads it), always in the checkout. Drafted in L3;
+    S5 refuses to arm until it exists and carries STATUS: FROZEN."""
+    return os.path.join(_PILOT_DIR, "ceremony", "v33_falsifier.md")
 
 
 # --- proxy base ---
