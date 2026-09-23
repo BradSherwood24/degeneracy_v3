@@ -302,6 +302,27 @@ REALISED rung-fills) -- that is expected; the realised gates come alive only aft
   CANCELLED + alarmed and the ladder proceeds (not a whole-window stand-down); an overflow/dup still
   stands the hour down.
 
+### Bucket-flap fix alarms (2026-09-23 hotfix; params are Brad's levers)
+- **Spot-bucket switch is debounced.** A boundary flap no longer re-places the whole ladder: a switch
+  commits only after the new bucket is the resolved spot continuously for `bucket_switch_deb_ms` (3000)
+  AND the implied spot sat `bucket_switch_hysteresis_usd` (15) inside it -- OR, if the hysteresis never
+  holds, after `bucket_switch_max_pending_ms` (15000) continuous (the anti-strand cap). While pending the
+  ladder stays on its bucket. **SIGNAL:** the journal should show ~1 bucket-change cancel-all per genuine
+  move, not per boundary tick; a burst of `cancel_rest`/`place_rest` at a bucket boundary means a lever is
+  mis-set (e.g. `bucket_switch_deb_ms` too low).
+- **Stale/missing-wing stand-down HOLDS the rests** for `stand_down_hold_ms` (1500) before cancelling;
+  journal lifecycle is `stand_down_hold` -> `stand_down_resume` (freshness returned, no cancel) or
+  `stand_down_cancel` (hold elapsed, cancel-all). Hold/resume are NOT counted as real stand-downs.
+- **NAKED-TAIL ALARM (the one edge to watch):** a rung can FILL during a hold. Its wings are taker orders
+  priced from the live book at fill time, so they hedge normally IF the strike book comes back. But if W
+  NEVER returns before the window's settle cutoff, that filled lot reaches the cutoff unhedged (a
+  `one_legged` set), exactly as any fill whose wings never priced. **CHECK:** whenever a window logs a
+  `stand_down_cancel` (a hold that expired to a real stand-down), read that window's report `one_legged`
+  count -- a hold that ended in a cancel is the case where a fill-during-hold could be a bounded naked
+  tail. Setting `stand_down_hold_ms` = 0 disables the hold entirely (immediate cancel, the pre-fix
+  behaviour) if the tail risk is judged worse than the flap-avoidance benefit. (No code guards this beyond
+  the existing one-legged latch + S1; it is a monitoring item, not an automated stop.)
+
 ---
 
 ## 10. Arming V3.3 (the flip) -- see `ops/V33_ARMING.md`

@@ -254,13 +254,20 @@ def test_batched_poll_covers_all_buckets_with_live_rungs():
 def test_params_sha_repinned_and_previous_defined():
     from service.v33.params import (
         FROZEN_V33_PARAMS_SHA256 as PIN,
-        PREVIOUS_V33_PARAMS_SHA256_L2_R2 as PREV,
+        PREVIOUS_V33_PARAMS_SHA256_L2_R2 as PREV_L2,
+        PREVIOUS_V33_PARAMS_SHA256_L3 as PREV_L3,
+        PREVIOUS_V33_PARAMS_SHA256_FLAP_R1 as PREV_FLAP_R1,
     )
-    assert PIN == "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
-    assert PREV == "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
-    assert PIN != PREV
+    # BUCKET-FLAP FIX R2 (2026-09-23): re-pinned over the FLAP-R1 sha (now kept as PREVIOUS_..._FLAP_R1).
+    assert PIN == "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78"
+    assert PREV_FLAP_R1 == "3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac"
+    assert PREV_L3 == "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
+    assert PREV_L2 == "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
+    assert PIN != PREV_FLAP_R1 != PREV_L3 != PREV_L2
     p = load_v33_params()
     assert p.sha256 == PIN and p.write_reserve_tokens == 30 and p.deep_obs_rungs == 10
+    assert (p.bucket_switch_deb_ms == 3000 and p.bucket_switch_hysteresis_usd == 15
+            and p.stand_down_hold_ms == 1500 and p.bucket_switch_max_pending_ms == 15000)
 
 
 def test_loader_fails_closed_on_bad_reserve(tmp_path):

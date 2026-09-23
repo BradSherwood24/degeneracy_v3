@@ -90,6 +90,7 @@ from service.v32.core import (
     _shadow_complete,
     _shadow_on_trade,
     _select_spot,
+    _valid_two_sided,
     _wing_prices,
     lock_value,
     solve_n,
@@ -294,6 +295,14 @@ class V33State:
     stood_down: bool = False
     stand_down_reason: str | None = None
     last_standdown_reason: str | None = None
+
+    # BUCKET-FLAP FIX (2026-09-23): the pending spot-bucket switch being timed (the ladder stays on
+    # ``rest_bucket_Sd`` until it commits), and the stale/missing-wing stand-down HOLD.
+    pending_switch_Sd: int | None = None                 # the candidate new bucket under the debounce timer
+    pending_switch_since: float | None = None            # when it first became the continuous resolved spot
+    pending_switch_hyst_met: bool = False                # the hysteresis was satisfied at least once pending
+    hold_reason: str | None = None                       # the stand-down reason currently being HELD
+    hold_since: float | None = None                      # when the hold began
 
     @classmethod
     def new(
@@ -511,11 +520,81 @@ def decide_v33(
 # ---------------------------------------------------------------------------
 # Context (spot / W / cap / n_top / shadows / E_rung refresh)
 # ---------------------------------------------------------------------------
+def _implied_spot(params: V33Params, st: V33State) -> Decimal | None:
+    """A cheap implied BTC spot from the range-bucket ladder: the yes-mid-weighted centroid of bucket
+    CENTRES over the valid two-sided buckets (E[settlement] ~ current spot for the short horizon). None
+    if no valid bucket carries weight. Used only by the bucket-switch hysteresis (Brad's "$X inside")."""
+    num = _ZERO
+    den = _ZERO
+    half = Decimal(params.bucket_width) / _TWO
+    for floor, top in st.bucket_tops.items():
+        if not _valid_two_sided(top):
+            continue
+        mid = (top.yes_bid + top.yes_ask) / _TWO  # type: ignore[operator]
+        if mid <= _ZERO:
+            continue
+        num += mid * (Decimal(floor) + half)
+        den += mid
+    return (num / den) if den > _ZERO else None
+
+
+def _hysteresis_ok(params: V33Params, st: V33State, candidate_Sd: int) -> bool:
+    """The bucket-switch hysteresis: the implied spot must sit >= ``bucket_switch_hysteresis_usd`` inside
+    the candidate bucket (away from either boundary). If the implied spot cannot be measured (thin
+    ladder), fall back to debounce-only (return True). ``hysteresis_usd`` == 0 also always passes."""
+    hyst = params.bucket_switch_hysteresis_usd
+    if hyst <= 0:
+        return True
+    imp = _implied_spot(params, st)
+    if imp is None:
+        return True
+    lo = Decimal(candidate_Sd) + hyst
+    hi = Decimal(candidate_Sd) + params.bucket_width - hyst
+    return lo <= imp < hi
+
+
+def _resolve_effective_bucket(
+    params: V33Params, st: V33State, raw_Sd: int | None, now: float
+) -> tuple[int | None, int | None, float | None, bool]:
+    """BUCKET-FLAP FIX (2026-09-23): map the instantaneous resolved spot ``raw_Sd`` to the EFFECTIVE bucket
+    the ladder uses, debouncing a switch. Returns (effective_Sd, pending_Sd, pending_since, pending_hyst).
+
+    While a switch is pending the ladder stays on ``rest_bucket_Sd`` (rolls continue there, fills book
+    there); the switch commits only once the new bucket has been the resolved spot continuously for
+    >= ``bucket_switch_deb_ms`` AND the implied spot sat >= ``bucket_switch_hysteresis_usd`` inside it at
+    least once. A flip back to the ladder's bucket (or to a different candidate) resets the timer. With no
+    ladder yet (first placement) the effective bucket follows ``raw_Sd`` immediately (nothing to protect)."""
+    rest = st.rest_bucket_Sd
+    if raw_Sd is None:
+        return None, None, None, False
+    if rest is None or raw_Sd == rest:
+        # first placement, or spot is back on the ladder's bucket -> no pending switch.
+        return raw_Sd, None, None, False
+    # raw_Sd != rest: a candidate switch under the debounce.
+    pend_Sd, pend_since, pend_hyst = (
+        st.pending_switch_Sd, st.pending_switch_since, st.pending_switch_hyst_met)
+    if pend_Sd != raw_Sd or pend_since is None:
+        pend_Sd, pend_since, pend_hyst = raw_Sd, now, False   # (re)start the timer for a new candidate
+    if not pend_hyst:
+        pend_hyst = _hysteresis_ok(params, st, raw_Sd)         # latch the hysteresis once satisfied
+    elapsed_ms = (now - pend_since) * 1000.0
+    # COMMIT when the debounce has elapsed AND either the hysteresis held OR the ANTI-STRAND cap has been
+    # reached (R2 NIT-1: the highest-yes-mid candidate and the centroid hysteresis can disagree, so a spot
+    # parked a few $ inside the new bucket would otherwise be stranded on the old bucket the whole window).
+    if elapsed_ms >= params.bucket_switch_deb_ms and (
+            pend_hyst or elapsed_ms >= params.bucket_switch_max_pending_ms):
+        return raw_Sd, None, None, False                       # COMMIT: effective flips to the new bucket
+    return rest, pend_Sd, pend_since, pend_hyst                 # still pending: stay on the old bucket
+
+
 def _recompute_context(params: V33Params, st: V33State, now: float) -> V33State:
     """Re-derive spot bucket, W, cap, the ladder-top ``n_top``, every shadow n, and refresh each live
     rung's LIVE labels (``rung`` AND ``E_rung``) from the current n_top. Uses the UNCHANGED V3.2
-    spot/W/cap law (imported)."""
-    spot_Sd = _select_spot(st)
+    spot/W/cap law (imported). The EFFECTIVE spot bucket is debounced (bucket-flap fix): a switch commits
+    only after ``bucket_switch_deb_ms`` + hysteresis (or the ``bucket_switch_max_pending_ms`` anti-strand
+    cap); while pending the ladder stays on its bucket."""
+    raw_Sd = _select_spot(st)
+    spot_Sd, pend_Sd, pend_since, pend_hyst = _resolve_effective_bucket(params, st, raw_Sd, now)
     spot_Su = spot_Sd + params.bucket_width if spot_Sd is not None else None
     spot_bucket_stale = spot_Sd is not None and not _fresh(
         now, st.bucket_ts.get(spot_Sd), params.bucket_freshness_max_age_s
@@ -540,6 +619,7 @@ def _recompute_context(params: V33Params, st: V33State, now: float) -> V33State:
     st = replace(
         st, spot_Sd=spot_Sd, spot_Su=spot_Su, W=W, cap=cap, n_top=n_top,
         spot_bucket_stale=spot_bucket_stale, shadows=shadows,
+        pending_switch_Sd=pend_Sd, pending_switch_since=pend_since, pending_switch_hyst_met=pend_hyst,
     )
     # refresh each rung's LIVE labels (BOTH rung AND E_rung) from the current n_top — BLOCKING #1
     # (reviewer 2026-09-22): rung was previously left stale while E_rung tracked n_top, corrupting the
@@ -1159,11 +1239,43 @@ def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, li
         no_quote_reason = "n_below_min"
 
     if no_quote_reason is not None:
+        # BUCKET-FLAP FIX item 2 (2026-09-23): a STALE/MISSING-WING stand-down with a LIVE ladder does NOT
+        # cancel immediately. HOLD the rests (no new places/rolls, no cancel) for up to ``stand_down_hold_ms``;
+        # if freshness returns (below), resume; if the hold elapses, cancel-all as before. The hold is for
+        # the RESTS only: a rung fill during the hold still books + spawns its wing batch (that path is
+        # independent of _converge, and wings are taker orders priced from the live book at fill time).
+        if (no_quote_reason == "stale_or_missing_wing" and params.stand_down_hold_ms > 0
+                and (st.ladder or st.rolls_in_flight)):
+            if st.hold_since is None:
+                st = replace(st, hold_reason=no_quote_reason, hold_since=now)
+                return st, [V33Action(kind=ActionKind.STAND_DOWN,
+                                      reason="stale_or_missing_wing_hold")]  # journalled as stand_down_hold
+            if (now - st.hold_since) * 1000.0 < params.stand_down_hold_ms:
+                return st, actions   # still holding: keep the rests, emit nothing new
+            # hold elapsed -> cancel-all + the real stand-down (journalled as stand_down_cancel). Set the
+            # dedup reason to the PLAIN form so subsequent stale ticks (ladder now empty) dedup silently.
+            st = replace(st, hold_reason=None, hold_since=None,
+                         last_standdown_reason="stale_or_missing_wing",
+                         stand_down_reason="stale_or_missing_wing")
+            st, ca = _cancel_all(st)
+            return st, ca + [V33Action(kind=ActionKind.STAND_DOWN,
+                                       reason="stale_or_missing_wing_cancel")]
+        # any other no-quote reason (or hold disabled / nothing to protect): cancel + stand down as before.
+        if st.hold_since is not None:
+            st = replace(st, hold_reason=None, hold_since=None)
         st, ca = _cancel_all(st)
         st, sa = _standdown(st, no_quote_reason)
         return st, ca + sa
 
-    # healthy: clear any stale stand-down reason.
+    # healthy: freshness returned. If we were HOLDING a stale/missing-wing stand-down, RESUME (the rests
+    # were kept; the convergence below picks up where it left off).
+    resume_actions: list[V33Action] = []
+    if st.hold_since is not None:
+        st = replace(st, hold_reason=None, hold_since=None)
+        resume_actions.append(V33Action(kind=ActionKind.STAND_DOWN,
+                                        reason="stale_or_missing_wing_resume"))  # -> stand_down_resume
+    actions += resume_actions
+    # clear any stale stand-down reason.
     if st.last_standdown_reason is not None:
         st = replace(st, last_standdown_reason=None, stand_down_reason=None)
 

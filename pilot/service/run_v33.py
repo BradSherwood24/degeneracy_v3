@@ -437,11 +437,26 @@ class V33Driver:
                 rk = "retry_wing" if is_retry else "take_wings"
             payload = {"legs": legs, "count": a.count, "lock": a.lock}
         elif k == ActionKind.STAND_DOWN:
-            rk = "stand_down"
-            payload = {"reason": a.reason}
-            if a.reason == "past_quote_end":
+            # BUCKET-FLAP FIX (2026-09-23): the stale/missing-wing HOLD lifecycle journals under distinct
+            # kinds and does NOT count as a real stand-down; only the terminal cancel (and other reasons) do.
+            if a.reason == "stale_or_missing_wing_hold":
+                rk = "stand_down_hold"
+                payload = {"reason": "stale_or_missing_wing"}
+            elif a.reason == "stale_or_missing_wing_resume":
+                rk = "stand_down_resume"
+                payload = {"reason": "stale_or_missing_wing"}
+            elif a.reason == "stale_or_missing_wing_cancel":
+                rk = "stand_down_cancel"
+                payload = {"reason": "stale_or_missing_wing"}
+                self._last_stand_down_reason = "stale_or_missing_wing"
+                self._real_stand_downs += 1
+            elif a.reason == "past_quote_end":
+                rk = "stand_down"
+                payload = {"reason": a.reason}
                 self._quote_end_cancel = True
             else:
+                rk = "stand_down"
+                payload = {"reason": a.reason}
                 self._last_stand_down_reason = a.reason
                 self._real_stand_downs += 1
         elif k == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW:
