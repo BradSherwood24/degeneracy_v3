@@ -443,7 +443,9 @@ def test_roll_up_past_cap_holds():
 # Bucket change: cancel-all -> place-all
 # ===========================================================================
 def test_bucket_change_cancels_all_then_places_all_after_confirm():
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    # immediate switch (bucket_switch_deb_ms=0/hysteresis=0); the debounce/hysteresis is covered by the
+    # dedicated bucket-flap tests below.
+    p = _params(tol=Decimal("0.01"), deb_ms=0, bucket_switch_deb_ms=0, bucket_switch_hysteresis_usd=0)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # ladder on bucket 79600
@@ -654,17 +656,38 @@ def test_warmup_before_window_seeds_nothing():
     assert st.ladder == ()
 
 
-def test_stale_wing_cancels_ladder():
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
+def test_stale_wing_holds_then_cancels_ladder():
+    # bucket-flap fix item 2: a stale wing HOLDS the rests first (no immediate cancel), then cancels once
+    # the hold elapses. (stand_down_hold_ms 500 for a short test.)
+    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=500)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
-    # let the strike books go stale (a ClockTick well past freshness) -> W None -> cancel + stand down.
+    # first stale tick -> HOLD, not cancel; the rests stay.
+    st, acts = _feed(p, st, ClockTick(now + 2))
+    assert st.W is None and st.hold_since is not None
+    assert not [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert [a for a in acts if a.kind == ActionKind.STAND_DOWN
+            and a.reason == "stale_or_missing_wing_hold"]
+    assert len(st.ladder) == 11
+    # a tick past the hold window -> cancel-all + the terminal stand-down.
+    st, acts = _feed(p, st, ClockTick(now + 2.6))
+    assert len([a for a in acts if a.kind == ActionKind.CANCEL_REST]) == 11
+    assert [a for a in acts if a.kind == ActionKind.STAND_DOWN
+            and a.reason == "stale_or_missing_wing_cancel"]
+    assert st.ladder == () and st.hold_since is None
+
+
+def test_stale_wing_cancels_immediately_when_hold_disabled():
+    # stand_down_hold_ms=0 restores the pre-fix immediate cancel.
+    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_ladder(p, st, now)
     st, acts = _feed(p, st, ClockTick(now + 5))
     assert st.W is None
     assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
-    assert [a for a in acts if a.kind == ActionKind.STAND_DOWN
-            and a.reason == "stale_or_missing_wing"]
+    assert [a for a in acts if a.kind == ActionKind.STAND_DOWN and a.reason == "stale_or_missing_wing"]
     assert st.ladder == ()
 
 
@@ -1127,7 +1150,7 @@ def test_big_move_after_partial_sweep_keeps_exposure_at_k():
 
 def test_bucket_change_after_partial_sweep_caps_at_k_minus_filled():
     # (b) partial sweep (3 filled) -> bucket change -> re-place exactly K-3=8 on the new ticker.
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    p = _params(tol=Decimal("0.01"), deb_ms=0, bucket_switch_deb_ms=0, bucket_switch_hysteresis_usd=0)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # bucket 79600
@@ -1153,7 +1176,7 @@ def test_bucket_change_after_partial_sweep_caps_at_k_minus_filled():
 
 def test_bucket_change_after_full_sweep_places_nothing():
     # (c) K filled -> allotment latched -> a bucket change places nothing.
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    p = _params(tol=Decimal("0.01"), deb_ms=0, bucket_switch_deb_ms=0, bucket_switch_hysteresis_usd=0)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)

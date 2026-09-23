@@ -49,12 +49,18 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # keeps; a non-priority create/amend never draws the bucket below it -- L2 review R2-N1) and
 # ``deep_obs_rungs`` (the SO-3 deep-observation ladder depth below the live ladder, margins
 # E_min_c+rungs .. E_min_c+rungs+deep_obs_rungs-1 = 16..25c; observation only, never placed) -> re-pinned.
-FROZEN_V33_PARAMS_SHA256 = "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
+# BUCKET-FLAP FIX (2026-09-23, first DRY window 07:00Z): ADDED ``bucket_switch_deb_ms`` (a spot-bucket
+# change is acted on only after the new bucket is the resolved spot continuously for >= this),
+# ``bucket_switch_hysteresis_usd`` (the implied spot must sit >= this many $ inside the new bucket at least
+# once while pending) and ``stand_down_hold_ms`` (a stale/missing-wing stand-down holds the rests for up to
+# this before cancelling) -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac"
 # History (add-only law). Kept DEFINED so prior-regime ledger rows stay identifiable.
 PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
 PREVIOUS_V33_PARAMS_SHA256_L1_R2 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
 PREVIOUS_V33_PARAMS_SHA256_L1_R4 = "6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3ef46ea784e7f8a11a421"
 PREVIOUS_V33_PARAMS_SHA256_L2_R2 = "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
+PREVIOUS_V33_PARAMS_SHA256_L3 = "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
 
 _CENT = Decimal("0.01")
 # The Basic-tier write-token cost of one non-priority create/amend (mirrors executor.COST_CREATE; kept as
@@ -129,6 +135,16 @@ class V33Params:
     n_min: Decimal
     replace_rate_alarm_per_min: int
     bucket_width: int
+    # BUCKET-FLAP FIX (2026-09-23): spot-bucket-switch debounce + hysteresis, and stale-wing stand-down hold.
+    bucket_switch_deb_ms: int            # a spot-bucket change commits only after the NEW bucket is the
+                                         # resolved spot continuously >= this (a flip back resets); while
+                                         # pending the ladder stays on the old bucket (rolls/fills there).
+    bucket_switch_hysteresis_usd: int    # the implied spot (yes-mid-weighted centroid of bucket centres)
+                                         # must sit >= this many $ inside the new bucket at least once while
+                                         # pending; 0 = debounce-only. Defends a boundary oscillation.
+    stand_down_hold_ms: int              # on a stale/missing-wing stand-down with a live ladder, HOLD the
+                                         # rests (no new places/rolls, no cancel) up to this; resume if
+                                         # freshness returns, else cancel-all. 0 = cancel immediately.
     # L2 (2026-09-23): wing-take chunking + write pacing + batched poll.
     max_contracts_per_order_hint: int  # upper bound on the wing chunk cap; actual cap = min(this, proxy)
     write_tokens_per_s: int            # Basic-tier write-token refill rate (100/s)
@@ -204,6 +220,19 @@ def load_v33_params(
         raise V33ParamsInvalid(
             f"v33 policy at {path} is invalid: deep_obs_rungs={raw['deep_obs_rungs']} must be >= 0"
         )
+    # BUCKET-FLAP FIX (2026-09-23): the debounce / hold windows and the hysteresis are non-negative; 0
+    # restores the pre-fix immediate behaviour (a lever, fail-closed on negatives). The hysteresis must not
+    # exceed half the bucket width (a slot at least 2*hyst wide must remain, else no spot ever qualifies).
+    if int(raw["bucket_switch_deb_ms"]) < 0 or int(raw["stand_down_hold_ms"]) < 0:
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: bucket_switch_deb_ms / stand_down_hold_ms must be >= 0"
+        )
+    hyst = int(raw["bucket_switch_hysteresis_usd"])
+    if hyst < 0 or 2 * hyst >= int(raw["bucket_width"]):
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: bucket_switch_hysteresis_usd={hyst} must be >= 0 and "
+            f"2*hyst < bucket_width={raw['bucket_width']} (an inner window must remain)"
+        )
     shadow_Es = tuple(Decimal(str(x)) for x in raw["shadow_Es"])
     # Fail closed (ruling L-6, generalised for the ladder): every shadow E must lie WITHIN the live
     # ladder's margin range [E_min, E_min + (rungs-1)c], else the in-process shadow tracks a rung the
@@ -235,6 +264,9 @@ def load_v33_params(
         n_min=Decimal(str(raw["n_min"])),
         replace_rate_alarm_per_min=int(raw["replace_rate_alarm_per_min"]),
         bucket_width=int(raw["bucket_width"]),
+        bucket_switch_deb_ms=int(raw["bucket_switch_deb_ms"]),
+        bucket_switch_hysteresis_usd=int(raw["bucket_switch_hysteresis_usd"]),
+        stand_down_hold_ms=int(raw["stand_down_hold_ms"]),
         max_contracts_per_order_hint=int(raw["max_contracts_per_order_hint"]),
         write_tokens_per_s=int(raw["write_tokens_per_s"]),
         write_bucket_size=int(raw["write_bucket_size"]),

@@ -23,7 +23,7 @@ to arm on it (an agent can never arm V3.3 by editing code).
   merged to `main` by Brad (Phase H #82-#84, L1 #85, L2 #87; L3 this branch). Live V3.2 untouched
   throughout (V3.3 lives in `service/v33/`, its own params / ledger / mode file).
 - Policy: roster `DegeneracyV3_3`, `pilot/policy/v33_params.json`, canonical sha
-  `c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3` (pinned in code as
+  `3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac` (pinned in code as
   `service.v33.params.FROZEN_V33_PARAMS_SHA256`; the loader self-verifies and refuses drift).
 - Evidence: `pilot/build/mc/v33_ladder_ideal.*` (167 armed windows 2026-09-14..21, ideal fills): the
   ladder 5..15c at 1 lot per rung = 1806c over 188 contracts / 28 pump windows (9.6c/contract); every one
@@ -47,7 +47,7 @@ is W-dependent (at the golden W the deepest rung's label is 15c while its realis
 
 ## Policy (roster `DegeneracyV3_3`, `pilot/policy/v33_params.json`, sha-pinned; loader refuses drift)
 
-sha `c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3`. Values: E_min 0.05, rungs 11
+sha `3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac`. Values: E_min 0.05, rungs 11
 (K), lots_per_rung 1, tol 0.01, deb_ms 5000 (start-of-convergence debounce), max_amends_in_flight 3,
 quote_start_s 900 (T-15), quote_end_s 300 (T-5), wing_margin 0.02, lock_floor -0.10,
 no_orders_after_s_to_settle 1, freshness_max_age_s 1.0, bucket_freshness_max_age_s 30.0 [pin],
@@ -166,7 +166,7 @@ acceptance or queue position -- the MUST CONFIRM list below stands for the first
 
 (empty -- awaiting Brad's freeze. Brad ALONE flips `STATUS: DRAFT -- NOT FROZEN` to exactly
 `STATUS: FROZEN` on his verbatim go and appends it here with the roster sha
-`c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3`. An agent never flips it.)
+`3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac`. An agent never flips it.)
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
