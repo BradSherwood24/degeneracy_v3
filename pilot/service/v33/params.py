@@ -39,12 +39,13 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # The canonical sha256 of the shipped policy/v33_params.json (sha of json.dumps(sort_keys=True,
 # separators=(",",":")).encode("utf-8")). Recompute + re-pin only when INTENTIONALLY re-freezing.
 # L1 FREEZE (2026-09-22): the first V3.3 ladder policy (E_min 0.05, rungs 11, lots_per_rung 1).
-# Round 2 (2026-09-22): added ``fast_shift_min_cents`` (the cap-crash / large-jump fast path, reviewer
-# QUESTION #4) -> re-pinned.
-FROZEN_V33_PARAMS_SHA256 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
-# History (add-only law): the L1 Round-1 sha (before fast_shift_min_cents). Kept DEFINED so any R1
-# ledger rows stay identifiable.
+# Round 2 (2026-09-22): added ``fast_shift_min_cents`` (superseded in R4). Round 4 (2026-09-22, Brad's
+# margin-array convergence): ``fast_shift_min_cents`` REMOVED (convergence moves N-at-a-time instead of a
+# cancel-all/place-all), ``max_amends_in_flight`` ADDED -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3ef46ea784e7f8a11a421"
+# History (add-only law). Kept DEFINED so prior-regime ledger rows stay identifiable.
 PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
+PREVIOUS_V33_PARAMS_SHA256_L1_R2 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
 
 _CENT = Decimal("0.01")
 
@@ -81,10 +82,11 @@ class V33Params:
                          >= tol); once committed, each subsequent cent rolls as soon as the prior amend
                          acks (no re-debounce) while the sign is unchanged; a sign flip re-debounces
                          (Round 2 pacing, reviewer Q4/Q5). Param-driven so Brad can retune without code.
-      * ``fast_shift_min_cents`` when |n_top - anchor| >= this AFTER the start debounce (e.g. a cap crash
-                         stranding most of the ladder above a bound cap), shift the WHOLE ladder in ONE
-                         step (cancel-all/place-all, like a bucket change) instead of crawling K rolls
-                         (reviewer QUESTION #4; V3.2 repriced its single order in one step). Default 4.
+      * ``max_amends_in_flight`` the convergence (Brad's margin-array model, R4) moves N orders at a time
+                         toward the desired open slots: up to this many amends are issued concurrently,
+                         and as each acks the next pair(s) issue until converged. 1 = strictly sequential
+                         (the R2 crawl); default 3. A large n_top jump / cap crash converges N-at-a-time
+                         (no cancel-all), keeping the other orders' queue. Fail closed on < 1.
       * ``wing_coalesce_ms`` rung fills landing within this of the first are coalesced into ONE wing
                          pair sized to the total filled (Q2). A later fill starts a new batch.
       * ``refill_in_window`` L1 supports only False (Q3 no-refill); ENFORCED in the loader — a future
@@ -109,7 +111,7 @@ class V33Params:
     bucket_freshness_max_age_s: float
     wing_coalesce_ms: int
     refill_in_window: bool
-    fast_shift_min_cents: int
+    max_amends_in_flight: int
     max_sets_per_hour: int
     n_min: Decimal
     replace_rate_alarm_per_min: int
@@ -150,10 +152,10 @@ def load_v33_params(
             f"v33 policy at {path} is invalid: refill_in_window=true is reserved for L2 (Q3 is "
             f"no-refill in L1); the core does not yet re-place filled rungs"
         )
-    if int(raw["fast_shift_min_cents"]) < 2:
+    if int(raw["max_amends_in_flight"]) < 1:
         raise V33ParamsInvalid(
-            f"v33 policy at {path} is invalid: fast_shift_min_cents="
-            f"{raw['fast_shift_min_cents']} must be >= 2 (a 1c move is always a single roll)"
+            f"v33 policy at {path} is invalid: max_amends_in_flight="
+            f"{raw['max_amends_in_flight']} must be >= 1 (at least one convergence amend at a time)"
         )
     shadow_Es = tuple(Decimal(str(x)) for x in raw["shadow_Es"])
     # Fail closed (ruling L-6, generalised for the ladder): every shadow E must lie WITHIN the live
@@ -181,7 +183,7 @@ def load_v33_params(
         bucket_freshness_max_age_s=float(raw["bucket_freshness_max_age_s"]),
         wing_coalesce_ms=int(raw["wing_coalesce_ms"]),
         refill_in_window=bool(raw["refill_in_window"]),
-        fast_shift_min_cents=int(raw["fast_shift_min_cents"]),
+        max_amends_in_flight=int(raw["max_amends_in_flight"]),
         max_sets_per_hour=int(raw["max_sets_per_hour"]),
         n_min=Decimal(str(raw["n_min"])),
         replace_rate_alarm_per_min=int(raw["replace_rate_alarm_per_min"]),

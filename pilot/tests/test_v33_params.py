@@ -34,7 +34,7 @@ def test_params_load_and_sha_pin():
     assert p.deb_ms == 5000
     assert p.wing_coalesce_ms == 150
     assert p.refill_in_window is False
-    assert p.fast_shift_min_cents == 4
+    assert p.max_amends_in_flight == 3
     assert p.max_sets_per_hour == 11
     assert p.replace_rate_alarm_per_min == 120
     assert p.n_min == Decimal("0.05")
@@ -118,10 +118,10 @@ def test_refill_in_window_true_fails_closed(tmp_path):
         load_v33_params(str(q), expected_sha=None)
 
 
-def test_fast_shift_min_cents_below_two_fails_closed(tmp_path):
+def test_max_amends_in_flight_below_one_fails_closed(tmp_path):
     with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
         raw = json.load(f)
-    raw["fast_shift_min_cents"] = 1
+    raw["max_amends_in_flight"] = 0
     q = tmp_path / "v33_params.json"
     q.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(V33ParamsInvalid):

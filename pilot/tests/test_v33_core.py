@@ -119,6 +119,24 @@ def _prices(st):
     return sorted((o.price for o in st.ladder), reverse=True)
 
 
+def _confirm_rolls(params, st, t):
+    """Confirm every in-flight convergence amend (each ack may issue continuation amends) until the
+    ladder has converged (no rolls in flight). Returns the settled state."""
+    i = 0
+    while st.rolls_in_flight:
+        rp = st.rolls_in_flight[0]
+        st, _ = _feed(params, st, OrderAmended(rp.order_id, rp.new_coid, rp.target_price, t + i * 0.001))
+        i += 1
+        assert i < 100, "convergence did not settle"
+    return st
+
+
+def _margins(params, st):
+    """The live orders' current margin indices (E_min_c + rung), sorted."""
+    from service.v33.core import _margin_of
+    return sorted(_margin_of(params, st.n_top, o.price) for o in st.ladder)
+
+
 # ===========================================================================
 # Ladder placement
 # ===========================================================================
@@ -213,7 +231,7 @@ def test_post_only_cap_shifts_whole_ladder_down():
 
 
 # ===========================================================================
-# The roll: 1c down / 1c up
+# Convergence: 1c down / 1c up (Brad's margin-array model; a 1c move = one order moves)
 # ===========================================================================
 def test_roll_1c_down_moves_top_order_to_new_bottom():
     p = _params(tol=Decimal("0.01"), deb_ms=0)
@@ -221,7 +239,7 @@ def test_roll_1c_down_moves_top_order_to_new_bottom():
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50, ladder 0.50..0.40
     ids_before = {o.price: o.order_id for o in st.ladder}
-    # n_top 0.50 -> 0.49 (W up): the TOP order (0.50) rolls to bottom-1c = 0.39.
+    # n_top 0.50 -> 0.49 (W up): the order at 0.50 falls off the top of S -> moves to the vacant 0.39.
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.77"), now + 1))
     assert st.n_top == Decimal("0.49")
@@ -231,10 +249,9 @@ def test_roll_1c_down_moves_top_order_to_new_bottom():
     assert am.price == Decimal("0.39") and am.order_id == ids_before[Decimal("0.50")]
     assert ActionKind.CANCEL_REST not in {a.kind for a in acts}
     assert ActionKind.PLACE_REST not in {a.kind for a in acts}
-    assert st.roll_pending is not None and st.roll_pending.target_price == Decimal("0.39")
-    # confirm -> the ladder is 0.49..0.39, K-1 order_ids untouched, the moved order at 0.39.
+    assert len(st.rolls_in_flight) == 1 and st.rolls_in_flight[0].target_price == Decimal("0.39")
     st, _ = _feed(p, st, OrderAmended(am.order_id, am.updated_client_order_id, am.price, now + 1.1))
-    assert st.roll_pending is None
+    assert not st.rolls_in_flight
     assert _prices(st) == [Decimal("0.49") - i * Decimal("0.01") for i in range(11)]
     ids_after = {o.price: o.order_id for o in st.ladder}
     untouched = sum(1 for pr in ids_after if pr in ids_before and ids_after[pr] == ids_before[pr])
@@ -249,7 +266,7 @@ def test_roll_1c_up_moves_bottom_order_to_new_top():
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50, ladder 0.50..0.40
     ids_before = {o.price: o.order_id for o in st.ladder}
-    # n_top 0.50 -> 0.51 (W down): the BOTTOM order (0.40) rolls to top+1c = 0.51.
+    # n_top 0.50 -> 0.51 (W down): the order at 0.40 falls off the bottom -> moves to the vacant 0.51.
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.75"), now + 1))
     assert st.n_top == Decimal("0.51")
@@ -263,15 +280,14 @@ def test_roll_1c_up_moves_bottom_order_to_new_top():
     assert moved.E_rung == Decimal("0.05") and moved.rung == 0
 
 
-def test_roll_below_tol_does_not_move():
-    p = _params(tol=Decimal("0.02"), deb_ms=0)
+def test_no_move_when_n_top_unchanged():
+    # n_top is cent-quantized (solve_n): a W nudge that does not change n_top produces NO order action.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
-    st, _ = _bring_up_ladder(p, st, now)
-    # a 1c n_top move (< tol 2c): no roll.
-    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
-    st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.77"), now + 1))
-    assert st.n_top == Decimal("0.49")
+    st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50
+    st, acts = _refresh(p, st, now + 1, sd_ask="0.76")   # same books -> n_top still 0.50
+    assert st.n_top == Decimal("0.50")
     assert not [a for a in acts if a.kind in (ActionKind.AMEND_REST, ActionKind.CANCEL_REST,
                                               ActionKind.PLACE_REST)]
 
@@ -307,36 +323,63 @@ def test_roll_holds_while_a_rung_is_pending():
 
 
 # ===========================================================================
-# The roll: 2c strictly sequential
+# Convergence: a 2c move = TWO orders move (concurrent, within max_amends_in_flight)
 # ===========================================================================
-def test_roll_2c_is_two_rolls_strictly_sequential():
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
+def test_roll_2c_moves_two_orders_concurrently():
+    p = _params(tol=Decimal("0.01"), deb_ms=0)   # max_amends_in_flight 3
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50
-    # jump n_top 0.50 -> 0.48 (down 2c) in one tick.
+    coids_before = {o.price: o.client_order_id for o in st.ladder}
+    # jump n_top 0.50 -> 0.48 (down 2c) in one tick -> exactly TWO amends (2 <= max 3).
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.78"), now + 1))
     assert st.n_top == Decimal("0.48")
     amends = [a for a in acts if a.kind == ActionKind.AMEND_REST]
-    assert len(amends) == 1                        # only the FIRST roll issued
-    am1 = amends[0]
-    assert am1.price == Decimal("0.39")            # move top(0.50) to bottom(0.40)-1c
-    # a second big move while the first roll is in flight -> queued, NO second amend.
-    st, held = _feed(p, st, BookUpdate(STK_SD, _sd("0.78"), now + 1.05))
-    assert not [a for a in held if a.kind == ActionKind.AMEND_REST]
-    # confirm the first -> the SECOND roll is now issued (deb_ms=0), moving new top(0.49) to 0.38.
-    st, acts2 = _feed(p, st, OrderAmended(am1.order_id, am1.updated_client_order_id, am1.price,
-                                          now + 1.1))
-    amends2 = [a for a in acts2 if a.kind == ActionKind.AMEND_REST]
-    assert len(amends2) == 1
-    am2 = amends2[0]
-    assert am2.price == Decimal("0.38")
-    st, _ = _feed(p, st, OrderAmended(am2.order_id, am2.updated_client_order_id, am2.price,
-                                      now + 1.2))
-    assert st.roll_pending is None
+    assert len(amends) == 2                        # the two orders that fell off the top (0.50, 0.49)
+    assert {a.price for a in amends} == {Decimal("0.39"), Decimal("0.38")}  # to the two vacant deep slots
+    assert len(st.rolls_in_flight) == 2
+    st = _confirm_rolls(p, st, now + 1.1)
     assert _prices(st) == [Decimal("0.48") - i * Decimal("0.01") for i in range(11)]
+    # 9 orders never moved -> kept their coid (queue); only the 2 rolled orders rotated coid.
+    kept = sum(1 for o in st.ladder if o.client_order_id == coids_before.get(o.price))
+    assert kept == 9
     assert st.roll_count == 2 and st.roll_single_order_count == 2
+
+
+def test_5c_move_converges_three_then_two():
+    # a 5c move = 5 orders move, capped at max_amends_in_flight (3) then the remaining 2 on the acks;
+    # 6 orders keep their queue. This REPLACES the R2 fast-shift's cancel-all.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50
+    coids_before = {o.price: o.client_order_id for o in st.ladder}
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.81"), now + 1))   # n_top -> 0.45 (down 5c)
+    amends = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert len(amends) == 3 and len(st.rolls_in_flight) == 3            # capped at 3 in flight
+    assert not [a for a in acts if a.kind == ActionKind.CANCEL_REST]    # NOT a cancel-all
+    st = _confirm_rolls(p, st, now + 1.1)
+    assert _prices(st) == [Decimal("0.45") - i * Decimal("0.01") for i in range(11)]
+    assert st.roll_count == 5                                           # exactly 5 orders moved
+    # 6 orders kept their coid (queue preserved) — the ladder 0.45..0.40 overlaps the old 0.50..0.40.
+    kept = sum(1 for o in st.ladder if o.client_order_id == coids_before.get(o.price))
+    assert kept == 6
+
+
+def test_3c_move_three_concurrent_amends():
+    p = _params(tol=Decimal("0.01"), deb_ms=0)
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_ladder(p, st, now)
+    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
+    st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.79"), now + 1))   # n_top -> 0.47 (down 3c)
+    amends = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert len(amends) == 3 and not [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    st = _confirm_rolls(p, st, now + 1.1)
+    assert _prices(st) == [Decimal("0.47") - i * Decimal("0.01") for i in range(11)]
+    assert st.roll_count == 3
 
 
 def test_confirmed_roll_counts_as_replace_and_roll():
@@ -348,17 +391,17 @@ def test_confirmed_roll_counts_as_replace_and_roll():
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.77"), now + 1))
     am = [a for a in acts if a.kind == ActionKind.AMEND_REST][0]
-    assert st.replace_count == 1                   # not counted at request
+    assert st.replace_count == 1                   # not counted at request (counted on confirm)
     st, _ = _feed(p, st, OrderAmended(am.order_id, am.updated_client_order_id, am.price, now + 1.1))
     assert st.replace_count == 2 and st.roll_count == 1 and st.roll_single_order_count == 1
 
 
 # ===========================================================================
-# The roll: n_min shrink + cap hold edges
+# Convergence: n_min shrink + cap hold edges
 # ===========================================================================
 def test_roll_down_past_n_min_shrinks_from_top():
-    # n_min high so the ladder is short and its bottom sits at n_min; a further n_top-down roll cannot
-    # place below n_min -> it CANCELS the top rung (shrink), counted as a one-order roll.
+    # n_min high so the ladder is short and its bottom sits at n_min; a further n_top-down move has an OUT
+    # order but NO placeable vacant slot -> it CANCELS the OUT order (shrink).
     p = _params(tol=Decimal("0.01"), deb_ms=0, n_min=Decimal("0.48"))
     st = _state(p)
     now = T - 600
@@ -370,28 +413,30 @@ def test_roll_down_past_n_min_shrinks_from_top():
     cancels = [a for a in acts if a.kind == ActionKind.CANCEL_REST]
     assert len(cancels) == 1 and cancels[0].order_id == top_id
     assert not [a for a in acts if a.kind == ActionKind.AMEND_REST]
-    assert st.roll_count == 1 and st.roll_single_order_count == 1
     # after the cancel confirms the ladder is 0.49/0.48 (shrunk by one from the top).
     st, _ = _feed(p, st, OrderCancelled(top_id, now + 1.1))
     assert _prices(st) == [Decimal("0.49"), Decimal("0.48")]
+    assert st.rungs_filled + len(st.ladder) <= p.rungs
 
 
 def test_roll_up_past_cap_holds():
-    # cap binds the top; an n_top-up roll that would exceed the cap holds (no order above the cap).
-    # bucket yes_bid 0.58 -> cap 0.41, n_top capped at 0.41. Then n_top rises but stays capped -> hold.
+    # the cap binds n_top so it cannot rise; n_top unchanged -> no OUT, no VACANT -> no order action.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
-    st, _ = _bring_up_ladder(p, st, now)          # start uncapped n_top 0.50
-    # now make the bucket cap bind at 0.41 while W would want a higher n_top.
-    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
-    st, _ = _feed(p, st, BookUpdate(STK_SD, _sd("0.72"), now + 1))       # W low -> wants n_top 0.54
-    st, acts = _feed(p, st, BookUpdate(B_SD, _top("0.58", "0.59"), now + 1))
-    assert st.cap == Decimal("0.41") and st.n_top == Decimal("0.41")
-    # the ladder top (0.50+) is above the new cap; desired n_top 0.41 is BELOW top -> shift DOWN, not up,
-    # so this is a shift-down roll (covered elsewhere). Assert no order is ever placed ABOVE the cap.
+    # bucket yes_bid 0.49 -> cap = 0.50; n_top solves/caps to 0.50.
+    st, _ = _feed_all(p, st, _books(now, sd_ask="0.76", b_bid="0.49"))
+    for o in list(st.ladder):
+        st, _ = _feed(p, st, OrderAck(o.client_order_id, f"OID-{o.client_order_id}", now))
+    assert st.cap == Decimal("0.50") and st.n_top == Decimal("0.50")
+    # W drops (would want a higher n_top) but the cap holds n_top at 0.50 -> nothing moves.
+    st, acts = _feed_all(p, st, [BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1),
+                                 BookUpdate(STK_SD, _sd("0.72"), now + 1),
+                                 BookUpdate(B_SD, _top("0.49", "0.50"), now + 1)])
+    assert st.n_top == Decimal("0.50")
+    assert not [a for a in acts if a.kind in (ActionKind.AMEND_REST, ActionKind.PLACE_REST)]
     for o in st.ladder:
-        assert o.price <= Decimal("0.50")          # never rolled up past a binding cap
+        assert o.price <= Decimal("0.50")
 
 
 # ===========================================================================
@@ -550,7 +595,7 @@ def test_fill_during_roll_books_pre_roll_price_no_double_place():
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.77"), now + 1))
     am = [a for a in acts if a.kind == ActionKind.AMEND_REST][0]
-    assert st.roll_pending is not None and am.order_id == top.order_id
+    assert len(st.rolls_in_flight) == 1 and am.order_id == top.order_id
     # the rolling order FILLS (a taker hit it at its pre-roll resting price 0.50) before the amend acks.
     st, acts = _feed(p, st, Fill(top.order_id, top.client_order_id, Decimal(1), None, "no", now + 1.05))
     assert st.rungs_filled == 1
@@ -558,8 +603,8 @@ def test_fill_during_roll_books_pre_roll_price_no_double_place():
     assert top.price not in _prices(st)                       # the filled rung left the ladder
     # the late OrderAmended for the now-filled order must NOT double-place.
     st, acts = _feed(p, st, OrderAmended(am.order_id, am.updated_client_order_id, am.price, now + 1.1))
-    assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.AMEND_REST)]
-    assert st.roll_pending is None
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert not st.rolls_in_flight
 
 
 def test_amend_cross_books_delta_and_skips_ws_echo():
@@ -659,21 +704,17 @@ def test_no_spot_bucket_stands_down_no_place():
 
 
 def test_replace_rate_alarm_stands_down():
-    # alarm at 3/min: the placement (1) + three confirmed rolls trip it and cancel the ladder.
+    # alarm at 3/min: the placement (1) + three confirmed amends trip it and cancel the ladder.
     p = _params(tol=Decimal("0.01"), deb_ms=0, replace_rate_alarm_per_min=3)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
-    asks = ["0.77", "0.78", "0.79"]                 # each moves n_top down 1c -> a roll
+    asks = ["0.77", "0.78", "0.79"]                 # each moves n_top down 1c -> a roll, keeping ladder full
     for i, a in enumerate(asks):
         t = now + 1 + i * 0.1
         st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), t))
-        st, acts = _feed(p, st, BookUpdate(STK_SD, _sd(a), t))
-        am = [x for x in acts if x.kind == ActionKind.AMEND_REST]
-        if am and st.roll_pending is not None:
-            st, _ = _feed(p, st, OrderAmended(st.roll_pending.order_id,
-                                              st.roll_pending.new_coid,
-                                              st.roll_pending.target_price, t + 0.01))
+        st, _ = _feed(p, st, BookUpdate(STK_SD, _sd(a), t))
+        st = _confirm_rolls(p, st, t + 0.01)        # confirm the amend(s) so they count on confirm
     st, acts = _feed(p, st, ClockTick(now + 2))
     assert st.stood_down
     assert st.ladder == ()
@@ -732,26 +773,27 @@ def test_check_invariants_flags_more_than_k_rests():
 
 
 # ===========================================================================
-# Roll edges: no spurious roll after a partial sweep; survivors roll; the anchor
+# Convergence edges: no spurious move after a partial sweep; survivors move on a real n_top move
 # ===========================================================================
 def test_no_spurious_roll_after_partial_sweep_with_w_constant():
-    # a partial sweep removes the TOP rungs; with W (hence n_top) unchanged, the ladder must NOT roll
-    # (the anchor, not the top survivor's price, is the trigger).
+    # a partial sweep marks the top margins state-2; with n_top unchanged, every survivor's margin is
+    # still an open slot -> OUT and VACANT are both empty -> NO order action.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
-    st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50, anchor 0.50
+    st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50
     for o in sorted(st.ladder, key=lambda o: o.price, reverse=True)[:3]:
         st, _ = _sweep_fill(p, st, o, now + 0.5)
-    assert st.rungs_filled == 3 and st.anchor_n_top == Decimal("0.50")
-    # a healthy tick with the SAME books -> no roll (n_top still 0.50 == anchor).
+    assert st.rungs_filled == 3 and st.margin_state[5] == 2 and st.margin_state[6] == 2
+    # a healthy tick with the SAME books -> no move (n_top still 0.50; survivors fill margins 8..15 = S).
     st, acts = _feed_all(p, st, _books(now + 0.8))
     assert not [a for a in acts if a.kind in (ActionKind.AMEND_REST, ActionKind.PLACE_REST)]
     assert len(st.ladder) == 8
 
 
 def test_survivors_roll_after_partial_sweep_on_real_n_top_move():
-    # after a partial sweep, a genuine n_top drop rolls a SURVIVING order one cent (still one order).
+    # after a partial sweep, a genuine n_top drop moves the survivor that landed on a filled (state-2)
+    # margin to the vacant open slot (still one order); 6+ untouched.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
@@ -759,32 +801,29 @@ def test_survivors_roll_after_partial_sweep_on_real_n_top_move():
     for o in sorted(st.ladder, key=lambda o: o.price, reverse=True)[:3]:
         st, _ = _sweep_fill(p, st, o, now + 0.5)   # fill 0.50/0.49/0.48 -> survivors 0.47..0.40
     bottom_before = min(st.ladder, key=lambda o: o.price).price
-    top_surv_before = max(st.ladder, key=lambda o: o.price)
-    # n_top 0.50 -> 0.49 (real W move) -> shift down: move top survivor (0.47) to bottom-1c.
+    top_surv_before = max(st.ladder, key=lambda o: o.price)   # 0.47 (margin 8)
+    # n_top 0.50 -> 0.49: 0.47 now lands on margin 7 (state 2) -> OUT -> moves to the vacant deep slot.
     st, acts = _refresh(p, st, now + 1, sd_ask="0.77")
     amends = [a for a in acts if a.kind == ActionKind.AMEND_REST]
     assert len(amends) == 1 and amends[0].order_id == top_surv_before.order_id
-    assert amends[0].price == bottom_before - Decimal("0.01")
-    st, _ = _feed(p, st, OrderAmended(amends[0].order_id, amends[0].updated_client_order_id,
-                                      amends[0].price, now + 1.1))
-    assert st.anchor_n_top == Decimal("0.49") and len(st.ladder) == 8
+    assert amends[0].price == bottom_before - Decimal("0.01")   # to below the deepest survivor
+    st = _confirm_rolls(p, st, now + 1.1)
+    assert len(st.ladder) == 8
+    # every survivor's margin is now an open slot.
+    open_span = set(m for m, s in enumerate(st.margin_state) if s == 1)
+    assert all(m in open_span for m in _margins(p, st))
 
 
-def test_roll_round_trip_up_then_down_restores_anchor():
+def test_roll_round_trip_up_then_down_restores_prices():
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
-    # up 1c
-    st, acts = _refresh(p, st, now + 1, sd_ask="0.75")     # n_top 0.51
-    am = [a for a in acts if a.kind == ActionKind.AMEND_REST][0]
-    st, _ = _feed(p, st, OrderAmended(am.order_id, am.updated_client_order_id, am.price, now + 1.1))
-    assert st.anchor_n_top == Decimal("0.51")
-    # down 1c back
-    st, acts = _refresh(p, st, now + 2, sd_ask="0.76")     # n_top 0.50
-    am = [a for a in acts if a.kind == ActionKind.AMEND_REST][0]
-    st, _ = _feed(p, st, OrderAmended(am.order_id, am.updated_client_order_id, am.price, now + 2.1))
-    assert st.anchor_n_top == Decimal("0.50")
+    st, acts = _refresh(p, st, now + 1, sd_ask="0.75")     # up 1c: n_top 0.51
+    st = _confirm_rolls(p, st, now + 1.1)
+    assert _prices(st) == [Decimal("0.51") - i * Decimal("0.01") for i in range(11)]
+    st, acts = _refresh(p, st, now + 2, sd_ask="0.76")     # down 1c back: n_top 0.50
+    st = _confirm_rolls(p, st, now + 2.1)
     assert _prices(st) == [Decimal("0.50") - i * Decimal("0.01") for i in range(11)]
 
 
@@ -800,13 +839,12 @@ def test_roll_fallback_cancel_creates_fresh_rung_at_target():
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.77"), now + 1))
     am = [a for a in acts if a.kind == ActionKind.AMEND_REST][0]
-    assert st.roll_pending is not None
+    assert len(st.rolls_in_flight) == 1
     # the amend FAILED -> the executor cancelled the order -> OrderCancelled(no fill).
     st, acts = _feed(p, st, OrderCancelled(am.order_id, now + 1.1))
     places = [a for a in acts if a.kind == ActionKind.PLACE_REST]
     assert len(places) == 1 and places[0].price == Decimal("0.39")   # fresh rung at the roll target
-    assert st.roll_pending is None
-    assert st.anchor_n_top == Decimal("0.49")
+    assert not st.rolls_in_flight
     # ack the fresh rung -> the ladder is whole again at 0.49..0.39.
     st, _ = _feed(p, st, OrderAck(places[0].client_order_id, "OID-new", now + 1.2))
     assert _prices(st) == [Decimal("0.49") - i * Decimal("0.01") for i in range(11)]
@@ -942,92 +980,95 @@ def test_rung_refreshed_with_e_rung_after_roll_down_and_up():
 
 
 def test_rungfill_captures_live_rung_after_rolls():
-    # BLOCKING #1 (falsifier key): after rolling the ladder down, a fill books the LIVE rung, not a stale one.
+    # BLOCKING #1 (falsifier key): after rolling the ladder down, a fill books the DERIVED live rung.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50
-    for i, ask in enumerate(["0.77", "0.78"]):    # roll down 2c -> ladder 0.48..0.38, n_top 0.48
-        st, acts = _refresh(p, st, now + 1 + i, sd_ask=ask)
-        while st.roll_pending is not None:
-            rp = st.roll_pending
-            st, _ = _feed(p, st, OrderAmended(rp.order_id, rp.new_coid, rp.target_price, now + 1 + i + 0.5))
+    st, _ = _refresh(p, st, now + 1, sd_ask="0.78")   # roll down 2c -> n_top 0.48, ladder 0.48..0.38
+    st = _confirm_rolls(p, st, now + 1.2)
     assert st.n_top == Decimal("0.48")
     top = max(st.ladder, key=lambda o: o.price)   # price 0.48 -> rung 0
     st, _ = _sweep_fill(p, st, top, now + 5)
     rf = st.rest_fills[-1]
     assert rf.price == Decimal("0.48") and rf.rung == 0 and rf.E_rung == Decimal("0.05")
+    # R4: the 2-slot is tied to THIS fill (order_id/coid/W/n_top), anchoring per-margin accounting.
+    assert st.margin_state[5] == 2 and st.filled_at[5] is rf
+    assert rf.order_id == top.order_id and rf.n_top == Decimal("0.48")
 
 
 def test_w_reverts_during_in_flight_roll_invariants_green():
     # BLOCKING #2 (scenario i): n_top reverts while a roll is in flight; check_invariants (asserted after
-    # EVERY event by _feed) must stay green, and the ladder self-heals.
+    # EVERY event by _feed) must stay green, and the ladder self-heals to 11 consecutive.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50
     st, acts = _refresh(p, st, now + 1, sd_ask="0.77")   # n_top -> 0.49, roll DOWN issued
     am = [a for a in acts if a.kind == ActionKind.AMEND_REST][0]
-    assert st.roll_pending is not None
-    st, _ = _refresh(p, st, now + 1.05, sd_ask="0.76")   # W reverts (n_top 0.50) while roll in flight
+    assert len(st.rolls_in_flight) == 1
+    st, _ = _refresh(p, st, now + 1.05, sd_ask="0.76")   # W reverts (n_top 0.50) while the roll is in flight
     assert st.n_top == Decimal("0.50")
     st, _ = _feed(p, st, OrderAmended(am.order_id, am.updated_client_order_id, am.price, now + 1.1))
-    for i in range(4):                            # the reverse-roll heals the ladder; each step checked
-        if st.roll_pending is not None:
-            rp = st.roll_pending
-            st, _ = _feed(p, st, OrderAmended(rp.order_id, rp.new_coid, rp.target_price, now + 1.2 + i * 0.1))
-        st, _ = _refresh(p, st, now + 1.6 + i * 0.1, sd_ask="0.76")
+    # drive to convergence: confirm any rolls + keep books fresh; each step is invariant-checked by _feed.
+    for i in range(6):
+        st = _confirm_rolls(p, st, now + 1.2 + i * 0.1)
+        st, _ = _refresh(p, st, now + 1.5 + i * 0.1, sd_ask="0.76")
+    st = _confirm_rolls(p, st, now + 3.0)
     assert len(st.ladder) == 11 and len(set(o.price for o in st.ladder)) == 11
-    for o in st.ladder:
-        assert o.rung == int((st.n_top - o.price) / Decimal("0.01"))
+    assert _prices(st) == [Decimal("0.50") - i * Decimal("0.01") for i in range(11)]
 
 
-def test_cap_crash_fast_shift_then_converges_invariants_green():
-    # BLOCKING #2 + QUESTION #4: a cap crash strands all K above a bound cap; the fast shift cancels all
-    # in ONE step and re-places below the cap. check_invariants green after every event (via _feed).
-    p = _params(tol=Decimal("0.01"), deb_ms=0)   # fast_shift_min_cents default 4
+def test_cap_crash_converges_bounded_in_flight_invariants_green():
+    # QUESTION #4 (R4 answer): a cap crash strands all K above a bound cap; the CONVERGENCE moves them
+    # down N (<= max_amends_in_flight) at a time (no cancel-all) with invariants green every step.
+    p = _params(tol=Decimal("0.01"), deb_ms=0)   # max_amends_in_flight 3
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # ladder 0.50..0.40, cap 0.64
-    ids = [o.order_id for o in st.ladder]
     st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 1))
     st, _ = _feed(p, st, BookUpdate(STK_SD, _sd("0.76"), now + 1))
     st, acts = _feed(p, st, BookUpdate(B_SD, _top("0.62", "0.63"), now + 1))   # cap -> 0.37, n_top -> 0.37
     assert st.cap == Decimal("0.37") and st.n_top == Decimal("0.37")
-    cancels = [a for a in acts if a.kind == ActionKind.CANCEL_REST]
-    assert len(cancels) == 11 and st.ladder == () and st.awaiting_replace   # ONE-step cancel, not a crawl
-    assert not [a for a in acts if a.kind == ActionKind.AMEND_REST]
-    for i, oid in enumerate(ids):
-        st, acts = _feed(p, st, OrderCancelled(oid, now + 1.1 + i * 0.001))
-    places = [a for a in acts if a.kind == ActionKind.PLACE_REST]
-    assert len(places) == 11
-    assert sorted((a.price for a in places), reverse=True)[0] == Decimal("0.37")
+    amends = [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    assert len(amends) == 3 and len(st.rolls_in_flight) == 3   # N-at-a-time, NOT a cancel-all
+    assert not [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    st = _confirm_rolls(p, st, now + 1.1)         # drives the rest 3-at-a-time; asserts <=3 in flight
+    assert _prices(st) == [Decimal("0.37") - i * Decimal("0.01") for i in range(11)]
     assert all(o.price <= st.cap for o in st.ladder)
+    assert st.roll_count == 11
 
 
-def test_pacing_2c_one_debounce_then_ack_driven():
-    # Q4/Q5: deb_ms debounces only the START; a same-sign continuation rolls on the ack (no re-debounce).
+def test_pacing_2c_one_debounce_two_concurrent():
+    # Q4/Q5: deb_ms debounces only the START; once past it a 2c move issues BOTH amends at once (<= 3).
     p = _params(tol=Decimal("0.01"), deb_ms=2000)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)          # placed at now, last_replace_ts=now
-    # keep strikes fresh at a <=1s cadence (no move, no roll) so the debounce clock stays at placement.
-    st, _ = _refresh(p, st, now + 0.9, sd_ask="0.76")
+    st, _ = _refresh(p, st, now + 0.9, sd_ask="0.76")    # keep fresh (<=1s cadence), no move
     st, _ = _refresh(p, st, now + 1.8, sd_ask="0.76")
-    assert st.last_replace_ts == now              # no re-placement happened
-    st, acts = _refresh(p, st, now + 2.1, sd_ask="0.78")  # deb elapsed, jump DOWN 2c -> first roll
+    assert st.last_replace_ts == now              # no re-placement happened (debounce clock at placement)
+    st, acts = _refresh(p, st, now + 2.1, sd_ask="0.78")  # deb elapsed, jump DOWN 2c -> TWO amends at once
     assert st.n_top == Decimal("0.48")
     ams = [a for a in acts if a.kind == ActionKind.AMEND_REST]
-    assert len(ams) == 1 and st.converging_dir == -1
-    am1 = ams[0]
-    st, acts2 = _feed(p, st, OrderAmended(am1.order_id, am1.updated_client_order_id, am1.price, now + 2.15))
-    ams2 = [a for a in acts2 if a.kind == ActionKind.AMEND_REST]
-    assert len(ams2) == 1, "second cent must roll on the ack without waiting deb_ms again"
-    am2 = ams2[0]
-    st, _ = _feed(p, st, OrderAmended(am2.order_id, am2.updated_client_order_id, am2.price, now + 2.2))
-    assert st.roll_pending is None and st.converging_dir == 0
+    assert len(ams) == 2 and st.converging_dir == -1
+    st = _confirm_rolls(p, st, now + 2.2)
     assert _prices(st) == [Decimal("0.48") - i * Decimal("0.01") for i in range(11)]
     assert st.roll_count == 2
+
+
+def test_pacing_start_debounce_blocks_first_move():
+    # a fresh convergence waits out deb_ms before ANY amend.
+    p = _params(tol=Decimal("0.01"), deb_ms=2000)
+    st = _state(p)
+    now = T - 600
+    st, _ = _bring_up_ladder(p, st, now)
+    st, acts = _refresh(p, st, now + 0.5, sd_ask="0.77")   # 1c move but deb not elapsed -> no amend
+    assert st.n_top == Decimal("0.49")
+    assert not [a for a in acts if a.kind == ActionKind.AMEND_REST]
+    st, _ = _refresh(p, st, now + 1.4, sd_ask="0.77")
+    st, acts = _refresh(p, st, now + 2.1, sd_ask="0.77")   # deb elapsed -> the amend fires
+    assert [a for a in acts if a.kind == ActionKind.AMEND_REST]
 
 
 def test_pacing_sign_flip_re_debounces():
@@ -1036,10 +1077,9 @@ def test_pacing_sign_flip_re_debounces():
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
     st, _ = _refresh(p, st, now + 0.9, sd_ask="0.76")    # keep fresh (< deb; no move)
-    st, _ = _refresh(p, st, now + 1.1, sd_ask="0.77")    # deb elapsed -> roll DOWN
-    assert st.converging_dir == -1 and st.roll_pending is not None
-    rp = st.roll_pending
-    st, _ = _feed(p, st, OrderAmended(rp.order_id, rp.new_coid, rp.target_price, now + 1.15))
+    st, acts = _refresh(p, st, now + 1.1, sd_ask="0.77")  # deb elapsed -> roll DOWN
+    assert st.converging_dir == -1 and len(st.rolls_in_flight) == 1
+    st = _confirm_rolls(p, st, now + 1.15)
     assert st.converging_dir == 0                         # converged at n_top 0.49
     st, acts = _refresh(p, st, now + 1.3, sd_ask="0.76")  # flip UP within deb of the last roll -> wait
     assert not [a for a in acts if a.kind == ActionKind.AMEND_REST]
@@ -1047,59 +1087,25 @@ def test_pacing_sign_flip_re_debounces():
     assert [a for a in acts if a.kind == ActionKind.AMEND_REST]
 
 
-def test_pacing_1c_single_roll_unchanged():
+def test_pacing_1c_single_move_unchanged():
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
-    st, acts = _refresh(p, st, now + 1, sd_ask="0.77")    # 1c move -> exactly one roll
+    st, acts = _refresh(p, st, now + 1, sd_ask="0.77")    # 1c move -> exactly one amend
     ams = [a for a in acts if a.kind == ActionKind.AMEND_REST]
     assert len(ams) == 1
-    rp = st.roll_pending
-    st, acts2 = _feed(p, st, OrderAmended(rp.order_id, rp.new_coid, rp.target_price, now + 1.1))
-    assert not [a for a in acts2 if a.kind == ActionKind.AMEND_REST]   # nothing more to roll
-    assert st.converging_dir == 0
-
-
-def test_fast_shift_5c_move_cancels_all_places_all():
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
-    st = _state(p)
-    now = T - 600
-    st, _ = _bring_up_ladder(p, st, now)          # n_top 0.50
-    st, _ = _refresh(p, st, now + 0.5, sd_ask="0.76")
-    ids = [o.order_id for o in st.ladder]
-    st, acts = _refresh(p, st, now + 1, sd_ask="0.81")   # n_top -> 0.45 (down 5c >= 4)
-    assert st.n_top == Decimal("0.45")
-    cancels = [a for a in acts if a.kind == ActionKind.CANCEL_REST]
-    assert len(cancels) == 11 and st.ladder == () and st.awaiting_replace
-    assert not [a for a in acts if a.kind == ActionKind.AMEND_REST]
-    for i, oid in enumerate(ids):
-        st, acts = _feed(p, st, OrderCancelled(oid, now + 1.1 + i * 0.001))
-    places = [a for a in acts if a.kind == ActionKind.PLACE_REST]
-    assert len(places) == 11
-    assert sorted((a.price for a in places), reverse=True) == [
-        Decimal("0.45") - i * Decimal("0.01") for i in range(11)
-    ]
-
-
-def test_3c_move_still_crawls_not_fast_shift():
-    p = _params(tol=Decimal("0.01"), deb_ms=0)
-    st = _state(p)
-    now = T - 600
-    st, _ = _bring_up_ladder(p, st, now)
-    st, _ = _refresh(p, st, now + 0.5, sd_ask="0.76")
-    st, acts = _refresh(p, st, now + 1, sd_ask="0.79")   # n_top -> 0.47 (down 3c < 4)
-    assert st.n_top == Decimal("0.47")
-    assert [a for a in acts if a.kind == ActionKind.AMEND_REST]   # a roll, not a cancel-all
-    assert not [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    st = _confirm_rolls(p, st, now + 1.1)
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert st.converging_dir == 0 and st.roll_count == 1
 
 
 # ---------------------------------------------------------------------------
-# Round 3 (reviewer 2026-09-22): re-placement must cap at K - filled (BLOCKING #R2-1)
+# Round 3 (reviewer 2026-09-22): window exposure must never exceed K (BLOCKING #R2-1)
 # ---------------------------------------------------------------------------
-def test_fast_shift_after_partial_sweep_caps_at_k_minus_filled():
-    # (a) partial sweep (3 filled) -> fast-shift 5c -> re-place exactly K-3=8, exposure <= K, and a burst
-    # sweep of the re-placed ladder books exactly K total (never > K). invariants green throughout (_feed).
+def test_big_move_after_partial_sweep_keeps_exposure_at_k():
+    # partial sweep (3 filled) -> a big n_top move -> the 8 survivors CONVERGE (move, not re-placed);
+    # exposure stays filled(3)+live(8)=K and a burst sweep books exactly K.
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
@@ -1107,18 +1113,13 @@ def test_fast_shift_after_partial_sweep_caps_at_k_minus_filled():
     for o in sorted(st.ladder, key=lambda o: o.price, reverse=True)[:3]:
         st, _ = _sweep_fill(p, st, o, now + 0.5)   # fill top 3 -> survivors 8
     assert st.rungs_filled == 3 and len(st.ladder) == 8
-    st, _ = _refresh(p, st, now + 0.8, sd_ask="0.76")   # keep fresh, anchor 0.50
-    st, acts = _refresh(p, st, now + 1, sd_ask="0.81")   # n_top -> 0.45 (down 5c) -> fast shift
-    cancels = [a for a in acts if a.kind == ActionKind.CANCEL_REST]
-    assert len(cancels) == 8 and st.ladder == () and st.awaiting_replace
-    for i, c in enumerate(cancels):
-        st, acts = _feed(p, st, OrderCancelled(c.order_id, now + 1.1 + i * 0.001))
-    places = [a for a in acts if a.kind == ActionKind.PLACE_REST]
-    assert len(places) == 8, "must re-place K - filled = 8, not K = 11"
-    for a in places:
-        st, _ = _feed(p, st, OrderAck(a.client_order_id, f"OID2-{a.client_order_id}", now + 1.3))
+    st, _ = _refresh(p, st, now + 0.8, sd_ask="0.76")
+    st, acts = _refresh(p, st, now + 1, sd_ask="0.81")   # n_top -> 0.45 (down 5c): survivors converge
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]   # no re-placement (survivors move)
+    assert len(st.rolls_in_flight) <= p.max_amends_in_flight
+    st = _confirm_rolls(p, st, now + 1.2)
     assert st.rungs_filled + len(st.ladder) == 11    # exposure exactly K
-    # burst sweep the re-placed ladder -> total window fills == K (never exceeds).
+    # a burst sweep of the survivors books at most K total (3 already + 8 now = 11).
     for o in list(st.ladder):
         st, _ = _feed(p, st, Fill(o.order_id, o.client_order_id, Decimal(1), o.price, "no", now + 1.5))
     assert st.rungs_filled == 11 and st.rest_allotment_done
@@ -1142,8 +1143,11 @@ def test_bucket_change_after_partial_sweep_caps_at_k_minus_filled():
     for i, c in enumerate(cancels):
         st, acts = _feed(p, st, OrderCancelled(c.order_id, now + 1.0 + i * 0.001))
     places = [a for a in acts if a.kind == ActionKind.PLACE_REST]
-    assert len(places) == 8, "bucket change must re-place K - filled = 8"
+    assert len(places) == 8, "bucket change must re-place the 8 OPEN margins"
     assert all(o.bucket_Sd == 79700 for o in st.ladder)
+    # R4: the new ticker gets the OPEN margins 8..15 (rungs 3..10) — NOT the nominal top 8 (margins 5..12);
+    # margins 5,6,7 stayed filled (state 2) from the partial sweep on the old ticker.
+    assert sorted(o.rung for o in st.ladder) == [3, 4, 5, 6, 7, 8, 9, 10]
     assert st.rungs_filled + len(st.ladder) == 11
 
 
@@ -1212,18 +1216,13 @@ def test_invariant_allows_negative_rung_above_n_top():
 
 
 def test_roll_integrity_all_rolls_single_order():
-    # every roll in a multi-cent convergence moves exactly one order -> single-order ratio 1.0.
+    # every convergence amend moves exactly one order -> single-order ratio 1.0 (falsifier metric).
     p = _params(tol=Decimal("0.01"), deb_ms=0)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
-    # drive n_top down 3c across separate ticks, confirming each roll.
-    for i, ask in enumerate(["0.77", "0.78"]):     # 0.50 -> 0.49 -> 0.48
-        st, acts = _refresh(p, st, now + 1 + i, sd_ask=ask)
-        am = [a for a in acts if a.kind == ActionKind.AMEND_REST]
-        # confirm any pending roll(s) issued (a 1c step issues one; a 2c continue issues via confirm)
-        while st.roll_pending is not None:
-            rp = st.roll_pending
-            st, _ = _feed(p, st, OrderAmended(rp.order_id, rp.new_coid, rp.target_price, now + 1 + i + 0.5))
-    assert st.roll_count >= 1
+    for i, ask in enumerate(["0.77", "0.79"]):     # a 1c then a 2c move
+        st, _ = _refresh(p, st, now + 1 + i, sd_ask=ask)
+        st = _confirm_rolls(p, st, now + 1 + i + 0.5)
+    assert st.roll_count >= 3
     assert st.roll_single_order_count == st.roll_count   # every roll moved exactly one order

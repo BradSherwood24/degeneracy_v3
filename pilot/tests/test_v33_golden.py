@@ -266,32 +266,29 @@ def test_golden_c_1c_move_rolls_one_order():
 # ===========================================================================
 # (d) a 2c move rolls two, strictly sequential
 # ===========================================================================
-def test_golden_d_2c_move_two_sequential_rolls():
+def test_golden_d_2c_move_two_concurrent_rolls():
     p = _sweep_params()
     cts = 1_000_000
     st = V33State.new("D", cts, BK, p)
     t0 = cts - 600
     st, _ = _bring_up_sweep_ladder(p, st, t0)          # n_top 0.45
-    # jump n_top 0.45 -> 0.43 (yes_ask 0.55 -> 0.57) in one tick.
+    coids_before = {o.price: o.client_order_id for o in st.ladder}
+    # jump n_top 0.45 -> 0.43 (yes_ask 0.55 -> 0.57) in one tick -> TWO amends at once (2 <= max 3).
     st, acts = _run(p, st, [BookUpdate(STK_SU, _top("0.10", "0.11"), t0 + 1),
                             BookUpdate(STK_SD, _top("0.56", "0.57"), t0 + 1)])
     assert st.n_top == Decimal("0.43")
     amends = [a for a in acts if a.kind == ActionKind.AMEND_REST]
-    assert len(amends) == 1 and amends[0].price == Decimal("0.34")   # move top(0.45) to bottom(0.35)-1c
-    # a further move while the first roll is in flight -> NO second amend (queued).
-    st, held = _run(p, st, [BookUpdate(STK_SD, _top("0.56", "0.57"), t0 + 1.05)])
-    assert not [a for a in held if a.kind == ActionKind.AMEND_REST]
-    am1 = amends[0]
-    st, acts2 = _run1(p, st, OrderAmended(am1.order_id, am1.updated_client_order_id, am1.price,
-                                          t0 + 1.1))
-    amends2 = [a for a in acts2 if a.kind == ActionKind.AMEND_REST]
-    assert len(amends2) == 1 and amends2[0].price == Decimal("0.33")   # the second roll, after the ack
-    am2 = amends2[0]
-    st, _ = _run1(p, st, OrderAmended(am2.order_id, am2.updated_client_order_id, am2.price, t0 + 1.2))
-    assert st.roll_pending is None and st.roll_count == 2
+    assert len(amends) == 2                                          # the two orders off the top
+    assert {a.price for a in amends} == {Decimal("0.34"), Decimal("0.33")}  # to the two vacant deep slots
+    assert len(st.rolls_in_flight) == 2
+    for rp in list(st.rolls_in_flight):
+        st, _ = _run1(p, st, OrderAmended(rp.order_id, rp.new_coid, rp.target_price, t0 + 1.1))
+    assert not st.rolls_in_flight and st.roll_count == 2
     assert sorted((o.price for o in st.ladder), reverse=True) == [
         Decimal("0.43") - i * _CENT for i in range(11)
     ]
+    # 9 orders kept their coid (queue); only the 2 rolled orders rotated coid.
+    assert sum(1 for o in st.ladder if o.client_order_id == coids_before.get(o.price)) == 9
 
 
 # ===========================================================================
@@ -333,12 +330,12 @@ def test_golden_f_fill_during_roll():
     st, acts = _run(p, st, [BookUpdate(STK_SU, _top("0.10", "0.11"), t0 + 1),
                             BookUpdate(STK_SD, _top("0.55", "0.56"), t0 + 1)])
     am = [a for a in acts if a.kind == ActionKind.AMEND_REST][0]
-    assert st.roll_pending is not None and am.order_id == top.order_id
+    assert len(st.rolls_in_flight) == 1 and am.order_id == top.order_id
     # the rolling order fills at its PRE-roll resting price 0.45 before the amend acks.
     st, _ = _run1(p, st, Fill(top.order_id, top.client_order_id, Decimal(1), None, "no", t0 + 1.05))
     assert st.rungs_filled == 1 and st.rest_fills[-1].price == Decimal("0.45")
     assert top.price not in [o.price for o in st.ladder]
     # the late OrderAmended for the filled order does NOT double-place.
     st, acts = _run1(p, st, OrderAmended(am.order_id, am.updated_client_order_id, am.price, t0 + 1.1))
-    assert not [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.AMEND_REST)]
-    assert st.roll_pending is None
+    assert not [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    assert not st.rolls_in_flight

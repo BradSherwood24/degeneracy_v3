@@ -21,21 +21,27 @@ WHAT V3.3 CHANGES (Brad, PLAN_V33 sec 1) — the ROLLING LADDER and THE ROLL:
     ``n_top`` and ``n_top`` is already capped by ``solve_n``'s cap arg, a capped top shifts the WHOLE
     ladder down by the same amount (the simplest rule, and the one that keeps every rung post-only).
 
-  * THE ROLL (``_roll``, replacing V3.2's ``_requote``): when W moves so ``n_top`` changes by one cent,
-    the ladder does NOT re-price K orders — it moves ONE order from the end that fell off to the end
-    that opened up (Brad's exact mechanism):
-      - n_top DOWN 1c (wings dearer) -> amend the current TOP order (shallowest) to ``bottom - 1c``; it
-        becomes the new deepest rung. The other K-1 orders are untouched and KEEP QUEUE.
-      - n_top UP 1c -> amend the current BOTTOM order (deepest) to ``top + 1c`` (new shallowest).
-    A 2c move = two rolls, STRICTLY SEQUENTIAL: the second is issued only after the first amend is
-    ACKNOWLEDGED (``roll_pending`` holds the one moving order; further W moves queue). Amend-first via
-    ``OrderAmended`` (PR #59 semantics); the executor's cancel -> confirm -> create is the fallback,
-    surfacing to the core as an ``OrderCancelled`` for the rolling order -> the core places a fresh rung
-    at the roll's target price. The tol/deb_ms gate is applied to the ``n_top`` signal EXACTLY as V3.2
-    applies it to its single price. Bucket change -> cancel ALL K, then place ALL K on the new ticker
-    (V3.2's cancel-confirm-then-place discipline generalised to K).
+  * THE MARGIN-ARRAY CONVERGENCE (``_converge``, replacing V3.2's ``_requote``; Brad's R4 model). The
+    desired state is a MARGIN ARRAY ``margin_state`` in profit space (index m = cents of profit at the
+    current n_top; m = E_min_c is n_top): 0 = no order (below E_min), 1 = OPEN order wanted, 2 = filled
+    (consumed; never re-opened, Q3). The OPEN 1-slots are ANONYMOUS — no order owns a slot; a live order's
+    index is ALWAYS derived from its current price vs n_top, and any live order may be paired with any
+    vacant 1-slot. A 2-slot is tied to the actual fill (``filled_at`` -> the RungFill with order_id/coid/W
+    /n_top) so the falsifier's per-margin accounting anchors to the fill.
+      Each tick (after a START-only debounce, ``deb_ms``, with sign-flip re-debounce) the core computes
+    OUT = live orders whose derived margin is not an open slot (fell off an end, or landed on a 2/0), and
+    VACANT = placeable open slots with no order, and pairs them greedily (minimal movement), emitting up
+    to ``max_amends_in_flight`` AMENDs at once; as each acks (or falls back via cancel->create per order)
+    the next pairs issue until converged. So a 1c W move = one order moves (Brad's one-order roll); a Nc
+    move = N orders move, N-at-a-time, the rest KEEP QUEUE (this replaces R2's single-roll + fast-shift
+    cancel-all). Extra OUT with no placeable slot -> CANCEL (shrink at n_min/cap); extra VACANT with no
+    OUT (a suppressed slot released) -> CREATE, never past K. Amend-first via ``OrderAmended`` (PR #59);
+    the executor's cancel -> confirm -> create fallback surfaces as an ``OrderCancelled`` for the rolling
+    order -> the core places a fresh order at that roll's target. Bucket change -> cancel ALL live, then
+    place the PLACEABLE OPEN slots on the new ticker (after a partial sweep, the remaining 1-margins).
+    Window exposure ``rungs_filled + live rests <= K`` holds at every step (BLOCKING #R2-1).
 
-  * Fill of rung k -> a rung fill carrying ``rung`` and ``E_rung`` -> a coalesced ``WingBatch`` (Q2):
+  * Fill of a rung -> a rung fill (its margin DERIVED from price vs n_top) -> a coalesced ``WingBatch``:
     rung fills arriving within ``wing_coalesce_ms`` (150 ms) of the FIRST are coalesced into ONE wing
     pair sized to the total filled; a fill after the window closes starts a new batch. A filled rung is
     NOT refilled inside the window (Q3 ``refill_in_window`` False) — the ladder simply has K-filled
@@ -118,20 +124,31 @@ class RestOrder:
     live: bool
     pending: bool
     bucket_Sd: int
+    # ``rung`` / ``E_rung`` are a DERIVED LABEL (refreshed every context tick from price vs n_top), NOT a
+    # stored identity: the open margin slots are anonymous (Brad R4) and any order may be paired to any
+    # vacant slot by the convergence. Used only for RungFill/report; never to decide an order's slot.
     rung: int
     E_rung: Decimal
 
 
 @dataclass(frozen=True)
 class RungFill:
-    """A fill of ONE rung: ``price`` = the resting n, ``count`` lots, tagged with ``rung`` / ``E_rung``
-    (captured at fill time) so the falsifier can compute per-rung solved-vs-realised lock."""
+    """A fill of ONE rung, and the reference a filled (state-2) margin slot carries (Brad's R4
+    clarification: "each E index with a value of 2 should be tied to a specific order that has been
+    filled"). ``rung`` is the DERIVED margin index at fill time (m - E_min_c; a label, not an identity —
+    the open 1-slots are anonymous), ``price`` = the resting n, ``count`` lots. ``coid`` / ``order_id``
+    tie the 2-slot to the actual order; ``W`` / ``n_top`` are the wing cost and top anchor at fill, so the
+    falsifier's per-margin accounting (solved lock = ``lock_value(price, W)``) is anchored to the fill."""
 
     rung: int
     E_rung: Decimal
     price: Decimal
     count: int
     server_ts: float
+    coid: str | None = None
+    order_id: str | None = None
+    W: Decimal | None = None
+    n_top: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -183,17 +200,18 @@ class CoalesceGroup:
 
 @dataclass(frozen=True)
 class RollPending:
-    """The one in-flight roll (amend of ONE rung moving end-to-end). Further W moves queue until this
-    resolves via ``OrderAmended`` (success) or ``OrderCancelled`` (the executor's cancel->create
-    fallback -> the core then places a fresh rung at ``target_price``)."""
+    """One in-flight convergence amend: order ``old_coid`` (venue ``order_id``) is being moved to
+    ``target_price`` (margin ``target_margin`` at issue time) under the rotated ``new_coid``. Up to
+    ``max_amends_in_flight`` of these run concurrently. Resolves via ``OrderAmended`` (success) or
+    ``OrderCancelled`` (the executor's cancel->create fallback -> the core places a fresh order at
+    ``target_price``). rung/E_rung of the moved order are re-derived from the CURRENT n_top at ack, so
+    only ``target_price`` (and ``target_margin`` for reference) is carried."""
 
     order_id: str | None
     old_coid: str
     new_coid: str
     target_price: Decimal
-    target_rung: int
-    target_E_rung: Decimal
-    direction: int            # the anchor step this roll effects: -1 (n_top down) or +1 (n_top up)
+    target_margin: int
     started_ts: float
 
 
@@ -225,16 +243,18 @@ class V33State:
 
     # ladder lifecycle
     ladder: tuple[RestOrder, ...] = ()                  # K rungs (live and/or pending)
-    anchor_n_top: Decimal | None = None                 # the n_top the ladder currently represents;
-                                                        # the roll trigger is n_top vs THIS (not the top
-                                                        # survivor's price, which fills would move) so a
-                                                        # partial sweep never spuriously triggers a roll.
-    roll_pending: RollPending | None = None             # the one in-flight roll
-    converging_dir: int = 0                              # 0 = not converging; +/-1 = an active multi-cent
-                                                        # convergence in that direction. deb_ms debounces
-                                                        # only the START; a same-sign continuation rolls
-                                                        # each acked cent without re-debounce; a sign flip
-                                                        # re-debounces (Round 2 pacing).
+    # MARGIN-ARRAY desired state (Brad's model, R4): index m = cents of profit at the current n_top
+    # (m = E_min_c is n_top). 0 = no order (below E_min), 1 = open order wanted, 2 = filled (consumed,
+    # never re-opened this window, Q3). The OPEN SPAN S = {m : state == 1}. A fill at current margin m
+    # sets state[m] = 2. Convergence keeps one live order per PLACEABLE open slot. The 1-slots are
+    # ANONYMOUS (no order home); a 2-slot is tied to the actual fill via ``filled_at`` (Brad R4).
+    margin_state: tuple[int, ...] = ()
+    filled_at: Mapping[int, RungFill] = field(default_factory=dict)   # margin -> the fill that consumed it
+    rolls_in_flight: tuple[RollPending, ...] = ()       # up to max_amends_in_flight concurrent amends
+    converging_dir: int = 0                              # 0 = idle; +/-1 = an active convergence in that
+                                                        # direction. deb_ms debounces only the START; a
+                                                        # same-sign continuation issues on each ack with no
+                                                        # re-debounce; a sign flip re-debounces (R2 pacing).
     awaiting_replace: bool = False                       # bucket change: cancelled all, place after confirms
     outstanding_cancels: int = 0                          # bucket-change cancels awaiting OrderCancelled
     rest_bucket_Sd: int | None = None                    # the bucket the ladder is on
@@ -279,12 +299,18 @@ class V33State:
         shakedown: bool = False,
     ) -> "V33State":
         shadows = {str(E): ShadowSub(E=E) for E in params.shadow_Es}
+        # margin array: indices 0..(E_min_c + K - 1); 0 below E_min, 1 (open order wanted) for the K
+        # slots at margins [E_min_c, E_min_c + K - 1].
+        e_min_c = _emin_cents(params)
+        margin_state = tuple(1 if e_min_c <= m <= e_min_c + params.rungs - 1 else 0
+                             for m in range(e_min_c + params.rungs))
         return cls(
             close_time=close_time,
             close_epoch=int(close_epoch),
             bucket_map=dict(bucket_map),
             shakedown=shakedown,
             shadows=shadows,
+            margin_state=margin_state,
         )
 
     # ------------------------------------------------------------------
@@ -299,8 +325,9 @@ class V33State:
           transiently (a fast up-move or a cap crash), i.e. rung < 0 = "stranded above the top" — that is
           allowed, not an error (BLOCKING #2); * ladder prices are consecutive cents from the top down
           while NO rung has filled (fills open gaps that are not refilled, so consecutiveness is only
-          asserted pre-fill); * at most one roll in flight, and its moving order is a ladder member unless
-          it has already filled (golden f); * a taken wing batch has exactly two legs sized to its total;
+          asserted pre-fill); * at most ``max_amends_in_flight`` concurrent rolls, each on a DISTINCT
+          order that is a ladder member unless it has already filled (golden f) — no order ever has two
+          amends in flight; * a taken wing batch has exactly two legs sized to its total;
           * ``rungs_filled`` equals the number of booked rung fills; * the WINDOW EXPOSURE
           ``rungs_filled + live rests <= K`` at every step (BLOCKING #R2-1: a re-placement after a partial
           sweep must never regrow the ladder past K - filled)."""
@@ -324,14 +351,22 @@ class V33State:
                 assert o.E_rung == params.E_min + (self.n_top - o.price), (
                     f"E_rung {o.E_rung} != E_min+(n_top-price) for price {o.price}, n_top {self.n_top}"
                 )
-        # roll / bucket-change mutual exclusion + the roll's moving order is a ladder member (unless the
-        # moving rung has already filled and been dropped -- golden f, then the late ack just clears it).
-        assert not (self.roll_pending is not None and self.awaiting_replace), (
-            "roll and bucket-change cannot be in flight together"
+        # rolls: at most max_amends_in_flight, on DISTINCT orders (no order two amends), mutually
+        # exclusive with a bucket change; each moving order matches <= 1 ladder member (0 if it filled).
+        assert len(self.rolls_in_flight) <= params.max_amends_in_flight, (
+            f"{len(self.rolls_in_flight)} rolls in flight > max_amends_in_flight "
+            f"{params.max_amends_in_flight}"
         )
-        if self.roll_pending is not None:
-            n_moving = sum(1 for o in lad if o.client_order_id == self.roll_pending.old_coid)
-            assert n_moving <= 1, f"roll_pending matches {n_moving} ladder orders (must be <= 1)"
+        assert not (self.rolls_in_flight and self.awaiting_replace), (
+            "rolls and bucket-change cannot be in flight together"
+        )
+        moving_coids = [r.old_coid for r in self.rolls_in_flight]
+        assert len(set(moving_coids)) == len(moving_coids), (
+            f"an order has two amends in flight: {moving_coids}"
+        )
+        for r in self.rolls_in_flight:
+            n_moving = sum(1 for o in lad if o.client_order_id == r.old_coid)
+            assert n_moving <= 1, f"roll {r.old_coid} matches {n_moving} ladder orders (must be <= 1)"
         # wing-batch / leg consistency: a TAKEN batch has exactly two legs, each sized to the batch total.
         for b in self.wing_batches:
             legs = [l for l in self.wing_legs if l.batch == b.index]
@@ -343,11 +378,10 @@ class V33State:
         assert self.rungs_filled == len(self.rest_fills), (
             f"rungs_filled {self.rungs_filled} != booked fills {len(self.rest_fills)}"
         )
-        # consecutiveness only before any fill (a filled rung is not refilled -> legitimate gaps)
-        if self.rungs_filled == 0 and len(prices) >= 2:
-            s = sorted(prices, reverse=True)
-            for a, b in zip(s, s[1:]):
-                assert a - b == _CENT, f"ladder prices not consecutive cents: {s}"
+        # NB (R4): consecutiveness is no longer a step invariant — a convergence moves up to
+        # max_amends_in_flight orders at once, so the ladder is transiently non-contiguous even before any
+        # fill. "Every live order's margin in the open span" is a REST property (nothing in flight, past
+        # the debounce), asserted by tests after convergence completes, not on every event.
 
 
 # ===========================================================================
@@ -375,20 +409,30 @@ def _rung_of(n_top: Decimal, price: Decimal) -> int:
     return int(((n_top - price) / _CENT).to_integral_value())
 
 
+def _emin_cents(params: V33Params) -> int:
+    """E_min in whole cents (the margin index of the top rung, n_top)."""
+    return int((params.E_min / _CENT).to_integral_value())
+
+
+def _margin_of(params: V33Params, n_top: Decimal, price: Decimal) -> int:
+    """The order's CURRENT margin index (cents of profit) at ``n_top``: E_min_c + (n_top - price)/1c."""
+    return _emin_cents(params) + _rung_of(n_top, price)
+
+
+def _price_of_margin(params: V33Params, n_top: Decimal, m: int) -> Decimal:
+    """The desired price for margin slot ``m`` at ``n_top``: n_top - (m - E_min_c) cents."""
+    return n_top - (m - _emin_cents(params)) * _CENT
+
+
+def _open_slots(st: V33State) -> list[int]:
+    """The OPEN SPAN S = margin indices whose desired state is 1 (order wanted, not filled/below-E_min)."""
+    return [m for m, s in enumerate(st.margin_state) if s == 1]
+
+
 def _sync_wing_mirrors(st: V33State) -> V33State:
     """Re-derive the ``one_legged`` mirror from the batch state (kept for L2/ledger compatibility)."""
     one_legged = any(b.one_legged for b in st.wing_batches)
     return replace(st, one_legged=one_legged)
-
-
-def _top_order(st: V33State) -> RestOrder | None:
-    """The shallowest (highest-price) rung, or None if the ladder is empty."""
-    return max(st.ladder, key=lambda o: o.price) if st.ladder else None
-
-
-def _bottom_order(st: V33State) -> RestOrder | None:
-    """The deepest (lowest-price) rung, or None if the ladder is empty."""
-    return min(st.ladder, key=lambda o: o.price) if st.ladder else None
 
 
 def _replace_order(ladder: tuple[RestOrder, ...], coid: str, **fields) -> tuple[RestOrder, ...]:
@@ -421,7 +465,7 @@ def decide_v33(
         st = _recompute_context(params, st, now)
         st, _ = _shadow_complete(params, st, now)
         st, wa = _wing_step(params, st, now)
-        st, qa = _roll(params, st, now)
+        st, qa = _converge(params, st, now)
         return st, wa + qa
 
     if isinstance(event, Trade):
@@ -451,7 +495,7 @@ def decide_v33(
         st = _recompute_context(params, st, now)
         st, _ = _shadow_complete(params, st, now)
         st, wa = _wing_step(params, st, now)
-        st, qa = _roll(params, st, now)
+        st, qa = _converge(params, st, now)
         return st, wa + qa
 
     return st, actions
@@ -519,53 +563,54 @@ def _apply_ack(st: V33State, event: OrderAck) -> V33State:
     return st
 
 
+def _drop_roll(st: V33State, old_coid: str) -> V33State:
+    """Remove the in-flight roll for ``old_coid`` from ``rolls_in_flight``."""
+    return replace(st, rolls_in_flight=tuple(r for r in st.rolls_in_flight if r.old_coid != old_coid))
+
+
 def _apply_amended(
     params: V33Params, st: V33State, event: OrderAmended, now: float
 ) -> tuple[V33State, list[V33Action]]:
-    """A roll amend confirm. The order_id PERSISTS; the moved rung updates price + coid + rung + E_rung
-    IN PLACE. ``rest_booked_by_coid`` carries forward (order_id persists, coid rotates). Counts one
-    confirmed roll (replace_count / replace_times / roll_count / roll_single_order_count). A cross fill
-    (fill_count > 0) books its own rung fill at the venue average price; then continue converging."""
+    """A convergence amend confirm. The order_id PERSISTS; the moved order updates price + coid + rung +
+    E_rung IN PLACE (labels from the CURRENT n_top, BLOCKING #2). ``rest_booked_by_coid`` carries forward
+    (order_id persists, coid rotates). Counts one confirmed roll. A cross fill (fill_count > 0) books its
+    own rung fill at the venue average price. Then RE-CONVERGES to issue the next pair(s) toward S."""
     actions: list[V33Action] = []
-    rp = st.roll_pending
-    matched = rp is not None and (
-        (event.order_id is not None and rp.order_id == event.order_id)
-        or rp.old_coid == event.client_order_id or rp.new_coid == event.client_order_id
+    rp = next(
+        (r for r in st.rolls_in_flight if
+         (event.order_id is not None and r.order_id == event.order_id)
+         or r.old_coid == event.client_order_id or r.new_coid == event.client_order_id),
+        None,
     )
-    if not matched:
-        # amend confirm for an order the core no longer rolls (e.g. it filled first) -> release the hold.
-        return replace(st, roll_pending=None), actions
+    if rp is None:
+        # amend confirm for an order the core no longer rolls -> nothing to do.
+        return st, actions
+    st = _drop_roll(st, rp.old_coid)
 
-    # the rolling order may have FILLED (removed from ladder) before the amend landed -> just clear.
+    # the moved order may have FILLED (removed from ladder) before the amend landed -> just drop the roll.
     order = next((o for o in st.ladder if o.client_order_id == rp.old_coid), None)
     if order is None:
-        return replace(st, roll_pending=None), actions
+        st, ra = _converge(params, st, now)
+        return st, actions + ra
 
     booked = dict(st.rest_booked_by_coid)
     if rp.new_coid != rp.old_coid and rp.old_coid in booked:
         booked[rp.new_coid] = booked.get(rp.new_coid, 0) + booked.pop(rp.old_coid)
 
     new_price = event.price if event.price is not None else rp.target_price
-    # BLOCKING #2 (reviewer 2026-09-22): derive rung/E_rung from the CURRENT n_top at ACK time, not the
-    # emit-time values baked into RollPending — n_top may have moved (W reverted, or the cap bound) while
-    # the amend was in flight, and the invariant checks against the current n_top. Fall back to the stored
-    # target only when n_top is momentarily unknown (no fresh wing).
     if st.n_top is not None:
         new_rung = _rung_of(st.n_top, new_price)
         new_E = _e_rung(params, st.n_top, new_price)
     else:
-        new_rung, new_E = rp.target_rung, rp.target_E_rung
+        new_rung = rp.target_margin - _emin_cents(params)
+        new_E = params.E_min + new_rung * _CENT
     ladder = _replace_order(
         st.ladder, rp.old_coid,
-        price=new_price, client_order_id=rp.new_coid,
-        rung=new_rung, E_rung=new_E,
+        price=new_price, client_order_id=rp.new_coid, rung=new_rung, E_rung=new_E,
     )
     times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
-    anchor = st.anchor_n_top
-    if anchor is not None:
-        anchor = anchor + rp.direction * _CENT           # the ladder has now shifted one cent
     st = replace(
-        st, ladder=ladder, roll_pending=None, rest_booked_by_coid=booked, anchor_n_top=anchor,
+        st, ladder=ladder, rest_booked_by_coid=booked,
         last_replace_ts=now, replace_count=st.replace_count + 1, replace_times=times,
         roll_count=st.roll_count + 1, roll_single_order_count=st.roll_single_order_count + 1,
     )
@@ -585,8 +630,8 @@ def _apply_amended(
                 acp[event.order_id] = acp.get(event.order_id, 0) + delta
                 st = replace(st, amend_cross_pending=acp)
 
-    # continue converging toward n_top (a 2c move: the next cent, now that this one acked).
-    st, ra = _roll(params, st, now)
+    # re-converge: issue the next pair(s) now this one acked (continuation, no re-debounce).
+    st, ra = _converge(params, st, now)
     return st, actions + ra
 
 
@@ -622,42 +667,37 @@ def _apply_cancelled(
                                      E_rung if E_rung is not None else params.E_min, now)
             actions += wa
 
-    rp = st.roll_pending
-    if rp is not None and event.order_id is not None and rp.order_id == event.order_id:
-        # FALLBACK: the amend failed and the executor cancelled -> drop the old rung, place a fresh one
-        # at the roll's target price (same end state as a successful amend, fresh queue). Skip the
-        # re-place if the order fully filled before the cancel (nothing left to move).
-        ladder = _drop_order(st.ladder, rp.old_coid)
-        anchor = st.anchor_n_top
-        if anchor is not None:
-            anchor = anchor + rp.direction * _CENT       # the roll's shift still takes effect
-        st = replace(st, ladder=ladder, roll_pending=None, anchor_n_top=anchor)
+    rp = next((r for r in st.rolls_in_flight
+               if event.order_id is not None and r.order_id == event.order_id), None)
+    if rp is not None:
+        # FALLBACK: the amend failed and the executor cancelled -> drop the old order and place a fresh
+        # one at the roll's target (same end state as a successful amend, fresh queue). Skip the re-place
+        # if the order fully filled before the cancel (nothing left to move).
+        st = _drop_roll(st, rp.old_coid)
+        st = replace(st, ladder=_drop_order(st.ladder, rp.old_coid))
         still_resting = st.rest_booked_by_coid.get(rp.new_coid, st.rest_booked_by_coid.get(
             rp.old_coid, 0)) < params.lots_per_rung
-        # NIT #9 (reviewer 2026-09-22): re-check the cap on the fallback re-place — for an up-roll the cap
-        # was only checked at emit; if no_ask dropped meanwhile the target could now sit above the cap.
-        # Clamp to the cap and drop the rung if that pushes it below n_min. Derive rung/E_rung from the
-        # CURRENT n_top (BLOCKING #2) so the fresh order's labels match the invariant, not emit-time.
+        # NIT #9: re-check the cap on the fallback re-place (no_ask may have dropped since emit). Clamp to
+        # the cap and drop if that pushes below n_min. Derive rung/E_rung from the CURRENT n_top.
         target = rp.target_price
         if st.cap is not None and target > st.cap:
             target = st.cap
         if (not st.rest_allotment_done and still_resting and _in_window(params, st, now)
-                and target >= params.n_min):
-            if st.n_top is not None:
-                r_rung, r_E = _rung_of(st.n_top, target), _e_rung(params, st.n_top, target)
-            else:
-                r_rung, r_E = rp.target_rung, rp.target_E_rung
+                and target >= params.n_min and st.n_top is not None
+                and len(st.ladder) + st.rungs_filled < params.rungs):
+            r_rung, r_E = _rung_of(st.n_top, target), _e_rung(params, st.n_top, target)
             st, pa = _place_one(params, st, target, r_rung, r_E, now)
             actions += pa
-        return st, actions
+        st, ra = _converge(params, st, now)
+        return st, actions + ra
 
-    # bucket-change / stand-down cancel: drop the slot (if still present) and decrement the count.
+    # bucket-change / stand-down / shrink cancel: drop the slot (if still present) and decrement the count.
     if live_order is not None:
         st = replace(st, ladder=_drop_order(st.ladder, live_order.client_order_id))
     if st.outstanding_cancels > 0:
         st = replace(st, outstanding_cancels=st.outstanding_cancels - 1)
     # a bucket change waiting to re-place: once all cancels confirmed and the ladder is clear, place all.
-    st, pa = _roll(params, st, now)
+    st, pa = _converge(params, st, now)
     return st, actions + pa
 
 
@@ -716,13 +756,15 @@ def _book_rung_fill(
     E_rung: Decimal, now: float
 ) -> tuple[V33State, list[V33Action]]:
     """Book ``delta`` filled lots of rung ``coid`` at ``price``: record the RungFill, remove the rung
-    from the ladder (Q3 no refill), and COALESCE the fill into the open wing group (Q2)."""
-    rf = RungFill(rung=rung, E_rung=E_rung, price=price, count=int(delta), server_ts=now)
+    from the ladder (Q3 no refill), and COALESCE the fill into the open wing group (Q2). The fill's margin
+    is DERIVED from ``price`` vs the current n_top (Brad R4: the index is never a stored identity); the
+    2-slot is tied to this fill via ``filled_at``."""
     booked = dict(st.rest_booked_by_coid)
     booked[coid] = booked.get(coid, 0) + int(delta)
     # remove the (now filled) rung from the live ladder; a filled rung is not refilled inside the window.
     ladder = st.ladder
     order = next((o for o in ladder if o.client_order_id == coid), None)
+    order_id = order.order_id if order is not None else None
     if order is not None:
         remaining = order.count - booked[coid]
         if remaining <= 0:
@@ -730,14 +772,39 @@ def _book_rung_fill(
         else:
             # a partial fill of a rung (only possible if lots_per_rung > 1): keep the remainder resting.
             ladder = _replace_order(ladder, coid, count=remaining)
+    # DERIVE the fill's margin from the price vs the current n_top (the passed rung/E_rung are the caller's
+    # fallback label when n_top is momentarily unknown). This is the literal "index derived from price".
+    if st.n_top is not None:
+        m = _margin_of(params, st.n_top, price)
+        rung = m - _emin_cents(params)
+        E_rung = params.E_min + rung * _CENT
+    else:
+        m = _emin_cents(params) + rung
+    rf = RungFill(rung=rung, E_rung=E_rung, price=price, count=int(delta), server_ts=now,
+                  coid=coid, order_id=order_id, W=st.W, n_top=st.n_top)
+    # MARGIN ARRAY (Brad R4): mark this fill's margin as consumed (state 2) and tie the 2-slot to THIS
+    # fill (``filled_at``). A rare fill on a STRANDED order (margin outside the nominal array) is still
+    # booked (rungs_filled ++, the exposure cap holds) but leaves the array untouched — the exposure
+    # guard, not the array, is the true K-lot cap.
+    margin_state = st.margin_state
+    filled_at = st.filled_at
+    if 0 <= m < len(margin_state):
+        if margin_state[m] != 2:
+            ms = list(margin_state)
+            ms[m] = 2
+            margin_state = tuple(ms)
+        fa = dict(filled_at)
+        fa[m] = rf
+        filled_at = fa
     st = replace(
         st, ladder=ladder, rest_fills=st.rest_fills + (rf,),
         rungs_filled=st.rungs_filled + 1, rest_booked_by_coid=booked,
+        margin_state=margin_state, filled_at=filled_at,
     )
     st = _coalesce_add(params, st, rf, now)
     # latch the allotment when every rung has filled (ladder empty via fills) or max_sets reached.
     if (st.rungs_filled >= params.max_sets_per_hour
-            or (not st.ladder and not st.awaiting_replace and st.roll_pending is None
+            or (not st.ladder and not st.awaiting_replace and not st.rolls_in_flight
                 and st.outstanding_cancels == 0)):
         st = replace(st, rest_allotment_done=True)
     st, wa = _wing_step(params, st, now)
@@ -944,7 +1011,7 @@ def _cancel_all(st: V33State, *, track_outstanding: bool = False) -> tuple[V33St
         if o.order_id is not None:
             st = _remember_cancel_ctx(st, o)
             n_live += 1
-    st = replace(st, ladder=(), roll_pending=None, anchor_n_top=None, converging_dir=0)
+    st = replace(st, ladder=(), rolls_in_flight=(), converging_dir=0)
     if track_outstanding:
         st = replace(st, outstanding_cancels=st.outstanding_cancels + n_live)
     return st, actions
@@ -980,62 +1047,56 @@ def _place_one(
     return st, [_place_action(st, params, coid, price)]
 
 
-def _desired_rungs(params: V33Params, n_top: Decimal) -> list[tuple[Decimal, int, Decimal]]:
-    """The full desired ladder: (price, rung k, E_rung) for k = 0..K-1 with price >= n_min (truncate
-    the bottom). The top honours the cap already (n_top came from solve_n with the cap)."""
-    out: list[tuple[Decimal, int, Decimal]] = []
-    for k in range(params.rungs):
-        price = n_top - k * _CENT
-        if price < params.n_min:
-            break
-        out.append((price, k, params.E_min + k * _CENT))
+def _placeable_open_slots(params: V33Params, st: V33State) -> list[tuple[int, Decimal]]:
+    """The open span slots (margin_state == 1) that are placeable at the current n_top (n_min <= price <=
+    cap), as (margin, price) sorted top-first (shallowest margin). This is Brad's "the 1s in the array"."""
+    assert st.n_top is not None
+    out: list[tuple[int, Decimal]] = []
+    for m in _open_slots(st):
+        price = _price_of_margin(params, st.n_top, m)
+        if price >= params.n_min and (st.cap is None or price <= st.cap):
+            out.append((m, price))
     return out
 
 
 def _place_all(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V33Action]]:
-    """Place the desired ladder, capped at the REMAINING hourly allotment (BLOCKING #R2-1, reviewer
-    2026-09-22): a re-placement after a partial sweep (fast shift or bucket change) must NOT regrow the
-    ladder past ``K - rungs_filled``, or the window could hold more than K lots (a burst sweep would book
-    them before the reactive ``max_sets_per_hour`` latch can act) — breaching DECIDED Q3 and undersizing
-    S4 (Q5). Place ``min(rungs, max_sets_per_hour - rungs_filled)`` rungs FROM THE TOP down; if that is
-    <= 0, latch ``rest_allotment_done`` and place nothing. Counts as ONE ladder placement (the debounce
-    anchor for the first roll); the per-rung PLACE_RESTs are emitted together."""
+    """Place one order at EACH placeable OPEN slot in the margin array (Brad's model, R4). After a partial
+    sweep of margins 5..k, this places the REMAINING open margins (k+1..15) on the new/first ticker — NOT
+    the nominal top K−filled — and the open-span size is exactly K − filled_in_range, so exposure
+    (rungs_filled + placed) <= K. If the allotment is already spent (no open placeable slot and filled >=
+    max_sets), latch ``rest_allotment_done``. Counts as ONE ladder placement (the debounce anchor)."""
     assert st.n_top is not None
     actions: list[V33Action] = []
-    budget = min(params.rungs, params.max_sets_per_hour - st.rungs_filled)
-    if budget <= 0:
-        # the hourly allotment is already spent -> place nothing and stop quoting for the window.
+    slots = _placeable_open_slots(params, st)
+    # never exceed the remaining allotment (belt-and-braces to the open-span sizing).
+    budget = params.max_sets_per_hour - st.rungs_filled
+    if budget <= 0 or (not slots and st.rungs_filled >= params.max_sets_per_hour):
         return replace(st, rest_allotment_done=True), actions
-    for price, rung, E_rung in _desired_rungs(params, st.n_top)[:budget]:
-        st, a = _place_one(params, st, price, rung, E_rung, now)
+    for m, price in slots[:budget]:
+        rung = m - _emin_cents(params)
+        st, a = _place_one(params, st, price, rung, params.E_min + rung * _CENT, now)
         actions += a
     if actions:
         times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
         st = replace(
-            st, rest_bucket_Sd=st.spot_Sd, anchor_n_top=st.n_top, converging_dir=0,
+            st, rest_bucket_Sd=st.spot_Sd, converging_dir=0,
             last_replace_ts=now, replace_count=st.replace_count + 1, replace_times=times,
         )
     return st, actions
 
 
 def _emit_roll(
-    params: V33Params, st: V33State, order: RestOrder, target_price: Decimal, direction: int,
+    params: V33Params, st: V33State, order: RestOrder, target_price: Decimal, target_margin: int,
     now: float
-) -> tuple[V33State, list[V33Action]]:
-    """Amend ONE rung end-to-end (Brad's roll). Mints a new coid (a price change forfeits queue), sets
-    ``roll_pending`` (blocks any further roll until confirm), and the moved rung's target rung/E_rung
-    are derived from the current n_top. Counted on CONFIRM (``_apply_amended``), like V3.2."""
-    assert st.n_top is not None
+) -> tuple[V33State, RollPending, V33Action]:
+    """Build ONE convergence amend moving ``order`` to ``target_price``. Mints a new coid (a price change
+    forfeits queue). Returns the new state, the RollPending to register, and the AMEND action. Counted on
+    CONFIRM (``_apply_amended``). The caller registers the roll + emits."""
     new_coid, st = _mint_coid(st)
-    # emit-time fallback labels only; _apply_amended re-derives from the CURRENT n_top at ack (BLOCKING #2).
-    target_rung = _rung_of(st.n_top, target_price)
-    target_E = _e_rung(params, st.n_top, target_price)
     rp = RollPending(
         order_id=order.order_id, old_coid=order.client_order_id, new_coid=new_coid,
-        target_price=target_price, target_rung=target_rung, target_E_rung=target_E,
-        direction=direction, started_ts=now,
+        target_price=target_price, target_margin=target_margin, started_ts=now,
     )
-    st = replace(st, roll_pending=rp)
     exp = st.close_epoch - params.quote_end_s
     action = _mk(
         ActionKind.AMEND_REST, st.shakedown,
@@ -1043,11 +1104,13 @@ def _emit_roll(
         action="buy", count=params.lots_per_rung, price=target_price, expiration_epoch=exp,
         client_order_id=order.client_order_id, updated_client_order_id=new_coid,
     )
-    return st, [action]
+    return st, rp, action
 
 
-def _roll(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V33Action]]:
-    """The place / roll / cancel / stand-down decision on the ladder (replaces V3.2 ``_requote``)."""
+def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V33Action]]:
+    """The place / converge / cancel / stand-down decision on the ladder (Brad's margin-array model, R4;
+    replaces V3.2 ``_requote`` and the R2 single-roll+fast-shift). Drives the live orders toward one order
+    per placeable OPEN slot of ``margin_state``, moving up to ``max_amends_in_flight`` at a time."""
     actions: list[V33Action] = []
     t_to_close = st.close_epoch - now
 
@@ -1056,7 +1119,7 @@ def _roll(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V
         st, ca = _cancel_all(st)
         return st, ca
 
-    # replace-rate alarm (trailing 60 s) — counts rolls + the ladder placement.
+    # replace-rate alarm (trailing 60 s) — counts placements + amends.
     recent = tuple(t for t in st.replace_times if now - t <= 60.0)
     if len(recent) > params.replace_rate_alarm_per_min and not st.stood_down:
         st, ca = _cancel_all(st)
@@ -1090,95 +1153,114 @@ def _roll(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V
     if st.last_standdown_reason is not None:
         st = replace(st, last_standdown_reason=None, stand_down_reason=None)
 
-    # bucket change: cancel ALL rungs on the old bucket, place ALL on the new one after confirms.
+    # bucket change: cancel ALL rungs on the old bucket, place the open slots on the new one after confirms.
     if (st.rest_bucket_Sd is not None and st.rest_bucket_Sd != st.spot_Sd
-            and st.roll_pending is None and st.ladder):
+            and not st.rolls_in_flight and st.ladder):
         st, ca = _cancel_all(st, track_outstanding=True)
         st = replace(st, awaiting_replace=True, rest_bucket_Sd=None)
         return st, actions + ca
 
-    # hold while a roll is in flight, or bucket-change cancels are unconfirmed, or any rung is pending.
-    if st.roll_pending is not None:
-        return st, actions
+    # hold while bucket-change cancels are unconfirmed.
     if st.awaiting_replace and st.outstanding_cancels > 0:
         return st, actions
-    if any(o.pending for o in st.ladder):
-        return st, actions
 
-    # place: first placement, or place-all after a bucket-change cancel confirmed, or an empty ladder.
-    if not st.ladder:
+    # place: first placement, or place the open slots after a bucket-change cancel confirmed.
+    if not st.ladder and not st.rolls_in_flight:
         if st.awaiting_replace:
             st = replace(st, awaiting_replace=False)
             st, pa = _place_all(params, st, now)
             return st, actions + pa
-        if st.rungs_filled > 0:
-            # every rung filled and none refilled (Q3) -> the allotment is done.
+        if st.rungs_filled > 0 and not _placeable_open_slots(params, st):
+            # every open slot filled and none refilled (Q3) -> the allotment is done.
             st = replace(st, rest_allotment_done=True)
             return st, actions
         st, pa = _place_all(params, st, now)
         return st, actions + pa
 
-    # a live ladder on the SAME bucket: roll toward n_top. The trigger is n_top vs the ANCHOR (the n_top
-    # the ladder represents), NOT the top survivor's price — so a partial sweep (which removes the top
-    # rungs) never spuriously triggers a roll while W is unchanged.
-    #
-    # PACING (Round 2, reviewer Q4/Q5 + Q-ROLL-DEB): ``deb_ms`` debounces only the START of a convergence.
-    # Once committed (``converging_dir`` == the move's sign), each subsequent cent rolls as soon as the
-    # prior amend acks (this ``_roll`` is re-entered from ``_apply_amended``) with NO re-debounce, while
-    # the sign is unchanged; a SIGN FLIP re-debounces. And a LARGE jump (|dn| >= fast_shift_min_cents,
-    # e.g. a cap crash stranding most of the ladder above a bound cap) shifts the WHOLE ladder in ONE
-    # step (cancel-all/place-all, like a bucket change) instead of crawling K one-cent rolls.
-    top = _top_order(st)
-    bottom = _bottom_order(st)
-    assert top is not None and bottom is not None and st.n_top is not None
-    if st.anchor_n_top is None:
-        st = replace(st, anchor_n_top=st.n_top)          # defensive: adopt the current top as anchor
+    # hold the convergence while any order is still PENDING an ack (an initial placement or a just-issued
+    # create) — it has no order_id to amend, and its price is committed; converge once it is live.
+    if any(o.pending for o in st.ladder):
         return st, actions
-    dn = st.n_top - st.anchor_n_top
-    if abs(dn) < params.tol or dn == _ZERO:
-        # converged (or within tolerance) -> the convergence is over.
-        if st.converging_dir != 0:
+
+    # ------------------------------------------------------------------
+    # CONVERGENCE: drive live orders toward one order per placeable open slot.
+    # ------------------------------------------------------------------
+    assert st.n_top is not None
+    # target price -> margin for each placeable open slot.
+    target = {price: m for (m, price) in _placeable_open_slots(params, st)}
+    inflight_old = {r.old_coid for r in st.rolls_in_flight}
+    inflight_targets = {r.target_price for r in st.rolls_in_flight}
+    occupied = {o.price for o in st.ladder}
+    # OUT = LIVE orders (acked, not already being amended) whose price is not a desired target.
+    OUT = [o for o in st.ladder if o.live and o.order_id is not None
+           and o.client_order_id not in inflight_old and o.price not in target]
+    # VACANT = target prices with no committed order (live/pending price or in-flight target).
+    VACANT = sorted(p for p in target if p not in occupied and p not in inflight_targets)
+
+    if not OUT and not VACANT:
+        # converged (nothing to move/place); clear the convergence flag once nothing is in flight.
+        if not st.rolls_in_flight and st.converging_dir != 0:
             st = replace(st, converging_dir=0)
         return st, actions
-    direction = -1 if dn < _ZERO else +1
-    mid = st.converging_dir == direction                 # a same-sign continuation is not re-debounced
+
+    # direction of the need (for the start-debounce sign-flip): OUT below the open span => n_top dropped
+    # (-1); OUT above => n_top rose (+1). VACANT-only => a released/new slot; treat as a fresh placement.
+    open_span = _open_slots(st)
+    min_open = open_span[0] if open_span else _emin_cents(params)
+    max_open = open_span[-1] if open_span else _emin_cents(params) + params.rungs - 1
+    if OUT:
+        below = sum(1 for o in OUT if _margin_of(params, st.n_top, o.price) < min_open)
+        above = sum(1 for o in OUT if _margin_of(params, st.n_top, o.price) > max_open)
+        direction = -1 if below >= above else +1
+    else:
+        direction = st.converging_dir if st.converging_dir != 0 else +1
+
+    mid = st.converging_dir == direction and (st.converging_dir != 0 or st.rolls_in_flight)
     since_ms = (now - (st.last_replace_ts if st.last_replace_ts is not None else -1e18)) * 1000.0
     if not mid and since_ms < params.deb_ms:
-        return st, actions                               # still waiting out the START debounce
-
-    # committed to converging in ``direction``.
-    cents = int((abs(dn) / _CENT).to_integral_value())
-    if cents >= params.fast_shift_min_cents:
-        # FAST SHIFT: cancel every rung and re-place the whole ladder at the new n_top in one step (the
-        # cap-crash / large-jump path). Place-all runs once the cancels confirm (via _apply_cancelled).
-        st, ca = _cancel_all(st, track_outstanding=True)
-        st = replace(st, awaiting_replace=True, converging_dir=0)
-        return st, actions + ca
+        return st, actions  # still waiting out the START debounce for a fresh convergence / sign flip
 
     st = replace(st, converging_dir=direction)
-    if direction < 0:
-        # n_top DOWN: shift the ladder down 1c -> move the TOP order to bottom-1c (new deepest).
-        target = bottom.price - _CENT
-        if target >= params.n_min:
-            st, ra = _emit_roll(params, st, top, target, -1, now)
-            return st, actions + ra
-        # the ladder cannot go below n_min -> shrink from the top (cancel the shallowest rung).
-        st = _remember_cancel_ctx(st, top)
-        action = _cancel_action(st, top)
-        st = replace(st, ladder=_drop_order(st.ladder, top.client_order_id),
-                     anchor_n_top=st.anchor_n_top - _CENT,
-                     outstanding_cancels=st.outstanding_cancels + (1 if top.order_id else 0),
-                     last_replace_ts=now,
-                     replace_count=st.replace_count + 1,
-                     replace_times=tuple(t for t in st.replace_times if now - t <= 60.0) + (now,),
-                     roll_count=st.roll_count + 1,
-                     roll_single_order_count=st.roll_single_order_count + 1)
-        return st, actions + [action]
-    # n_top UP: shift the ladder up 1c -> move the BOTTOM order to top+1c (new shallowest), provided the
-    # new top honours the post-only cap.
-    target = top.price + _CENT
-    if st.cap is None or target <= st.cap:
-        st, ra = _emit_roll(params, st, bottom, target, +1, now)
-        return st, actions + ra
-    # cannot exceed the cap -> hold (the top already sits at the cap).
+    budget = params.max_amends_in_flight - len(st.rolls_in_flight)
+    if budget <= 0:
+        return st, actions  # already at the concurrency cap; wait for acks
+
+    # pair OUT and VACANT greedily by price (minimal movement): move OUT[i] -> VACANT[i] via AMEND.
+    # AMENDs are counted toward the replace-rate alarm on CONFIRM (``_apply_amended``), not here, so they
+    # are NOT added to ``replace_times`` at emit (that would double-count). Shrink-cancels and vacant-
+    # creates have no confirm-count path, so they ARE counted here on emit.
+    OUT_sorted = sorted(OUT, key=lambda o: o.price)
+    pairs = min(len(OUT_sorted), len(VACANT), budget)
+    rolls = list(st.rolls_in_flight)
+    for i in range(pairs):
+        o = OUT_sorted[i]
+        tprice = VACANT[i]
+        st, rp, action = _emit_roll(params, st, o, tprice, target[tprice], now)
+        rolls.append(rp)
+        actions.append(action)
+    st = replace(st, rolls_in_flight=tuple(rolls))
+    remaining = budget - pairs
+    extra_times: list[float] = []      # replace_times entries for the NON-amend ops (cancel/create)
+    if remaining > 0 and len(OUT_sorted) > pairs:
+        # extra OUT with no vacant slot (n_min/cap suppressed the deep end) -> CANCEL (shrink).
+        for o in OUT_sorted[pairs:pairs + remaining]:
+            st = _remember_cancel_ctx(st, o)
+            actions.append(_cancel_action(st, o))
+            st = replace(st, ladder=_drop_order(st.ladder, o.client_order_id),
+                         outstanding_cancels=st.outstanding_cancels + (1 if o.order_id else 0))
+            extra_times.append(now)
+    elif remaining > 0 and len(VACANT) > pairs:
+        # extra VACANT with no OUT order (a suppressed slot became placeable) -> CREATE, but never past K.
+        for tprice in VACANT[pairs:pairs + remaining]:
+            if len(st.ladder) + st.rungs_filled >= params.rungs:
+                break
+            m = target[tprice]
+            rung = m - _emin_cents(params)
+            st, pa = _place_one(params, st, tprice, rung, params.E_min + rung * _CENT, now)
+            actions += pa
+            extra_times.append(now)
+
+    if actions:
+        new_times = tuple(t for t in st.replace_times if now - t <= 60.0) + tuple(extra_times)
+        st = replace(st, last_replace_ts=now, replace_times=new_times)
     return st, actions
