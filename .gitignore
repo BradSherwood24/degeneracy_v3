@@ -6,13 +6,16 @@ sim/out/
 historical-data/
 pilot/journals/
 pilot/journals_v32/
+pilot/journals_v33/
 pilot/logs/
 pilot/logs_v32/
+pilot/logs_v33/
 
 # --- runtime state (machine-local, not source) ---
 pilot/ledger/
 pilot/ops/mode.txt
 pilot/ops/v32_mode.txt
+pilot/ops/v33_mode.txt
 # generated box-report artifacts (regenerated on each run; only the README is tracked)
 pilot/reports/*.json
 
@@ -32,3 +35,4 @@ __pycache__/
 pilot/ops/strategy.txt
 pilot/ops/stops_*.json
 pilot/ops/v32_stops_*.json
+pilot/ops/v33_stops_*.json
