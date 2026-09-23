@@ -39,7 +39,12 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # The canonical sha256 of the shipped policy/v33_params.json (sha of json.dumps(sort_keys=True,
 # separators=(",",":")).encode("utf-8")). Recompute + re-pin only when INTENTIONALLY re-freezing.
 # L1 FREEZE (2026-09-22): the first V3.3 ladder policy (E_min 0.05, rungs 11, lots_per_rung 1).
-FROZEN_V33_PARAMS_SHA256 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
+# Round 2 (2026-09-22): added ``fast_shift_min_cents`` (the cap-crash / large-jump fast path, reviewer
+# QUESTION #4) -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
+# History (add-only law): the L1 Round-1 sha (before fast_shift_min_cents). Kept DEFINED so any R1
+# ledger rows stay identifiable.
+PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
 
 _CENT = Decimal("0.01")
 
@@ -72,11 +77,18 @@ class V33Params:
       * ``rungs``        ladder depth K: rest K one-lot NO bids at n_top, n_top-1c, ... n_top-(K-1)c
                          (truncated from the bottom at n_min; the top honours the post-only cap).
       * ``lots_per_rung`` lots on EACH rung (1). The hour's allotment is rungs * lots_per_rung.
-      * ``tol`` / ``deb_ms`` roll gate: roll the ladder one cent only when |n_top - top_price| >= tol
-                         AND >= deb_ms since the last roll (the SAME gate V3.2 applies to its one price).
+      * ``tol`` / ``deb_ms`` roll gate: ``deb_ms`` debounces the START of a convergence (|n_top - anchor|
+                         >= tol); once committed, each subsequent cent rolls as soon as the prior amend
+                         acks (no re-debounce) while the sign is unchanged; a sign flip re-debounces
+                         (Round 2 pacing, reviewer Q4/Q5). Param-driven so Brad can retune without code.
+      * ``fast_shift_min_cents`` when |n_top - anchor| >= this AFTER the start debounce (e.g. a cap crash
+                         stranding most of the ladder above a bound cap), shift the WHOLE ladder in ONE
+                         step (cancel-all/place-all, like a bucket change) instead of crawling K rolls
+                         (reviewer QUESTION #4; V3.2 repriced its single order in one step). Default 4.
       * ``wing_coalesce_ms`` rung fills landing within this of the first are coalesced into ONE wing
                          pair sized to the total filled (Q2). A later fill starts a new batch.
-      * ``refill_in_window`` a filled rung is NOT re-placed inside the same window when False (Q3).
+      * ``refill_in_window`` L1 supports only False (Q3 no-refill); ENFORCED in the loader — a future
+                         True (re-place a filled rung after its wings book) is reserved for L2.
       * ``max_sets_per_hour`` stop quoting after this many completed sets (K).
       * ``replace_rate_alarm_per_min`` rolls (amends) in a trailing 60 s above this -> stand down.
       * ``shadow_Es``    the E ladder the in-process shadow re-solves each tick; each must lie in
@@ -97,6 +109,7 @@ class V33Params:
     bucket_freshness_max_age_s: float
     wing_coalesce_ms: int
     refill_in_window: bool
+    fast_shift_min_cents: int
     max_sets_per_hour: int
     n_min: Decimal
     replace_rate_alarm_per_min: int
@@ -128,6 +141,20 @@ def load_v33_params(
     rungs = int(raw["rungs"])
     if rungs < 1:
         raise V33ParamsInvalid(f"v33 policy at {path} is invalid: rungs={rungs} must be >= 1")
+    # NIT #7 (reviewer, 2026-09-22): ``refill_in_window`` is a real, ENFORCED gate — L1 supports only the
+    # DECIDED no-refill behaviour (Q3). A future ``true`` (re-place a filled rung's price after its wings
+    # are booked, capped by max_sets_per_hour) is reserved for L2; fail closed here so the flag can never
+    # be silently ignored.
+    if bool(raw["refill_in_window"]):
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: refill_in_window=true is reserved for L2 (Q3 is "
+            f"no-refill in L1); the core does not yet re-place filled rungs"
+        )
+    if int(raw["fast_shift_min_cents"]) < 2:
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: fast_shift_min_cents="
+            f"{raw['fast_shift_min_cents']} must be >= 2 (a 1c move is always a single roll)"
+        )
     shadow_Es = tuple(Decimal(str(x)) for x in raw["shadow_Es"])
     # Fail closed (ruling L-6, generalised for the ladder): every shadow E must lie WITHIN the live
     # ladder's margin range [E_min, E_min + (rungs-1)c], else the in-process shadow tracks a rung the
@@ -154,6 +181,7 @@ def load_v33_params(
         bucket_freshness_max_age_s=float(raw["bucket_freshness_max_age_s"]),
         wing_coalesce_ms=int(raw["wing_coalesce_ms"]),
         refill_in_window=bool(raw["refill_in_window"]),
+        fast_shift_min_cents=int(raw["fast_shift_min_cents"]),
         max_sets_per_hour=int(raw["max_sets_per_hour"]),
         n_min=Decimal(str(raw["n_min"])),
         replace_rate_alarm_per_min=int(raw["replace_rate_alarm_per_min"]),

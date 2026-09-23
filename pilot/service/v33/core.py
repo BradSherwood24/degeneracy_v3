@@ -230,6 +230,11 @@ class V33State:
                                                         # survivor's price, which fills would move) so a
                                                         # partial sweep never spuriously triggers a roll.
     roll_pending: RollPending | None = None             # the one in-flight roll
+    converging_dir: int = 0                              # 0 = not converging; +/-1 = an active multi-cent
+                                                        # convergence in that direction. deb_ms debounces
+                                                        # only the START; a same-sign continuation rolls
+                                                        # each acked cent without re-debounce; a sign flip
+                                                        # re-debounces (Round 2 pacing).
     awaiting_replace: bool = False                       # bucket change: cancelled all, place after confirms
     outstanding_cancels: int = 0                          # bucket-change cancels awaiting OrderCancelled
     rest_bucket_Sd: int | None = None                    # the bucket the ladder is on
@@ -286,24 +291,52 @@ class V33State:
     def check_invariants(self, params: V33Params) -> None:
         """Cheap structural invariants, asserted each step by the tests (and safe to run live).
 
-        * never more than K live rests; * never two rests on one price; * every live rest has a rung
-        index and ``E_rung = E_min + (n_top - price)``; * ladder prices are consecutive cents from the
-        top down while NO rung has filled (fills open gaps that are not refilled, so consecutiveness is
-        only asserted pre-fill); * at most one roll in flight."""
+        * never more than K live rests; * never two rests on one price; * prices are whole cents >= n_min;
+        * every live rest's ``rung`` AND ``E_rung`` are CONSISTENT with the current ``n_top``
+          (``rung == round((n_top - price)/1c)`` and ``E_rung == E_min + (n_top - price)``) — both are
+          refreshed together on every context recompute and reconciled on every roll ack, so they never
+          disagree (BLOCKING #1/#2, reviewer 2026-09-22); * a rung may legitimately sit ABOVE ``n_top``
+          transiently (a fast up-move or a cap crash), i.e. rung < 0 = "stranded above the top" — that is
+          allowed, not an error (BLOCKING #2); * ladder prices are consecutive cents from the top down
+          while NO rung has filled (fills open gaps that are not refilled, so consecutiveness is only
+          asserted pre-fill); * at most one roll in flight, and its moving order is a ladder member unless
+          it has already filled (golden f); * a taken wing batch has exactly two legs sized to its total;
+          * ``rungs_filled`` equals the number of booked rung fills."""
         lad = self.ladder
         assert len(lad) <= params.rungs, f"ladder has {len(lad)} > K={params.rungs} rests"
         prices = [o.price for o in lad]
         assert len(set(prices)) == len(prices), f"two rests on one price: {sorted(prices)}"
         for o in lad:
             assert o.count == params.lots_per_rung, f"rung count {o.count} != {params.lots_per_rung}"
-            assert isinstance(o.rung, int) and o.rung >= 0, f"bad rung index {o.rung}"
+            assert isinstance(o.rung, int), f"bad rung index {o.rung!r}"
+            assert o.price == o.price.quantize(_CENT), f"rung price {o.price} not a whole cent"
             assert o.price >= params.n_min, f"rung price {o.price} < n_min {params.n_min}"
             if self.n_top is not None:
+                # rung/E_rung are the LIVE position vs n_top (negative rung = stranded above the top).
+                assert o.rung == _rung_of(self.n_top, o.price), (
+                    f"rung {o.rung} != round((n_top-price)/1c) for price {o.price}, n_top {self.n_top}"
+                )
                 assert o.E_rung == params.E_min + (self.n_top - o.price), (
                     f"E_rung {o.E_rung} != E_min+(n_top-price) for price {o.price}, n_top {self.n_top}"
                 )
+        # roll / bucket-change mutual exclusion + the roll's moving order is a ladder member (unless the
+        # moving rung has already filled and been dropped -- golden f, then the late ack just clears it).
         assert not (self.roll_pending is not None and self.awaiting_replace), (
             "roll and bucket-change cannot be in flight together"
+        )
+        if self.roll_pending is not None:
+            n_moving = sum(1 for o in lad if o.client_order_id == self.roll_pending.old_coid)
+            assert n_moving <= 1, f"roll_pending matches {n_moving} ladder orders (must be <= 1)"
+        # wing-batch / leg consistency: a TAKEN batch has exactly two legs, each sized to the batch total.
+        for b in self.wing_batches:
+            legs = [l for l in self.wing_legs if l.batch == b.index]
+            if b.taken:
+                assert len(legs) == 2, f"taken batch {b.index} has {len(legs)} legs (must be 2)"
+                assert all(l.count == b.total_count for l in legs), (
+                    f"batch {b.index} leg counts != total {b.total_count}"
+                )
+        assert self.rungs_filled == len(self.rest_fills), (
+            f"rungs_filled {self.rungs_filled} != booked fills {len(self.rest_fills)}"
         )
         # consecutiveness only before any fill (a filled rung is not refilled -> legitimate gaps)
         if self.rungs_filled == 0 and len(prices) >= 2:
@@ -329,6 +362,12 @@ def _mint_coid(st: V33State) -> tuple[str, V33State]:
 def _e_rung(params: V33Params, n_top: Decimal, price: Decimal) -> Decimal:
     """The rung's margin label from its price vs the current top: E_min + (n_top - price)."""
     return params.E_min + (n_top - price)
+
+
+def _rung_of(n_top: Decimal, price: Decimal) -> int:
+    """The rung's live index = (n_top - price) in cents. Negative when the order rests ABOVE n_top (a
+    transient during a fast up-move or a cap crash: "stranded above the top")."""
+    return int(((n_top - price) / _CENT).to_integral_value())
 
 
 def _sync_wing_mirrors(st: V33State) -> V33State:
@@ -418,7 +457,8 @@ def decide_v33(
 # ---------------------------------------------------------------------------
 def _recompute_context(params: V33Params, st: V33State, now: float) -> V33State:
     """Re-derive spot bucket, W, cap, the ladder-top ``n_top``, every shadow n, and refresh each live
-    rung's ``E_rung`` from the current n_top. Uses the UNCHANGED V3.2 spot/W/cap law (imported)."""
+    rung's LIVE labels (``rung`` AND ``E_rung``) from the current n_top. Uses the UNCHANGED V3.2
+    spot/W/cap law (imported)."""
     spot_Sd = _select_spot(st)
     spot_Su = spot_Sd + params.bucket_width if spot_Sd is not None else None
     spot_bucket_stale = spot_Sd is not None and not _fresh(
@@ -445,12 +485,16 @@ def _recompute_context(params: V33Params, st: V33State, now: float) -> V33State:
         st, spot_Sd=spot_Sd, spot_Su=spot_Su, W=W, cap=cap, n_top=n_top,
         spot_bucket_stale=spot_bucket_stale, shadows=shadows,
     )
-    # refresh each rung's E_rung label from the current n_top (the moved/unmoved orders all re-derive
-    # their margin vs the new top; a purely cosmetic re-tag, load-bearing only for the falsifier).
+    # refresh each rung's LIVE labels (BOTH rung AND E_rung) from the current n_top — BLOCKING #1
+    # (reviewer 2026-09-22): rung was previously left stale while E_rung tracked n_top, corrupting the
+    # §6 per-rung falsifier key after any roll. They must move together and stay the live position.
     if n_top is not None and st.ladder:
         st = replace(
             st,
-            ladder=tuple(replace(o, E_rung=_e_rung(params, n_top, o.price)) for o in st.ladder),
+            ladder=tuple(
+                replace(o, rung=_rung_of(n_top, o.price), E_rung=_e_rung(params, n_top, o.price))
+                for o in st.ladder
+            ),
         )
     return st
 
@@ -497,10 +541,19 @@ def _apply_amended(
         booked[rp.new_coid] = booked.get(rp.new_coid, 0) + booked.pop(rp.old_coid)
 
     new_price = event.price if event.price is not None else rp.target_price
+    # BLOCKING #2 (reviewer 2026-09-22): derive rung/E_rung from the CURRENT n_top at ACK time, not the
+    # emit-time values baked into RollPending — n_top may have moved (W reverted, or the cap bound) while
+    # the amend was in flight, and the invariant checks against the current n_top. Fall back to the stored
+    # target only when n_top is momentarily unknown (no fresh wing).
+    if st.n_top is not None:
+        new_rung = _rung_of(st.n_top, new_price)
+        new_E = _e_rung(params, st.n_top, new_price)
+    else:
+        new_rung, new_E = rp.target_rung, rp.target_E_rung
     ladder = _replace_order(
         st.ladder, rp.old_coid,
         price=new_price, client_order_id=rp.new_coid,
-        rung=rp.target_rung, E_rung=rp.target_E_rung,
+        rung=new_rung, E_rung=new_E,
     )
     times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
     anchor = st.anchor_n_top
@@ -576,8 +629,20 @@ def _apply_cancelled(
         st = replace(st, ladder=ladder, roll_pending=None, anchor_n_top=anchor)
         still_resting = st.rest_booked_by_coid.get(rp.new_coid, st.rest_booked_by_coid.get(
             rp.old_coid, 0)) < params.lots_per_rung
-        if not st.rest_allotment_done and still_resting and _in_window(params, st, now):
-            st, pa = _place_one(params, st, rp.target_price, rp.target_rung, rp.target_E_rung, now)
+        # NIT #9 (reviewer 2026-09-22): re-check the cap on the fallback re-place — for an up-roll the cap
+        # was only checked at emit; if no_ask dropped meanwhile the target could now sit above the cap.
+        # Clamp to the cap and drop the rung if that pushes it below n_min. Derive rung/E_rung from the
+        # CURRENT n_top (BLOCKING #2) so the fresh order's labels match the invariant, not emit-time.
+        target = rp.target_price
+        if st.cap is not None and target > st.cap:
+            target = st.cap
+        if (not st.rest_allotment_done and still_resting and _in_window(params, st, now)
+                and target >= params.n_min):
+            if st.n_top is not None:
+                r_rung, r_E = _rung_of(st.n_top, target), _e_rung(params, st.n_top, target)
+            else:
+                r_rung, r_E = rp.target_rung, rp.target_E_rung
+            st, pa = _place_one(params, st, target, r_rung, r_E, now)
             actions += pa
         return st, actions
 
@@ -874,7 +939,7 @@ def _cancel_all(st: V33State, *, track_outstanding: bool = False) -> tuple[V33St
         if o.order_id is not None:
             st = _remember_cancel_ctx(st, o)
             n_live += 1
-    st = replace(st, ladder=(), roll_pending=None, anchor_n_top=None)
+    st = replace(st, ladder=(), roll_pending=None, anchor_n_top=None, converging_dir=0)
     if track_outstanding:
         st = replace(st, outstanding_cancels=st.outstanding_cancels + n_live)
     return st, actions
@@ -933,8 +998,8 @@ def _place_all(params: V33Params, st: V33State, now: float) -> tuple[V33State, l
     if actions:
         times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
         st = replace(
-            st, rest_bucket_Sd=st.spot_Sd, anchor_n_top=st.n_top, last_replace_ts=now,
-            replace_count=st.replace_count + 1, replace_times=times,
+            st, rest_bucket_Sd=st.spot_Sd, anchor_n_top=st.n_top, converging_dir=0,
+            last_replace_ts=now, replace_count=st.replace_count + 1, replace_times=times,
         )
     return st, actions
 
@@ -948,7 +1013,8 @@ def _emit_roll(
     are derived from the current n_top. Counted on CONFIRM (``_apply_amended``), like V3.2."""
     assert st.n_top is not None
     new_coid, st = _mint_coid(st)
-    target_rung = int((st.n_top - target_price) / _CENT)
+    # emit-time fallback labels only; _apply_amended re-derives from the CURRENT n_top at ack (BLOCKING #2).
+    target_rung = _rung_of(st.n_top, target_price)
     target_E = _e_rung(params, st.n_top, target_price)
     rp = RollPending(
         order_id=order.order_id, old_coid=order.client_order_id, new_coid=new_coid,
@@ -1038,10 +1104,16 @@ def _roll(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V
         st, pa = _place_all(params, st, now)
         return st, actions + pa
 
-    # a live ladder on the SAME bucket: roll one cent iff n_top has moved >= tol from the ANCHOR (the
-    # n_top the ladder represents) AND >= deb_ms since the last roll. Using the anchor (not the top
-    # survivor's price) means a partial sweep — which removes the top rungs — never spuriously triggers
-    # a roll while W is unchanged.
+    # a live ladder on the SAME bucket: roll toward n_top. The trigger is n_top vs the ANCHOR (the n_top
+    # the ladder represents), NOT the top survivor's price — so a partial sweep (which removes the top
+    # rungs) never spuriously triggers a roll while W is unchanged.
+    #
+    # PACING (Round 2, reviewer Q4/Q5 + Q-ROLL-DEB): ``deb_ms`` debounces only the START of a convergence.
+    # Once committed (``converging_dir`` == the move's sign), each subsequent cent rolls as soon as the
+    # prior amend acks (this ``_roll`` is re-entered from ``_apply_amended``) with NO re-debounce, while
+    # the sign is unchanged; a SIGN FLIP re-debounces. And a LARGE jump (|dn| >= fast_shift_min_cents,
+    # e.g. a cap crash stranding most of the ladder above a bound cap) shifts the WHOLE ladder in ONE
+    # step (cancel-all/place-all, like a bucket change) instead of crawling K one-cent rolls.
     top = _top_order(st)
     bottom = _bottom_order(st)
     assert top is not None and bottom is not None and st.n_top is not None
@@ -1049,33 +1121,50 @@ def _roll(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V
         st = replace(st, anchor_n_top=st.n_top)          # defensive: adopt the current top as anchor
         return st, actions
     dn = st.n_top - st.anchor_n_top
+    if abs(dn) < params.tol or dn == _ZERO:
+        # converged (or within tolerance) -> the convergence is over.
+        if st.converging_dir != 0:
+            st = replace(st, converging_dir=0)
+        return st, actions
+    direction = -1 if dn < _ZERO else +1
+    mid = st.converging_dir == direction                 # a same-sign continuation is not re-debounced
     since_ms = (now - (st.last_replace_ts if st.last_replace_ts is not None else -1e18)) * 1000.0
-    if abs(dn) >= params.tol and since_ms >= params.deb_ms and dn != _ZERO:
-        if dn <= -_CENT:
-            # n_top DOWN: shift the ladder down 1c -> move the TOP order to bottom-1c (new deepest).
-            target = bottom.price - _CENT
-            if target >= params.n_min:
-                st, ra = _emit_roll(params, st, top, target, -1, now)
-                return st, actions + ra
-            # the ladder cannot go below n_min -> shrink from the top (cancel the shallowest rung).
-            st = _remember_cancel_ctx(st, top)
-            action = _cancel_action(st, top)
-            st = replace(st, ladder=_drop_order(st.ladder, top.client_order_id),
-                         anchor_n_top=st.anchor_n_top - _CENT,
-                         outstanding_cancels=st.outstanding_cancels + (1 if top.order_id else 0),
-                         last_replace_ts=now,
-                         replace_count=st.replace_count + 1,
-                         replace_times=tuple(t for t in st.replace_times if now - t <= 60.0) + (now,),
-                         roll_count=st.roll_count + 1,
-                         roll_single_order_count=st.roll_single_order_count + 1)
-            return st, actions + [action]
-        elif dn >= _CENT:
-            # n_top UP: shift the ladder up 1c -> move the BOTTOM order to top+1c (new shallowest),
-            # provided the new top honours the post-only cap.
-            target = top.price + _CENT
-            if st.cap is None or target <= st.cap:
-                st, ra = _emit_roll(params, st, bottom, target, +1, now)
-                return st, actions + ra
-            # cannot exceed the cap -> hold (the top already sits at the cap).
-            return st, actions
+    if not mid and since_ms < params.deb_ms:
+        return st, actions                               # still waiting out the START debounce
+
+    # committed to converging in ``direction``.
+    cents = int((abs(dn) / _CENT).to_integral_value())
+    if cents >= params.fast_shift_min_cents:
+        # FAST SHIFT: cancel every rung and re-place the whole ladder at the new n_top in one step (the
+        # cap-crash / large-jump path). Place-all runs once the cancels confirm (via _apply_cancelled).
+        st, ca = _cancel_all(st, track_outstanding=True)
+        st = replace(st, awaiting_replace=True, converging_dir=0)
+        return st, actions + ca
+
+    st = replace(st, converging_dir=direction)
+    if direction < 0:
+        # n_top DOWN: shift the ladder down 1c -> move the TOP order to bottom-1c (new deepest).
+        target = bottom.price - _CENT
+        if target >= params.n_min:
+            st, ra = _emit_roll(params, st, top, target, -1, now)
+            return st, actions + ra
+        # the ladder cannot go below n_min -> shrink from the top (cancel the shallowest rung).
+        st = _remember_cancel_ctx(st, top)
+        action = _cancel_action(st, top)
+        st = replace(st, ladder=_drop_order(st.ladder, top.client_order_id),
+                     anchor_n_top=st.anchor_n_top - _CENT,
+                     outstanding_cancels=st.outstanding_cancels + (1 if top.order_id else 0),
+                     last_replace_ts=now,
+                     replace_count=st.replace_count + 1,
+                     replace_times=tuple(t for t in st.replace_times if now - t <= 60.0) + (now,),
+                     roll_count=st.roll_count + 1,
+                     roll_single_order_count=st.roll_single_order_count + 1)
+        return st, actions + [action]
+    # n_top UP: shift the ladder up 1c -> move the BOTTOM order to top+1c (new shallowest), provided the
+    # new top honours the post-only cap.
+    target = top.price + _CENT
+    if st.cap is None or target <= st.cap:
+        st, ra = _emit_roll(params, st, bottom, target, +1, now)
+        return st, actions + ra
+    # cannot exceed the cap -> hold (the top already sits at the cap).
     return st, actions

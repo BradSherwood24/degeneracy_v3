@@ -34,6 +34,7 @@ def test_params_load_and_sha_pin():
     assert p.deb_ms == 5000
     assert p.wing_coalesce_ms == 150
     assert p.refill_in_window is False
+    assert p.fast_shift_min_cents == 4
     assert p.max_sets_per_hour == 11
     assert p.replace_rate_alarm_per_min == 120
     assert p.n_min == Decimal("0.05")
@@ -100,6 +101,27 @@ def test_rungs_below_one_fails_closed(tmp_path):
     with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
         raw = json.load(f)
     raw["rungs"] = 0
+    q = tmp_path / "v33_params.json"
+    q.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(V33ParamsInvalid):
+        load_v33_params(str(q), expected_sha=None)
+
+
+def test_refill_in_window_true_fails_closed(tmp_path):
+    # NIT #7 (reviewer): refill_in_window is ENFORCED — L1 supports only no-refill (Q3); True is L2.
+    with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["refill_in_window"] = True
+    q = tmp_path / "v33_params.json"
+    q.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(V33ParamsInvalid):
+        load_v33_params(str(q), expected_sha=None)
+
+
+def test_fast_shift_min_cents_below_two_fails_closed(tmp_path):
+    with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
+        raw = json.load(f)
+    raw["fast_shift_min_cents"] = 1
     q = tmp_path / "v33_params.json"
     q.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(V33ParamsInvalid):

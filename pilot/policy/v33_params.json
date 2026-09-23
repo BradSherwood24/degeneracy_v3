@@ -13,6 +13,7 @@
   "bucket_freshness_max_age_s": 30.0,
   "wing_coalesce_ms": 150,
   "refill_in_window": false,
+  "fast_shift_min_cents": 4,
   "max_sets_per_hour": 11,
   "n_min": "0.05",
   "replace_rate_alarm_per_min": 120,
