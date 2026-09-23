@@ -279,3 +279,85 @@ Tests: `test_fast_shift_after_partial_sweep_caps_at_k_minus_filled` (3 filled �
 nothing placed), `test_place_all_budget_zero_latches_allotment` (defensive budget≤0 branch),
 `test_invariant_flags_window_exposure_over_k`. Existing goldens unchanged (first placement, filled 0,
 still places full K).
+
+---
+
+# Round 4 (2026-09-22) — Brad's margin-array convergence (replaces the anchor/roll + fast-shift)
+
+Round 3 was APPROVED, then Brad answered the two open policy questions with a design and asked for it in
+this PR. Suite after R4: **1042 passed, 2 skipped, 2 errors** (same pre-existing corpus gaps); **85 v33
+tests** (was 84). fast_shift removed; `max_amends_in_flight` (default 3) added; params re-pinned
+`6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3ef46ea784e7f8a11a421` (R2 sha kept as
+`PREVIOUS_V33_PARAMS_SHA256_L1_R2`).
+
+## Brad's words (verbatim)
+> "E_min is at 5c, so will say E_zero is when profit at that level sits at exactly break-even. That
+> becomes the zero index in an array, lets just call it E. The first few indexes are of some value
+> representing 'do not place order' on some conditional. Something like: E = [0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1]
+> where 0 means 'no order' and 1 means 'open order'. Now if a partial sweep happens, E gets updated to
+> [0,0,0,0,0,2,2,2,2,1,1,1,1,1,1,1] where 2 means 'order filled'. Now E_zero gets moved as the wings move,
+> aka a reprice, what I'd want is for reprices to match the array. In this case, a reprice might move E_15
+> to E_9. Or vise versa." … "just a continual, maybe recursive function. Keep submitting updates until the
+> prices of the orders match E … Would be useful to move a handful at a time in volatile times."
+
+Clarification (verbatim): "E array is in profit space, derived from price space. And just to note, a 1 in
+that array is not tied to a specific order id. Each 1 should have an order id, but each order id can move
+to different indexes of E with a value of 1 as reprices happen. However, each E index with a value of 2
+should be tied to a specific order that has been filled."
+
+## The array model (one paragraph)
+`margin_state` is an array in PROFIT space, index m = cents of margin at the current n_top (m = E_min_c is
+n_top, i.e. the top rung). 0 = below E_min (no order), 1 = open order wanted, 2 = filled (consumed,
+Q3-permanent). The 1-slots are ANONYMOUS: no order has a home index — an order's index is always DERIVED
+from its live price vs n_top (`m = E_min_c + (n_top - price)/1c`), refreshed every context tick, and any
+live order may be paired to any vacant 1-slot. As n_top moves (a reprice), each order's derived index
+shifts; the CONVERGENCE `_converge` keeps one live order per placeable 1-slot by pairing OUT orders
+(derived index not a 1-slot) with VACANT 1-slots and amending, up to `max_amends_in_flight` at a time,
+continuing on each ack until the prices match the array — "keep submitting updates until the prices match
+E … move a handful at a time." A 2-slot is tied to the actual fill via `filled_at[m] -> RungFill`
+(order_id, coid, W, n_top at fill), anchoring the falsifier's per-margin accounting to the real fill.
+
+## What changed vs R2/R3
+- Removed `anchor_n_top` (no longer the trigger) and the single `roll_pending`; added `margin_state`,
+  `filled_at`, and `rolls_in_flight: tuple[RollPending, ...]` (up to `max_amends_in_flight`).
+- `_roll` -> `_converge`: OUT/VACANT set-diff by price, greedy minimal-movement pairing, N-at-a-time
+  amends, ack-driven continuation. A 1c move = 1 amend (unchanged), a 2c move = 2 concurrent amends, a 5c
+  move = 3 then 2, a cap crash = the same loop N-at-a-time (NOT R2's cancel-all — 6+ orders keep queue).
+- `RestOrder.rung`/`E_rung` are a DERIVED LABEL only (refreshed each tick), never a stored identity.
+- `RungFill` carries `coid`/`order_id`/`W`/`n_top`; `filled_at` maps each 2-margin to its fill.
+- Bucket change (and any re-placement) places the PLACEABLE OPEN slots (the 1-margins) — after a partial
+  sweep of margins 5..k the new ticker gets k+1..15, not the nominal top K−filled.
+- `_place_all` places the open placeable slots; the exposure guard `rungs_filled + live <= K` holds every
+  step (R2-1 preserved). The consecutiveness invariant was dropped (a convergence is transiently
+  non-contiguous even with no fills); "every live margin ∈ the open span" is a REST property asserted by
+  tests after convergence, not on every event.
+- Params: `fast_shift_min_cents` removed, `max_amends_in_flight` (>=1, default 3) added + enforced.
+
+## Pacing (kept, per instruction)
+`deb_ms` still debounces only the START of a convergence; same-sign continuations issue on the ack (no
+re-debounce, driven by `_apply_amended` re-entering `_converge`); a sign flip re-debounces
+(`converging_dir`). n_top is cent-quantized by `solve_n`, so `tol` no longer gates (any move is >= 1c);
+it remains a param (unused by convergence) for compatibility.
+
+## Tests (85 v33)
+Updated goldens (d) [now two CONCURRENT amends, 9 untouched coids] and (f) [rolls_in_flight]. New/updated
+core tests: 1c move (one order); 2c two concurrent; 3c three concurrent; 5c → 3-then-2 with 6 coids kept;
+partial sweep then a real n_top move (survivor that landed on a 2 moves to the open slot); partial sweep
+then W constant → no move; cap crash converges bounded-in-flight (<=3), invariants green every step, no
+cancel-all; bucket change after a partial sweep places margins 8..15 only (rungs 3..10); big move after a
+partial sweep keeps exposure at K; n_min shrink; cap-hold (n_top capped → no move); start-debounce blocks
+first move; sign-flip re-debounces; RungFill captures the derived live rung + `filled_at` tie; window-
+exposure invariant. check_invariants runs after every event.
+
+## Policy questions — now ANSWERED by the design (were Brad's open items)
+- Shift-up into the filled region / survivor relocation: SUBSUMED by the anonymous-slot convergence — an
+  order simply pairs to whatever vacant 1-slot is nearest; no special-casing, lot cap holds.
+- n_min shrink regrowth: a suppressed slot that becomes placeable again is a 1 in the array and IS placed
+  by the convergence (a create, guarded by the K exposure cap), not a refill.
+
+## L2 contract note (unchanged + R4 additions)
+The core still emits per-order AMEND/CANCEL/PLACE actions. Brad asked about a batched multi-order update
+endpoint: the executor MAY group cancels/creates into Kalshi's batch create/cancel endpoints (limits to be
+verified in L2); there is (as far as known) no batch AMEND, so rolls stay per-order amends. L3 computes
+each rung's solved E from `lock_value(price, W_at_fill)` (now on `RungFill.W`/`price`), not the integer
+label; per-margin accounting uses `filled_at`.
