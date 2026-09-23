@@ -17,10 +17,12 @@ import os
 from decimal import Decimal
 from typing import Any
 
-DEFAULT_V32_LEDGER_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "ledger"
-)
-DEFAULT_V32_LEDGER_PATH = os.path.join(DEFAULT_V32_LEDGER_DIR, "v32_ledger.jsonl")
+from service.paths import ledger_dir_v32, ledger_path_v32
+
+# Writable ledger location routes through service.paths so DV3_DATA_DIR can relocate it; with
+# DV3_DATA_DIR unset both values are byte-identical to the historic pilot/ledger default.
+DEFAULT_V32_LEDGER_DIR = ledger_dir_v32()
+DEFAULT_V32_LEDGER_PATH = ledger_path_v32()
 
 
 def _json_default(obj: object) -> str:
