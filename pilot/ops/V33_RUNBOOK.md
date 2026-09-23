@@ -217,10 +217,31 @@ V3.2 down IN THE SAME WINDOW so only ONE roster is armed per bucket:
 echo armed> ops\v33_mode.txt          # (or the DV3_DATA_DIR copy)
 echo dry> ops\v32_mode.txt            # V3.2 stops placing; its falsifier closes with the Q4 line
 ```
-Before flipping to armed, Brad applies the proxy amend cap (`ops/proxy_amend_cap.md`) and raises
-`DAILY_ORDER_BUDGET` to 8000 (PLAN_V33 Q6/step 1). Until the amend cap is applied, the roll runs
-cancel->create per order (the executor's default fallback path) -- correct, just more orders. The V3.3
-falsifier (`ceremony/v33_falsifier.md`, drafted in L3) MUST carry `STATUS: FROZEN` before S5 will arm.
+**Before flipping to armed** (the arm gate is the L3 falsifier PLUS these, all CLEARED in code as of L2
+Round 2):
+
+- **MUST-FIX-1 wing chunking -- CLEARED.** The coalesced wing take is split into `ceil(count / cap)` IOC
+  chunks of <= cap, so no oversized order is rejected and no filled rung is left naked. S5 now accepts a
+  proxy `MAX_CONTRACTS_PER_ORDER` anywhere in `[lots_per_rung, K*lots_per_rung]` (= `[1, 11]`).
+- **MUST-FIX-2 pre-place stall -- CLEARED.** The 0.5 s recheck now fires ONLY on a flagged anomaly; a
+  healthy resting ladder proceeds on the first read (no per-create stall of the WS reader).
+- **MUST-FIX-3 per-rung bucket -- CLEARED.** `RungFill` carries the bucket captured at fill time; the held
+  bucket-NO leg + the settlement backfill price against the right market across a mid-window bucket change.
+- **MUST-FIX-4 write pacing -- CLEARED.** A Basic-tier write-token pacer (100/s, create/amend 10, cancel 2)
+  paces the 11-create ladder / chunked wing bursts; cancels + wing takes are priority (never queued).
+
+**Brad's proxy levers (his hands only):**
+- `MAX_CONTRACTS_PER_ORDER`: leave at **2** and the wings go as `ceil(K/2) = 6` IOC chunks per side; or
+  raise to **11** and each wing goes as **1** order (fewer writes, but it also lifts the one-lot-per-rung
+  guard, so weigh it). BOTH values arm (S5 accepts `[1, 11]`); the executor's `wing_cap` = `min(params
+  max_contracts_per_order_hint = 11, the live proxy cap)`, read from `/health` at window start.
+- The **amend cap** (`ops/proxy_amend_cap.md`, Brad's `.env` + restart): until applied, the roll runs
+  cancel->create per order (the executor's default fallback) -- correct, just more orders; applying it flips
+  the roll to amend-first with no code change.
+- **`DAILY_ORDER_BUDGET` -> 8000** (PLAN_V33 Q6/step 1) so the ~200 orders/window + bucket-change re-places
+  fit the day.
+
+The V3.3 falsifier (`ceremony/v33_falsifier.md`, drafted in L3) MUST carry `STATUS: FROZEN` before S5 arms.
 
 ---
 

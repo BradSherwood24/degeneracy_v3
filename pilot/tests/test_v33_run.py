@@ -189,6 +189,20 @@ def test_o1_partial_sweep_does_not_latch_allotment_until_full():
     assert drv.state.rest_allotment_done
 
 
+def test_close_time_flush_takes_wings_for_last_coalesce_group():
+    """NIT-3: the core FLUSHES the open coalesce group and TAKES its wings by close, so no rung is left
+    un-batched (un-hedged) in the money math. A fill opens a coalesce group; a clock tick past
+    wing_coalesce_ms flushes it into a WingBatch and the (synthetic) wings are taken."""
+    fix, p, cts, drv = _dry_driver()
+    _bring_up(drv, cts)
+    drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": "0.55", "count_fp": "1.00"}, cts - 500)
+    assert drv.state.coalesce_open is not None and drv.state.wing_batches == ()
+    drv.on_clock_tick(cts - 498)   # 2 s later >> 150 ms wing_coalesce_ms
+    assert drv.state.coalesce_open is None and len(drv.state.wing_batches) == 1
+    m = compute_ladder_money_math(drv.state, dry_sim=True)
+    assert Decimal(m["floor_booked"]) > 0    # the flushed+hedged batch books a real floor, not naked
+
+
 def test_dry_convergence_rolls_via_frozen_amend():
     """A W move in dry cycles the convergence through the FrozenExecutor's synthetic amend (would_amend
     -> synth OrderAmended -> the moved order re-labels). No real order is sent."""

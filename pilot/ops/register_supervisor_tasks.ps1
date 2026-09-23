@@ -120,10 +120,8 @@ if ($WithV33) {
     Write-Output ("[register_supervisor] v33 log         : " + $v33Log)
     Write-Output ("[register_supervisor] v33 command     : " + $v33CommandLine)
     Write-Output ("[register_supervisor] NOTE: DegeneracyV3_3 starts in DRY (v33_mode.txt absent -> dry); it sends nothing and never touches v32-* rests.")
-} else {
-    Write-Output ("[register_supervisor] v33 task        : (not requested; pass -WithV33 to register the dry ladder alongside)")
 }
-Write-Output ("[register_supervisor] WARNING: unregister DegeneracyV3_2 before the supervisor drives windows -- never two V3.2 drivers.")
+Write-Output ("[register_supervisor] WARNING: unregister DegeneracyV3_2 before the supervisor drives windows -- never two.")
 
 if ($DryRun) {
     Write-Output "[register_supervisor] DRY RUN -- nothing registered."

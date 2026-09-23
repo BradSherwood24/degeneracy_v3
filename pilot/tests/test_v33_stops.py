@@ -36,23 +36,36 @@ def test_day_guard_path_is_v33_prefixed():
     assert "v33_stops_" in p and "v32_stops_" not in p
 
 
-def test_caps_agree_ok():
-    ok, why = v33_caps_agree(_health(), lots_per_rung=1)
+def test_caps_agree_ok_cap_two():
+    # MUST-FIX-1: proxy cap 2 (wings chunk to ceil(K/2) IOC takes) is ACCEPTED at K=11.
+    ok, why = v33_caps_agree(_health(maxc=2), lots_per_rung=1, k_rungs=11)
+    assert ok, why
+
+
+def test_caps_agree_ok_cap_eleven():
+    # MUST-FIX-1: proxy cap 11 (wings go as 2 orders) is ALSO accepted (== K*lots_per_rung ceiling).
+    ok, why = v33_caps_agree(_health(maxc=11), lots_per_rung=1, k_rungs=11)
     assert ok, why
 
 
 def test_caps_reject_over_ceiling():
-    ok, why = v33_caps_agree(_health(maxc=3), lots_per_rung=1)
+    # cap above K*lots_per_rung (11) removes the one-lot-per-rung guard -> refuse.
+    ok, why = v33_caps_agree(_health(maxc=12), lots_per_rung=1, k_rungs=11)
     assert not ok and "ceiling" in why
 
 
+def test_caps_reject_below_lots_per_rung():
+    ok, why = v33_caps_agree(_health(maxc=0), lots_per_rung=1, k_rungs=11)
+    assert not ok and "lots_per_rung" in why
+
+
 def test_caps_reject_low_budget():
-    ok, why = v33_caps_agree(_health(remaining=100), lots_per_rung=1)
+    ok, why = v33_caps_agree(_health(remaining=100), lots_per_rung=1, k_rungs=11)
     assert not ok and "orders_remaining_today" in why
 
 
 def test_caps_reject_missing_prefix():
-    ok, why = v33_caps_agree(_health(prefixes=("KXETH",)), lots_per_rung=1)
+    ok, why = v33_caps_agree(_health(prefixes=("KXETH",)), lots_per_rung=1, k_rungs=11)
     assert not ok and "prefixes" in why
 
 
@@ -99,20 +112,20 @@ def test_reconcile_clean_and_dirty():
 def test_arming_check_ok(tmp_path):
     fpath = tmp_path / "v33_falsifier.md"
     fpath.write_text("STATUS: FROZEN\n", encoding="utf-8")
-    dec = v33_arming_check(str(fpath), _health(), params_verified=True, lots_per_rung=1)
+    dec = v33_arming_check(str(fpath), _health(), params_verified=True, lots_per_rung=1, k_rungs=11)
     assert dec.armed and dec.reasons == ()
 
 
 def test_arming_check_refuses_unfrozen_falsifier(tmp_path):
     fpath = tmp_path / "v33_falsifier.md"
     fpath.write_text("STATUS: DRAFT\n", encoding="utf-8")
-    dec = v33_arming_check(str(fpath), _health(), params_verified=True, lots_per_rung=1)
+    dec = v33_arming_check(str(fpath), _health(), params_verified=True, lots_per_rung=1, k_rungs=11)
     assert not dec.armed and any("STATUS" in r for r in dec.reasons)
 
 
 def test_decide_arming_dry_passes_through():
     out = decide_v33_arming(resolved_mode="dry", falsifier_path="/none", health={}, positions=None,
-                            params_verified=True, lots_per_rung=1, day_guard=DayGuard(utc_day=DAY))
+                            params_verified=True, lots_per_rung=1, k_rungs=11, day_guard=DayGuard(utc_day=DAY))
     assert out.effective_mode == "dry" and not out.armed and out.degrade_reason is None
 
 
@@ -125,7 +138,7 @@ def test_decide_arming_all_gates_pass(tmp_path):
 
     out = decide_v33_arming(resolved_mode="armed", falsifier_path=str(fpath), health=_health(),
                             positions={"market_positions": []}, params_verified=True, lots_per_rung=1,
-                            day_guard=DayGuard(utc_day=DAY), s4=_S4())
+                            day_guard=DayGuard(utc_day=DAY), s4=_S4(), k_rungs=11)
     assert out.armed and out.effective_mode == "armed"
 
 
@@ -138,7 +151,7 @@ def test_decide_arming_degrades_on_s4_latch(tmp_path):
 
     out = decide_v33_arming(resolved_mode="armed", falsifier_path=str(fpath), health=_health(),
                             positions={"market_positions": []}, params_verified=True, lots_per_rung=1,
-                            day_guard=DayGuard(utc_day=DAY), s4=_S4())
+                            day_guard=DayGuard(utc_day=DAY), s4=_S4(), k_rungs=11)
     assert not out.armed and out.effective_mode == "dry" and "S4" in "; ".join(out.reasons)
 
 
@@ -147,5 +160,5 @@ def test_decide_arming_degrades_on_dirty_positions(tmp_path):
     fpath.write_text("STATUS: FROZEN\n", encoding="utf-8")
     out = decide_v33_arming(resolved_mode="armed", falsifier_path=str(fpath), health=_health(),
                             positions={"market_positions": [{"ticker": "KXBTC-X", "position": 1}]},
-                            params_verified=True, lots_per_rung=1, day_guard=DayGuard(utc_day=DAY))
+                            params_verified=True, lots_per_rung=1, k_rungs=11, day_guard=DayGuard(utc_day=DAY))
     assert not out.armed and any("reconcile" in r for r in out.reasons)

@@ -107,11 +107,20 @@ def _shadow_summary(state) -> dict[str, Any]:
 
 
 def _bucket_ticker_for_fill(state, rf) -> str | None:
-    """The bucket-NO ticker a rung fill rested on: the fill's own ``bucket_Sd`` -> ticker if present,
-    else the last-quoted bucket ticker. A rung fill carries no bucket_Sd directly, so we resolve via the
-    fill's ``n_top`` bucket is not stored; use the state's bucket ticker for the fill's price bucket."""
-    # RungFill does not store the bucket ticker; resolve from state.rest_bucket_Sd (the ladder's bucket)
-    # or the current spot_Sd. A mid-window bucket change is rare in dry sim; fall back to spot.
+    """The bucket-NO ticker a rung fill ACTUALLY rested on. MUST-FIX-3: the RungFill now carries
+    ``bucket_ticker`` captured AT FILL TIME, so a rest-and-fill across a bucket change within one window
+    prices the held bucket-NO leg against the RIGHT market (else the settlement backfill mis-settles).
+    Falls back to the fill's ``bucket_Sd`` -> current ticker, then the ladder's / spot bucket (older
+    fills / an unrecoverable ticker)."""
+    if rf is not None:
+        tk = getattr(rf, "bucket_ticker", None)
+        if tk:
+            return tk
+        sd = getattr(rf, "bucket_Sd", None)
+        if sd is not None:
+            tk = getattr(state, "bucket_tickers", {}).get(sd)
+            if tk:
+                return tk
     for sd in (getattr(state, "rest_bucket_Sd", None), getattr(state, "spot_Sd", None)):
         if sd is not None:
             tk = getattr(state, "bucket_tickers", {}).get(sd)
@@ -145,8 +154,13 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
     for b in wing_batches:
         for rf in b.fills:
             batch_of_fill[id(rf)] = b.index
-    # a fill still in the OPEN coalesce group (wings not yet taken) has no batch — treat its wings as
-    # unpaid (lock unknown until taken); it still contributes its rest cost + floor via a phantom batch.
+    # NIT-3 (reviewer): a rung fill still in the OPEN coalesce group at compute time has NO wing pair yet.
+    # Its guaranteed floor is genuinely $0 (a lone bucket-NO leg is directional: v33_set_floor_dollars(1,
+    # count) == 0), so accruing its rest cost with no floor is CORRECT, not an understatement — an
+    # un-hedged rung is honestly a loss until its wings book. In practice the core flushes coalesce_open
+    # and takes the wings by close (the pump ticks past wing_coalesce_ms), so no rung is left un-batched
+    # (proved by test_close_time_flush_takes_wings_for_last_coalesce_group). A fill left un-batched is
+    # counted as a naked rest cost (fail-safe / conservative), never optimistically.
 
     held: list[dict[str, Any]] = []
     floor = _ZERO

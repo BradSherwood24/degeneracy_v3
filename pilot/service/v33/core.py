@@ -149,6 +149,13 @@ class RungFill:
     order_id: str | None = None
     W: Decimal | None = None
     n_top: Decimal | None = None
+    # The bucket the rung ACTUALLY rested on, captured at FILL time (L2 R2, reviewer MUST-FIX-3): a
+    # rest-and-fill across a bucket change within one window would otherwise mislabel the held bucket-NO
+    # leg and mis-settle the backfill. ``bucket_ticker`` is what the ledger/backfill price against;
+    # ``bucket_Sd``/``bucket_Su`` are the fill-time spot bounds for the report.
+    bucket_ticker: str | None = None
+    bucket_Sd: int | None = None
+    bucket_Su: int | None = None
 
 
 @dataclass(frozen=True)
@@ -765,6 +772,12 @@ def _book_rung_fill(
     ladder = st.ladder
     order = next((o for o in ladder if o.client_order_id == coid), None)
     order_id = order.order_id if order is not None else None
+    # capture the bucket the rung ACTUALLY rested on, at FILL time (MUST-FIX-3): from the order's own
+    # bucket_Sd (the rung was placed on it), falling back to the ladder's / current spot bucket.
+    fill_Sd = order.bucket_Sd if order is not None and order.bucket_Sd is not None else (
+        st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd)
+    fill_bucket_ticker = st.bucket_tickers.get(fill_Sd) if fill_Sd is not None else None
+    fill_Su = (fill_Sd + params.bucket_width) if fill_Sd is not None else None
     if order is not None:
         remaining = order.count - booked[coid]
         if remaining <= 0:
@@ -781,7 +794,8 @@ def _book_rung_fill(
     else:
         m = _emin_cents(params) + rung
     rf = RungFill(rung=rung, E_rung=E_rung, price=price, count=int(delta), server_ts=now,
-                  coid=coid, order_id=order_id, W=st.W, n_top=st.n_top)
+                  coid=coid, order_id=order_id, W=st.W, n_top=st.n_top,
+                  bucket_ticker=fill_bucket_ticker, bucket_Sd=fill_Sd, bucket_Su=fill_Su)
     # MARGIN ARRAY (Brad R4): mark this fill's margin as consumed (state 2) and tie the 2-slot to THIS
     # fill (``filled_at``). A rare fill on a STRANDED order (margin outside the nominal array) is still
     # booked (rungs_filled ++, the exposure cap holds) but leaves the array untouched — the exposure

@@ -42,10 +42,14 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # Round 2 (2026-09-22): added ``fast_shift_min_cents`` (superseded in R4). Round 4 (2026-09-22, Brad's
 # margin-array convergence): ``fast_shift_min_cents`` REMOVED (convergence moves N-at-a-time instead of a
 # cancel-all/place-all), ``max_amends_in_flight`` ADDED -> re-pinned.
-FROZEN_V33_PARAMS_SHA256 = "6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3ef46ea784e7f8a11a421"
+# L2 R2 (2026-09-23): ADDED ``max_contracts_per_order_hint`` (wing-take chunk cap upper bound),
+# ``write_tokens_per_s`` / ``write_bucket_size`` (Basic-tier write-token pacer) and ``order_poll_batched``
+# (a single /portfolio/orders?ticker= poll vs per-rung GETs) -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
 # History (add-only law). Kept DEFINED so prior-regime ledger rows stay identifiable.
 PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
 PREVIOUS_V33_PARAMS_SHA256_L1_R2 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
+PREVIOUS_V33_PARAMS_SHA256_L1_R4 = "6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3ef46ea784e7f8a11a421"
 
 _CENT = Decimal("0.01")
 
@@ -116,6 +120,11 @@ class V33Params:
     n_min: Decimal
     replace_rate_alarm_per_min: int
     bucket_width: int
+    # L2 (2026-09-23): wing-take chunking + write pacing + batched poll.
+    max_contracts_per_order_hint: int  # upper bound on the wing chunk cap; actual cap = min(this, proxy)
+    write_tokens_per_s: int            # Basic-tier write-token refill rate (100/s)
+    write_bucket_size: int             # write-token bucket capacity (100)
+    order_poll_batched: bool           # one /portfolio/orders?ticker= poll vs per-rung GETs (default true)
     shadow_Es: tuple[Decimal, ...]
     sha256: str
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
@@ -157,6 +166,16 @@ def load_v33_params(
             f"v33 policy at {path} is invalid: max_amends_in_flight="
             f"{raw['max_amends_in_flight']} must be >= 1 (at least one convergence amend at a time)"
         )
+    # L2 R2: the wing-take chunk cap upper bound must cover at least one lot per rung.
+    if int(raw["max_contracts_per_order_hint"]) < int(raw["lots_per_rung"]):
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: max_contracts_per_order_hint="
+            f"{raw['max_contracts_per_order_hint']} < lots_per_rung {raw['lots_per_rung']}"
+        )
+    if int(raw["write_tokens_per_s"]) < 1 or int(raw["write_bucket_size"]) < 1:
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: write_tokens_per_s / write_bucket_size must be >= 1"
+        )
     shadow_Es = tuple(Decimal(str(x)) for x in raw["shadow_Es"])
     # Fail closed (ruling L-6, generalised for the ladder): every shadow E must lie WITHIN the live
     # ladder's margin range [E_min, E_min + (rungs-1)c], else the in-process shadow tracks a rung the
@@ -188,6 +207,10 @@ def load_v33_params(
         n_min=Decimal(str(raw["n_min"])),
         replace_rate_alarm_per_min=int(raw["replace_rate_alarm_per_min"]),
         bucket_width=int(raw["bucket_width"]),
+        max_contracts_per_order_hint=int(raw["max_contracts_per_order_hint"]),
+        write_tokens_per_s=int(raw["write_tokens_per_s"]),
+        write_bucket_size=int(raw["write_bucket_size"]),
+        order_poll_batched=bool(raw["order_poll_batched"]),
         shadow_Es=shadow_Es,
         sha256=sha,
         raw=raw,

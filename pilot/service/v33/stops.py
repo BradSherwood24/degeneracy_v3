@@ -40,7 +40,10 @@ from service.v32.stops import reconcile_positions_clean  # noqa: F401  (re-expor
 # ---------------------------------------------------------------------------
 V33_S4_DAY_LOSS_CAP_DOLLARS = Decimal("3.00")     # [pin] day balance-loss cap (Q5: stands for K=11)
 V33_MIN_ORDER_BUDGET_AT_ARM = 500                 # [pin] creates left in today's budget required at :40
-V33_MAX_CONTRACTS_PER_ORDER = 2                   # [pin] proxy cap ceiling (one lot per rung; never > 2)
+V33_MAX_CONTRACTS_PER_ORDER = 2                   # the proxy's per-order cap TODAY (one lot per rung).
+# NOTE: the S5 ceiling is K*lots_per_rung (a coalesced wing take is CHUNKED to <= cap, so any cap in
+# [lots_per_rung, K*lots_per_rung] arms; ``v33_caps_agree`` uses that, not this constant). This value
+# just records the current proxy setting for the runbook/report.
 V33_S1_LEGGED_LATCH_THRESHOLD = 2                 # [pin] one-legged sets below floor before a DAY latch
 
 V33_RANGE_TICKER_PROBE = "KXBTC-"     # a range bucket ticker starts here
@@ -65,9 +68,11 @@ def v33_day_guard_path(ops_dir: str, utc_day: str) -> str:
 # ---------------------------------------------------------------------------
 # S5 caps agreement (the proxy /health caps must allow what V3.3 will send)
 # ---------------------------------------------------------------------------
-def v33_caps_agree(health: Any, lots_per_rung: int) -> tuple[bool, str]:
+def v33_caps_agree(health: Any, lots_per_rung: int, k_rungs: int = 1) -> tuple[bool, str]:
     """The /health caps + budget agree with the V3.3 order profile. Requires: ``orders_enabled`` true;
-    ``max_contracts_per_order`` in [lots_per_rung, 2] (one lot per rung; never above the ceiling); the
+    ``max_contracts_per_order`` in [lots_per_rung, K*lots_per_rung] (MUST-FIX-1: a rung needs cap >= one
+    lot; a COALESCED wing take is chunked to <= cap, so any cap >= lots_per_rung works — Brad may set the
+    proxy cap to 2 (wings go as ceil(K/2) chunks) or to 11 (wings go as 2 orders), and BOTH must arm); the
     ticker prefixes cover BOTH ``KXBTC-...`` and ``KXBTCD-...`` (via startswith, exactly as the proxy);
     ``orders_remaining_today`` >= ``V33_MIN_ORDER_BUDGET_AT_ARM``."""
     if not isinstance(health, dict):
@@ -83,9 +88,10 @@ def v33_caps_agree(health: Any, lots_per_rung: int) -> tuple[bool, str]:
         return False, "proxy max_contracts_per_order missing/non-numeric"
     if proxy_max < int(lots_per_rung):
         return False, f"proxy max_contracts_per_order {proxy_max} < lots_per_rung {lots_per_rung}"
-    if proxy_max > V33_MAX_CONTRACTS_PER_ORDER:
+    ceiling = int(k_rungs) * int(lots_per_rung)
+    if proxy_max > ceiling:
         return False, (f"proxy max_contracts_per_order {proxy_max} > V3.3 ceiling "
-                       f"{V33_MAX_CONTRACTS_PER_ORDER}")
+                       f"K*lots_per_rung={ceiling}")
     prefixes = caps.get("ticker_prefixes")
     if not isinstance(prefixes, (list, tuple)):
         return False, "proxy ticker_prefixes missing"
@@ -108,7 +114,7 @@ class V33ArmDecision:
 
 
 def v33_arming_check(
-    falsifier_path: str, health: Any, params_verified: bool, lots_per_rung: int
+    falsifier_path: str, health: Any, params_verified: bool, lots_per_rung: int, k_rungs: int = 1
 ) -> V33ArmDecision:
     """S5. armed=True ONLY if the falsifier is FROZEN, the params sha is verified, and the /health caps
     + budget agree (``v33_caps_agree``). Any failure -> refuse with the reasons."""
@@ -118,7 +124,7 @@ def v33_arming_check(
     if not falsifier_is_frozen(falsifier_path):
         reasons.append(f"falsifier STATUS line is not exactly '{_FROZEN_LINE}' at "
                        f"{os.path.basename(falsifier_path)}")
-    caps_ok, caps_reason = v33_caps_agree(health, lots_per_rung)
+    caps_ok, caps_reason = v33_caps_agree(health, lots_per_rung, k_rungs)
     if not caps_ok:
         reasons.append(caps_reason)
     return V33ArmDecision(armed=not reasons, reasons=tuple(reasons))
@@ -185,6 +191,7 @@ def decide_v33_arming(
     lots_per_rung: int,
     day_guard: DayGuard,
     s4: Any = None,
+    k_rungs: int = 1,
 ) -> V33ArmingOutcome:
     """The single arm-or-degrade gate (mirrors ``decide_v32_arming``). Only ``resolved_mode == "armed"``
     is a candidate; anything else passes through unarmed. An armed candidate must clear ALL of: the day
@@ -201,7 +208,7 @@ def decide_v33_arming(
         latched = v33_latched_stop_kind(day_guard)
         if latched is not None:
             reasons.append(f"day-halting stop already latched today: {latched}")
-    dec = v33_arming_check(falsifier_path, health, params_verified, lots_per_rung)
+    dec = v33_arming_check(falsifier_path, health, params_verified, lots_per_rung, k_rungs)
     reasons.extend(dec.reasons)
     clean, detail = reconcile_positions_clean(positions)
     if not clean:

@@ -153,20 +153,32 @@ def _resolve_v33_guard_path(utc_day: str) -> str:
 # ===========================================================================
 # Executor selection — the ONE place the executor kind is chosen
 # ===========================================================================
+def _proxy_max_contracts(health: Any) -> int | None:
+    """The proxy's MAX_CONTRACTS_PER_ORDER from /health caps, or None if unreadable."""
+    try:
+        return int((health or {}).get("caps", {}).get("max_contracts_per_order"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def build_executor_v33(
     effective_mode: str, *, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
     params: V33Params, writer: ProxyWriter | None, clock: Callable[[], float] = time.time,
-    batch_create: bool = False,
+    batch_create: bool = False, wing_cap: int | None = None,
 ) -> Any:
     """``armed`` -> the real ``V33LiveExecutor`` (requires a ProxyWriter); everything else -> the reused
-    dry ``FrozenExecutor`` (refuses a real action kind). A LiveExecutor is NEVER constructed unless
-    armed."""
+    dry ``FrozenExecutor`` (refuses a real action kind). ``wing_cap`` = the chunk cap for coalesced wing
+    takes = min(params.max_contracts_per_order_hint, proxy /health cap); the write pacer is sized from
+    params. A LiveExecutor is NEVER constructed unless armed."""
     if effective_mode == "armed":
         if writer is None:
             raise ValueError("armed executor requires a ProxyWriter")
+        cap = wing_cap if wing_cap is not None else params.max_contracts_per_order_hint
         return V33LiveExecutor(
             writer, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
             params.quote_end_s, k_rungs=params.rungs, clock=clock, batch_create=batch_create,
+            wing_cap=cap, write_tokens_per_s=params.write_tokens_per_s,
+            write_bucket_size=params.write_bucket_size,
         )
     return R.FrozenExecutor(bucket_map)
 
@@ -448,13 +460,34 @@ async def _order_status_poll_v33(
     driver: V33Driver, executor: Any, clock: Callable[[], float], deadline: float,
     sleep: Callable[[float], Awaitable[None]], interval: float = ORDER_POLL_INTERVAL_S,
 ) -> None:
-    """ARMED belt-and-braces: every ``interval`` s, GET the status of every LIVE ladder rung and book any
-    fill the WS ``fill`` channel missed (de-duped by order_id in ``driver.on_poll_fill``). Never raises."""
+    """ARMED belt-and-braces: every ``interval`` s, book any fill the WS ``fill`` channel missed (de-duped
+    by order_id in ``driver.on_poll_fill``). With ``params.order_poll_batched`` (default ON for v33, NIT-d)
+    it does ONE ``GET /portfolio/orders?ticker=<bucket>`` per tick instead of K per-rung GETs; else it
+    polls each live rung. Never raises."""
+    batched = getattr(driver.params, "order_poll_batched", True)
     while clock() < deadline:
         await sleep(interval)
         if clock() >= deadline:
             break
-        for o in list(driver.state.ladder):
+        st = driver.state
+        if batched:
+            rest_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
+            ticker = st.bucket_tickers.get(rest_sd) if rest_sd is not None else None
+            if ticker is None:
+                continue
+            try:
+                filled_by_oid = executor.poll_orders_for_bucket(ticker)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[V33] batched order-status poll error: %s", e)
+                continue
+            for o in list(st.ladder):
+                if not o.live or o.order_id is None:
+                    continue
+                fc = filled_by_oid.get(str(o.order_id))
+                if fc and fc > 0:
+                    driver.on_poll_fill(o.order_id, int(fc), driver.server_now() or clock())
+            continue
+        for o in list(st.ladder):
             if not o.live or o.order_id is None:
                 continue
             try:
@@ -662,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- arming resolution (S5 + reconcile-first + day latch + S4) ---
     writer: ProxyWriter | None = None
+    health: Any = None
     if resolved_mode == "armed":
         writer = ProxyWriter(proxy_auth=proxy, base_url=proxy_base_url)
         health = R.get_health(proxy_base_url)
@@ -686,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
         outcome = decide_v33_arming(
             resolved_mode=resolved_mode, falsifier_path=args.falsifier, health=health,
             positions=positions, params_verified=True, lots_per_rung=params.lots_per_rung,
-            day_guard=day_guard, s4=s4)
+            day_guard=day_guard, s4=s4, k_rungs=params.rungs)
         effective_mode = outcome.effective_mode
         if not outcome.armed:
             degrade = "degrade_to_dry"
@@ -708,9 +742,14 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(b, "ticker", None):
             exch_map[b.ticker] = coerce_exchange_index(getattr(b, "exchange_index", None))
 
+    # wing-take chunk cap = min(params hint, the proxy's live MAX_CONTRACTS_PER_ORDER). At the proxy's
+    # 2 today, K rung fills chunk into ceil(K/2) IOC takes per wing; if Brad raises it to 11, 1 take/wing.
+    proxy_cap = _proxy_max_contracts(health)
+    wing_cap = (min(params.max_contracts_per_order_hint, proxy_cap)
+                if proxy_cap is not None else params.max_contracts_per_order_hint)
     executor = build_executor_v33(effective_mode, bucket_map=bucket_map, exchange_index_by_ticker=exch_map,
                                   journal=journal, close_epoch_val=cts, params=params, writer=writer,
-                                  clock=clock, batch_create=args.batch_create)
+                                  clock=clock, batch_create=args.batch_create, wing_cap=wing_cap)
     driver = V33Driver(params, state, journal, executor, dry_sim=dry_sim,
                        batch_create=args.batch_create, clock=clock)
     shared = R.V32Recorder(journal, driver, clock=clock, m15_tickers=frozenset(m15_disc.tickers))

@@ -121,3 +121,78 @@ through the real `V33Driver` in dry** is the receipt (`test_v33_run.py`):
 The V3.3 falsifier draft (`ceremony/v33_falsifier.md`, `STATUS: FROZEN` required before S5 arms),
 `ops/V33_ARMING.md`, the LADDER SCOREBOARD / per-rung falsifier scoreboard in the report, the SO-3 deep
 observation ladder (16..25c), the full report, and the V3.2 Registration close line (Q4).
+
+---
+
+# Round 2 (2026-09-23) — addressing PR #87 review (APPROVE WITH NITS for dry; MUST-FIX-BEFORE-ARM)
+
+Review verdict was APPROVE for the dry side-by-side with a MUST-FIX-BEFORE-ARM list. Brad's word:
+"Make sure V3.3 is running exactly as expected before $20+ are on the line" -> all four MUST-FIX items +
+the NITs are fixed NOW in this PR. Suite after Round 2: **1192 passed, 1 skipped** (+9 over R1's 1183;
+net new v33 L2 tests ~91). The L1 core suite stays **85 green** (the one named core change — a new
+optional `RungFill` field — is additive; no L1 test asserts on it).
+
+## MUST-FIX-1 — chunked coalesced wing take (naked-leg fix) — FIXED
+`V33LiveExecutor._take_wings` now splits EACH wing leg into `ceil(remaining / wing_cap)` IOC chunks of
+`<= wing_cap` and issues all chunks of both wings in one priority-paced burst. `wing_cap = min(params
+.max_contracts_per_order_hint = 11, the live proxy /health cap)`, read at window start. The chunk fills
+are AGGREGATED back into ONE Fill per original leg (the core still sees one leg — money math unchanged):
+a FULL aggregate -> leg filled at the weighted-avg price; a PARTIAL (a rejected/IOC-unfilled chunk) ->
+leg reported unfilled so the core emits RETRY_WING, and `self._wing_filled[(batch, side)]` makes the
+retry (a new coid) re-chunk ONLY the remaining count — never over-hedging. S5 `v33_caps_agree` now
+accepts a proxy cap in `[lots_per_rung, K*lots_per_rung]` (so cap 2 -> 6+6 chunks AND cap 11 -> 1+1 both
+arm). Tests: cap 2 -> 12 chunks aggregated to 11; cap 11 -> 2 orders; a rejected chunk retried for the
+remainder only; a CAP-ENFORCING fake replaces the permissive one.
+
+## MUST-FIX-2 — pre-place invariant no longer stalls the steady state — FIXED
+`_pre_place_invariant` now decides overflow/dup/stray on the FIRST venue read (via a `_invariant_verdict`
+helper + RestBook price attribution). The 0.5 s blocking recheck (sleep + 2nd GET) runs ONLY when the
+first read flags an anomaly (which may itself be read-path lag). A healthy partial/full resting ladder —
+the V3.3 steady state — proceeds on ONE GET with NO sleep. Tests: 10 healthy rungs + a fresh-price create
+-> exactly one GET, zero sleeps, zero rechecks; a dup price -> 2 GETs + 1 sleep (recheck path).
+
+## MUST-FIX-3 — per-rung bucket ticker (settlement correctness) — FIXED (named core change)
+`RungFill` (core) gains `bucket_ticker` / `bucket_Sd` / `bucket_Su`, captured at FILL time in
+`_book_rung_fill` from the filling order's own `bucket_Sd`. `ledger._bucket_ticker_for_fill` uses
+`rf.bucket_ticker`, so a rest-and-fill across a bucket change lands two batches with DIFFERENT bucket-NO
+tickers and the settlement backfill prices each against its own market. Additive (defaults None) — no L1
+test broke. Test: fills before/after a bucket change -> held bucket-NO legs carry the two distinct buckets.
+
+## MUST-FIX-4 — Basic-tier write-token pacer — FIXED
+New `WriteTokenBucket` (rate `write_tokens_per_s`=100, size `write_bucket_size`=100; cost create/amend 10,
+cancel 2, batch create 10*n). `V33LiveExecutor` overrides `_place_rest`/`_amend_rest`/`_cancel_rest`
+(and paces `place_batch` + the chunked wing take) to `acquire` before sending; a non-priority write waits
+(injected sleep) until the bucket has room, journaling `write_paced`. Cancels + wing takes are PRIORITY
+(served immediately, never queued behind ladder creates). Tests: 11 creates never overdraw the bucket
+(wall-clock via an advancing injected clock); a priority cancel after a depleted-by-creates bucket waits 0.
+
+## NITs
+- NIT-3 (open coalesce group floor): fixed the misleading comment — an un-batched fill has a GENUINELY $0
+  floor (a lone bucket-NO is directional), so accruing its rest cost with no floor is conservative/correct,
+  not an understatement. Added `test_close_time_flush_takes_wings_for_last_coalesce_group` proving the core
+  flushes `coalesce_open` + takes wings by close so no rung is left un-batched.
+- NIT-4 / 5(b) (sweep 404): the v33 startup sweep now treats a 404 on OUR `v33-*` order as "already gone"
+  (terminal) regardless of the shard, per the coordinator; the per-order `expiration_time` backstops the rest.
+- NIT-6 / 5(c) (ps1 cosmetics): reverted — `-DryRun` WITHOUT `-WithV33` is byte-identical to main (the
+  "not requested" line removed; the warning restored to "never two.").
+- NIT-1 / 5(d) (batched poll): added `params.order_poll_batched` (default ON) + `poll_orders_for_bucket` —
+  one `GET /portfolio/orders?ticker=<bucket>` per tick instead of K per-rung GETs, per-order dedup kept.
+- 5(e) (runbook flip): the flip section now lists all four MUST-FIX items as CLEARED and Brad's proxy
+  levers (MAX_CONTRACTS_PER_ORDER 2 vs 11 with the wing-chunk consequence, the amend cap, budget 8000).
+
+## Params re-pin
+Added `max_contracts_per_order_hint` (11), `write_tokens_per_s` (100), `write_bucket_size` (100),
+`order_poll_batched` (true) to `policy/v33_params.json`; re-pinned
+`FROZEN_V33_PARAMS_SHA256 = 415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2` (R4 sha kept
+as `PREVIOUS_V33_PARAMS_SHA256_L1_R4`). New fail-closed loader checks (hint >= lots_per_rung; write
+tokens/bucket >= 1) with tests.
+
+## Brad's lever choices to record
+- Proxy `MAX_CONTRACTS_PER_ORDER`: 2 (wings as 6+6 IOC chunks) OR 11 (wings as 1+1, but lifts the
+  one-lot-per-rung guard) — both arm; the executor's wing_cap follows the live /health cap.
+- Amend cap (fallback cancel->create until applied) + `DAILY_ORDER_BUDGET` -> 8000.
+
+## Still deferred to L3 (unchanged)
+The V3.3 falsifier draft + STATUS: FROZEN, `V33_ARMING.md`, the LADDER SCOREBOARD / per-rung falsifier,
+SO-3 deep observation ladder, the full report, the V3.2 Registration close line. NIT-2 (a stray stands the
+whole window down) is accepted for L2 and noted for L3 hardening.

@@ -145,29 +145,86 @@ def test_roll_amend_failure_falls_back_to_cancel_create():
 
 
 # ---------------------------------------------------------------------------
-# coalesced wing take (sized to the batch total)
+# chunked coalesced wing take (MUST-FIX-1) against a CAP-ENFORCING fake
 # ---------------------------------------------------------------------------
-def test_coalesced_wing_take_two_legs_sized_to_total():
-    w = FakeWriter()
-    ex = _exec(w)
-    st = _state()
-    # a coalesced batch of 3 rungs -> both wings sized 3.
-    legs = (
-        WingLeg(S_SD, "yes", 3, Decimal("0.55"), "v33-wy", batch=0),
-        WingLeg(S_SU, "no", 3, Decimal("0.90"), "v33-wn", batch=0),
-    )
-    st = st.__class__.new(CLOSE, CTS, BUCKET_MAP, load_v33_params())
+class CapWriter(FakeWriter):
+    """A proxy fake that ENFORCES ``MAX_CONTRACTS_PER_ORDER``: any create whose count > cap is rejected
+    (like the real proxy). Records every chunk's count so a test can assert the chunking. Echoes each
+    order's coid so the executor can aggregate."""
+
+    def __init__(self, cap, reject_coids=()):
+        super().__init__()
+        self.cap = cap
+        self.reject_coids = set(reject_coids)
+        self.chunk_counts: list[int] = []
+
+    def _slot(self, o):
+        coid = o.get("client_order_id")
+        cnt = int(Decimal(str(o.get("count", 1))))
+        self.chunk_counts.append(cnt)
+        if cnt > self.cap or coid in self.reject_coids:
+            return {"client_order_id": coid, "order_id": None, "fill_count": "0.00",
+                    "error": "too_large"}
+        return {"client_order_id": coid, "order_id": f"oid-{coid}", "fill_count": f"{cnt}.00",
+                "average_fill_price": o.get("price", "0.5000")}
+
+    def rest_post(self, path, body):
+        self.posts.append((path, body))
+        if "orders" in body:                      # batch create
+            return WriteResponse(200, {"orders": [self._slot(o) for o in body["orders"]]}, True)
+        return WriteResponse(200, {"order": self._slot(body)}, True)   # single create
+
+
+def _wing_state(count):
     from dataclasses import replace as dr
-    st = dr(st, wing_legs=legs)
-    w.post_queue.append(WriteResponse(200, {"orders": [
-        {"client_order_id": "v33-wy", "order_id": "wy1", "fill_count": "3.00",
-         "yes_price_dollars": "0.5700"},
-        {"client_order_id": "v33-wn", "order_id": "wn1", "fill_count": "3.00",
-         "yes_price_dollars": "0.0900"}]}, True))
-    events = ex.on_action(V32Action(kind=ActionKind.TAKE_WINGS, count=3), st, CTS - 400)
+    st = V33State.new(CLOSE, CTS, BUCKET_MAP, load_v33_params())
+    legs = (WingLeg(S_SD, "yes", count, Decimal("0.55"), "v33-wy", batch=0),
+            WingLeg(S_SU, "no", count, Decimal("0.90"), "v33-wn", batch=0))
+    return dr(st, wing_legs=legs)
+
+
+def test_wing_take_chunks_at_cap_two_six_plus_six():
+    w = CapWriter(cap=2)
+    ex = _exec(w, k=11)
+    ex.wing_cap = 2
+    st = _wing_state(11)
+    events = ex._take_wings(st, CTS - 400)
+    # 11 lots per wing at cap 2 -> ceil(11/2)=6 chunks per wing -> 12 chunk orders, none over cap 2.
+    assert ex.wing_chunks == 12 and all(c <= 2 for c in w.chunk_counts)
     fills = [e for e in events if isinstance(e, Fill)]
-    assert len(fills) == 2 and all(f.count == Decimal(3) for f in fills)
-    assert ex.wing_batches == 1
+    assert len(fills) == 2 and all(f.count == Decimal(11) for f in fills)   # aggregated to the full 11
+
+
+def test_wing_take_cap_eleven_one_plus_one():
+    w = CapWriter(cap=11)
+    ex = _exec(w, k=11)
+    ex.wing_cap = 11
+    st = _wing_state(11)
+    ex._take_wings(st, CTS - 400)
+    assert ex.wing_chunks == 2 and w.chunk_counts == [11, 11]   # 1 order per wing
+
+
+def test_wing_take_rejected_chunk_retried_for_remainder():
+    # cap 2, count 4 -> 2 chunks per wing; reject ONE yes chunk -> yes leg partial -> reported unfilled;
+    # a second take (the core's RETRY) sends chunks ONLY for the remaining 2 (never over-hedging).
+    w = CapWriter(cap=2, reject_coids={"v33-wc-1"})   # the first yes chunk fails
+    ex = _exec(w, k=11)
+    ex.wing_cap = 2
+    st = _wing_state(4)
+    events1 = ex._take_wings(st, CTS - 400)
+    yes_fill = next(e for e in events1 if isinstance(e, Fill) and e.side == "yes")
+    no_fill = next(e for e in events1 if isinstance(e, Fill) and e.side == "no")
+    assert no_fill.count == Decimal(4)          # no leg fully filled
+    assert yes_fill.count == Decimal(0)         # yes leg partial (1 chunk rejected) -> unfilled -> retry
+    assert ex._wing_filled[(0, "yes")] == 2     # 2 of 4 taken; retry must send only the remaining 2
+    # simulate the core's RETRY_WING: the leg re-pends with a NEW coid, still count 4.
+    from dataclasses import replace as dr
+    st2 = dr(st, wing_legs=(dr(st.wing_legs[0], client_order_id="v33-wy2", status="pending"),
+                            dr(st.wing_legs[1], status="filled")))
+    w.chunk_counts.clear()
+    w.reject_coids.clear()
+    ex._take_wings(st2, CTS - 390)
+    assert sum(w.chunk_counts) == 2             # only the 2 remaining lots re-chunked, not 4
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +318,91 @@ def test_invariant_unattributable_stray_is_violation():
     ex._pending_place_price = Decimal("0.43")
     out = ex._pre_place_invariant("v33-c", CTS - 500)
     assert out is not None and ex.rest_invariant_violations == 1
+
+
+def test_invariant_healthy_partial_ladder_one_get_no_sleep():
+    """MUST-FIX-2: a HEALTHY resting ladder (all attributed, no dup, < K) proceeds on the FIRST read --
+    exactly ONE venue GET, NO 0.5 s recheck sleep. (V3.2 stalled here on every create.)"""
+    w = FakeWriter()
+    sleeps: list[float] = []
+    ex = V33LiveExecutor(w, BUCKET_MAP, EXCH, FakeJournal(), CTS, 300, k_rungs=11,
+                         clock=lambda: 0.0, sleep=lambda s: sleeps.append(s))
+    seeded = _seed_resting(ex, [(f"v33-r{i}", f"o{i}", str(Decimal("0.45") - i * Decimal("0.01")))
+                                for i in range(10)])   # 10 healthy rungs, K=11
+    w.get_map["/portfolio/orders"] = {"orders": seeded}
+    ex._pending_place_price = Decimal("0.35")          # a fresh price, none resting there
+    assert ex._pre_place_invariant("v33-r10", CTS - 500) is None
+    open_orders_gets = [g for g in w.gets if g[0] == "/portfolio/orders"]
+    assert len(open_orders_gets) == 1 and sleeps == []   # ONE GET, NO sleep
+    assert ex.rest_invariant_rechecks == 0
+
+
+def test_invariant_dup_triggers_recheck():
+    """A flagged anomaly (dup price) DOES recheck (sleep + 2nd GET) before declaring a violation."""
+    w = FakeWriter()
+    sleeps: list[float] = []
+    ex = V33LiveExecutor(w, BUCKET_MAP, EXCH, FakeJournal(), CTS, 300, k_rungs=11,
+                         clock=lambda: 0.0, sleep=lambda s: sleeps.append(s))
+    seeded = _seed_resting(ex, [("v33-a", "oa", "0.45")])
+    w.get_map["/portfolio/orders"] = {"orders": seeded}
+    ex._pending_place_price = Decimal("0.45")          # dup with the resting order -> anomaly -> recheck
+    out = ex._pre_place_invariant("v33-c", CTS - 500)
+    open_orders_gets = [g for g in w.gets if g[0] == "/portfolio/orders"]
+    assert len(open_orders_gets) == 2 and len(sleeps) == 1   # recheck fired
+    assert out is not None and ex.rest_invariant_dup_price == 1
+
+
+# ---------------------------------------------------------------------------
+# write-token pacer (MUST-FIX-4)
+# ---------------------------------------------------------------------------
+class _AdvancingClock:
+    """A clock whose ``sleep`` advances it, so the pacer's token refill is testable in wall-clock."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def test_pacer_11_creates_never_go_negative():
+    from service.v33.executor import WriteTokenBucket, COST_CREATE
+    ck = _AdvancingClock()
+    b = WriteTokenBucket(rate=100.0, size=100.0, clock=ck.now, sleep=ck.sleep)
+    min_tokens = b.tokens
+    for _ in range(11):
+        b.acquire(COST_CREATE, "create")
+        min_tokens = min(min_tokens, b.tokens)
+    assert min_tokens >= 0.0                    # a burst of 11 creates never overdraws the bucket
+    assert b.total_wait_s > 0.0 and ck.t > 0.0  # the 11th create paced (110 tokens > 100 in one burst)
+
+
+def test_pacer_cancels_not_delayed_behind_creates():
+    from service.v33.executor import WriteTokenBucket, COST_CREATE, COST_CANCEL
+    ck = _AdvancingClock()
+    b = WriteTokenBucket(rate=100.0, size=100.0, clock=ck.now, sleep=ck.sleep)
+    for _ in range(10):                          # deplete the bucket to 0 with creates (no clock advance)
+        b.acquire(COST_CREATE, "create")
+    t_before = ck.t
+    wait = b.acquire(COST_CANCEL, "cancel", priority=True)   # a priority cancel jumps the queue
+    assert wait == 0.0 and ck.t == t_before      # the cancel is NOT delayed behind the creates
+
+
+# ---------------------------------------------------------------------------
+# batched order poll (NIT-d)
+# ---------------------------------------------------------------------------
+def test_batched_poll_returns_filled_by_order_id():
+    w = FakeWriter()
+    ex = _exec(w, k=11)
+    w.get_map["/portfolio/orders"] = {"orders": [
+        {"client_order_id": "v33-a", "order_id": "oa", "fill_count_fp": "1.00"},
+        {"client_order_id": "v33-b", "order_id": "ob", "fill_count_fp": "0.00"},
+        {"client_order_id": "v32-x", "order_id": "ox", "fill_count_fp": "2.00"}]}  # foreign -> excluded
+    res = ex.poll_orders_for_bucket(B)
+    assert res == {"oa": 1, "ob": 0} and "ox" not in res
 
 
 # ---------------------------------------------------------------------------

@@ -162,6 +162,39 @@ def test_pending_credit_counts_armed_not_dry_sim():
     assert pess == Decimal(4) and opt == Decimal(4)
 
 
+def test_per_batch_bucket_ticker_from_rungfill():
+    """MUST-FIX-3: a rest-and-fill across a bucket change -> two batches, each with its OWN captured
+    bucket_ticker; the held bucket-NO leg prices against the RIGHT market (else backfill mis-settles)."""
+    BA = "KXBTC-26SEP2000-B80450"
+    BB = "KXBTC-26SEP2000-B80550"
+    p = load_v33_params()
+    st = V33State.new(CLOSE, CTS, BK, p)
+    rfA = RungFill(rung=0, E_rung=Decimal("0.05"), price=Decimal("0.45"), count=1, server_ts=CTS - 500,
+                   coid="v33-a", order_id="oa", W=W, n_top=Decimal("0.45"), bucket_ticker=BA)
+    rfB = RungFill(rung=0, E_rung=Decimal("0.05"), price=Decimal("0.45"), count=1, server_ts=CTS - 400,
+                   coid="v33-b", order_id="ob", W=W, n_top=Decimal("0.45"), bucket_ticker=BB)
+    bA = WingBatch(index=0, server_ts=CTS - 500, fills=(rfA,), taken=True, completed=True)
+    bB = WingBatch(index=1, server_ts=CTS - 400, fills=(rfB,), taken=True, completed=True)
+    legs = (
+        WingLeg(S_SD, "yes", 1, Decimal("0.55"), "wyA", status="filled",
+                fill_price=Decimal("0.55"), fill_fee=_fee(Decimal("0.55")), batch=0),
+        WingLeg(S_SU, "no", 1, Decimal("0.90"), "wnA", status="filled",
+                fill_price=Decimal("0.09"), fill_fee=_fee(Decimal("0.09")), batch=0),
+        WingLeg("KXBTCD-26SEP2000-T80549.99", "yes", 1, Decimal("0.55"), "wyB", status="filled",
+                fill_price=Decimal("0.55"), fill_fee=_fee(Decimal("0.55")), batch=1),
+        WingLeg("KXBTCD-26SEP2000-T80649.99", "no", 1, Decimal("0.90"), "wnB", status="filled",
+                fill_price=Decimal("0.09"), fill_fee=_fee(Decimal("0.09")), batch=1),
+    )
+    st = dr(st, rest_fills=(rfA, rfB), wing_batches=(bA, bB), wing_legs=legs, rungs_filled=2,
+            spot_Sd=80550, rest_bucket_Sd=80550, bucket_tickers={80450: BA, 80550: BB},
+            n_top=Decimal("0.45"))
+    m = compute_ladder_money_math(st, dry_sim=False)
+    held_bucket_tickers = {h["ticker"] for h in m["held_legs"]
+                           if h["side"] == "no" and h["ticker"].startswith("KXBTC-")}
+    # the two batches' bucket-NO legs carry the TWO distinct buckets, NOT both the current (BB).
+    assert held_bucket_tickers == {BA, BB}
+
+
 def test_floor_reconstructs_from_wing_batch_sets_when_no_explicit_floor():
     from service.v33.ledger import _v33_floor_booked_for_entry
     entry = {"wing_batch_sets": [{"held_legs": 3, "fill_count": 2},
