@@ -578,7 +578,11 @@ def _resolve_effective_bucket(
     if not pend_hyst:
         pend_hyst = _hysteresis_ok(params, st, raw_Sd)         # latch the hysteresis once satisfied
     elapsed_ms = (now - pend_since) * 1000.0
-    if elapsed_ms >= params.bucket_switch_deb_ms and pend_hyst:
+    # COMMIT when the debounce has elapsed AND either the hysteresis held OR the ANTI-STRAND cap has been
+    # reached (R2 NIT-1: the highest-yes-mid candidate and the centroid hysteresis can disagree, so a spot
+    # parked a few $ inside the new bucket would otherwise be stranded on the old bucket the whole window).
+    if elapsed_ms >= params.bucket_switch_deb_ms and (
+            pend_hyst or elapsed_ms >= params.bucket_switch_max_pending_ms):
         return raw_Sd, None, None, False                       # COMMIT: effective flips to the new bucket
     return rest, pend_Sd, pend_since, pend_hyst                 # still pending: stay on the old bucket
 
@@ -587,7 +591,8 @@ def _recompute_context(params: V33Params, st: V33State, now: float) -> V33State:
     """Re-derive spot bucket, W, cap, the ladder-top ``n_top``, every shadow n, and refresh each live
     rung's LIVE labels (``rung`` AND ``E_rung``) from the current n_top. Uses the UNCHANGED V3.2
     spot/W/cap law (imported). The EFFECTIVE spot bucket is debounced (bucket-flap fix): a switch commits
-    only after ``bucket_switch_deb_ms`` + hysteresis; while pending the ladder stays on its bucket."""
+    only after ``bucket_switch_deb_ms`` + hysteresis (or the ``bucket_switch_max_pending_ms`` anti-strand
+    cap); while pending the ladder stays on its bucket."""
     raw_Sd = _select_spot(st)
     spot_Sd, pend_Sd, pend_since, pend_hyst = _resolve_effective_bucket(params, st, raw_Sd, now)
     spot_Su = spot_Sd + params.bucket_width if spot_Sd is not None else None

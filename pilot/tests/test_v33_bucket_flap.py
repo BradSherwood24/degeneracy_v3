@@ -146,6 +146,45 @@ def test_flap_hysteresis_blocks_boundary_oscillation():
     assert st.rest_bucket_Sd == 79600
 
 
+def test_strand_commits_at_max_pending_when_hysteresis_never_holds():
+    # R2 NIT-1: a spot parked ~8$ inside the new bucket (highest yes-mid, so the resolved candidate) never
+    # satisfies the 15$ hysteresis, but the anti-strand cap commits the switch once it has been the resolved
+    # spot continuously for bucket_switch_max_pending_ms (15 s). Exactly ONE switch, at ~15 s.
+    p = _flap_params()                                   # deb 3000, hyst 15, max_pending 15000
+    st = _state(p)
+    now = T - 600
+    st, _ = _flip_to(p, st, 79600, now)
+    st = _ack_all(p, st, now)
+    all_acts = []
+    committed_at = None
+    for i in range(20):                                  # 79700 the resolved spot every 1 s for 20 s
+        tt = now + 0.5 + i * 1.0
+        st, a = _flip_to(p, st, 79700, tt, tgt=("0.38", "0.42"), oth=("0.28", "0.30"))
+        all_acts += a
+        if committed_at is None and [x for x in a if x.kind == ActionKind.CANCEL_REST]:
+            committed_at = tt - (now + 0.5)              # elapsed since the candidate started pending
+    cancels = [a for a in all_acts if a.kind == ActionKind.CANCEL_REST]
+    assert len(cancels) == 11                            # exactly one cancel-all (one switch)
+    assert committed_at is not None and 14.0 <= committed_at <= 16.0   # ~ max_pending (15 s)
+    assert not st.pending_switch_hyst_met                # committed WITHOUT the hysteresis ever holding
+
+
+def test_strand_flip_back_before_max_pending_resets():
+    # a flip back at ~14 s (< 15 s max_pending) resets both timers -> NO switch.
+    p = _flap_params()
+    st = _state(p)
+    now = T - 600
+    st, _ = _flip_to(p, st, 79600, now)
+    st = _ack_all(p, st, now)
+    all_acts = []
+    for i in range(14):                                  # 79700 for ~13.5 s (< 15 s)
+        st, a = _flip_to(p, st, 79700, now + 0.5 + i * 1.0, tgt=("0.38", "0.42"), oth=("0.28", "0.30"))
+        all_acts += a
+    st, a = _flip_to(p, st, 79600, now + 0.5 + 14.0); all_acts += a   # flip back at ~14 s -> RESET
+    assert not [a for a in all_acts if a.kind == ActionKind.CANCEL_REST]
+    assert st.rest_bucket_Sd == 79600 and st.pending_switch_Sd is None
+
+
 # ===========================================================================
 # item 2 — stale/missing-wing stand-down HOLD
 # ===========================================================================

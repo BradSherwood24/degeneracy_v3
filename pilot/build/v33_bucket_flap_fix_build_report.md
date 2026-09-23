@@ -89,3 +89,41 @@ The core now emits far fewer cancel/place actions on a flap (one commit, or none
 hold/resume/cancel STAND_DOWN reasons. The executor is unchanged (it never acted on STAND_DOWN; the driver
 journals + counts it). No proxy / budget change here; the budget pressure the finding flagged is removed at
 the source (the flap no longer generates orders).
+
+---
+
+## Round 2 (2026-09-23) — PR #89 review (APPROVE WITH NITS)
+
+Reviewer replay of the real hour: pre-fix 264 creates / 23 switches -> shipped 22 creates / 1 switch.
+
+### NIT-1 (strand) — FIXED: `bucket_switch_max_pending_ms` (default 15000 = 5x deb)
+The switch CANDIDATE is `_select_spot` (highest yes-mid) but the hysteresis GATE is the yes-mid-weighted
+centroid; on ~10k boundary ticks they disagree, and a spot parked 5-14$ inside the new bucket satisfies the
+3 s debounce yet is blocked by the 15$ hysteresis for the WHOLE window — stranding the ladder on the old
+(now-wrong) bucket. Added an ANTI-STRAND cap: once the new bucket has been the resolved spot continuously
+for >= `bucket_switch_max_pending_ms`, commit the switch even if the hysteresis never held (the debounce
+still applies; a flip back still resets both timers). Loader fails closed if
+`bucket_switch_max_pending_ms < bucket_switch_deb_ms`. Re-pinned sha
+`20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78` (FLAP-R1 sha kept as
+`PREVIOUS_V33_PARAMS_SHA256_FLAP_R1`); ceremony + arming docs updated. Tests: spot 8$ inside for 20 s ->
+exactly one switch at ~15 s (committed with `pending_switch_hyst_met` False); flip back at ~14 s -> no
+switch. Existing tests unchanged.
+
+### NIT-2 (fill-during-hold naked tail when W never returns) — doc only, no code change
+A rung can FILL during a stale-wing HOLD. Its wings are taker orders priced from the live book at fill
+time, so they hedge normally once the strike book returns. But if W NEVER returns before the settle cutoff,
+that filled lot reaches the cutoff unhedged — a `one_legged` set, identical to any fill whose wings never
+priced (already latched by the existing one-legged rule + S1). This is a monitoring item, not a new stop:
+**whenever a window logs `stand_down_cancel` (a hold that expired to a real cancel), check that window's
+report `one_legged` count** — that is the case where a fill-during-hold could be a bounded naked tail.
+`stand_down_hold_ms` = 0 disables the hold (immediate cancel, pre-fix behaviour) if the tail risk is judged
+worse than the flap-avoidance benefit. Added to `ops/V33_RUNBOOK.md` §9 alarms.
+
+### Levers (updated)
+- `bucket_switch_deb_ms` (3000), `bucket_switch_hysteresis_usd` (15),
+  **`bucket_switch_max_pending_ms` (15000 = anti-strand cap)**, `stand_down_hold_ms` (1500). Each is a
+  lever; 0 (or, for the cap, == deb) restores the narrower behaviour.
+
+### Tests / suite (R2)
++2 flap tests (anti-strand commit; flip-back reset); sha-pin test updated to the new pin + FLAP_R1 chain.
+Full pilot suite green (see the handback for the final count).
