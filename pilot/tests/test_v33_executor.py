@@ -309,15 +309,44 @@ def test_invariant_o2_fresh_order_at_previously_filled_price_ok():
     assert ex.rest_invariant_violations == 0
 
 
-def test_invariant_unattributable_stray_is_violation():
+def test_invariant_stray_only_cancels_and_proceeds():
+    """L3 stray decision (L2 review NIT-2): a lone unattributable v33-* stray with venue truth OTHERWISE
+    matching (no overflow past K, no dup at the place price) is CANCELLED + alarmed, and the place
+    PROCEEDS (the other rungs keep working) -- NOT a whole-window stand-down. It is not counted as a
+    rest_invariant_violation."""
     w = FakeWriter()
-    ex = _exec(w, k=11)
-    # a v33 order on the venue that is NOT in our RestBook (a stray we cannot attribute a price to).
+    j = FakeJournal()
+    ex = _exec(w, journal=j, k=11)
     w.get_map["/portfolio/orders"] = {"orders": [
         {"ticker": B, "order_id": "o-stray", "client_order_id": "v33-stray", "exchange_index": 2}]}
     ex._pending_place_price = Decimal("0.43")
     out = ex._pre_place_invariant("v33-c", CTS - 500)
-    assert out is not None and ex.rest_invariant_violations == 1
+    assert out is None                       # PROCEED with the place
+    assert ex.rest_invariant_violations == 0
+    assert ex.rest_stray_cancels == 1
+    assert ex.stand_down_reason is None      # no whole-window stand-down
+    # the stray was DELETEd and the action journaled
+    assert any("o-stray" in d for d in w.deletes)
+    assert "stray_cancel" in j.kinds() and "rest_stray_cancelled" in j.kinds()
+
+
+def test_invariant_stray_with_overflow_still_stands_down():
+    """A stray ALONGSIDE an overflow (>= K of ours already resting) means our accounting genuinely
+    disagrees with the venue (the 21-rest incident class) -> keep the HARD stand-down, do NOT proceed."""
+    w = FakeWriter()
+    j = FakeJournal()
+    ex = _exec(w, journal=j, k=3)   # small K so 3 resting = overflow
+    seeded = _seed_resting(ex, [("v33-a", "oa", "0.44"), ("v33-b", "ob", "0.43"),
+                                ("v33-c", "oc", "0.42")])   # 3 attributed = K -> overflow
+    seeded.append({"ticker": B, "order_id": "o-stray", "client_order_id": "v33-stray",
+                   "exchange_index": 2})
+    w.get_map["/portfolio/orders"] = {"orders": seeded}
+    ex._pending_place_price = Decimal("0.41")
+    out = ex._pre_place_invariant("v33-d", CTS - 500)
+    assert out is not None                       # short-circuit the place
+    assert ex.rest_invariant_violations == 1
+    assert ex.rest_invariant_overflow == 1
+    assert ex.stand_down_reason == "rest_invariant_violation"
 
 
 def test_invariant_healthy_partial_ladder_one_get_no_sleep():

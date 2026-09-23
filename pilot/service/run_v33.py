@@ -70,6 +70,7 @@ from service.v33 import (
 )
 from service.v33.actions import ActionKind
 from service.v33.executor import V33LiveExecutor, cancel_stale_open_orders
+from service.v33.shadow import DeepObservationLadder
 from service.v33.ledger import (
     append_v33_ledger_row,
     build_v33_ledger_row,
@@ -169,16 +170,25 @@ def build_executor_v33(
     """``armed`` -> the real ``V33LiveExecutor`` (requires a ProxyWriter); everything else -> the reused
     dry ``FrozenExecutor`` (refuses a real action kind). ``wing_cap`` = the chunk cap for coalesced wing
     takes = min(params.max_contracts_per_order_hint, proxy /health cap); the write pacer is sized from
-    params. A LiveExecutor is NEVER constructed unless armed."""
+    params. A LiveExecutor is NEVER constructed unless armed.
+
+    BELT (L2 review R2-N2): an armed executor MUST NOT guess the venue's contract cap. If ``wing_cap`` is
+    None -- the proxy /health cap was unreadable at window start -- REFUSE to build the armed executor
+    (raise) so the window fails closed rather than sizing wing chunks against an assumed cap. In practice
+    S5 (``v33_caps_agree``) already refuses to arm when /health has no caps, so armed implies a known cap;
+    this belt catches the race where the cap read failed AFTER the S5 gate passed."""
     if effective_mode == "armed":
         if writer is None:
             raise ValueError("armed executor requires a ProxyWriter")
-        cap = wing_cap if wing_cap is not None else params.max_contracts_per_order_hint
+        if wing_cap is None:
+            raise ValueError("armed executor requires a known proxy contract cap (wing_cap); the "
+                             "/health cap was unreadable -- refusing to size wings against a guess")
         return V33LiveExecutor(
             writer, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
             params.quote_end_s, k_rungs=params.rungs, clock=clock, batch_create=batch_create,
-            wing_cap=cap, write_tokens_per_s=params.write_tokens_per_s,
+            wing_cap=wing_cap, write_tokens_per_s=params.write_tokens_per_s,
             write_bucket_size=params.write_bucket_size,
+            write_reserve_tokens=params.write_reserve_tokens,
         )
     return R.FrozenExecutor(bucket_map)
 
@@ -217,6 +227,8 @@ class V33Driver:
         self._real_stand_downs: int = 0
         self._quote_end_cancel: bool = False
         self._dry_sim_fills: int = 0        # count of simulated rung fills (dry only)
+        # SO-3 deep-end observation ladder (16..25c): observation-only, runs in EVERY mode, never places.
+        self.deep_obs = DeepObservationLadder(params, state.close_epoch)
 
     # --- clock source ---
     def _stamp(self, server_ts: float) -> None:
@@ -247,6 +259,8 @@ class V33Driver:
         # yes_price >= 1 - n. Fill each crossed LIVE rung on the ladder's bucket. Sends nothing.
         if self.dry_sim:
             self._simulate_ladder_fills(market, ev, self._last_server_ts)
+        # SO-3 deep-end observation (16..25c), observation-only, EVERY mode. Sends nothing.
+        self._observe_deep(market, ev, self._last_server_ts)
 
     def on_clock_tick(self, server_ts: float) -> None:
         self._pump([ClockTick(server_ts=server_ts)])
@@ -334,6 +348,27 @@ class V33Driver:
                                  "count": o.count}, self.clock())
             self._pump([Fill(order_id=o.order_id, client_order_id=o.client_order_id,
                              count=Decimal(int(o.count)), price=o.price, side="no", server_ts=now)])
+
+    # --- SO-3 deep-end observation (16..25c; observation only, all modes) ---
+    def _observe_deep(self, market: str, trade: Trade, now: float) -> None:
+        """Fold a spot-bucket YES-taker print inside the quoting window into the deep observation ladder.
+        Gated to the ladder's spot bucket and the live quoting window T-quote_start .. T-quote_end, so the
+        deep observation measures exactly the counterfactual the live path could have reached. It NEVER
+        emits a Fill or touches an order path -- SO-3 is measurement, not a position."""
+        st = self.state
+        if trade.taker_side != "yes":
+            return
+        rest_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
+        if rest_sd is None:
+            return
+        bucket_ticker = st.bucket_tickers.get(rest_sd)
+        if bucket_ticker is None or market != bucket_ticker:
+            return
+        t_minus = st.close_epoch - now
+        if not (self.params.quote_end_s <= t_minus <= self.params.quote_start_s):
+            return
+        self.deep_obs.observe(taker_side=trade.taker_side, yes_price=trade.yes_price,
+                              count=trade.count, n_top=st.n_top, W=st.W, server_ts=now)
 
     # --- decide + route loop ---
     def _pump(self, events: list[Any]) -> None:
@@ -471,15 +506,28 @@ async def _order_status_poll_v33(
             break
         st = driver.state
         if batched:
-            rest_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
-            ticker = st.bucket_tickers.get(rest_sd) if rest_sd is not None else None
-            if ticker is None:
+            # R2-N4: poll EVERY bucket that still has a live rung, not just the current one. After a
+            # mid-window bucket change the core cancels the prior-bucket rungs, but one can FILL before its
+            # cancel confirms; polling only the new bucket would miss that fill (an un-hedged rung). Gather
+            # the current rest/spot bucket AND every distinct bucket a live ladder rung rests on.
+            tickers: set[str] = set()
+            cur_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
+            if cur_sd is not None and st.bucket_tickers.get(cur_sd):
+                tickers.add(st.bucket_tickers[cur_sd])
+            for o in st.ladder:
+                if o.live and o.order_id is not None:
+                    tk = st.bucket_tickers.get(o.bucket_Sd)
+                    if tk:
+                        tickers.add(tk)
+            if not tickers:
                 continue
-            try:
-                filled_by_oid = executor.poll_orders_for_bucket(ticker)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[V33] batched order-status poll error: %s", e)
-                continue
+            filled_by_oid: dict[str, int] = {}
+            for tk in tickers:
+                try:
+                    filled_by_oid.update(executor.poll_orders_for_bucket(tk))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[V33] batched order-status poll error for %s: %s", tk, e)
+                    continue
             for o in list(st.ladder):
                 if not o.live or o.order_id is None:
                     continue
@@ -565,7 +613,7 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         realized_delta=m.get("realized_delta"), realized_lock=m.get("realized_lock"),
         one_legged=m.get("one_legged"), realized_unsettled=m.get("realized_unsettled", False),
         lots_filled=m.get("lots_filled", 0), m15_tickers=list(m15_tickers or []),
-        m15_frames=shared.m15_frames,
+        m15_frames=shared.m15_frames, deep_obs=driver.deep_obs.summary(),
     )
     append_v33_ledger_row(row, ledger_path)
     summary = {
@@ -728,6 +776,16 @@ def main(argv: list[str] | None = None) -> int:
             journal.append("degrade_to_dry", {"reason": degrade_reason, "from_mode": resolved_mode,
                                                "reasons": list(outcome.reasons)}, clock())
             logger.warning("[V33] ARMED refused -> dry: %s", degrade_reason)
+        elif _proxy_max_contracts(health) is None:
+            # BELT (R2-N2): S5 passed but the /health contract cap read came back unreadable (a race). An
+            # armed executor MUST NOT guess the venue cap -> degrade to dry rather than size wings against a
+            # guess (build_executor_v33 would refuse to build it anyway; degrade so the window still runs).
+            effective_mode = "dry"
+            degrade = "degrade_to_dry"
+            degrade_reason = "proxy contract cap (/health max_contracts_per_order) unreadable at arm"
+            journal.append("degrade_to_dry", {"reason": degrade_reason, "from_mode": resolved_mode,
+                                               "reasons": [degrade_reason]}, clock())
+            logger.warning("[V33] ARMED refused -> dry: %s", degrade_reason)
 
     armed = effective_mode == "armed"
     shakedown = not armed
@@ -744,9 +802,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # wing-take chunk cap = min(params hint, the proxy's live MAX_CONTRACTS_PER_ORDER). At the proxy's
     # 2 today, K rung fills chunk into ceil(K/2) IOC takes per wing; if Brad raises it to 11, 1 take/wing.
+    # BELT (R2-N2): when the /health cap is UNREADABLE, wing_cap stays None so build_executor_v33 REFUSES
+    # to build an armed executor (fail closed, never guess). Dry never reads the cap (FrozenExecutor).
     proxy_cap = _proxy_max_contracts(health)
     wing_cap = (min(params.max_contracts_per_order_hint, proxy_cap)
-                if proxy_cap is not None else params.max_contracts_per_order_hint)
+                if proxy_cap is not None else None)
     executor = build_executor_v33(effective_mode, bucket_map=bucket_map, exchange_index_by_ticker=exch_map,
                                   journal=journal, close_epoch_val=cts, params=params, writer=writer,
                                   clock=clock, batch_create=args.batch_create, wing_cap=wing_cap)

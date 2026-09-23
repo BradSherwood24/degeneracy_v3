@@ -70,20 +70,95 @@ COST_CREATE = 10
 COST_AMEND = 10
 COST_CANCEL = 2
 
+# L3 (L2 review R2-N1): the backoff floor for a 429 with no Retry-After hint (a POST is never retried on
+# an UNKNOWN outcome -- timeout/5xx -- but a 429 is a DEFINITIVE non-execution: the venue throttled the
+# request and created nothing, so it is safe to re-send the SAME client_order_id once after a wait).
+RATE_LIMIT_RETRY_WAIT_S = 1.0
+_HTTP_TOO_MANY_REQUESTS = 429
+
+
+class _RateLimitWriter:
+    """A thin belt (L2 review R2-N1) around a ``ProxyWriter`` that distinguishes an HTTP 429 / rate-limit
+    response from a business rejection. A 429 on a POST is NOT a business reject and NOT an unknown
+    outcome: the venue throttled the request and executed NOTHING, so re-sending the SAME
+    ``client_order_id`` is safe (idempotency is preserved -- there is no first order to duplicate). On a
+    429 this wrapper waits (``Retry-After`` from the body if present, else the pacer's estimate, else
+    ``RATE_LIMIT_RETRY_WAIT_S``), journals ``rate_limited``, and retries the POST ONCE. A business 4xx /
+    5xx / timeout passes straight through unchanged (the executor's normal reject/unknown path handles
+    it). GET and DELETE pass straight through (GET is read-only; the base ``rest_delete`` already retries
+    429 internally). If the single retry is STILL 429, the response is returned as-is and the executor's
+    ``_reject_place`` override exempts a 429 status from the consecutive-reject stand-down."""
+
+    def __init__(self, inner: ProxyWriter, journal: Any, clock: Callable[[], float],
+                 sleep: Callable[[float], None], estimate_wait: Callable[[], float]) -> None:
+        self._inner = inner
+        self._journal = journal
+        self._clock = clock
+        self._sleep = sleep
+        self._estimate_wait = estimate_wait
+        self.rate_limited = 0        # 429s observed (post retry attempts) — surfaced on the exec counters
+
+    def _retry_after_s(self, resp: Any) -> float | None:
+        body = getattr(resp, "body", None)
+        if isinstance(body, dict):
+            for key in ("retry_after", "retry_after_s", "retry_after_seconds"):
+                v = body.get(key)
+                if v is not None:
+                    try:
+                        return max(0.0, float(v))
+                    except (TypeError, ValueError):
+                        pass
+        return None
+
+    def rest_post(self, path: str, body: dict[str, Any]) -> Any:
+        resp = self._inner.rest_post(path, body)
+        if getattr(resp, "status_code", None) != _HTTP_TOO_MANY_REQUESTS:
+            return resp
+        self.rate_limited += 1
+        wait = self._retry_after_s(resp)
+        if wait is None:
+            wait = self._estimate_wait() or RATE_LIMIT_RETRY_WAIT_S
+        try:
+            self._journal.append("rate_limited",
+                                 {"path": path, "coid": body.get("client_order_id"),
+                                  "wait_s": round(wait, 4), "retry": "once"}, self._clock())
+        except Exception:  # noqa: BLE001 — telemetry must never break the send path
+            pass
+        if wait > 0:
+            self._sleep(wait)
+        # retry ONCE (safe: a 429 executed nothing). A still-429 is returned as-is; _reject_place exempts
+        # it from the consecutive-reject stand-down (it is throttling, not a business rejection).
+        return self._inner.rest_post(path, body)
+
+    def rest_delete(self, path: str) -> Any:
+        return self._inner.rest_delete(path)
+
+    def rest_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._inner.rest_get(path, params)
+
 
 class WriteTokenBucket:
-    """A Basic-tier write-token pacer (MUST-FIX-4). Refills at ``rate`` tokens/s up to ``size``; a write
-    of ``cost`` tokens waits (via the injected ``sleep``) until the bucket has room, so a burst (an initial
-    11-create ladder = 110 tokens, or a chunked full-sweep wing take = 120) never exceeds the 100-token/s
-    budget the proxy would otherwise 429. PRIORITY writes (the T-5 cancel-all and the wing takes — the
-    safety-critical hedge/flatten) are served IMMEDIATELY: they draw the bucket down (possibly transiently
-    negative, bounded by their small cost) rather than queue behind pending ladder creates/amends. Every
-    paced wait is journaled ``write_paced``. Time comes only from the injected clock (replay-safe)."""
+    """A Basic-tier write-token pacer (MUST-FIX-4 + L3 R2-N1 headroom reserve). Refills at ``rate``
+    tokens/s up to ``size``; a write of ``cost`` tokens waits (via the injected ``sleep``) until the
+    bucket has room, so a burst (an initial 11-create ladder = 110 tokens, or a chunked full-sweep wing
+    take = 120) never exceeds the 100-token/s budget the proxy would otherwise 429. PRIORITY writes (the
+    T-5 cancel-all and the wing takes — the safety-critical hedge/flatten) are served IMMEDIATELY: they
+    draw the bucket down (possibly transiently negative, bounded by their small cost) rather than queue
+    behind pending ladder creates/amends.
+
+    HEADROOM RESERVE (L3, L2 review R2-N1): a NON-priority write (ladder create/amend) never draws the
+    bucket BELOW ``reserve`` tokens — it waits until the bucket holds ``cost + reserve`` — so a priority
+    cancel-all / wing burst that arrives right after a run of creates ALWAYS finds room and never itself
+    has to wait. A priority write ignores the reserve (it may spend into it, and even go transiently
+    negative). ``reserve`` is validated in the loader to be < ``size`` so a non-priority write can always
+    eventually proceed. Every paced wait is journaled ``write_paced``. Time comes only from the injected
+    clock (replay-safe)."""
 
     def __init__(self, rate: float, size: float, clock: Callable[[], float],
-                 sleep: Callable[[float], None], journal: Any = None) -> None:
+                 sleep: Callable[[float], None], journal: Any = None, reserve: float = 0.0) -> None:
         self.rate = float(rate)
         self.size = float(size)
+        self.reserve = max(0.0, float(reserve))
         self.tokens = float(size)
         self._last = clock()
         self._clock = clock
@@ -99,11 +174,13 @@ class WriteTokenBucket:
 
     def acquire(self, cost: int, kind: str, *, priority: bool = False) -> float:
         """Reserve ``cost`` tokens; return the seconds waited (0 for a priority write or an unconstrained
-        one). A non-priority write sleeps until the bucket holds ``cost``; a priority write proceeds now."""
+        one). A non-priority write sleeps until the bucket holds ``cost + reserve`` (so the reserve is
+        always left for a priority burst); a priority write proceeds now (ignoring the reserve)."""
         self._refill()
         wait = 0.0
-        if not priority and self.tokens < cost:
-            wait = (cost - self.tokens) / self.rate if self.rate > 0 else 0.0
+        floor = 0.0 if priority else self.reserve
+        if not priority and self.tokens < cost + floor:
+            wait = (cost + floor - self.tokens) / self.rate if self.rate > 0 else 0.0
             if wait > 0:
                 self._sleep(wait)
                 self.total_wait_s += wait
@@ -111,7 +188,8 @@ class WriteTokenBucket:
                 if self._journal is not None:
                     try:
                         self._journal.append("write_paced",
-                                             {"kind": kind, "cost": cost, "wait_s": round(wait, 4)},
+                                             {"kind": kind, "cost": cost, "reserve": self.reserve,
+                                              "wait_s": round(wait, 4)},
                                              self._clock())
                     except Exception:  # noqa: BLE001 — pacing telemetry must never break the send path
                         pass
@@ -144,9 +222,23 @@ class V33LiveExecutor(LiveExecutor):
         wing_cap: int | None = None,
         write_tokens_per_s: float = 100.0,
         write_bucket_size: float = 100.0,
+        write_reserve_tokens: float = 0.0,
     ) -> None:
+        # write-token pacer (MUST-FIX-4 + L3 R2-N1 reserve): a Basic-tier bucket so the initial 11-create
+        # ladder / chunked wing bursts never blow the 100 tokens/s budget; cancels + wing takes are
+        # priority (served now, ignoring the reserve), and a non-priority create/amend leaves
+        # ``write_reserve_tokens`` headroom so a priority burst always finds room.
+        self._pacer = WriteTokenBucket(write_tokens_per_s, write_bucket_size, clock, sleep, journal,
+                                       reserve=write_reserve_tokens)
+        # 429 belt (L2 review R2-N1): wrap the writer so a rate-limit response is retried once and NOT
+        # counted as a business rejection. super() stores this wrapped writer as ``self.writer``, so every
+        # inherited POST path (place/amend/wing/batch) gets the belt. GET/DELETE pass through.
+        self._rl_writer = _RateLimitWriter(
+            writer, journal, clock, sleep,
+            estimate_wait=lambda: max(0.0, (COST_CREATE - self._pacer.tokens) / self._pacer.rate)
+            if self._pacer.rate > 0 else RATE_LIMIT_RETRY_WAIT_S)
         super().__init__(
-            writer, bucket_map, exchange_index_by_ticker, journal, close_epoch, quote_end_s,
+            self._rl_writer, bucket_map, exchange_index_by_ticker, journal, close_epoch, quote_end_s,
             clock=clock, sleep=sleep,
         )
         self.k_rungs = int(k_rungs)
@@ -157,12 +249,15 @@ class V33LiveExecutor(LiveExecutor):
         if self.wing_cap < 1:
             self.wing_cap = 1
         self._pending_place_price: Decimal | None = None
-        # write-token pacer (MUST-FIX-4): a Basic-tier bucket so the initial 11-create ladder / chunked
-        # wing bursts never blow the 100 tokens/s budget; cancels + wing takes are priority (served now).
-        self._pacer = WriteTokenBucket(write_tokens_per_s, write_bucket_size, clock, sleep, journal)
         # per (batch_index, side) lots already TAKEN across chunks + retries, so a chunked wing take never
         # over-hedges: it only ever sends chunks for the remaining count (retries mint a new coid).
         self._wing_filled: dict[tuple[int, str], int] = defaultdict(int)
+        # R2-N3: notional (price*count) taken per (batch, side) CUMULATIVELY across the original take AND
+        # every retry chunk, so a leg that completes over multiple takes reports the true weighted-average
+        # price (not just the last take's average).
+        self._wing_notional: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal(0))
+        # strays cancelled by the pre-place invariant (surfaced on the ledger row).
+        self.rest_stray_cancels = 0
         # ladder-specific venue-truth counters (surfaced on the ledger row alongside the inherited ones)
         self.rest_invariant_overflow = 0     # venue already held >= K of ours at a place
         self.rest_invariant_dup_price = 0    # venue already held one of ours at the place price
@@ -177,6 +272,25 @@ class V33LiveExecutor(LiveExecutor):
             # record the price being placed so the pre-place invariant can check "no two on one price".
             self._pending_place_price = action.price
         return super().on_action(action, state, now)
+
+    # =====================================================================
+    # 429 exemption (L2 review R2-N1): a rate-limit response is throttling, not a business rejection
+    # =====================================================================
+    def _reject_place(self, coid: str, ticker: str, now: float, detail: dict, *,
+                      unknown: bool = False, n: Decimal | None = None) -> list[Any]:
+        """A place that came back 429 even after the rate-limit writer's single retry is THROTTLING, not a
+        business rejection: it executed nothing and must NOT count toward the 3-consecutive-reject
+        stand-down (else a burst of throttles would spuriously latch the hour). Journal ``rate_limited_reject``
+        and feed the core an ``OrderCancelled(0)`` so it clears the pending slot and re-solves (retries the
+        rung next tick, after the pacer has refilled). Any other rejection (business 4xx, unknown 5xx /
+        timeout) routes the inherited path unchanged (the consecutive counter, the unknown-outcome latch)."""
+        if detail.get("status") == _HTTP_TOO_MANY_REQUESTS and not unknown:
+            self.rests_rejected += 1
+            self._bump("rest_rate_limited")
+            self.journal.append("rate_limited_reject",
+                                {"client_order_id": coid, "ticker": ticker, **detail}, self.clock())
+            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+        return super()._reject_place(coid, ticker, now, detail, unknown=unknown, n=n)
 
     # =====================================================================
     # write-token pacing (MUST-FIX-4): pace each write before the inherited path sends it
@@ -270,15 +384,19 @@ class V33LiveExecutor(LiveExecutor):
                                "price": price, "fee": nr.average_fee_paid, "count": fc, "ts": now,
                                "path": "wing_chunk", "client_order_id": chunk_coid})
             self._bump("wing_fill")
-        # emit ONE Fill per original leg: full aggregate -> filled at the avg price; partial -> count 0
-        # (the core retries the WHOLE leg, but self._wing_filled makes the retry send only the remainder).
+        # emit ONE Fill per original leg: full aggregate -> filled at the WEIGHTED-AVERAGE price over ALL
+        # chunks incl. prior retries (R2-N3); partial -> count 0 (the core retries the WHOLE leg, but
+        # self._wing_filled makes the retry send only the remainder, tracked per (batch, side)).
         for lg in pending:
             key = (lg.batch, lg.side)
             got = agg_count.get(key, 0)
             self._wing_filled[key] += got
+            self._wing_notional[key] += agg_notional.get(key, Decimal(0))
             total = self._wing_filled[key]
             if total >= int(lg.count) and got > 0:
-                avg = (agg_notional[key] / got) if got else lg.limit
+                # cumulative weighted average across the original take + every retry chunk (never just
+                # this call's average — a leg completed over two takes reports the true blended price).
+                avg = (self._wing_notional[key] / total) if total else lg.limit
                 events.append(Fill(order_id=None, client_order_id=lg.client_order_id, count=Decimal(total),
                                    price=avg, side=lg.side, server_ts=now))
             elif key in leg_by_key:
@@ -440,6 +558,25 @@ class V33LiveExecutor(LiveExecutor):
         overflow, dup, strays = self._invariant_verdict(reread)
         if not (overflow or dup or strays):
             return None  # cleared on recheck -> the first read was lag -> proceed
+        # STRAY-ONLY handling (L3 decision, L2 review NIT-2). A stray is a resting ``v33-*`` order we
+        # cannot attribute to our RestBook. If venue truth OTHERWISE matches (no OVERFLOW past K, no DUP at
+        # the place price), a lone unattributable stray is most likely a crashed-process leftover the
+        # startup sweep raced, or a stale list entry -- standing the WHOLE window down would sacrifice K
+        # working rungs for one anomaly. DECISION: CANCEL the stray(s) + alarm, and PROCEED with this place
+        # (the ladder is restored to <= K, no-dup consistency; every v33-* coid is minted by our core, so a
+        # true stray is never a live rung of ours we would be cancelling out from under a fill). But an
+        # OVERFLOW or DUP means our accounting genuinely disagrees with the venue (the 21-rest incident
+        # class) -> keep the HARD stand-down below, whether or not strays are also present.
+        if strays and not (overflow or dup):
+            for r in strays:
+                self._cancel_stray(r, now)
+            self.rest_stray_cancels += len(strays)
+            info = {"strays": [r["client_order_id"] for r in strays], "count": len(strays),
+                    "coid_attempted": coid}
+            self._bump("rest_stray_cancelled")
+            self.journal.append("rest_stray_cancelled", info, self.clock())
+            self._record_alarm("rest_stray_cancelled", info)
+            return None  # ladder restored -> proceed with the place (the other rungs keep working)
         place_price = self._pending_place_price
         detail = {
             "count_resting": len(reread), "k": self.k_rungs, "coid_attempted": coid,
@@ -459,6 +596,26 @@ class V33LiveExecutor(LiveExecutor):
             self.stand_down_reason = "rest_invariant_violation"
         # Feed a filled-0 confirm so the core clears the pending slot; the stand-down blocks any replace.
         return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+
+    def _cancel_stray(self, r: dict[str, Any], now: float) -> None:
+        """DELETE one unattributable ``v33-*`` stray (priority-paced -- the cancel is safety-critical).
+        Fail-closed: a failed/404 cancel is journaled but never raises out of the place path. A 404 means
+        the stray was already terminal (off the book), which is the outcome we want."""
+        oid = r.get("order_id")
+        if oid is None:
+            return
+        exch = r.get("exchange_index")
+        exch_i = exch if isinstance(exch, int) else None
+        try:
+            self._pacer.acquire(COST_CANCEL, "stray_cancel", priority=True)
+            wr = self.writer.rest_delete(cancel_path(oid, exch_i))
+            self.journal.append("stray_cancel",
+                                {"order_id": oid, "client_order_id": r.get("client_order_id"),
+                                 "exchange_index": exch_i, "status": wr.status_code}, self.clock())
+        except Exception as e:  # noqa: BLE001 — never raise out of the place path
+            logger.warning("[V33-EXEC] stray cancel failed for %s: %s", oid, e)
+            self.journal.append("stray_cancel_error",
+                                {"order_id": oid, "error": str(e)}, self.clock())
 
     # =====================================================================
     # OPTIONAL batch create (default OFF) — chunked /portfolio/orders/batched
