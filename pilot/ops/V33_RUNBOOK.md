@@ -162,7 +162,69 @@ timezone, SIGTERM grace 300 s (the supervisor's is 240 s), deploys only in a :02
 
 ---
 
-## 8. Brad's levers (nothing here is Claude's to pull)
+## 8. V3.3 dry ladder alongside V3.2 (Phase L2 -- the side-by-side watch)
+
+Phase L2 adds a SECOND roster, `DegeneracyV3_3`, that runs the rolling K-rung ladder in DRY next to the
+live V3.2. It **sends nothing**: it runs the full V3.3 core against the live feed, journals every order it
+WOULD send, and SIMULATES ladder fills with the ideal rule (a spot-bucket YES-taker print at
+`yes_price >= 1 - rung price` fills that rung; wings priced from the live strike book at fill time). Those
+fills land in `ledger/v33_ledger.jsonl` as `dry_sim` -- clearly labelled, NEVER realised money. Brad's
+words (2026-09-22): "run it along side V3.2 without it trading, then flip V3.3 to contracts 10 and V3.2 to
+0. Just to watch and compare."
+
+V3.3 keeps its own writable state, all routed through `service.paths` + `DV3_DATA_DIR` exactly like V3.2:
+
+| thing | V3.2 | V3.3 |
+|---|---|---|
+| mode file | `ops/v32_mode.txt` | `ops/v33_mode.txt` (**absent -> dry**, never armed by default) |
+| ledger | `ledger/v32_ledger.jsonl` | `ledger/v33_ledger.jsonl` |
+| journals | `journals_v32/` | `journals_v33/` |
+| logs | `logs_v32/` | `logs_v33/` |
+| day guard | `ops/v32_stops_<day>.json` | `ops/v33_stops_<day>.json` |
+| coid prefix | `v32-*` | `v33-*` (the sweep + venue read NEVER touch the other roster) |
+
+### Run one V3.3 dry window by hand (sends nothing)
+From `pilot\`:
+```
+python -m service.run_v33 --mode dry
+```
+(or via the supervisor: `python -m service.supervisor --roster v33 --once --now`). Confirm it sent nothing:
+its journal (`journals_v33\<close>.jsonl.gz`) has only `would_place_rest`/`would_amend_rest`/
+`would_cancel_rest`/`dry_sim_fill` records and no `place_rest`/`amend_rest`/`take_wings`; and the proxy
+`GET /health` `orders_remaining_today` is unchanged before/after.
+
+### Register the dry ladder as a third task (Brad, in a :02-:33 window)
+```
+powershell -ExecutionPolicy Bypass -File ops\register_supervisor_tasks.ps1 -WithV33 -DryRun   # preview
+powershell -ExecutionPolicy Bypass -File ops\register_supervisor_tasks.ps1 -WithV33           # apply
+```
+`-WithV33` registers `DegeneracyV3_3` = `python -m service.supervisor --roster v33` (its own boot sweep is a
+no-op in dry and, when armed later, sweeps ONLY `v33-*`). It is SEPARATE from the two base tasks; running
+it alongside `DegeneracyV3_Supervisor` (V3.2) is expected -- the "never two drivers" rule is about two
+drivers of the SAME roster, not the two different rosters.
+
+### Read the comparison
+```
+python -m service.v33.report --days 3
+```
+prints the per-window LADDER block and a SIDE-BY-SIDE block (V3.2 realised/dry set lock vs V3.3
+dry_sim/realised ladder lock, per hour both wrote a row, with running totals).
+
+### The flip (Brad's hands only, in a :02-:33 window; NEVER between :38 and :59)
+After the dry side-by-side proves V3.3 runs as expected (>= 2 days, PLAN_V33 step 4-5), arm V3.3 and stand
+V3.2 down IN THE SAME WINDOW so only ONE roster is armed per bucket:
+```
+echo armed> ops\v33_mode.txt          # (or the DV3_DATA_DIR copy)
+echo dry> ops\v32_mode.txt            # V3.2 stops placing; its falsifier closes with the Q4 line
+```
+Before flipping to armed, Brad applies the proxy amend cap (`ops/proxy_amend_cap.md`) and raises
+`DAILY_ORDER_BUDGET` to 8000 (PLAN_V33 Q6/step 1). Until the amend cap is applied, the roll runs
+cancel->create per order (the executor's default fallback path) -- correct, just more orders. The V3.3
+falsifier (`ceremony/v33_falsifier.md`, drafted in L3) MUST carry `STATUS: FROZEN` before S5 will arm.
+
+---
+
+## 9. Brad's levers (nothing here is Claude's to pull)
 
 - Registering / unregistering any scheduled task (`register_supervisor_tasks.ps1`,
   `unregister_v32_task.ps1`, `register_v32_task.ps1`).

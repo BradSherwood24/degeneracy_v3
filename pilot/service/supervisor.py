@@ -179,10 +179,15 @@ class PopenChild:
             pass
 
 
-def _default_spawn(child_args: list[str]) -> PopenChild:
-    """Spawn ``python -m service.run_v32 <child_args>`` from the pilot dir (same as the scheduled
-    task). The child inherits the environment (DV3_DATA_DIR / DV3_PROXY_BASE / mode file govern it)."""
-    cmd = [sys.executable, "-m", "service.run_v32", *child_args]
+_ROSTER_MODULE = {"v32": "service.run_v32", "v33": "service.run_v33"}
+
+
+def _default_spawn(child_args: list[str], module: str = "service.run_v32") -> PopenChild:
+    """Spawn ``python -m <module> <child_args>`` from the pilot dir (same as the scheduled task). The
+    child inherits the environment (DV3_DATA_DIR / DV3_PROXY_BASE / mode file govern it). ``module`` is
+    ``service.run_v32`` for the live roster (default, byte-identical to before) or ``service.run_v33``
+    for the V3.3 dry ladder alongside it (Brad's ``-WithV33`` task)."""
+    cmd = [sys.executable, "-m", module, *child_args]
     kwargs: dict[str, Any] = {"cwd": pilot_dir()}
     if os.name == "nt":
         # A new process group is required for CTRL_BREAK_EVENT to reach the child on Windows.
@@ -273,29 +278,33 @@ def _default_boot_sweep(
     retry_interval_s: float = BOOT_SWEEP_RETRY_INTERVAL_S,
     ready_fn: Callable[[str], bool] = _proxy_ready,
     sleep: Callable[[float], None] = time.sleep,
+    roster: str = "v32",
 ) -> dict[str, Any]:
-    """Cancel stray resting ``v32-*`` KXBTC orders via the proxy (crash-recovery on boot).
+    """Cancel stray resting KXBTC orders of THIS roster via the proxy (crash-recovery on boot).
 
+    - ``roster`` selects which roster's coids and mode file: ``v32`` (default; sweeps ``v32-*`` via
+      ``service.v32.executor.cancel_stale_open_orders``, reads ``v32_mode.txt``) or ``v33`` (sweeps
+      ``v33-*`` ONLY -- never the concurrently-armed V3.2 rests -- via
+      ``service.v33.executor.cancel_stale_open_orders``, reads ``v33_mode.txt``).
     - ``--dry-sweep``: list what WOULD be cancelled (read-only), issue no DELETE. Independent of mode.
-    - mode != ``armed`` (from the mode file): a no-op with a log line (nothing is placed in dry, so
-      nothing of ours should be resting to cancel; if a prior armed run left rests, ``--dry-sweep`` or
-      an armed boot clears them). No proxy is touched -> no readiness wait.
-    - mode == ``armed``: the real sweep. Fail-closed: an unreachable proxy just cancels nothing
-      (``cancel_stale_open_orders`` swallows the read error and returns zeros).
+    - mode != ``armed`` (from the roster's mode file): a no-op with a log line (nothing is placed in dry).
+    - mode == ``armed``: the real sweep. Fail-closed: an unreachable proxy just cancels nothing.
 
-    Before any proxy-touching sweep it waits (bounded, explicit ``max_attempts`` / ``retry_interval_s``,
-    one log line per attempt) for the proxy to answer ``/health`` -- a fresh host boot may start the
-    supervisor before the proxy is up. It proceeds regardless once the attempts are spent (the sweep is
-    already fail-closed).
+    Before any proxy-touching sweep it waits (bounded) for the proxy to answer ``/health``.
     """
     from service.proxy_writer import ProxyWriter
-    from service.v32.executor import cancel_stale_open_orders
+    if roster == "v33":
+        from service.v33.executor import cancel_stale_open_orders
+    else:
+        from service.v32.executor import cancel_stale_open_orders
 
-    mode = _read_mode_safe()
+    # v32 keeps the historic zero-arg call (tests patch it that way); v33 passes its roster explicitly.
+    mode = _read_mode_safe() if roster == "v32" else _read_mode_safe(roster)
     journal = _LogJournal(log)
     if not dry_sweep and mode != "armed":
-        result = {"skipped": True, "mode": mode, "found": 0, "cancelled": 0, "errors": 0}
-        log(f"boot_sweep skipped (mode={mode}, not armed)")
+        result = {"skipped": True, "roster": roster, "mode": mode, "found": 0, "cancelled": 0,
+                  "errors": 0}
+        log(f"boot_sweep skipped (roster={roster}, mode={mode}, not armed)")
         return result
 
     ready = _boot_sweep_wait_ready(
@@ -320,10 +329,16 @@ def _default_boot_sweep(
 _VALID_MODES = ("shakedown", "dry", "armed")
 
 
-def _read_mode_safe() -> str:
-    """Read the V3.2 mode file; unknown/absent/error -> ``shakedown`` (fail-closed, never raises)."""
+def _read_mode_safe(roster: str = "v32") -> str:
+    """Read the roster's mode file; unknown/absent/error -> ``shakedown`` (fail-closed, never raises).
+
+    ``v32`` reads ``v32_mode.txt`` (missing -> shakedown, as before). ``v33`` reads ``v33_mode.txt``;
+    absent there means the V3.3 dry ladder is not deployed, so the sweep is a no-op -> ``shakedown`` too
+    (a missing v33 mode file NEVER arms the boot sweep)."""
+    from service.paths import mode_path_v33
+    path = mode_path_v33() if roster == "v33" else mode_path_v32()
     try:
-        with open(mode_path_v32(), "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             raw = f.read().strip().lower()
         return raw if raw in _VALID_MODES else "shakedown"
     except OSError:
@@ -382,7 +397,9 @@ class Supervisor:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         log_path: str | None = None,
         install_signals: bool = True,
+        roster: str = "v32",
     ) -> None:
+        self._roster = roster if roster in _ROSTER_MODULE else "v32"
         self._proxy_base = proxy_base
         self._child_args = list(child_args or [])
         self._once = once
@@ -394,17 +411,23 @@ class Supervisor:
         self._boot_sweep_max_attempts = boot_sweep_max_attempts
         self._boot_sweep_retry_interval_s = boot_sweep_retry_interval_s
         self._clock = clock
-        self._spawn = spawn or _default_spawn
+        self._spawn = spawn or (lambda ca: _default_spawn(ca, _ROSTER_MODULE[self._roster]))
         self._sweep = sweep or (
             lambda base: _default_boot_sweep(
                 base, dry_sweep=self._dry_sweep, clock=self._clock, log=logger.info,
                 max_attempts=self._boot_sweep_max_attempts,
-                retry_interval_s=self._boot_sweep_retry_interval_s,
+                retry_interval_s=self._boot_sweep_retry_interval_s, roster=self._roster,
             )
         )
         self._rotate = rotate or (lambda jd: _default_rotate(jd, clock=self._clock))
         self._on_event = on_event
-        self._log_path = log_path if log_path is not None else supervisor_log_path()
+        if log_path is not None:
+            self._log_path = log_path
+        elif self._roster == "v33":
+            from service.paths import log_dir_v33
+            self._log_path = os.path.join(log_dir_v33(), "supervisor.out")
+        else:
+            self._log_path = supervisor_log_path()
 
         self._install_signals = install_signals
         self._stop_event = threading.Event()
@@ -499,6 +522,7 @@ class Supervisor:
         self._emit({
             "event": "boot",
             "at": _iso(self._clock()),
+            "roster": self._roster,
             "proxy_base": self._proxy_base,
             "once": self._once,
             "dry_sweep": self._dry_sweep,
@@ -534,7 +558,9 @@ class Supervisor:
             first = False
 
             try:
-                rot = self._rotate(journal_dir_v32())
+                from service.paths import journal_dir_v33
+                jdir = journal_dir_v33() if self._roster == "v33" else journal_dir_v32()
+                rot = self._rotate(jdir)
             except Exception as e:  # noqa: BLE001 - rotation must never affect the window run
                 logger.warning("[SUPERVISOR] journal rotation failed (ignored): %s", e)
                 rot = {"error": repr(e)}
@@ -547,6 +573,7 @@ class Supervisor:
             duration = self._clock() - start
             self._emit({
                 "event": "window",
+                "roster": self._roster,
                 "wake": wake_iso,
                 "pid": getattr(child, "pid", None),
                 "exit_code": rc,
@@ -582,8 +609,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--proxy-base", default=None,
                    help="Proxy base URL for the boot sweep (default: $DV3_PROXY_BASE else "
                         "http://127.0.0.1:8642).")
+    p.add_argument("--roster", choices=("v32", "v33"), default="v32",
+                   help="Which roster this supervisor drives: v32 (default; run_v32 + v32-* boot sweep + "
+                        "v32_mode.txt) or v33 (run_v33 + v33-* boot sweep + v33_mode.txt, the dry ladder "
+                        "alongside V3.2). Default is byte-identical to before.")
     p.add_argument("--child-args", nargs=argparse.REMAINDER, default=[],
-                   help="Everything after this flag is passed verbatim to run_v32 (must be last).")
+                   help="Everything after this flag is passed verbatim to the child (must be last).")
     return p
 
 
@@ -598,6 +629,7 @@ def main(argv: list[str] | None = None) -> int:
         once=args.once,
         run_now=args.now,
         dry_sweep=args.dry_sweep,
+        roster=args.roster,
     )
     return sup.run()
 
