@@ -22,6 +22,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
@@ -42,11 +43,77 @@ DEFAULT_LAG_THRESHOLD = 30.0
 DEFAULT_SILENCE_THRESHOLD = 45.0
 DEFAULT_POLL_SECONDS = 0.5
 
+# Slack added to the per-dial connect timeout: the deadline supervisor (polling every
+# DEFAULT_POLL_SECONDS) is the PRIMARY close at the deadline; this asyncio.wait_for bound is the
+# in-loop backstop that cancels a dial which outran the deadline (e.g. a socket that dialed after
+# close and then sat idle on a dead market -- the 2026-09-23 hang). Small so the backstop is prompt,
+# but large enough that a healthy deadline close via the supervisor never trips it.
+CONNECT_TIMEOUT_SLACK_S = 5.0
+
+# In-process HARD STOP grace (belt-and-braces): if the whole window is STILL running this long after
+# its own deadline (close + GRACE_SECONDS), a daemon timer force-exits the process. This is the same
+# figure the supervisor's external watchdog uses (service.supervisor.WATCHDOG_GRACE_S = 120 s, keyed
+# off close, not off the deadline), so this in-process stop lands at close + GRACE_SECONDS + 120 =
+# close + 130 s -- deliberately a hair AFTER the supervisor's close+120 s kill so the two never race
+# (the supervisor, when present, wins; this covers the plain-task V3.2 run that has no supervisor).
+HARD_STOP_GRACE_S = 120.0
+# Process exit code used by the hard stop (distinct from a clean 0 / a stand-down).
+HARD_STOP_EXIT_CODE = 3
+
 CONTINUE = "continue"
 FORCE_CLOSE = "force_close"
 DEADLINE = "deadline"
 
 DEFAULT_JOURNAL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "journals")
+
+
+def arm_hard_stop(
+    deadline: float,
+    close_label: str,
+    *,
+    grace_s: float = HARD_STOP_GRACE_S,
+    exit_code: int = HARD_STOP_EXIT_CODE,
+    clock: Callable[[], float] = time.time,
+    exit_fn: Callable[[int], None] = os._exit,
+    timer_factory: Callable[[float, Callable[[], None]], Any] = threading.Timer,
+) -> Any:
+    """Arm an out-of-asyncio HARD STOP so a window can NEVER outlive its close + a grace, even if the
+    event loop is fully blocked (e.g. inside the SYNC ``proxy_auth.ws_connect_params()`` mint, which
+    holds the loop so no ``wait_for`` timeout or supervisor tick can ever fire -- the 2026-09-23 hang).
+
+    Returns the armed (started, daemon) timer; the caller MUST ``.cancel()`` it on the normal exit
+    path. Fires at ``deadline + grace_s`` measured on the real wall clock: logs one clear line, flushes
+    logging handlers, and calls ``exit_fn(exit_code)`` (``os._exit`` in production -- a hard exit that
+    does NOT run atexit/finalizers, because the point is that something is wedged). ``exit_fn``,
+    ``timer_factory`` and ``clock`` are injected so tests exercise the arming/firing/cancel without
+    ever exiting the test process.
+
+    The timer thread is a daemon so it can never, by itself, keep the process alive.
+    """
+    fire_at = deadline + grace_s
+    delay = max(0.0, fire_at - clock())
+    since_close = int(round(grace_s + GRACE_SECONDS))  # close+130 s with the defaults
+
+    def _fire() -> None:
+        logger.critical(
+            "[HARD-STOP] window %s still running at close+%ds; exiting %d",
+            close_label, since_close, exit_code,
+        )
+        for h in list(logging.getLogger().handlers):
+            try:
+                h.flush()
+            except Exception:  # noqa: BLE001 - never let a flush error swallow the hard stop
+                pass
+        exit_fn(exit_code)
+
+    timer = timer_factory(delay, _fire)
+    # threading.Timer is a Thread subclass; guard for injected fakes that may not expose `daemon`.
+    try:
+        timer.daemon = True
+    except Exception:  # noqa: BLE001
+        pass
+    timer.start()
+    return timer
 
 
 def next_top_of_hour_iso(now_epoch: float) -> str:
@@ -209,43 +276,67 @@ async def run_recording(
     silence_threshold: float = DEFAULT_SILENCE_THRESHOLD,
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    connect_timeout_slack: float = CONNECT_TIMEOUT_SLACK_S,
 ) -> WindowRecorder:
     """Drive connect/reconnect until the deadline, with a supervisor that force-closes on a watchdog
-    trip or at the deadline. `sleep` is injected so tests drive the supervisor deterministically."""
+    trip or at the deadline. `sleep` is injected so tests drive the supervisor deterministically.
+
+    Deadline safety (2026-09-23 hang fix): a plain ``force_close()`` is a NO-OP while ``connect()`` is
+    still minting params / dialing (``ws.ws is None``), so a deadline that lands mid-dial used to let
+    the supervisor exit, the dial complete unsupervised, and ``handler()`` sit forever on an idle
+    socket. Two guards now prevent that: (1) the supervisor, once it decides to end the window
+    (DEADLINE or a watchdog trip), keeps retrying ``force_close()`` on every tick until the connect
+    task ends (``stop`` set) rather than returning after a single no-op close; (2) each dial is bounded
+    by ``asyncio.wait_for`` at ``deadline + slack`` so a dial that outran the deadline is cancelled
+    even if the supervisor's close never lands. No new dial can start at/after the deadline: the
+    ``while ... < deadline`` guard is the only place a dial begins."""
     ws = recorder.ws_client
     assert ws is not None, "recorder.ws_client must be set before run_recording"
     while recorder.clock() < deadline:
         stop = asyncio.Event()
 
         async def supervise() -> None:
+            forcing = False  # latched once we decide to end this dial; then we retry the close
             while not stop.is_set():
                 await sleep(poll_seconds)
                 if stop.is_set():
                     return
-                action = watchdog_action(
-                    recorder.clock(),
-                    deadline,
-                    ws.data_age_seconds(),
-                    ws.silence_seconds(),
-                    lag_threshold,
-                    silence_threshold,
-                )
-                if action == CONTINUE:
-                    continue
-                if action == FORCE_CLOSE:
-                    recorder.record_alarm(
-                        "watchdog_stale",
-                        {
-                            "data_age_seconds": ws.data_age_seconds(),
-                            "silence_seconds": ws.silence_seconds(),
-                        },
+                if not forcing:
+                    action = watchdog_action(
+                        recorder.clock(),
+                        deadline,
+                        ws.data_age_seconds(),
+                        ws.silence_seconds(),
+                        lag_threshold,
+                        silence_threshold,
                     )
+                    if action == CONTINUE:
+                        continue
+                    if action == FORCE_CLOSE:
+                        recorder.record_alarm(
+                            "watchdog_stale",
+                            {
+                                "data_age_seconds": ws.data_age_seconds(),
+                                "silence_seconds": ws.silence_seconds(),
+                            },
+                        )
+                    forcing = True
+                # End-of-dial: close the live socket if there is one. A no-op close (dial still
+                # minting, ws is None) does NOT end supervision -- we loop and retry so the close
+                # lands the moment the socket exists. The trailing yield lets connect() unwind and
+                # set `stop` even when the injected `sleep` does not yield (deterministic tests).
                 await ws.force_close()
-                return
+                await asyncio.sleep(0)
 
         sup = asyncio.create_task(supervise())
         try:
-            await ws.connect()
+            timeout = max(0.0, deadline - recorder.clock()) + connect_timeout_slack
+            await asyncio.wait_for(ws.connect(), timeout=timeout)
+        except asyncio.TimeoutError:
+            # The dial outran the deadline (event-loop-blocking mint, or an idle handler on a dead
+            # market that the supervisor's close could not reach). A normal end-of-window close, not
+            # an error -- journal an alarm, do not log it as a failure.
+            recorder.record_alarm("deadline_forced_close", {"deadline": deadline})
         except Exception as e:  # noqa: BLE001 - a dial failure is logged + journaled, then retried
             logger.warning("[RECORD] connection error: %s", e)
             recorder.record_alarm("ws_error", {"error": str(e)})

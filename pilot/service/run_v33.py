@@ -47,6 +47,7 @@ from service.record_range import RANGE_SERIES, StreamJournal, discover_range_mar
 from service.record_window import (
     GRACE_SECONDS,
     _append_summary,
+    arm_hard_stop,
     next_top_of_hour_iso,
     write_standdown_summary,
 )
@@ -850,6 +851,11 @@ def main(argv: list[str] | None = None) -> int:
     deadline = cts + GRACE_SECONDS
     gate = R.connect_gate_epoch(cts, params)
     lag_sampler = R.LagSampler({"strikes": strike_ws, "buckets": bucket_ws})
+    # HARD STOP (belt-and-braces): a daemon timer force-exits at close + 130 s if the window is still
+    # running. V3.3 also runs under service.supervisor, whose external watchdog kills at close + 120 s;
+    # this in-process stop lands a hair later (130 s) so the supervisor, when present, always wins the
+    # race and this never fights it -- but the guarantee still holds if V3.3 is ever run bare.
+    hard_stop = arm_hard_stop(deadline, close_iso)
     try:
         asyncio.run(run_v33_window(shared, strike_conn, bucket_conn, driver, clock, deadline, gate,
                                    order_poll=armed, lag_sampler=lag_sampler))
@@ -873,6 +879,7 @@ def main(argv: list[str] | None = None) -> int:
                             lag_stats=lag_sampler.summaries(), clock=clock,
                             m15_tickers=list(m15_disc.tickers), armed=armed, degrade_reason=degrade_reason)
         logger.info("[V33] window done: %s", summary)
+        hard_stop.cancel()  # normal exit: disarm the belt-and-braces hard stop
     return 0
 
 

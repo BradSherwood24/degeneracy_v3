@@ -13,7 +13,11 @@ from service.record_window import (
     CONTINUE,
     DEADLINE,
     FORCE_CLOSE,
+    GRACE_SECONDS,
+    HARD_STOP_EXIT_CODE,
+    HARD_STOP_GRACE_S,
     WindowRecorder,
+    arm_hard_stop,
     next_top_of_hour_iso,
     run_recording,
     watchdog_action,
@@ -210,3 +214,180 @@ def test_standdown_summary_written(tmp_path) -> None:
     with open(spath) as f:
         line = json.loads(f.readline())
     assert line["close_time"] == CLOSE and line["stand_down"] is True
+
+
+# === 2026-09-23 hang: deadline-mid-dial escape + wait_for backstop ===
+
+
+class _EscapeFakeWs:
+    """Reproduces the 2026-09-23 hang. The deadline lands while ``connect()`` is still minting (``ws``
+    is None), so the FIRST force_close is a no-op; THEN the in-flight dial completes and ``handler()``
+    would idle forever on a dead market. The fixed supervisor must keep supervising through the no-op
+    close and close the socket once it exists, and no new dial must start after the deadline."""
+
+    def __init__(self) -> None:
+        self.ws = None            # phase A: minting -- no live socket the close can reach
+        self.calls = 0
+        self.noop_closes = 0
+        self.real_closes = 0
+        self._dialed = asyncio.Event()   # released when the (post-deadline) dial completes
+        self._closed = asyncio.Event()   # released only by a real force_close (live socket)
+
+    async def connect(self):
+        self.calls += 1
+        self.ws = None
+        await self._dialed.wait()        # the dial completes only after the deadline no-op close
+        await self._closed.wait()        # phase B: socket live; handler idles until force_close
+
+    async def force_close(self):
+        if self.ws is None:
+            self.noop_closes += 1
+            # Model the incident: the mint/dial in flight completes right after the no-op close.
+            self.ws = object()
+            self._dialed.set()
+            return
+        self.real_closes += 1
+        self._closed.set()
+
+    def data_age_seconds(self):
+        return None                       # unmeasured -- still in per-dial startup grace
+
+    def silence_seconds(self):
+        return 0.0
+
+    def current_lag_seconds(self):
+        return None
+
+
+def test_run_recording_deadline_mid_dial_does_not_hang() -> None:
+    clock = FakeClock(0.0)
+    rec = WindowRecorder(make_wake_result(), Journal(), clock=clock)
+    ws = _EscapeFakeWs()
+    rec.ws_client = ws
+
+    async def yielding_sleep(_):
+        await asyncio.sleep(0)  # let connect() make progress between supervisor ticks
+        clock.t += 60.0
+
+    async def _run():
+        # A real-time guard: the OLD code hangs here (connect never returns after the no-op close);
+        # the fixed code returns promptly. asyncio.TimeoutError would fail the test.
+        await asyncio.wait_for(
+            run_recording(rec, deadline=100.0, sleep=yielding_sleep), timeout=5.0
+        )
+
+    asyncio.run(_run())
+    assert ws.calls == 1          # no new dial started at/after the deadline
+    assert ws.noop_closes >= 1    # supervisor kept supervising through the no-op close...
+    assert ws.real_closes == 1    # ...and closed the socket once it existed
+
+
+class _WedgedFakeWs:
+    """A dial that never returns and whose force_close never lands (models an idle handler the close
+    cannot reach). Only the ``asyncio.wait_for`` backstop can end it. connect() jumps the clock past
+    the deadline so the loop does not re-dial once the wedged dial is cancelled."""
+
+    def __init__(self, clock, deadline) -> None:
+        self._clock = clock
+        self._deadline = deadline
+        self.ws = object()
+        self.calls = 0
+        self.force_closed = 0
+        self._never = asyncio.Event()
+
+    async def connect(self):
+        self.calls += 1
+        self._clock.t = self._deadline + 100.0
+        await self._never.wait()
+
+    async def force_close(self):
+        self.force_closed += 1  # a close that cannot reach the wedged dial
+
+    def data_age_seconds(self):
+        return None
+
+    def silence_seconds(self):
+        return 0.0
+
+    def current_lag_seconds(self):
+        return None
+
+
+def test_run_recording_wait_for_backstop_cancels_wedged_dial() -> None:
+    clock = FakeClock(99.99)  # a hair before the deadline so the real wait_for timeout is short
+    rec = WindowRecorder(make_wake_result(), Journal(), clock=clock)
+    ws = _WedgedFakeWs(clock, deadline=100.0)
+    rec.ws_client = ws
+
+    async def _run():
+        await asyncio.wait_for(
+            run_recording(rec, deadline=100.0, poll_seconds=0.02, connect_timeout_slack=0.05),
+            timeout=5.0,
+        )
+
+    asyncio.run(_run())
+    alarms = [r for r in rec.journal.iter_records()
+              if r["kind"] == "alarm" and r["obj"].get("alarm") == "deadline_forced_close"]
+    assert alarms                 # the wedged dial was cancelled and journaled as a deadline close
+    assert ws.calls == 1          # exactly one dial, no re-dial after the deadline
+
+
+# === in-process HARD STOP (belt-and-braces) ===
+
+
+class _FakeTimer:
+    """A stand-in for threading.Timer: records arming/cancel and fires on demand (never a real thread,
+    never a real os._exit)."""
+
+    def __init__(self, delay, fn) -> None:
+        self.delay = delay
+        self.fn = fn
+        self.started = False
+        self.cancelled = False
+        self.daemon = False
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.fn()
+
+
+def test_arm_hard_stop_arms_daemon_timer_at_deadline_plus_grace() -> None:
+    made: dict[str, _FakeTimer] = {}
+
+    def factory(delay, fn):
+        t = _FakeTimer(delay, fn)
+        made["t"] = t
+        return t
+
+    exits: list[int] = []
+    clock = FakeClock(1000.0)
+    timer = arm_hard_stop(2000.0, CLOSE, grace_s=120.0,
+                          clock=clock, exit_fn=exits.append, timer_factory=factory)
+    assert timer is made["t"]
+    assert made["t"].started is True
+    assert made["t"].daemon is True                 # can never keep the process alive on its own
+    assert abs(made["t"].delay - 1120.0) < 1e-9     # (deadline 2000 + grace 120) - now 1000
+    assert exits == []                              # not fired
+    timer.cancel()
+    assert made["t"].cancelled is True
+
+
+def test_arm_hard_stop_fires_exit_code_when_not_cancelled() -> None:
+    exits: list[int] = []
+    clock = FakeClock(0.0)
+    t = arm_hard_stop(10.0, CLOSE, grace_s=5.0, clock=clock, exit_fn=exits.append,
+                      timer_factory=lambda d, f: _FakeTimer(d, f))
+    t.fire()                                        # simulate the timer elapsing (no real os._exit)
+    assert exits == [HARD_STOP_EXIT_CODE]
+
+
+def test_hard_stop_grace_lands_just_after_supervisor_watchdog() -> None:
+    # The in-process stop fires at close + GRACE_SECONDS + HARD_STOP_GRACE_S = close + 130 s, a hair
+    # after service.supervisor's external close + 120 s watchdog, so the two never race.
+    assert HARD_STOP_GRACE_S == 120.0
+    assert GRACE_SECONDS + HARD_STOP_GRACE_S == 130.0

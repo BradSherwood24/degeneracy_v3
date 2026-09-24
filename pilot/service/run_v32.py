@@ -79,6 +79,7 @@ from service.record_range import (
 from service.record_window import (
     GRACE_SECONDS,
     _append_summary,
+    arm_hard_stop,
     next_top_of_hour_iso,
     run_recording,
     write_standdown_summary,
@@ -1991,6 +1992,11 @@ def main(argv: list[str] | None = None) -> int:
     deadline = cts + GRACE_SECONDS
     gate = connect_gate_epoch(cts, params)
     lag_sampler = LagSampler({"strikes": strike_ws, "buckets": bucket_ws})
+    # HARD STOP (belt-and-braces): a daemon timer force-exits this process at close + 130 s if the
+    # window is somehow still running (a wedged mint/dial holding the event loop, past which no
+    # in-asyncio guard can fire). The plain V3.2 scheduled task has no external supervisor watchdog,
+    # so this is its only guarantee it cannot outlive its window and starve the next hour's fire.
+    hard_stop = arm_hard_stop(deadline, close_iso)
     try:
         asyncio.run(run_v32_window(shared, strike_conn, bucket_conn, driver, clock, deadline, gate,
                                    order_poll=armed, lag_sampler=lag_sampler))
@@ -2022,6 +2028,7 @@ def main(argv: list[str] | None = None) -> int:
             degrade_reason=degrade_reason,
         )
         logger.info("[V32] window done: %s", summary)
+        hard_stop.cancel()  # normal exit: disarm the belt-and-braces hard stop
     return 0
 
 
