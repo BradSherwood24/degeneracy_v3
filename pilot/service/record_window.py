@@ -81,17 +81,24 @@ def arm_hard_stop(
     event loop is fully blocked (e.g. inside the SYNC ``proxy_auth.ws_connect_params()`` mint, which
     holds the loop so no ``wait_for`` timeout or supervisor tick can ever fire -- the 2026-09-23 hang).
 
-    Returns the armed (started, daemon) timer; the caller MUST ``.cancel()`` it on the normal exit
-    path. Fires at ``deadline + grace_s`` measured on the real wall clock: logs one clear line, flushes
-    logging handlers, and calls ``exit_fn(exit_code)`` (``os._exit`` in production -- a hard exit that
-    does NOT run atexit/finalizers, because the point is that something is wedged). ``exit_fn``,
-    ``timer_factory`` and ``clock`` are injected so tests exercise the arming/firing/cancel without
-    ever exiting the test process.
+    Returns the (daemon) timer; the caller MUST ``.cancel()`` it on the normal exit path. Fires at
+    ``deadline + grace_s`` measured on the real wall clock: logs one clear line, flushes logging
+    handlers, and calls ``exit_fn(exit_code)`` (``os._exit`` in production -- a hard exit that does NOT
+    run atexit/finalizers, because the point is that something is wedged). ``exit_fn``, ``timer_factory``
+    and ``clock`` are injected so tests exercise the arming/firing/cancel without ever exiting the test
+    process.
+
+    Past-deadline guard: if the fire time is ALREADY in the past at arm time (``delay <= 0``), the
+    process was started more than ``GRACE_SECONDS + grace_s`` after close -- there is no live window
+    left to protect, so the timer is created but NOT started (it never fires). This keeps a normal
+    :40 launch always armed (fire_at is ~130 s after a close ~20 min away) while making the function
+    safe to call from a test that uses a historical close. The un-started timer is returned so the
+    caller's ``.cancel()`` stays a no-op-safe call.
 
     The timer thread is a daemon so it can never, by itself, keep the process alive.
     """
     fire_at = deadline + grace_s
-    delay = max(0.0, fire_at - clock())
+    delay = fire_at - clock()
     since_close = int(round(grace_s + GRACE_SECONDS))  # close+130 s with the defaults
 
     def _fire() -> None:
@@ -106,12 +113,17 @@ def arm_hard_stop(
                 pass
         exit_fn(exit_code)
 
-    timer = timer_factory(delay, _fire)
+    timer = timer_factory(max(0.0, delay), _fire)
     # threading.Timer is a Thread subclass; guard for injected fakes that may not expose `daemon`.
     try:
         timer.daemon = True
     except Exception:  # noqa: BLE001
         pass
+    if delay <= 0.0:
+        # Already past close + grace at arm time: nothing to guard. Do NOT start a firing timer.
+        logger.warning("[HARD-STOP] window %s already past close+%ds at arm time; not arming",
+                       close_label, since_close)
+        return timer
     timer.start()
     return timer
 
@@ -332,11 +344,19 @@ async def run_recording(
         try:
             timeout = max(0.0, deadline - recorder.clock()) + connect_timeout_slack
             await asyncio.wait_for(ws.connect(), timeout=timeout)
-        except asyncio.TimeoutError:
-            # The dial outran the deadline (event-loop-blocking mint, or an idle handler on a dead
-            # market that the supervisor's close could not reach). A normal end-of-window close, not
-            # an error -- journal an alarm, do not log it as a failure.
-            recorder.record_alarm("deadline_forced_close", {"deadline": deadline})
+        except asyncio.TimeoutError as e:
+            # A TimeoutError here can be EITHER our deadline backstop firing OR an ordinary
+            # early-window failure -- websockets raises a bare TimeoutError on its open-handshake
+            # timeout, and on py3.12 `asyncio.TimeoutError is TimeoutError`, so the two are
+            # indistinguishable by type. Disambiguate by the clock: at/after the deadline it is the
+            # backstop (a normal end-of-window close, journaled quietly); before the deadline it is a
+            # real dial failure, logged + journaled as `ws_error` exactly like the generic path so the
+            # loop retries as before.
+            if recorder.clock() >= deadline:
+                recorder.record_alarm("deadline_forced_close", {"deadline": deadline})
+            else:
+                logger.warning("[RECORD] connection error: %s", e)
+                recorder.record_alarm("ws_error", {"error": str(e)})
         except Exception as e:  # noqa: BLE001 - a dial failure is logged + journaled, then retried
             logger.warning("[RECORD] connection error: %s", e)
             recorder.record_alarm("ws_error", {"error": str(e)})

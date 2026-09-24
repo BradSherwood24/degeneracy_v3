@@ -332,6 +332,57 @@ def test_run_recording_wait_for_backstop_cancels_wedged_dial() -> None:
     assert ws.calls == 1          # exactly one dial, no re-dial after the deadline
 
 
+class _EarlyTimeoutFakeWs:
+    """connect() raises a BARE TimeoutError on the first dial -- exactly what websockets raises on its
+    open-handshake timeout, and on py3.12 `asyncio.TimeoutError is TimeoutError`, so this is
+    indistinguishable by type from the deadline backstop. It happens BEFORE the deadline (the clock is
+    NOT advanced during the failing dial), so it must be treated as an ordinary dial failure
+    (ws_error + retry), NOT a quiet deadline_forced_close. The retry dial connects and, the deadline
+    now reached, closes cleanly. The fake drives the clock so task ordering cannot change the verdict."""
+
+    def __init__(self, clock, deadline) -> None:
+        self._clock = clock
+        self._deadline = deadline
+        self.calls = 0
+        self.force_closed = 0
+
+    async def connect(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise TimeoutError("simulated open-handshake timeout")  # clock stays < deadline
+        self._clock.t = self._deadline + 100.0  # dial 2 connects; the window is now past its deadline
+        # returns immediately -> a clean connected close; the loop sees clock >= deadline and stops
+
+    async def force_close(self):
+        self.force_closed += 1
+
+    def data_age_seconds(self):
+        return 1.0
+
+    def silence_seconds(self):
+        return 0.5
+
+    def current_lag_seconds(self):
+        return 1.0
+
+
+def test_run_recording_early_timeout_is_ws_error_not_deadline_close() -> None:
+    clock = FakeClock(0.0)
+    rec = WindowRecorder(make_wake_result(), Journal(), clock=clock)
+    ws = _EarlyTimeoutFakeWs(clock, deadline=100.0)
+    rec.ws_client = ws
+
+    async def yielding_sleep(_):
+        await asyncio.sleep(0)  # yield only; the fake drives the clock, so dial 1 stays pre-deadline
+
+    asyncio.run(run_recording(rec, deadline=100.0, sleep=yielding_sleep))
+    kinds = [r["obj"].get("alarm") for r in rec.journal.iter_records() if r["kind"] == "alarm"]
+    # A pre-deadline TimeoutError is a real dial failure: journaled as ws_error, and the loop re-dials.
+    assert "ws_error" in kinds
+    assert "deadline_forced_close" not in kinds
+    assert ws.calls == 2          # the failed dial was retried
+
+
 # === in-process HARD STOP (belt-and-braces) ===
 
 
@@ -384,6 +435,27 @@ def test_arm_hard_stop_fires_exit_code_when_not_cancelled() -> None:
                       timer_factory=lambda d, f: _FakeTimer(d, f))
     t.fire()                                        # simulate the timer elapsing (no real os._exit)
     assert exits == [HARD_STOP_EXIT_CODE]
+
+
+def test_arm_hard_stop_does_not_arm_when_already_past_deadline() -> None:
+    # A process armed more than GRACE_SECONDS + grace after close has no live window to guard: the
+    # timer must NOT start/fire (this is also what keeps a real main() called with a historical close,
+    # e.g. the v33 stand-down test, from os._exit-ing the whole test process).
+    made: dict[str, _FakeTimer] = {}
+
+    def factory(delay, fn):
+        t = _FakeTimer(delay, fn)
+        made["t"] = t
+        return t
+
+    exits: list[int] = []
+    clock = FakeClock(10_000.0)  # well past deadline(100) + grace(120)
+    timer = arm_hard_stop(100.0, CLOSE, grace_s=120.0,
+                          clock=clock, exit_fn=exits.append, timer_factory=factory)
+    assert made["t"].started is False   # no firing timer armed for an already-overdue window
+    assert exits == []
+    timer.cancel()                      # still safe to cancel
+    assert made["t"].cancelled is True
 
 
 def test_hard_stop_grace_lands_just_after_supervisor_watchdog() -> None:

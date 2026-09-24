@@ -1804,6 +1804,16 @@ def main(argv: list[str] | None = None) -> int:
     close_iso = args.close or next_top_of_hour_iso(clock())
     summary_path = os.path.join(args.journal_dir, "summary.jsonl")
 
+    # HARD STOP (belt-and-braces) armed HERE -- the earliest point the deadline is known, BEFORE the
+    # first proxy call (the settlement-backfill sweep + discovery below), so a hang in the synchronous
+    # wake/discovery path is covered too, not just the async window. The daemon timer fires at the
+    # ABSOLUTE close + 130 s regardless of when it is armed, so arming early is free. The plain V3.2
+    # scheduled task has no external supervisor watchdog, so this is its only guarantee it cannot
+    # outlive its window and starve the next hour's fire. Cancelled on the normal exit path (a
+    # stand-down returns long before the deadline and the daemon timer dies with the process).
+    deadline = close_epoch(close_iso) + GRACE_SECONDS
+    hard_stop = arm_hard_stop(deadline, close_iso)
+
     resolved_mode = resolve_v32_mode(args.mode, args.mode_file)
 
     # Load + sha-verify the frozen policy; any drift -> clean stand-down (fail-closed, S5 discipline).
@@ -1989,46 +1999,47 @@ def main(argv: list[str] | None = None) -> int:
     strike_conn = _ConnRecorder(shared, strike_ws, "strikes", list(strike_disc.tickers))
     bucket_conn = _ConnRecorder(shared, bucket_ws, "buckets", bucket_sub_tickers)
 
-    deadline = cts + GRACE_SECONDS
+    # `deadline` (= cts + GRACE_SECONDS) was computed and the hard stop armed at the top of main(),
+    # before discovery; `cts` here is the same close_epoch(close_iso).
     gate = connect_gate_epoch(cts, params)
     lag_sampler = LagSampler({"strikes": strike_ws, "buckets": bucket_ws})
-    # HARD STOP (belt-and-braces): a daemon timer force-exits this process at close + 130 s if the
-    # window is somehow still running (a wedged mint/dial holding the event loop, past which no
-    # in-asyncio guard can fire). The plain V3.2 scheduled task has no external supervisor watchdog,
-    # so this is its only guarantee it cannot outlive its window and starve the next hour's fire.
-    hard_stop = arm_hard_stop(deadline, close_iso)
+    # Outer try/finally so the hard stop is cancelled even if _finalize itself RAISES (F4): the inner
+    # finally runs _finalize, and this outer finally always disarms the timer afterward. A wedge
+    # (finalize HANGS) never reaches the cancel, so the timer still fires -- exactly what we want.
     try:
-        asyncio.run(run_v32_window(shared, strike_conn, bucket_conn, driver, clock, deadline, gate,
-                                   order_poll=armed, lag_sampler=lag_sampler))
-    except KeyboardInterrupt:
-        logger.warning("[V32] Ctrl+C — flushing streamed journal.")
+        try:
+            asyncio.run(run_v32_window(shared, strike_conn, bucket_conn, driver, clock, deadline, gate,
+                                       order_poll=armed, lag_sampler=lag_sampler))
+        except KeyboardInterrupt:
+            logger.warning("[V32] Ctrl+C — flushing streamed journal.")
+        finally:
+            # S1_LEGGED: a completed set left one-legged below the floor at T-1 s. One occurrence stood
+            # the hour down (core); the DAY latches at the threshold (in the SEPARATE v32 day guard).
+            if armed and driver.state.one_legged:
+                try:
+                    utc_day = close_iso[:10]
+                    n = record_legged_occurrence(_resolve_v32_guard_path(utc_day), utc_day,
+                                                 close_iso, "set left one-legged below lock floor",
+                                                 clock())
+                    journal.append("s1_legged_occurrence",
+                                   {"count": n, "latch_threshold": V32_S1_LEGGED_LATCH_THRESHOLD},
+                                   clock())
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[V32] S1_LEGGED record failed: %s", e)
+            summary = _finalize(
+                journal=journal, shared=shared, driver=driver, close_iso=close_iso,
+                resolved_mode=resolved_mode, effective_mode=effective_mode, degrade=degrade,
+                params=params, strike_disc=strike_disc, bucket_map=bucket_map,
+                bucket_generations=range_disc.generations, journal_path=journal_path,
+                summary_path=summary_path, ledger_path=args.ledger,
+                strike_lag=lag_sampler.mean("strikes"), bucket_lag=lag_sampler.mean("buckets"),
+                lag_stats=lag_sampler.summaries(),
+                clock=clock, m15_tickers=list(m15_disc.tickers), armed=armed,
+                degrade_reason=degrade_reason,
+            )
+            logger.info("[V32] window done: %s", summary)
     finally:
-        # S1_LEGGED: a completed set left one-legged below the floor at T-1 s. One occurrence stood the
-        # hour down (core); the DAY latches at the threshold (recorded in the SEPARATE v32 day guard).
-        if armed and driver.state.one_legged:
-            try:
-                utc_day = close_iso[:10]
-                n = record_legged_occurrence(_resolve_v32_guard_path(utc_day), utc_day,
-                                             close_iso, "set left one-legged below lock floor",
-                                             clock())
-                journal.append("s1_legged_occurrence",
-                               {"count": n, "latch_threshold": V32_S1_LEGGED_LATCH_THRESHOLD},
-                               clock())
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[V32] S1_LEGGED record failed: %s", e)
-        summary = _finalize(
-            journal=journal, shared=shared, driver=driver, close_iso=close_iso,
-            resolved_mode=resolved_mode, effective_mode=effective_mode, degrade=degrade,
-            params=params, strike_disc=strike_disc, bucket_map=bucket_map,
-            bucket_generations=range_disc.generations, journal_path=journal_path,
-            summary_path=summary_path, ledger_path=args.ledger,
-            strike_lag=lag_sampler.mean("strikes"), bucket_lag=lag_sampler.mean("buckets"),
-            lag_stats=lag_sampler.summaries(),
-            clock=clock, m15_tickers=list(m15_disc.tickers), armed=armed,
-            degrade_reason=degrade_reason,
-        )
-        logger.info("[V32] window done: %s", summary)
-        hard_stop.cancel()  # normal exit: disarm the belt-and-braces hard stop
+        hard_stop.cancel()  # normal exit / _finalize error: disarm the belt-and-braces hard stop
     return 0
 
 

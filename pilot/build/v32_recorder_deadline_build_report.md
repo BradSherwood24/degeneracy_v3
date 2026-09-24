@@ -126,3 +126,61 @@ was 1264 passed, 1 skipped; +5 new tests). The recorder/ws/run subset (`test_rec
   rely on the no-op distinction, so this was left as-is to keep the change surgical.
 - The supervisor's external watchdog (`service/supervisor.py`, close+120 s) is unchanged; the
   in-process stop is intentionally 10 s later so it never fights the supervisor.
+
+## Round 2 -- review nits (APPROVE WITH NITS on 0309503)
+
+Applied F1 (MEDIUM) and F5+F4 (LOW). F2 is queued separately and `service/run_window.py` was NOT
+touched.
+
+### F1 -- TimeoutError disambiguation (record_window.py)
+`except asyncio.TimeoutError` around `wait_for(ws.connect(), ...)` caught ANY TimeoutError from
+`connect()`, not just the deadline backstop. On py3.12 `asyncio.TimeoutError is TimeoutError`, and
+websockets raises a BARE `TimeoutError` on its open-handshake timeout, so an ordinary early-window
+handshake failure was being journaled as a quiet `deadline_forced_close` with the `[RECORD] connection
+error` warning suppressed. Fix: inside the except, branch on the clock -- `recorder.clock() >= deadline`
+-> `deadline_forced_close` (quiet, as before); else -> `logger.warning("[RECORD] connection error: %s")`
++ `ws_error` alarm exactly like the generic `except Exception` path, so the loop retries as before.
+New test `test_run_recording_early_timeout_is_ws_error_not_deadline_close`: a fake whose `connect()`
+raises `TimeoutError` before the deadline produces a `ws_error` alarm (not `deadline_forced_close`) and
+re-dials (`calls == 2`); the fake drives the clock and the injected sleep does not, so the pre-deadline
+classification is deterministic regardless of task ordering. The existing backstop test still asserts
+`deadline_forced_close` (its wedged dial jumps the clock past the deadline before `wait_for` cancels).
+
+### F5 -- arm the hard stop earlier (run_v32.py + run_v33.py)
+`arm_hard_stop(deadline, close_iso)` moved to the earliest point `close_iso` (hence
+`deadline = close_epoch(close_iso) + GRACE_SECONDS`) is known -- immediately after `close_iso` is set,
+BEFORE the first proxy call (the settlement-backfill sweep and discovery). A synchronous hang in the
+wake/discovery path is now covered too, not just the async window. The daemon timer fires at the
+ABSOLUTE close + 130 s regardless of when armed, so arming early is free. The redundant later
+`deadline = cts + GRACE_SECONDS` assignment was removed (the value is identical; `cts` is unchanged and
+still used for state/gate).
+
+### F4 -- robust cancel (run_v32.py + run_v33.py)
+The single `hard_stop.cancel()` was inside the window's inner `finally`, AFTER `_finalize(...)`, so a
+raise inside `_finalize` would skip it. Wrapped the whole window body in an OUTER `try/finally` whose
+`finally` is the single `hard_stop.cancel()`; the inner `try/except KeyboardInterrupt/finally` (S1
+latch + `_finalize` + `window done` log) is unchanged in content. Now a `_finalize` EXCEPTION still
+cancels the timer, while a `_finalize` HANG never reaches the cancel and the timer still fires -- the
+intended behaviour.
+
+### Past-deadline guard (record_window.py) -- required to keep the suite green under F5
+Moving the arm before the stand-down paths meant a test that calls the real `main()` with a HISTORICAL
+`--close` (`test_v33_run.py::test_params_sha_mismatch_stands_down`, close 2026-09-20) would arm a REAL
+`threading.Timer` whose fire time is already in the past -> `delay == 0` -> it fired `os._exit(3)` and
+killed the whole pytest process (observed: suite EXIT=3). Correct fix in `arm_hard_stop`: if the fire
+time is already in the past at arm time (`delay <= 0`), the process was started more than
+`GRACE_SECONDS + grace_s` after close and there is no live window to guard, so the timer is created but
+NOT started (never fires); the un-started timer is returned so the caller's `.cancel()` stays safe. A
+normal :40 launch (fire_at ~130 s after a close ~20 min out) is always armed, so production protection
+is unchanged. New test `test_arm_hard_stop_does_not_arm_when_already_past_deadline` locks this.
+
+Note on stand-down early returns: they occur long before the deadline and return before the outer
+try/finally, so they do not cancel the (future-dated, daemon) timer explicitly; the daemon timer dies
+with the process on the immediate `SystemExit`. Under the past-deadline guard, a historical-close
+stand-down never arms a firing timer at all.
+
+### Round 2 suite
+`python -m pytest -q` from `dv3_wt_v11/pilot`: **1271 passed, 1 skipped** (Round 1 was 1269/1; +2 new
+tests: the F1 early-timeout test and the past-deadline-guard test). `service/run_window.py` untouched
+(F2 separate). ASCII: the only non-ASCII in the diff is two pre-existing `Ctrl+C` log lines that merely
+shifted indentation in the F4 restructure -- no new non-ASCII content authored.
