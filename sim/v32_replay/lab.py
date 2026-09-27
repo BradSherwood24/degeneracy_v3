@@ -18,7 +18,7 @@ from decimal import Decimal
 from . import REPO_ROOT
 from .calibration import aggregate as aggregate_calibration
 from .estimates import build_estimates
-from .frames import discover_journals, iter_frames, read_window_meta
+from .frames import SealedDateRefusal, discover_journals, iter_frames, read_window_meta
 from .models import BASE_CELL
 from .replay import WindowEngine, WindowResult
 
@@ -29,6 +29,37 @@ DEFAULT_OUT = os.path.join(REPO_ROOT, "sim", "out", "v32_replay")
 def _load_params():
     from service.v32.params import load_v32_params
     return load_v32_params()
+
+
+def _wanted_basenames(only: str | None, files_from: str | None) -> set[str] | None:
+    """Parse the ``--only`` / ``--files-from`` restriction into a set of ``*.jsonl.gz`` basenames, or
+    ``None`` when neither is given (replay all discovered windows, the default). ``--files-from`` reads
+    one basename per line ('#' comments and blanks ignored). Basenames are used as-is (no path)."""
+    if only is None and files_from is None:
+        return None
+    wanted: set[str] = set()
+    if only:
+        wanted.update(b.strip() for b in only.split(",") if b.strip())
+    if files_from:
+        with open(files_from, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                wanted.add(os.path.basename(s))
+    return wanted
+
+
+def _filter_paths(paths: list[str], wanted: set[str] | None) -> tuple[list[str], list[str]]:
+    """Restrict discovered ``paths`` to the ``wanted`` basenames (``None`` -> keep all). Returns
+    ``(selected, missing)`` where ``missing`` are requested basenames absent from ``paths`` (sorted).
+    ``selected`` preserves the discovery order restricted to the wanted set."""
+    if wanted is None:
+        return list(paths), []
+    by_base = {os.path.basename(p): p for p in paths}
+    selected = [by_base[b] for b in (os.path.basename(p) for p in paths) if b in wanted]
+    missing = sorted(w for w in wanted if w not in by_base)
+    return selected, missing
 
 
 def run_window(path: str, params) -> WindowResult:
@@ -301,20 +332,45 @@ def main(argv: list[str] | None = None) -> int:
                          "+ 1-hour-range + the scratchpad range loader)")
     ap.add_argument("--range-loader", default=None,
                     help="path to the scratchpad range/ dir (rangelab.py) for --apply-to-forward")
+    ap.add_argument("--only", default=None,
+                    help="comma-separated *.jsonl.gz basenames; replay ONLY these windows (a subset of "
+                         "--journals). Used by the incremental daily runner. Backwards-compatible.")
+    ap.add_argument("--files-from", default=None,
+                    help="path to a text file of *.jsonl.gz basenames (one per line, '#' comments "
+                         "allowed); replay ONLY these windows. Combined with --only if both given.")
     args = ap.parse_args(argv)
 
     params = _load_params()
     cal_dir = args.calibrate_from or args.journals
     paths = discover_journals(cal_dir, since=args.since)
+    wanted = _wanted_basenames(args.only, args.files_from)
+    if wanted is not None:
+        paths, missing = _filter_paths(paths, wanted)
+        for w in missing:
+            print(f"[replay-lab] --only/--files-from: '{w}' not found in {cal_dir}; skipping")
     if not paths:
         print(f"[replay-lab] no *.jsonl.gz journals in {cal_dir}"
-              f"{' since ' + args.since if args.since else ''}")
+              f"{' since ' + args.since if args.since else ''}"
+              f"{' matching --only/--files-from' if wanted is not None else ''}")
         return 1
 
     results: list[WindowResult] = []
+    skipped = 0
     for p in paths:
         print(f"[replay-lab] replaying {os.path.basename(p)} ...", flush=True)
-        results.append(run_window(p, params))
+        try:
+            results.append(run_window(p, params))
+        except SealedDateRefusal:
+            raise  # house law: a sealed/holdout journal is refused, never skipped silently
+        except Exception as exc:  # noqa: BLE001 -- a partial/corrupt journal must not abort the run
+            skipped += 1
+            print(f"[replay-lab] SKIP {os.path.basename(p)}: {type(exc).__name__}: {exc}", flush=True)
+    if skipped:
+        print(f"[replay-lab] skipped {skipped} unreadable/partial journal(s) (no window_meta or "
+              f"read error); replayed {len(results)}.", flush=True)
+    if not results:
+        print(f"[replay-lab] no replayable windows in {cal_dir} (all skipped).")
+        return 1
 
     est = build_estimates(results)
     calib = aggregate_calibration(results)

@@ -16,6 +16,10 @@ pilot/ledger/
 pilot/ops/mode.txt
 pilot/ops/v32_mode.txt
 pilot/ops/v33_mode.txt
+# daily replay tripwire artifacts (regenerated each run by tools/daily_replay.py)
+pilot/ops/replay_tripwire.txt
+pilot/ops/replay_tripwire.json
+pilot/ops/replay_daily.log
 # generated box-report artifacts (regenerated on each run; only the README is tracked)
 pilot/reports/*.json
 

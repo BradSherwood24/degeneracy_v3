@@ -104,7 +104,10 @@ def test_pessimistic_drops_sub_1_lot_prints_only():
 def test_cli_writes_outputs(tmp_path):
     from sim.v32_replay import lab
     out = os.path.join(tmp_path, "out")
-    rc = lab.main(["--journals", FIXTURE_DIR, "--out", out])
+    # Pin the head window with --only: FIXTURE_DIR also holds partial incident fixtures (added later
+    # in 09993f2) that are not full windows, so globbing the whole dir is no longer deterministic.
+    rc = lab.main(["--journals", FIXTURE_DIR, "--out", out,
+                   "--only", "live_window_20260914T170000Z_head.jsonl.gz"])
     assert rc == 0
     report = os.path.join(out, "report_20260914.md")
     assert os.path.exists(report)
