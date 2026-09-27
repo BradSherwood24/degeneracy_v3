@@ -8,6 +8,7 @@ are skipped on Windows with a reason.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import os
 import signal
 import subprocess
@@ -437,3 +438,142 @@ def test_boot_sweep_skips_readiness_and_proxy_when_not_armed(monkeypatch):
     )
     assert result["skipped"] is True and result["mode"] == "dry"
     assert probed == []              # no readiness probe when the sweep touches no proxy
+
+
+# ===========================================================================
+# One-run-per-close guard (respawn hotfix)
+# ===========================================================================
+# The bug: after a child returns EARLY (an instant stand-down at a no-bucket close, a crash, or a
+# watchdog kill), the loop -- still inside the [:40, :60) launch band -- respawned another child for the
+# SAME close on every pass until :60. Measured hundreds-to-thousands of spawns/hour at the 21:00Z close
+# (each doing proxy discovery GETs and appending a duplicate stand-down ledger row). The fix: one run
+# per close; a subsequent in-band pass for a close already run sleeps to the next hour's :40.
+def test_fast_standdown_in_band_runs_once_then_sleeps_close_already_run():
+    """(a) A child that exits in ~0.6 s while still inside the band -> exactly ONE spawn, then a sleep
+    event to the next :40 with reason 'close_already_run' (NOT a respawn for the same close)."""
+    clk = _Clock(_epoch("2026-09-22T00:45:00Z"))  # in band, close = 01:00
+    spawns = []
+
+    def spawn(args):
+        spawns.append(clk.t)
+
+        def on_wait(_n):
+            clk.t += 0.6  # instant stand-down: child returns 0 after ~0.6 s
+
+        return FakeChild([0], on_wait=on_wait)
+
+    events = []
+    sup = Supervisor(**_quiet_fakes(
+        once=False, run_now=True, clock=clk, spawn=spawn, on_event=events.append,
+    ))
+
+    def fake_sleep(_secs):
+        # the close_already_run sleep-to-next-:40; advance the clock and stop so the test terminates.
+        clk.t = _epoch("2026-09-22T01:40:00Z")
+        sup.request_stop(signal.SIGTERM)
+        return True
+
+    sup._sleep = fake_sleep
+    assert sup.run() == 0
+    assert len(spawns) == 1  # ONE spawn for close 01:00, not a respawn storm
+    car = [e for e in events if e["event"] == "sleep" and e.get("reason") == "close_already_run"]
+    assert len(car) == 1
+    assert car[0]["close"] == "2026-09-22T01:00:00Z"
+    assert car[0]["wake"] == "2026-09-22T01:40:00Z"
+    assert [e["event"] for e in events].count("window") == 1
+
+
+def test_boot_inside_band_runs_current_close_once():
+    """(b) Booting inside the band (no --now) runs exactly one window for the current close, no
+    close_already_run guard trip (last_close_run starts None -> a genuine late first wake still runs)."""
+    now = _epoch("2026-09-22T00:45:00Z")
+    events = []
+    sup = Supervisor(**_quiet_fakes(
+        once=True, run_now=False, clock=lambda: now,
+        spawn=lambda args: FakeChild([0]),
+        on_event=events.append,
+    ))
+    assert sup.run() == 0
+    kinds = [e["event"] for e in events]
+    assert kinds.count("window") == 1
+    assert not any(e.get("reason") == "close_already_run" for e in events if e["event"] == "sleep")
+
+
+def test_watchdog_killed_child_not_rerun_for_same_close():
+    """(c) A watchdog-killed child gets ONE run for its close; the loop moves on to the next :40 and
+    never respawns for the killed close."""
+    clk = _Clock(_epoch("2026-09-22T00:45:00Z"))  # boot in band, close = 01:00
+    spawns = []
+
+    def on_wait(_n):
+        # every wait sees the clock past close(01:00) + watchdog grace(120 s) -> watchdog fires.
+        clk.t = _epoch("2026-09-22T01:02:00Z")
+
+    def spawn(args):
+        spawns.append(clk.t)
+        return FakeChild([None, None, None], on_wait=on_wait)  # never exits on its own
+
+    events = []
+    sup = Supervisor(**_quiet_fakes(
+        once=False, run_now=True, clock=clk, spawn=spawn, on_event=events.append,
+    ))
+
+    def fake_sleep(_secs):
+        # the post-window sleep-to-next-:40; stop so the test terminates.
+        sup.request_stop(signal.SIGTERM)
+        return True
+
+    sup._sleep = fake_sleep
+    assert sup.run() == 0
+    assert len(spawns) == 1  # the killed window ran once; not respawned for close 01:00
+    kinds = [e["event"] for e in events]
+    assert "child_watchdog_killed" in kinds
+    window = [e for e in events if e["event"] == "window"][0]
+    assert window["status"] == "watchdog_killed"
+
+
+def test_normal_path_next_spawn_at_next_forty():
+    """(d) Normal path unchanged: a child that runs to just past close, then the loop sleeps to the next
+    :40 and spawns the NEXT window (no close_already_run event)."""
+    clk = _Clock(_epoch("2026-09-22T00:45:00Z"))
+    spawns = []
+
+    def on_wait(_n):
+        clk.t = (math.floor(clk.t / 3600.0) + 1) * 3600 + 5  # advance to this window's close + 5 s
+
+    def spawn(args):
+        spawns.append(clk.t)
+        return FakeChild([0], on_wait=on_wait)
+
+    events = []
+    sup = Supervisor(**_quiet_fakes(
+        once=False, run_now=True, clock=clk, spawn=spawn, on_event=events.append,
+    ))
+    state = {"n": 0}
+
+    def fake_sleep(_secs):
+        state["n"] += 1
+        if state["n"] == 1:
+            clk.t = _epoch("2026-09-22T01:40:00Z")  # wake at the next :40 -> run window 2
+            return False
+        sup.request_stop(signal.SIGTERM)  # stop after the second window's post-close sleep
+        return True
+
+    sup._sleep = fake_sleep
+    assert sup.run() == 0
+    assert len(spawns) == 2
+    assert spawns[0] == _epoch("2026-09-22T00:45:00Z")
+    assert spawns[1] == _epoch("2026-09-22T01:40:00Z")
+    assert not any(e.get("reason") == "close_already_run" for e in events if e["event"] == "sleep")
+
+
+def test_once_exits_after_one_window_with_guard():
+    """(e) --once still exits after exactly one window (the guard never fires on the first run)."""
+    spawns = []
+    sup = Supervisor(**_quiet_fakes(
+        once=True, run_now=True,
+        clock=lambda: _epoch("2026-09-22T00:45:00Z"),
+        spawn=lambda args: spawns.append(1) or FakeChild([0]),
+    ))
+    assert sup.run() == 0
+    assert len(spawns) == 1

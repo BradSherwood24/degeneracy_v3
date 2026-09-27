@@ -21,7 +21,12 @@ The loop, once per UTC hour:
      (wake time, child pid, exit code, duration). A per-window WATCHDOG kills a child still running at
      its window close + a grace (default 120 s; run_v32's own deadline is close + 10 s) and moves on,
      so one wedged window can never take the strategy offline for hours.
-  5. repeat (``--once`` runs exactly one window then exits).
+  5. repeat (``--once`` runs exactly one window then exits). A child that returns EARLY (an instant
+     stand-down -- e.g. the 21:00Z close has no co-settling $100 KXBTC range buckets -- a crash, or a
+     watchdog kill) is NOT respawned for the same close: the loop tracks the close it last launched for
+     and, if it is still inside the [:40, :60) band for that same close, sleeps to the next hour's :40
+     (event ``sleep`` with ``reason": "close_already_run"``). Restart-on-failure is the scheduled
+     task's job, not the loop's -- one run per close.
 
 SIGTERM / SIGINT / (Windows) SIGBREAK: while idle it exits 0 promptly; while a child runs it forwards
 the signal to the child, waits up to ``SIGTERM_GRACE_S`` (240 s, under Render's 300 s cap), then
@@ -540,6 +545,11 @@ class Supervisor:
             return 0
 
         first = True
+        # The window close (next :00 epoch) the last child was launched FOR. A child that exits early
+        # for ANY reason (stand-down, crash, watchdog kill) must get exactly ONE run per close: without
+        # this, an instant stand-down inside the [:40, :60) band would respawn on every loop pass until
+        # :60 (measured: hundreds-to-thousands of spawns per hour at the 21:00Z no-bucket close).
+        last_close_run: float | None = None
         while True:
             if not (first and self._run_now):
                 now = self._clock()
@@ -557,6 +567,21 @@ class Supervisor:
                 # else already in the launch band -> run for the current hour (on-time or late)
             first = False
 
+            # One-run-per-close guard: if we are back inside the band for a close we have ALREADY run
+            # this session (the child returned early), do NOT respawn -- sleep to the next hour's :40.
+            # ``--now`` (run_now) forces the first window regardless of band; last_close_run starts None
+            # so a genuine late first wake for an un-run close still runs once.
+            now = self._clock()
+            close_epoch = _next_top_of_hour_epoch(now)
+            if in_launch_band(now) and close_epoch == last_close_run:
+                wake = next_forty(now)
+                self._emit({"event": "sleep", "reason": "close_already_run",
+                            "close": _iso(close_epoch), "wake": _iso(wake)})
+                if self._sleep_until(wake):
+                    self._emit({"event": "stop_idle", "at": _iso(self._clock())})
+                    return 0
+                continue
+
             try:
                 from service.paths import journal_dir_v33
                 jdir = journal_dir_v33() if self._roster == "v33" else journal_dir_v32()
@@ -567,7 +592,11 @@ class Supervisor:
 
             wake_iso = _iso(self._clock())
             start = self._clock()
-            watchdog_deadline = _next_top_of_hour_epoch(start) + self._watchdog_grace_s
+            close_epoch = _next_top_of_hour_epoch(start)
+            watchdog_deadline = close_epoch + self._watchdog_grace_s
+            # Mark this close as run BEFORE the wait: whatever status the child returns with
+            # (exited/watchdog_killed), the same close is never spawned twice.
+            last_close_run = close_epoch
             child = self._spawn(self._child_args)
             rc, status = self._wait_child(child, watchdog_deadline)
             duration = self._clock() - start
