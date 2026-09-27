@@ -577,3 +577,48 @@ def test_once_exits_after_one_window_with_guard():
     ))
     assert sup.run() == 0
     assert len(spawns) == 1
+
+
+def test_large_watchdog_grace_kill_in_next_band_runs_new_close_once():
+    """N2: a watchdog kill whose deadline (close + a LARGE grace) lands inside the NEXT hour's launch
+    band must run the NEW close exactly once and must NOT re-run the killed close. This discriminates
+    the fix: the guard keys on the close epoch, so a legitimate next-hour band entry is not suppressed
+    while a same-close re-entry is. The fake clock is advanced INSIDE the child wait and the sleep."""
+    clk = _Clock(_epoch("2026-09-22T00:45:00Z"))  # boot in band, close = 01:00, grace 2500s -> 01:41:40
+    spawns = []
+
+    def spawn(args):
+        idx = len(spawns)
+        spawns.append(clk.t)
+        if idx == 0:
+            def on_wait(_n):
+                # past close(01:00) + grace(2500s) = 01:41:40, which is INSIDE the 02:00 window's band.
+                clk.t = _epoch("2026-09-22T01:41:40Z")
+            return FakeChild([None, None, None], on_wait=on_wait)  # never exits -> watchdog fires
+
+        def on_wait2(_n):
+            clk.t = _epoch("2026-09-22T02:00:05Z")  # window 2 runs to just past its close
+
+        return FakeChild([0], on_wait=on_wait2)
+
+    events = []
+    sup = Supervisor(**_quiet_fakes(
+        once=False, run_now=True, clock=clk, watchdog_grace_s=2500.0,
+        spawn=spawn, on_event=events.append,
+    ))
+
+    def fake_sleep(_secs):
+        sup.request_stop(signal.SIGTERM)  # stop at window 2's post-close sleep
+        return True
+
+    sup._sleep = fake_sleep
+    assert sup.run() == 0
+    assert len(spawns) == 2
+    assert spawns[0] == _epoch("2026-09-22T00:45:00Z")   # close 01:00 (watchdog-killed)
+    assert spawns[1] == _epoch("2026-09-22T01:41:40Z")   # close 02:00 -- the NEW close, not a re-run
+    windows = [e for e in events if e["event"] == "window"]
+    assert windows[0]["status"] == "watchdog_killed"
+    assert windows[1]["status"] == "exited"
+    assert "child_watchdog_killed" in [e["event"] for e in events]
+    # different closes -> the one-run-per-close guard never fires
+    assert not any(e.get("reason") == "close_already_run" for e in events)

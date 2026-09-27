@@ -84,3 +84,57 @@ safe-band boundaries; refuse-without-force; force override; dry-run no-write; re
 - `pilot/tests/test_supervisor.py` (modified)
 - `tools/dedupe_v33_ledger.py` (new)
 - `pilot/tests/test_dedupe_v33_ledger.py` (new)
+
+## Round 2 (review of 95f3b75: APPROVE WITH NITS)
+
+Reviewer verified the supervisor fix (old code: 1501 spawns in the guard test; new: 1). Two items addressed
+as a second commit on `fix/supervisor-respawn`.
+
+### F1 [HIGH, latent] -- backfill rows must never be collapsed; window-row conflicts must be refused
+
+An ARMED window gets a WINDOW row (`run_v33.py` append at close) AND, later, a settlement BACKFILL row with
+the SAME `close_time` (`build_v33_backfill_row`: `mode == "backfill"`, `backfill_of` set; carries only
+settlement_results/payoff/floor_netted/realized_delta -- NO rung_fills/wing_batch_sets/ladder/lock_solved/
+realized_lock). The reporter/falsifier read the window row (`report._is_window_row` = `mode != "backfill"`)
+and the backfill separately. Round-1 keep-last would DESTROY the window row (latent only because the backfill
+sweep skips `dry_sim` rows today).
+
+Fix in `tools/dedupe_v33_ledger.py`:
+- `_is_backfill(row)` (`mode == "backfill"` OR `backfill_of` present): such rows PASS THROUGH untouched, are
+  never deduped and never used as a survivor.
+- Collapse ONLY non-backfill rows: for each `close_time` keep the LAST non-backfill row in its
+  first-occurrence slot. `dedupe_rows` now returns `(out, stats, conflicts)`; stats gains `backfill_kept`.
+- Conflict guard: if a `close_time` has >= 2 non-backfill rows differing by more than `flushed_at` /
+  `record_count` (`_IGNORE_ON_COMPARE`), `run` REFUSES with exit 2, writes nothing, and prints each
+  offending close -- unless `--force` (which then keeps the last non-backfill row and logs the collapse).
+  Exit codes are now: 0 ok/no-op, 1 time-band refusal, 2 window-row conflict refusal.
+- Docstring rewritten to state the backfill contract and the conflict refusal.
+
+New dedupe tests (`pilot/tests/test_dedupe_v33_ledger.py`, +4; existing direct-call tests updated to the
+3-tuple + `backfill_kept`):
+- `test_window_row_and_later_backfill_both_kept_order_preserved` -- window + later backfill (same close) ->
+  BOTH kept, order [armed, dry, backfill], removed=0, backfill_kept=1.
+- `test_backfill_never_used_as_survivor_for_standdown_storm` -- 3500 stand-downs + 1 backfill -> written=2
+  ([dry, backfill]), removed=3499, backfill_kept=1.
+- `test_conflict_two_different_window_rows_refused` -- two window rows differing in realized_lock -> exit 2,
+  file untouched, no .bak, offending close printed; then `--force` collapses to the LAST (realized_lock 9.99)
+  and writes the .bak.
+- `test_no_conflict_when_only_flushed_at_and_record_count_differ` -- rows differing only in those two fields
+  are NOT a conflict (collapse to 1).
+CLI smoke-tested: a synthetic 2-window + backfill file returns exit 2, keeps the backfill, writes nothing.
+
+### N2 -- strengthen the supervisor tests
+
+Added `test_large_watchdog_grace_kill_in_next_band_runs_new_close_once`: `watchdog_grace_s=2500` so the kill
+deadline (01:00 close + 2500 s = 01:41:40) lands INSIDE the 02:00 window's band. Asserts exactly TWO spawns
+(00:45:00Z for close 01:00, watchdog-killed; 01:41:40Z for the NEW close 02:00, exited), `child_watchdog_killed`
+logged, and NO `close_already_run` (different closes -> the guard keys on close epoch and does not suppress a
+legitimate next-hour entry, nor re-run the killed close). This test and `test_normal_path_next_spawn_at_next_forty`
+/ `test_fast_standdown_in_band_runs_once_then_sleeps_close_already_run` each advance the fake clock inside the
+injected sleep (N2's "at least one" satisfied, now several).
+
+### Round 2 counts
+- `python -m pytest tests/test_supervisor.py -q`: 36 passed, 1 skipped (Round 1: 35+1).
+- `python -m pytest tests/test_dedupe_v33_ledger.py -q`: 15 passed (Round 1: 11).
+- Full suite from worktree `pilot/` (`python -m pytest -q`): **1338 passed, 1 skipped** (Round 1: 1333+1; +5 =
+  1 supervisor + 4 dedupe). ASCII-only confirmed on all changed files.

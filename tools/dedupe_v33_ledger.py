@@ -5,10 +5,18 @@ Why this exists: the supervisor respawn bug (fixed in service/supervisor.py) res
 close every day). Every respawn appended an identical stand-down row to ``ledger/v33_ledger.jsonl``, so
 the ledger accumulated thousands of duplicate stand-down rows for the same close_time.
 
-The V3.3 ledger is append-ONE-row-per-window by contract, so for any given close_time the LAST row is
-the one to keep (the duplicates for a stood-down close are byte-identical anyway). This tool rewrites the
-ledger keeping, for each close_time, only the last row -- preserving the original slot of that close so
-window order is unchanged. Rows without a close_time are passed through untouched and never deduped.
+The V3.3 ledger has AT MOST ONE window row per close_time, but an ARMED window can ALSO get a later
+settlement BACKFILL row for the same close_time (``mode == "backfill"``, ``backfill_of`` set; it carries
+settlement_results/payoff/floor_netted/realized_delta only -- NO rung_fills/wing_batch_sets/ladder/
+lock_solved). The reporter/falsifier read the WINDOW row (report._is_window_row = mode != "backfill") and
+the backfill separately, so a backfill row must NEVER be collapsed away and never be used as the survivor.
+
+So this tool collapses ONLY the duplicate NON-backfill window rows: for each close_time it keeps the LAST
+non-backfill row (in that close's first-occurrence slot, so window order is unchanged). Backfill rows and
+rows without a close_time pass through UNTOUCHED and are never deduped. If a close_time has two or more
+non-backfill rows that differ by more than ``flushed_at`` / ``record_count`` (i.e. it would be choosing
+between two genuinely different window rows), it REFUSES (exit 2, no write) and prints the offending
+closes -- unless ``--force`` (which then keeps the last non-backfill row anyway).
 
 Safety:
   - Idempotent: a second run over an already-clean file changes nothing (0 removed).
@@ -16,7 +24,7 @@ Safety:
     ledger; a ``.bak`` copy of the original is kept first.
   - REFUSES to run when a ``run_v33`` window could be mid-write -- i.e. outside the safe UTC minute band
     [:02, :33]. run_v33 windows run :40 -> :00. Pass ``--force`` to override (document: run it between
-    :02 and :33). ``--dry-run`` never writes and never refuses.
+    :02 and :33). ``--dry-run`` never writes and never refuses on the time band.
   - This tool NEVER touches the proxy and NEVER reads key material. It is a pure file rewrite.
 
 Run:  python tools/dedupe_v33_ledger.py --dry-run
@@ -69,35 +77,67 @@ def _load_rows(path: str) -> tuple[list[dict], int]:
     return rows, bad
 
 
-def dedupe_rows(rows: list[dict]) -> tuple[list[dict], dict]:
-    """Keep, for each close_time, only the LAST row (replaced in the FIRST occurrence's slot so window
-    order is preserved). Rows lacking a close_time are kept untouched, never deduped.
+# Fields allowed to differ between two rows of the same close_time WITHOUT it counting as a conflict:
+# a respawn re-runs discovery so these two vary even between otherwise-identical stand-down rows.
+_IGNORE_ON_COMPARE = ("flushed_at", "record_count")
 
-    Returns (out_rows, stats) where stats has: read, unique_close, removed, no_close_kept, written.
+
+def _is_backfill(row: dict) -> bool:
+    """A settlement backfill row (mode == 'backfill' or carries backfill_of): NEVER deduped, never a
+    survivor -- the reporter/falsifier read it separately from the window row."""
+    return isinstance(row, dict) and (row.get("mode") == "backfill" or row.get("backfill_of") is not None)
+
+
+def _compare_key(row: dict) -> dict:
+    """The row minus the fields that legitimately vary across respawns, for conflict detection."""
+    return {k: v for k, v in row.items() if k not in _IGNORE_ON_COMPARE}
+
+
+def dedupe_rows(rows: list[dict]) -> tuple[list[dict], dict, list[str]]:
+    """Collapse duplicate NON-backfill window rows: for each close_time keep the LAST non-backfill row,
+    in that close's first-occurrence slot (window order preserved). Backfill rows and rows lacking a
+    close_time pass through UNTOUCHED and are never deduped or used as a survivor.
+
+    Returns (out_rows, stats, conflicts) where:
+      - stats has: read, unique_close, removed, no_close_kept, backfill_kept, written;
+      - conflicts is the sorted list of close_times that had >= 2 non-backfill rows differing by more
+        than flushed_at/record_count (would be choosing between two genuinely different window rows).
     """
     out: list[dict] = []
-    slot: dict[str, int] = {}
+    slot: dict[str, int] = {}          # close_time -> index of its surviving non-backfill row in out
+    variants: dict[str, list[dict]] = {}   # close_time -> distinct _compare_key dicts seen
     no_close = 0
+    backfill_kept = 0
     for row in rows:
+        if _is_backfill(row):
+            out.append(row)            # passthrough; never a survivor, never deduped
+            backfill_kept += 1
+            continue
         ct = row.get("close_time") if isinstance(row, dict) else None
         if not ct:
             out.append(row)
             no_close += 1
             continue
         ct = str(ct)
+        key = _compare_key(row)
+        seen = variants.setdefault(ct, [])
+        if key not in seen:
+            seen.append(key)
         if ct in slot:
-            out[slot[ct]] = row  # later row wins, in the original slot
+            out[slot[ct]] = row        # later non-backfill row wins, in the original slot
         else:
             slot[ct] = len(out)
             out.append(row)
+    conflicts = sorted(ct for ct, seen in variants.items() if len(seen) > 1)
     stats = {
         "read": len(rows),
         "unique_close": len(slot),
         "removed": len(rows) - len(out),
         "no_close_kept": no_close,
+        "backfill_kept": backfill_kept,
         "written": len(out),
     }
-    return out, stats
+    return out, stats, conflicts
 
 
 def _atomic_write(path: str, out_rows: list[dict]) -> None:
@@ -130,7 +170,8 @@ def in_safe_band(now: datetime) -> bool:
 
 def run(path: str, *, dry_run: bool, force: bool, now: datetime,
         log=print) -> int:
-    """Dedupe the ledger at ``path``. Returns an exit code (0 ok, 1 refused, 2 error-shaped is unused)."""
+    """Dedupe the ledger at ``path``. Exit codes: 0 ok/no-op, 1 refused (time band), 2 refused
+    (window-row conflict)."""
     if not os.path.exists(path):
         log(f"[dedupe_v33] ledger not found: {path} (nothing to do)")
         return 0
@@ -142,13 +183,25 @@ def run(path: str, *, dry_run: bool, force: bool, now: datetime,
         return 1
 
     rows, bad = _load_rows(path)
-    out_rows, stats = dedupe_rows(rows)
+    out_rows, stats, conflicts = dedupe_rows(rows)
     if bad:
         log("[dedupe_v33] note: tolerated one truncated trailing line (dropped from the rewrite)")
 
     log(f"[dedupe_v33] path={path}")
     log(f"[dedupe_v33] read={stats['read']} unique_close={stats['unique_close']} "
-        f"removed={stats['removed']} no_close_kept={stats['no_close_kept']} written={stats['written']}")
+        f"removed={stats['removed']} no_close_kept={stats['no_close_kept']} "
+        f"backfill_kept={stats['backfill_kept']} written={stats['written']}")
+
+    if conflicts and not force:
+        log(f"[dedupe_v33] REFUSING: {len(conflicts)} close_time(s) have >= 2 DIFFERENT non-backfill "
+            f"window rows (differ beyond flushed_at/record_count); refusing to choose. Inspect these, "
+            f"then re-run with --force to keep the LAST non-backfill row per close:")
+        for ct in conflicts:
+            log(f"[dedupe_v33]   conflict close_time={ct}")
+        return 2
+    if conflicts and force:
+        log(f"[dedupe_v33] --force: {len(conflicts)} conflicting close(s) collapsed to their LAST "
+            f"non-backfill row: {', '.join(conflicts)}")
 
     if dry_run:
         log("[dedupe_v33] --dry-run: no files written")
@@ -175,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--path", default=None,
                    help="Ledger path (default: the live v33_ledger.jsonl via service.paths).")
     p.add_argument("--dry-run", action="store_true",
-                   help="Report counts only; write nothing (and skip the time guard).")
+                   help="Report counts only; write nothing (and skip the time band guard).")
     p.add_argument("--force", action="store_true",
                    help="Override the :02-:33 UTC safe-band guard (use only when no run_v33 is active).")
     return p
