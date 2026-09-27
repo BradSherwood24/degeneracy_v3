@@ -28,5 +28,11 @@
   "write_reserve_tokens": 30,
   "order_poll_batched": true,
   "deep_obs_rungs": 10,
+  "print_through": false,
+  "print_through_ticks": 1,
+  "print_through_slack_c": 0,
+  "print_through_stall_ms": 1500,
+  "print_through_min_lock_c": 0,
+  "print_through_policy": "complete_else_unwind",
   "shadow_Es": ["0.08", "0.10", "0.12"]
 }

@@ -148,6 +148,7 @@ def build_v33_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "scoreboard": build_ladder_scoreboard(rows),
         "gate_table": build_falsifier_gate_table(rows),
         "deep_end": build_deep_end(rows),
+        "print_through": build_print_through(rows),
         "totals": {
             "windows": sum(1 for r in rows if _is_window_row(r)),
             "rungs_filled": tot_rungs,
@@ -425,6 +426,61 @@ def build_deep_end(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# PRINT-THROUGH (Brad, 2026-09-26): the early-hedge trigger scoreboard
+# ---------------------------------------------------------------------------
+def build_print_through(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate the per-window ``print_through`` trigger blocks: how many triggers fired, how they
+    resolved (filled / complete / unwind / partial), the contracts pre-hedged, the mean lock struck at the
+    early ask (the win the trigger is chasing) vs the lock at completion for the stall ``complete`` branch,
+    and the total round-trip cost of unwinds (the price of a mis-fire). This is the reporter's score of the
+    feature; the counterfactual (what the fill-triggered take would have paid) is the trigger-ask lock the
+    trigger recorded vs the realised batch lock the ladder scoreboard already carries for filled rungs."""
+    windows = 0
+    triggers = 0
+    contracts = 0
+    res: dict[str, int] = {"filled": 0, "complete": 0, "unwind": 0, "partial": 0, "open": 0}
+    trigger_locks_c: list[Decimal] = []       # lock at the early ask, per FILLED trigger (cents/contract)
+    completion_locks_c: list[Decimal] = []    # lock at completion for the `complete` branch
+    roundtrip_total = _ZERO
+    for r in rows:
+        if not _is_window_row(r):
+            continue
+        pts = r.get("print_through")
+        if not isinstance(pts, list) or not pts:
+            continue
+        windows += 1
+        for t in pts:
+            triggers += 1
+            cnt = int(t.get("count", 0) or 0)
+            contracts += cnt
+            resolution = t.get("resolution") if t.get("resolved") else "open"
+            res[resolution] = res.get(resolution, 0) + 1
+            lat = _dec(t.get("lock_at_trigger"))
+            if resolution == "filled" and lat is not None and cnt:
+                trigger_locks_c.append((lat / Decimal(cnt)) * 100)
+            if resolution == "complete":
+                lc = _dec(t.get("lock_at_completion"))
+                if lc is not None:
+                    completion_locks_c.append(lc * 100)
+            rt = _dec(t.get("roundtrip_cost"))
+            if rt is not None:
+                roundtrip_total += rt
+    mean_trigger_lock = (sum(trigger_locks_c, _ZERO) / Decimal(len(trigger_locks_c))
+                         if trigger_locks_c else None)
+    mean_completion_lock = (sum(completion_locks_c, _ZERO) / Decimal(len(completion_locks_c))
+                            if completion_locks_c else None)
+    return {
+        "windows_with_triggers": windows,
+        "triggers": triggers,
+        "contracts_prehedged": contracts,
+        "resolutions": res,
+        "mean_trigger_lock_c": mean_trigger_lock,
+        "mean_completion_lock_c": mean_completion_lock,
+        "unwind_roundtrip_cost": roundtrip_total,
+    }
+
+
+# ---------------------------------------------------------------------------
 # SIDE-BY-SIDE (extended: entered-vs-not lists)
 # ---------------------------------------------------------------------------
 def _v32_set_lock(r: dict[str, Any]) -> Decimal | None:
@@ -608,6 +664,24 @@ def _render_deep_end(de: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_print_through(pt: dict[str, Any]) -> list[str]:
+    lines = ["", "PRINT-THROUGH WINGS (Brad 2026-09-26; early-hedge trigger -- inert unless print_through on)",
+             "-" * 92,
+             f"  windows with triggers = {pt['windows_with_triggers']}   triggers = {pt['triggers']}   "
+             f"contracts pre-hedged = {pt['contracts_prehedged']}"]
+    if not pt["triggers"]:
+        lines.append("  (no print-through triggers -- feature off, or no qualifying prints)")
+        return lines
+    res = pt["resolutions"]
+    lines.append(f"  resolutions: filled={res.get('filled', 0)}  complete={res.get('complete', 0)}  "
+                 f"unwind={res.get('unwind', 0)}  partial(fail-closed)={res.get('partial', 0)}  "
+                 f"open={res.get('open', 0)}")
+    lines.append(f"  mean lock at trigger ask (filled) = {_cc(pt['mean_trigger_lock_c'])}   "
+                 f"mean lock at completion (stall complete) = {_cc(pt['mean_completion_lock_c'])}")
+    lines.append(f"  total unwind round-trip cost = {_c(pt['unwind_roundtrip_cost'])}")
+    return lines
+
+
 def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
     lines: list[str] = []
     header = ["close_time".ljust(22), "mode".ljust(10), "bucket".ljust(26), "rungs".rjust(6),
@@ -641,6 +715,7 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
     lines.extend(_render_scoreboard(report["scoreboard"]))
     lines.extend(_render_gate_table(report["gate_table"]))
     lines.extend(_render_deep_end(report["deep_end"]))
+    lines.extend(_render_print_through(report["print_through"]))
 
     # --- SIDE-BY-SIDE ---
     lines.append("")

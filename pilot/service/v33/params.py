@@ -58,7 +58,15 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # strand cap: commit a switch once the new bucket has been the resolved spot continuously for >= this even
 # if the hysteresis was never satisfied -- the candidate (highest yes-mid) and the centroid hysteresis can
 # disagree, stranding the ladder on the old bucket for the whole window) -> re-pinned.
-FROZEN_V33_PARAMS_SHA256 = "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78"
+# PRINT-THROUGH WINGS (2026-09-26, Brad's idea): ADDED the print-through wing trigger levers --
+# ``print_through`` (master enable, DEFAULT FALSE so the shipped policy is behaviour-identical to the
+# pre-feature ladder; Brad flips it to true to arm the early-hedge for the dry roster), ``print_through_ticks``
+# (a bucket YES print within this many cents of a resting rung's offer, moving toward it, fires the wing take
+# EARLY -- before our own fill confirms), ``print_through_slack_c`` (the wing IOC limit = current ask + this
+# many cents; 0 = at the ask), ``print_through_stall_ms`` (no rung fill within this of the trigger -> the
+# stall policy runs), ``print_through_min_lock_c`` (the min lock in cents for the ``complete`` stall branch),
+# ``print_through_policy`` (the stall policy string: complete_else_unwind / complete / unwind) -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
 # History (add-only law). Kept DEFINED so prior-regime ledger rows stay identifiable.
 PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
 PREVIOUS_V33_PARAMS_SHA256_L1_R2 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
@@ -66,6 +74,12 @@ PREVIOUS_V33_PARAMS_SHA256_L1_R4 = "6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3
 PREVIOUS_V33_PARAMS_SHA256_L2_R2 = "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
 PREVIOUS_V33_PARAMS_SHA256_L3 = "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
 PREVIOUS_V33_PARAMS_SHA256_FLAP_R1 = "3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac"
+PREVIOUS_V33_PARAMS_SHA256_FLAP_R2 = "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78"
+
+# Valid stall-policy strings (print-through). ``complete_else_unwind`` (default): take the bucket-NO
+# ourselves at the current NO ask if the resulting lock >= the floor, else unwind the pre-taken wings.
+# ``complete`` / ``unwind``: force one branch (for tuning / kill-switch).
+V33_PRINT_THROUGH_POLICIES = ("complete_else_unwind", "complete", "unwind")
 
 _CENT = Decimal("0.01")
 # The Basic-tier write-token cost of one non-priority create/amend (mirrors executor.COST_CREATE; kept as
@@ -163,6 +177,17 @@ class V33Params:
     order_poll_batched: bool           # one /portfolio/orders?ticker= poll vs per-rung GETs (default true)
     deep_obs_rungs: int                # L3 (SO-3): observation-only rungs BELOW the live ladder (margins
                                        # E_min_c+rungs .. +deep_obs_rungs-1 = 16..25c); never placed (10)
+    # PRINT-THROUGH WINGS (2026-09-26): fire the wing takes EARLY off a bucket TRADE print, before our own
+    # rung fill confirms, so the wings are IN HAND at the ask the sweep started from (not the ask it jumped
+    # to in the same ~50 ms). All OFF by default (``print_through`` False) -> the ladder is byte-identical.
+    print_through: bool                # master enable (False -> the feature is inert; Brad flips to arm it)
+    print_through_ticks: int           # a bucket YES print within this many cents of a rung's offer
+                                       # (1-n), moving toward it, fires the wing take for that rung early
+    print_through_slack_c: int         # the pre-emptive wing IOC limit = current ask + this many cents
+                                       # (0 = at the ask; the early ask is what we lock, before the jump)
+    print_through_stall_ms: int        # no rung fill within this of the trigger -> the STALL POLICY runs
+    print_through_min_lock_c: int      # the min lock (cents/contract) for the ``complete`` stall branch
+    print_through_policy: str          # complete_else_unwind (default) / complete / unwind
     shadow_Es: tuple[Decimal, ...]
     sha256: str
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
@@ -229,6 +254,29 @@ def load_v33_params(
         raise V33ParamsInvalid(
             f"v33 policy at {path} is invalid: deep_obs_rungs={raw['deep_obs_rungs']} must be >= 0"
         )
+    # PRINT-THROUGH WINGS (2026-09-26): the levers are non-negative counts; the policy must be a known
+    # string. ``print_through`` False leaves them inert (validated anyway so a future flip fails closed on a
+    # bad value rather than at runtime). ``print_through_min_lock_c`` MAY be negative (a floor below break-
+    # even is a legitimate "complete unless deeply underwater" setting), so it is not range-checked here.
+    if int(raw["print_through_ticks"]) < 0:
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: print_through_ticks={raw['print_through_ticks']} must be >= 0"
+        )
+    if int(raw["print_through_slack_c"]) < 0:
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: print_through_slack_c={raw['print_through_slack_c']} "
+            f"must be >= 0"
+        )
+    if int(raw["print_through_stall_ms"]) < 0:
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: print_through_stall_ms={raw['print_through_stall_ms']} "
+            f"must be >= 0"
+        )
+    if str(raw["print_through_policy"]) not in V33_PRINT_THROUGH_POLICIES:
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: print_through_policy={raw['print_through_policy']!r} "
+            f"must be one of {V33_PRINT_THROUGH_POLICIES}"
+        )
     # BUCKET-FLAP FIX (2026-09-23): the debounce / hold windows and the hysteresis are non-negative; 0
     # restores the pre-fix immediate behaviour (a lever, fail-closed on negatives). The hysteresis must not
     # exceed half the bucket width (a slot at least 2*hyst wide must remain, else no spot ever qualifies).
@@ -291,6 +339,12 @@ def load_v33_params(
         write_reserve_tokens=int(raw["write_reserve_tokens"]),
         order_poll_batched=bool(raw["order_poll_batched"]),
         deep_obs_rungs=int(raw["deep_obs_rungs"]),
+        print_through=bool(raw["print_through"]),
+        print_through_ticks=int(raw["print_through_ticks"]),
+        print_through_slack_c=int(raw["print_through_slack_c"]),
+        print_through_stall_ms=int(raw["print_through_stall_ms"]),
+        print_through_min_lock_c=int(raw["print_through_min_lock_c"]),
+        print_through_policy=str(raw["print_through_policy"]),
         shadow_Es=shadow_Es,
         sha256=sha,
         raw=raw,

@@ -42,9 +42,11 @@ from math import ceil
 from typing import Any
 
 from service.orders.envelope import build_batch, parse_batch_response, parse_single_response
+from service.orders.translate import to_v2_order
 from service.proxy_writer import ProxyWriter
 from service.v32.actions import ActionKind
 from service.v32.core import BUY_NO
+from service.v33.actions import V33ActionKind
 from service.v32.events import Fill, OrderAck, OrderCancelled
 from service.v32.executor import (  # inherited, UNCHANGED wire law
     INVARIANT_RECHECK_S,
@@ -223,6 +225,7 @@ class V33LiveExecutor(LiveExecutor):
         write_tokens_per_s: float = 100.0,
         write_bucket_size: float = 100.0,
         write_reserve_tokens: float = 0.0,
+        enable_print_through: bool = False,
     ) -> None:
         # write-token pacer (MUST-FIX-4 + L3 R2-N1 reserve): a Basic-tier bucket so the initial 11-create
         # ladder / chunked wing bursts never blow the 100 tokens/s budget; cancels + wing takes are
@@ -263,15 +266,122 @@ class V33LiveExecutor(LiveExecutor):
         self.rest_invariant_dup_price = 0    # venue already held one of ours at the place price
         self.batch_creates = 0               # PLACE_REST batches sent via place_batch
         self.wing_chunks = 0                 # individual chunk orders sent for wing takes
+        # PRINT-THROUGH (2026-09-26): the stall-policy mechanics live behind this flag (enabled by the
+        # run_v33 wiring ONLY when params.print_through). The pre-emptive wing TAKE itself reuses the
+        # inherited TAKE_WINGS path; these counters/handlers cover only the stall complete/unwind.
+        self.enable_print_through = bool(enable_print_through)
+        self.pt_bucket_no_takes = 0          # complete: IOC bucket-NO taker orders sent
+        self.pt_bucket_no_fills = 0          # of those, lots that actually filled (reconciliation)
+        self.pt_unwinds = 0                  # unwind / fail-closed: wing sell-back bursts sent
 
     # =====================================================================
     # on_action — intercept PLACE_REST to record the target price for the K-aware invariant
     # =====================================================================
     def on_action(self, action, state, now: float) -> list[Any]:
-        if action.kind == ActionKind.PLACE_REST:
+        k = action.kind
+        # PRINT-THROUGH stall-policy kinds (V3.3-only). A WOULD_* twin reaching this ARMED executor is a
+        # mis-wire (the core must be armed when a LiveExecutor is selected) -> fail loud (P3-1).
+        if k in (V33ActionKind.WOULD_TAKE_BUCKET_NO, V33ActionKind.WOULD_UNWIND_WINGS):
+            raise AssertionError(
+                f"V33LiveExecutor received a shakedown twin {k}; the core must be armed (P3-1)")
+        if k == V33ActionKind.TAKE_BUCKET_NO:
+            return self._take_bucket_no(action, now)
+        if k == V33ActionKind.UNWIND_WINGS:
+            return self._unwind_wings(action, now)
+        if k == ActionKind.PLACE_REST:
             # record the price being placed so the pre-place invariant can check "no two on one price".
             self._pending_place_price = action.price
         return super().on_action(action, state, now)
+
+    # =====================================================================
+    # PRINT-THROUGH stall policy (Brad, 2026-09-26): complete via bucket-NO taker, or unwind the wings
+    # =====================================================================
+    def _pt_taker_entry(self, ticker: str, side: str, act: str, count: int, limit: Decimal,
+                        exch: int, coid: str) -> dict[str, Any]:
+        """One IOC taker order body (buy or sell) for the print-through stall policy. YES-space 4-dp price;
+        the buy/sell book-side flip is ``to_v2_order``'s job (its direction guard is the only automated
+        check on a sell)."""
+        legacy = {"ticker": ticker, "side": side, "action": act, "count": int(count),
+                  "time_in_force": "immediate_or_cancel", "self_trade_prevention_type": "taker_at_cross",
+                  "client_order_id": coid, "exchange_index": int(exch)}
+        if side == "yes":
+            legacy["yes_price"] = int((Decimal(limit) * 100).to_integral_value())
+        else:
+            legacy["no_price"] = int((Decimal(limit) * 100).to_integral_value())
+        body = to_v2_order(legacy)
+        p = Decimal(limit) if side == "yes" else (Decimal(1) - Decimal(limit))
+        body["price"] = str(p.quantize(Decimal("0.0001")))
+        return body
+
+    def _take_bucket_no(self, action, now: float) -> list[Any]:
+        """COMPLETE branch: buy the bucket-NO ourselves as an IOC taker at the current NO ask (chunked to
+        wing_cap), completing the set the pre-taken wings were waiting on. The core already booked the
+        completion optimistically (honest taker cost), so this SENDS + reconciles: it feeds no event back;
+        a shortfall vs the intended count is ALARMED for the operator (never silently naked)."""
+        ticker = (action.legs[0].ticker if action.legs else action.ticker) or ""
+        limit = action.legs[0].limit if action.legs else action.price
+        want = int(action.count or (action.legs[0].count if action.legs else 0))
+        exch = self._exch(ticker)
+        if exch is None or limit is None or want <= 0:
+            self._record_alarm("print_through_complete_unrouted", {"ticker": ticker, "count": want})
+            return []
+        got = 0
+        n_chunks = ceil(want / self.wing_cap)
+        entries: list[dict[str, Any]] = []
+        for c in range(n_chunks):
+            cnt = min(self.wing_cap, want - c * self.wing_cap)
+            entries.append(self._pt_taker_entry(ticker, BUY_NO, "buy", cnt, limit, exch,
+                                                self._mint_wing_coid()))
+        self._pacer.acquire(COST_CREATE * len(entries), "print_through_complete", priority=True)
+        self.pt_bucket_no_takes += 1
+        self.journal.append("print_through_complete",
+                            {"ticker": ticker, "limit": str(limit), "count": want,
+                             "chunks": len(entries)}, self.clock())
+        if len(entries) == 1:
+            resp = self.writer.rest_post(REL_SINGLE_CREATE, entries[0])
+            parsed = [parse_single_response(resp.body, side=BUY_NO)] if resp.ok else []
+        else:
+            resp = self.writer.rest_post(REL_BATCH_CREATE, build_batch(entries))
+            parsed = parse_batch_response(resp.body) if resp.ok else []
+        for r in parsed:
+            if r is not None and not r.error and r.fill_count and r.fill_count > 0:
+                got += int(r.fill_count)
+        self.pt_bucket_no_fills += got
+        if got < want:
+            self._record_alarm("print_through_complete_partial",
+                               {"ticker": ticker, "wanted": want, "filled": got})
+        return []
+
+    def _unwind_wings(self, action, now: float) -> list[Any]:
+        """UNWIND / fail-closed branch: sell the pre-taken wings back as IOC takers at the current bids.
+        Best-effort + journaled (the core has already dropped the batch and recorded the round-trip cost);
+        a leg that cannot route is alarmed. Feeds no event back to the core."""
+        entries: list[dict[str, Any]] = []
+        routed = 0
+        for lg in action.legs:
+            exch = self._exch(lg.ticker)
+            if exch is None or lg.count <= 0:
+                self._record_alarm("print_through_unwind_unrouted",
+                                   {"ticker": lg.ticker, "side": lg.side, "count": lg.count})
+                continue
+            n_chunks = ceil(int(lg.count) / self.wing_cap)
+            for c in range(n_chunks):
+                cnt = min(self.wing_cap, int(lg.count) - c * self.wing_cap)
+                entries.append(self._pt_taker_entry(lg.ticker, lg.side, "sell", cnt, lg.limit, exch,
+                                                    self._mint_wing_coid()))
+                routed += 1
+        if not entries:
+            return []
+        self._pacer.acquire(COST_CREATE * len(entries), "print_through_unwind", priority=True)
+        self.pt_unwinds += 1
+        self.journal.append("print_through_unwind",
+                            {"legs": [{"ticker": e.get("ticker"), "count": e.get("count")}
+                                      for e in entries], "chunks": len(entries)}, self.clock())
+        if len(entries) == 1:
+            self.writer.rest_post(REL_SINGLE_CREATE, entries[0])
+        else:
+            self.writer.rest_post(REL_BATCH_CREATE, build_batch(entries))
+        return []
 
     # =====================================================================
     # 429 exemption (L2 review R2-N1): a rate-limit response is throttling, not a business rejection

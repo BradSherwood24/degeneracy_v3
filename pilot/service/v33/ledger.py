@@ -231,6 +231,10 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
     cost = _ZERO
     for rf in rest_fills:
         cost += rf.price * Decimal(int(rf.count))   # bucket-NO maker leg, fee 0 on crypto
+        # PRINT-THROUGH (2026-09-26): the `complete` stall branch buys the bucket-NO as a TAKER, so that
+        # leg carries the venue taker fee (a maker rung fill is fee 0 on crypto).
+        if getattr(rf, "taker", False):
+            cost += _fee_total(rf.price, int(rf.count))
     for lg in wing_legs:
         if lg.status == "filled" and lg.fill_price is not None:
             cost += lg.fill_price * Decimal(int(lg.count)) + _fee_total(lg.fill_price, int(lg.count))
@@ -326,6 +330,7 @@ def build_v33_ledger_row(
     m15_tickers: list[str] | None = None,
     m15_frames: int = 0,
     deep_obs: dict[str, Any] | None = None,
+    print_through: list[Any] | None = None,
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
     (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row.
@@ -388,6 +393,7 @@ def build_v33_ledger_row(
         "settlement": settlement,
         "realized_delta_note": (REALIZED_DELTA_NOTE if realized_delta is not None else None),
         "deep_obs": deep_obs or {},
+        "print_through": print_through or [],
         "flushed_at": now,
     }
     return row
