@@ -442,9 +442,16 @@ def build_print_through(rows: list[dict[str, Any]]) -> dict[str, Any]:
     trigger_locks_c: list[Decimal] = []       # lock at the early ask, per FILLED trigger (cents/contract)
     completion_locks_c: list[Decimal] = []    # lock at completion for the `complete` branch
     roundtrip_total = _ZERO
+    complete_takes = 0                          # F3: bucket-NO taker completes ATTEMPTED (lots)
+    complete_fills = 0                          # F3: of those, lots the venue actually filled
+    unwind_shortfalls = 0                       # F4: unwinds that did not fully sell back -> stood down
     for r in rows:
         if not _is_window_row(r):
             continue
+        sc = r.get("synth_counts") or {}
+        complete_takes += int(sc.get("pt_bucket_no_take", 0) or 0)
+        complete_fills += int(sc.get("pt_bucket_no_fill", 0) or 0)
+        unwind_shortfalls += int(sc.get("pt_unwind_short", 0) or 0)
         pts = r.get("print_through")
         if not isinstance(pts, list) or not pts:
             continue
@@ -477,6 +484,9 @@ def build_print_through(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_trigger_lock_c": mean_trigger_lock,
         "mean_completion_lock_c": mean_completion_lock,
         "unwind_roundtrip_cost": roundtrip_total,
+        "complete_takes": complete_takes,           # F3 reconciliation: taker-complete lots attempted
+        "complete_fills": complete_fills,           # ... vs actually filled (a chronic gap = watch)
+        "unwind_shortfalls": unwind_shortfalls,     # F4: unwinds that stood the window down
     }
 
 
@@ -679,6 +689,9 @@ def _render_print_through(pt: dict[str, Any]) -> list[str]:
     lines.append(f"  mean lock at trigger ask (filled) = {_cc(pt['mean_trigger_lock_c'])}   "
                  f"mean lock at completion (stall complete) = {_cc(pt['mean_completion_lock_c'])}")
     lines.append(f"  total unwind round-trip cost = {_c(pt['unwind_roundtrip_cost'])}")
+    lines.append(f"  taker-complete fills = {pt.get('complete_fills', 0)} / "
+                 f"{pt.get('complete_takes', 0)} attempted   "
+                 f"unwind shortfalls (stood down) = {pt.get('unwind_shortfalls', 0)}")
     return lines
 
 

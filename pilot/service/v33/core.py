@@ -247,6 +247,14 @@ class PrintThroughTrigger:
     lock_at_completion: Decimal | None = None
     roundtrip_cost: Decimal | None = None     # per-window unwind round-trip cost ($ total)
     resolved_ts: float | None = None
+    # F2 (2026-09-26 R2): a stall cancels the unfilled rests FIRST and finalises (complete/unwind) only
+    # once those cancels confirm, so a fill that races the cancel is attributed to THIS (still-active)
+    # batch and the complete size is the TRUE remaining shortfall -- never a second wing batch.
+    stall_pending: bool = False               # cancels emitted, awaiting confirm before finalise
+    pending_cancels: tuple[str, ...] = ()     # order_ids of the stall cancels we are waiting on
+    # F3 (2026-09-26 R2): ARMED completes book the taker bucket-NO from the IOC response (like the wings),
+    # not optimistically; this is the coid the core is waiting on. DRY books optimistically (no venue).
+    complete_coid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -346,6 +354,8 @@ class V33State:
     # can resolve it via the stall policy.
     print_through: tuple[PrintThroughTrigger, ...] = ()
     pt_stood_down: bool = False                         # a print-through partial fail-closed latched down
+    pt_one_legged: bool = False                         # latched one-legged from a fail-closed/short unwind
+                                                        # (the batch is dropped, so the mirror needs a latch)
 
     # shadow (keyed by str(E)) — the V3.2 shadow, forked faithfully
     shadows: Mapping[str, ShadowSub] = field(default_factory=dict)
@@ -518,8 +528,10 @@ def _open_slots(st: V33State) -> list[int]:
 
 
 def _sync_wing_mirrors(st: V33State) -> V33State:
-    """Re-derive the ``one_legged`` mirror from the batch state (kept for L2/ledger compatibility)."""
-    one_legged = any(b.one_legged for b in st.wing_batches)
+    """Re-derive the ``one_legged`` mirror from the batch state (kept for L2/ledger compatibility). A
+    print-through fail-closed / complete-short drops the batch, so ``pt_one_legged`` LATCHES that event
+    (it can never be un-set by a later sync)."""
+    one_legged = any(b.one_legged for b in st.wing_batches) or st.pt_one_legged
     return replace(st, one_legged=one_legged)
 
 
@@ -861,6 +873,10 @@ def _apply_cancelled(
         st = replace(st, ladder=_drop_order(st.ladder, live_order.client_order_id))
     if st.outstanding_cancels > 0:
         st = replace(st, outstanding_cancels=st.outstanding_cancels - 1)
+    # PRINT-THROUGH F2: if this was a stall cancel, drop it from the trigger's pending list and finalise
+    # once they have all confirmed (any racing fill was booked above, so the shortfall is now the TRUTH).
+    st, pt_a = _pt_on_cancel_confirmed(params, st, event.order_id, now)
+    actions += pt_a
     # a bucket change waiting to re-place: once all cancels confirmed and the ladder is clear, place all.
     st, pa = _converge(params, st, now)
     return st, actions + pa
@@ -872,6 +888,10 @@ def _apply_fill(
     """A private fill. A wing-leg fill updates leg status; a rung fill books the rung (at its PRE-roll
     resting price if a roll is in flight for it) and spawns/joins the coalesced wing batch."""
     actions: list[V33Action] = []
+    # PRINT-THROUGH complete taker fill (armed F3): book the bucket-NO from the IOC response, not optimistically.
+    res = _pt_apply_complete_fill(params, st, event, now)
+    if res is not None:
+        return res
     # wing-leg fill?
     for i, leg in enumerate(st.wing_legs):
         if leg.client_order_id == event.client_order_id:
@@ -1202,22 +1222,24 @@ def _maybe_close_set(st: V33State, index: int) -> V33State:
 # Print-through wings (Brad, 2026-09-26): fire the wing take EARLY off a bucket print
 # ---------------------------------------------------------------------------
 def _pt_covered_coids(st: V33State) -> set[str]:
-    """Rung coids currently pre-hedged by an ACTIVE (unresolved) print-through trigger and not yet
-    filled. Convergence never rolls these, and a new trigger never double-hedges them."""
+    """Rung coids pre-hedged by an ACTIVE (unresolved) print-through trigger. Convergence never rolls
+    these, and a new trigger never double-hedges them. F7 (2026-09-26 R2): covers EVERY rung_coid of an
+    unresolved trigger (not only the not-yet-filled ones), so a partially-filled rung (lots_per_rung > 1)
+    can never be re-hedged by a second trigger while its remainder still rests."""
     out: set[str] = set()
     for t in st.print_through:
         if not t.resolved:
-            for c in t.rung_coids:
-                if c not in t.filled_coids:
-                    out.add(c)
+            out.update(t.rung_coids)
     return out
 
 
 def _pt_trigger_index_for_coid(st: V33State, coid: str) -> int | None:
-    """The index into ``st.print_through`` of the active trigger that pre-hedged ``coid`` (and has not yet
-    booked its fill), or None."""
+    """The index into ``st.print_through`` of the active trigger that pre-hedged ``coid``, or None. F7: a
+    fill on a pre-hedged coid attributes to its unresolved trigger's batch even on a later partial
+    (lots_per_rung > 1) -- so repeated partials of one rung all attach to the same pre-emptive batch and
+    never coalesce a fresh one."""
     for i, t in enumerate(st.print_through):
-        if not t.resolved and coid in t.rung_coids and coid not in t.filled_coids:
+        if not t.resolved and coid in t.rung_coids:
             return i
     return None
 
@@ -1271,13 +1293,16 @@ def _pt_bucket_no_ask(st: V33State) -> Decimal | None:
 
 
 def _batch_wpaid_held(st: V33State, batch_index: int) -> Decimal:
-    """Per-contract wing cost actually in hand for a batch (fill_price + fee where filled, else limit)."""
+    """Per-contract wing cost actually IN HAND for a batch: sum over FILLED legs only of
+    ``fill_price + fee`` (or the limit if a filled leg somehow lacks a price). F1 (2026-09-26 R2): an
+    UNFILLED leg contributes 0 -- we never paid for a wing that did not fill, so it is not part of the
+    held cost (nor of the round-trip). Used by ``complete`` (both wings filled by the stall gate) and
+    ``unwind`` (per filled leg)."""
     w = _ZERO
     for lg in _batch_legs(st, batch_index):
-        if lg.status == "filled" and lg.fill_price is not None:
-            w += lg.fill_price + fee(lg.fill_price)
-        else:
-            w += lg.limit + fee(lg.limit)
+        if lg.status == "filled":
+            price = lg.fill_price if lg.fill_price is not None else lg.limit
+            w += price + fee(price)
     return w
 
 
@@ -1300,6 +1325,12 @@ def _print_through_step(
         return st, []
     if st.rest_allotment_done or st.stood_down or st.pt_stood_down:
         return st, []
+    # F6 (2026-09-26 R2): fire the PRE-emptive take only inside the live quoting window (T-quote_start ..
+    # T-quote_end). A print after quote-end (or in the settle grace) would pre-hedge a rung that can no
+    # longer fill before settle -> a forced unwind. (A wing take on a REAL fill is legitimately post-window;
+    # a pre-emptive take on an unfilled rung is not.)
+    if not _in_window(params, st, now):
+        return st, []
     asks = _pt_wing_asks(st, now, params)
     if asks is None:
         return st, []                     # cannot hedge without fresh wing books -> do not fire
@@ -1308,13 +1339,20 @@ def _print_through_step(
     threshold = params.print_through_ticks * _CENT
     covered = _pt_covered_coids(st)
     inflight_old = {r.old_coid for r in st.rolls_in_flight}
-    cands = [
-        o for o in st.ladder
-        if o.live and o.order_id is not None
-        and o.client_order_id not in covered and o.client_order_id not in inflight_old
-        # the print is within `ticks` cents at/below the rung's offer (1-n), or already at/through it.
-        and yes_print + threshold + _EPS >= (_ONE - o.price)
-    ]
+    # F5 (2026-09-26 R2): a print pre-hedges a rung only when it is APPROACHING that rung's offer from
+    # below within `print_through_ticks` -- i.e. the print sits in [offer - ticks*1c, offer - 1c]. This is
+    # the leading-edge signal (fire one-to-ticks cents EARLY, before the cross); the cross itself fills the
+    # rung and attributes to the pre-emptive batch. A lone deep print (far above a cheap rung's offer) no
+    # longer pre-hedges the whole cheaper ladder.
+    cands = []
+    for o in st.ladder:
+        if not (o.live and not o.pending and o.order_id is not None):
+            continue                       # F6: only a live, acked, resting rung (never a pending create)
+        if o.client_order_id in covered or o.client_order_id in inflight_old:
+            continue
+        offer = _ONE - o.price
+        if (offer - threshold) - _EPS <= yes_print <= (offer - _CENT) + _EPS:
+            cands.append(o)
     if not cands:
         return st, []
     slack = params.print_through_slack_c * _CENT
@@ -1350,129 +1388,232 @@ def _print_through_step(
     return st, [_mk(ActionKind.TAKE_WINGS, st.shakedown, legs=legs, count=count, lock=lock_at_trigger)]
 
 
+def _pt_latch_if_done(params: V33Params, st: V33State) -> V33State:
+    """Latch ``rest_allotment_done`` when the allotment is fully spent (mirrors _book_rung_fill's latch)."""
+    if (st.rungs_filled >= params.max_sets_per_hour
+            or (not st.ladder and not st.awaiting_replace and not st.rolls_in_flight
+                and st.outstanding_cancels == 0)):
+        return replace(st, rest_allotment_done=True)
+    return st
+
+
+def _pt_book_taker_complete(
+    params: V33Params, st: V33State, idx: int, price: Decimal, count: int, now: float
+) -> V33State:
+    """Book ``count`` bucket-NO lots bought as an IOC TAKER (the ``complete`` stall leg) into the trigger's
+    batch at ``price`` -- a fee-bearing taker leg (RungFill.taker=True). Shared by the DRY optimistic book
+    and the ARMED book-from-IOC-response path (F3)."""
+    if count <= 0:
+        return st
+    trig = st.print_through[idx]
+    batch = next(b for b in st.wing_batches if b.index == trig.batch_index)
+    rest_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
+    bt = st.bucket_tickers.get(rest_sd) if rest_sd is not None else None
+    rung_lbl = _rung_of(st.n_top, price) if st.n_top is not None else 0
+    e_lbl = _e_rung(params, st.n_top, price) if st.n_top is not None else params.E_min
+    rf = RungFill(rung=rung_lbl, E_rung=e_lbl, price=price, count=int(count), server_ts=now,
+                  coid=None, order_id=None, W=st.W, n_top=st.n_top, bucket_ticker=bt,
+                  bucket_Sd=rest_sd, bucket_Su=(rest_sd + params.bucket_width) if rest_sd is not None
+                  else None, taker=True)
+    st = replace(st, rest_fills=st.rest_fills + (rf,), rungs_filled=st.rungs_filled + 1,
+                 wing_batches=_replace_batch(st.wing_batches, batch.index, fills=batch.fills + (rf,)))
+    return st
+
+
 def _pt_cancel_unfilled_rungs(
     params: V33Params, st: V33State, trig: PrintThroughTrigger, now: float
-) -> tuple[V33State, list[V33Action]]:
-    """Cancel-first: pull every pre-hedged rung of ``trig`` that has NOT filled and is still resting, so
-    the stall/fail-closed resolution can never end up double-filled. Marks each cancelled rung's current
-    margin consumed (state 2) so convergence never re-places it this window."""
+) -> tuple[V33State, list[V33Action], list[str]]:
+    """Cancel-first: pull every pre-hedged rung of ``trig`` still RESTING in the ladder (F7: by ladder
+    membership, so a partially-filled rung's remainder is pulled too), so the stall/fail-closed resolution
+    can never end up double-filled. Marks each cancelled rung's current margin consumed (state 2) so
+    convergence never re-places it. Returns (st, actions, cancelled_order_ids) -- the order_ids we now
+    await a cancel confirm for (F2)."""
     actions: list[V33Action] = []
-    unfilled = [c for c in trig.rung_coids if c not in trig.filled_coids]
     ms = list(st.margin_state)
-    for coid in unfilled:
+    cancelled: list[str] = []
+    for coid in trig.rung_coids:
         o = next((x for x in st.ladder if x.client_order_id == coid), None)
         if o is None:
-            continue
+            continue                            # already filled+dropped, or never placed
         actions.append(_cancel_action(st, o))
         st = _remember_cancel_ctx(st, o)
         if st.n_top is not None:
             m = _margin_of(params, st.n_top, o.price)
             if 0 <= m < len(ms):
                 ms[m] = 2                       # consumed by the stall -> convergence never re-places it
+        if o.order_id is not None:
+            cancelled.append(o.order_id)
         st = replace(st, ladder=_drop_order(st.ladder, coid),
                      outstanding_cancels=st.outstanding_cancels + (1 if o.order_id else 0))
     st = replace(st, margin_state=tuple(ms))
+    return st, actions, cancelled
+
+
+def _pt_begin_stall(
+    params: V33Params, st: V33State, idx: int, now: float
+) -> tuple[V33State, list[V33Action]]:
+    """F2 phase 1: on a stall, cancel the unfilled rests FIRST and mark the trigger ``stall_pending``,
+    then WAIT for those cancels to confirm before finalising. A fill that races the cancel arrives as an
+    OrderCancelled(filled>0) and attributes to THIS still-active batch, so ``_pt_finalize_stall`` completes
+    the TRUE remaining shortfall -- never over-buying a taker set and never coalescing a second wing batch.
+    If nothing is awaiting a confirm (no order_ids to cancel), finalise immediately."""
+    st, ca, oids = _pt_cancel_unfilled_rungs(params, st, st.print_through[idx], now)
+    st = replace(st, print_through=_replace_pt(st.print_through, idx, stall_pending=True,
+                                               pending_cancels=tuple(oids)))
+    if not oids:
+        st, fa = _pt_finalize_stall(params, st, idx, now)
+        return st, ca + fa
+    return st, ca
+
+
+def _pt_on_cancel_confirmed(
+    params: V33Params, st: V33State, order_id: str | None, now: float
+) -> tuple[V33State, list[V33Action]]:
+    """A stall cancel confirmed (F2): drop ``order_id`` from any stall_pending trigger's
+    ``pending_cancels``; when a trigger's list empties, finalise it. Called from ``_apply_cancelled``
+    AFTER any racing fill has been booked (and thus attributed to the batch)."""
+    actions: list[V33Action] = []
+    if order_id is None or not st.print_through:
+        return st, actions
+    for idx in range(len(st.print_through)):
+        t = st.print_through[idx]
+        if not t.stall_pending or t.resolved or order_id not in t.pending_cancels:
+            continue
+        remaining = tuple(o for o in t.pending_cancels if o != order_id)
+        st = replace(st, print_through=_replace_pt(st.print_through, idx, pending_cancels=remaining))
+        if not remaining:
+            st, fa = _pt_finalize_stall(params, st, idx, now)
+            actions += fa
     return st, actions
 
 
-def _pt_resolve_stall(
+def _pt_finalize_stall(
     params: V33Params, st: V33State, idx: int, now: float
 ) -> tuple[V33State, list[V33Action]]:
-    """The stall policy for one trigger whose pre-hedged rung(s) never filled within the stall window but
-    whose WINGS are in hand. Cancel the un-filled rests first, then either COMPLETE (buy the bucket-NO
-    ourselves as a taker so the wings are not wasted) or UNWIND (sell the wings back)."""
+    """F2 phase 2: the stall cancels have confirmed and any racing fill has attributed to the batch. Now
+    complete the TRUE remaining shortfall (buy the bucket-NO taker) or unwind the pre-taken wings."""
     actions: list[V33Action] = []
     trig = st.print_through[idx]
-    batch = next(b for b in st.wing_batches if b.index == trig.batch_index)
-    filled_lots = batch.total_count
-    shortfall = trig.count - filled_lots
-    if shortfall <= 0:
+    if trig.resolved:
         return st, actions
-    st, ca = _pt_cancel_unfilled_rungs(params, st, trig, now)
-    actions += ca
-    w_paid = _batch_wpaid_held(st, batch.index)
+    st = replace(st, print_through=_replace_pt(st.print_through, idx, stall_pending=False))
+    batch = next((b for b in st.wing_batches if b.index == trig.batch_index), None)
+    if batch is None:
+        return _pt_mark_resolution(st, trig.batch_index, "filled", now), actions
+    shortfall = trig.count - batch.total_count
+    if shortfall <= 0:
+        # the race filled every pre-hedged rung -> no taker needed; the wing/rung fills close the set.
+        st = _maybe_close_set(st, batch.index)
+        st = _pt_mark_resolution(st, batch.index, "filled", now)
+        return _sync_wing_mirrors(st), actions
     no_ask = _pt_bucket_no_ask(st)
-    floor = params.print_through_min_lock_c * _CENT
+    w_paid = _batch_wpaid_held(st, batch.index)          # both wings in hand (stall gate)
     lock_complete_per = lock_value(no_ask, w_paid) if no_ask is not None else None
+    floor = params.print_through_min_lock_c * _CENT
     policy = params.print_through_policy
-    # prefer completing when we already have partial fills (do not waste the bought wings) or when the
-    # taker lock clears the floor; force one branch when the policy pins it.
     do_complete = (
         policy != "unwind" and no_ask is not None and lock_complete_per is not None
-        and (filled_lots > 0 or lock_complete_per >= floor)
+        and (batch.total_count > 0 or lock_complete_per >= floor)
     )
-    if policy == "unwind":
-        do_complete = False
     if do_complete:
-        rest_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
-        bt = st.bucket_tickers.get(rest_sd) if rest_sd is not None else None
-        rung_lbl = _rung_of(st.n_top, no_ask) if st.n_top is not None else 0
-        e_lbl = _e_rung(params, st.n_top, no_ask) if st.n_top is not None else params.E_min
-        rf = RungFill(rung=rung_lbl, E_rung=e_lbl, price=no_ask, count=int(shortfall), server_ts=now,
-                      coid=None, order_id=None, W=st.W, n_top=st.n_top, bucket_ticker=bt,
-                      bucket_Sd=rest_sd, bucket_Su=(rest_sd + params.bucket_width) if rest_sd else None,
-                      taker=True)
-        st = replace(
-            st, rest_fills=st.rest_fills + (rf,), rungs_filled=st.rungs_filled + 1,
-            wing_batches=_replace_batch(st.wing_batches, batch.index, fills=batch.fills + (rf,)),
-            print_through=_replace_pt(st.print_through, idx, shortfall=int(shortfall),
-                                      complete_price=no_ask,
-                                      lock_at_completion=lock_complete_per,
-                                      resolved=True, resolution="complete", resolved_ts=now),
-        )
-        legs = (LegOrder(bt or "", BUY_NO, "buy", int(shortfall), no_ask),)
-        actions.append(_mk(V33ActionKind.TAKE_BUCKET_NO, st.shakedown, legs=legs,
-                           ticker=bt or "", side=BUY_NO, action="buy", count=int(shortfall),
-                           price=no_ask))
-        st = _maybe_close_set(st, batch.index)
-        if (st.rungs_filled >= params.max_sets_per_hour
-                or (not st.ladder and not st.awaiting_replace and not st.rolls_in_flight
-                    and st.outstanding_cancels == 0)):
-            st = replace(st, rest_allotment_done=True)
+        st, a = _pt_complete(params, st, idx, int(shortfall), no_ask, lock_complete_per, now)
     else:
-        st, ua = _pt_unwind(params, st, idx, int(shortfall), now, resolution="unwind")
-        actions += ua
-    return _sync_wing_mirrors(st), actions
+        st, a = _pt_unwind(params, st, idx, now, resolution="unwind")
+    return _sync_wing_mirrors(st), actions + a
+
+
+def _pt_complete(
+    params: V33Params, st: V33State, idx: int, shortfall: int, no_ask: Decimal,
+    lock_complete_per: Decimal, now: float
+) -> tuple[V33State, list[V33Action]]:
+    """The ``complete`` branch: buy ``shortfall`` bucket-NO as an IOC taker. DRY books it optimistically
+    (no venue). ARMED (F3) sends the IOC with ``complete_coid`` and books from its Fill in ``_apply_fill``;
+    a fill shortfall there unwinds the un-hedged wings + stands down."""
+    trig = st.print_through[idx]
+    batch = next(b for b in st.wing_batches if b.index == trig.batch_index)
+    rest_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
+    bt = st.bucket_tickers.get(rest_sd) if rest_sd is not None else None
+    if st.shakedown:
+        st = _pt_book_taker_complete(params, st, idx, no_ask, int(shortfall), now)
+        st = replace(st, print_through=_replace_pt(
+            st.print_through, idx, resolved=True, resolution="complete", shortfall=int(shortfall),
+            complete_price=no_ask, lock_at_completion=lock_complete_per, resolved_ts=now))
+        st = _maybe_close_set(st, batch.index)
+        st = _pt_latch_if_done(params, st)
+    else:
+        cc, st = _mint_coid(st)
+        st = replace(st, print_through=_replace_pt(
+            st.print_through, idx, resolved=True, resolution="complete", shortfall=int(shortfall),
+            complete_price=no_ask, lock_at_completion=lock_complete_per, resolved_ts=now,
+            complete_coid=cc))
+    legs = (LegOrder(bt or "", BUY_NO, "buy", int(shortfall), no_ask),)
+    action = _mk(V33ActionKind.TAKE_BUCKET_NO, st.shakedown, legs=legs, ticker=bt or "", side=BUY_NO,
+                 action="buy", count=int(shortfall), price=no_ask,
+                 client_order_id=(None if st.shakedown else st.print_through[idx].complete_coid))
+    return st, [action]
 
 
 def _pt_unwind(
-    params: V33Params, st: V33State, idx: int, shortfall: int, now: float, *, resolution: str
+    params: V33Params, st: V33State, idx: int, now: float, *, resolution: str
 ) -> tuple[V33State, list[V33Action]]:
-    """Sell ``shortfall`` of each pre-taken wing back IOC at the current bids, record the round-trip cost,
-    and drop the (now-flat) pre-emptive batch + legs so the ledger never counts the unwound wings as held.
-    Used by the ``unwind`` stall branch and (via _pt_fail_closed) the partial-fill fail-closed branch."""
+    """Sell the pre-taken wings back IOC at the current bids. F1 (2026-09-26 R2): sell ONLY legs that
+    FILLED, each sized to what we actually HOLD -- never the never-filled wing (that would open a naked
+    short, the opposite of going flat). Cost/round-trip from filled legs only.
+
+    Two shapes: (a) both wings filled (a clean stall-unwind) -> sell the un-hedged remainder
+    (``leg.count - filled_lots``) of each; if some rungs filled, keep those as a completed set. (b) only
+    one wing filled (fail-closed) -> sell that one leg's full held count and drop the batch."""
     actions: list[V33Action] = []
     trig = st.print_through[idx]
     batch = next(b for b in st.wing_batches if b.index == trig.batch_index)
-    w_paid = _batch_wpaid_held(st, batch.index)
+    legs = _batch_legs(st, batch.index)
+    filled_legs = [lg for lg in legs if lg.status == "filled"]
+    both_filled = len(filled_legs) == 2
+    filled_lots = batch.total_count
     yes_bid, no_bid = _pt_wing_bids(st)
-    proceeds = _ZERO
-    if yes_bid is not None:
-        proceeds += yes_bid - fee(yes_bid)
-    if no_bid is not None:
-        proceeds += no_bid - fee(no_bid)
-    roundtrip = (w_paid - proceeds) * Decimal(int(shortfall))
-    legs_sell = []
-    top_sd = st.strike_tops.get(st.spot_Sd) if st.spot_Sd is not None else None
-    top_su = st.strike_tops.get(st.spot_Su) if st.spot_Su is not None else None
-    yleg = next((lg for lg in _batch_legs(st, batch.index) if lg.side == BUY_YES), None)
-    nleg = next((lg for lg in _batch_legs(st, batch.index) if lg.side == BUY_NO), None)
-    if yleg is not None and yes_bid is not None:
-        legs_sell.append(LegOrder(yleg.ticker, BUY_YES, "sell", int(shortfall), yes_bid))
-    if nleg is not None and no_bid is not None:
-        legs_sell.append(LegOrder(nleg.ticker, BUY_NO, "sell", int(shortfall), no_bid))
-    # drop the pre-emptive batch + its legs (unwound -> flat), and record the round-trip on the trigger.
-    st = replace(
-        st,
-        wing_batches=tuple(b for b in st.wing_batches if b.index != batch.index),
-        wing_legs=tuple(lg for lg in st.wing_legs if lg.batch != batch.index),
-        print_through=_replace_pt(st.print_through, idx, shortfall=int(shortfall),
-                                  roundtrip_cost=roundtrip, resolved=True, resolution=resolution,
-                                  resolved_ts=now),
-    )
+
+    def _bid(side: str) -> Decimal | None:
+        return yes_bid if side == BUY_YES else no_bid
+
+    legs_sell: list[LegOrder] = []
+    roundtrip = _ZERO
+    keep_hedged = both_filled and filled_lots > 0
+    sell_each = (filled_legs[0].count - filled_lots) if both_filled else None  # per-leg for the pair case
+    for lg in filled_legs:
+        n = sell_each if sell_each is not None else lg.count
+        if n <= 0:
+            continue
+        paid = lg.fill_price if lg.fill_price is not None else lg.limit
+        bid = _bid(lg.side)
+        if bid is not None:
+            legs_sell.append(LegOrder(lg.ticker, lg.side, "sell", int(n), bid))
+            roundtrip += ((paid + fee(paid)) - (bid - fee(bid))) * Decimal(int(n))
+        else:
+            roundtrip += (paid + fee(paid)) * Decimal(int(n))       # no bid -> conservative full loss
+
+    if keep_hedged:
+        # keep the ``filled_lots`` sets: shrink both wing legs + taken_count to filled_lots, complete them.
+        new_legs = tuple(replace(lg, count=filled_lots) if (lg.batch == batch.index
+                                                            and lg.status == "filled") else lg
+                         for lg in st.wing_legs)
+        st = replace(st, wing_legs=new_legs,
+                     wing_batches=_replace_batch(st.wing_batches, batch.index, taken_count=filled_lots),
+                     print_through=_replace_pt(st.print_through, idx,
+                                               shortfall=int(sell_each or 0), roundtrip_cost=roundtrip,
+                                               resolved=True, resolution=resolution, resolved_ts=now))
+        st = _maybe_close_set(st, batch.index)
+    else:
+        # drop the (now-flat, or one-legged) batch + legs so the ledger never counts unwound wings as held.
+        st = replace(
+            st,
+            wing_batches=tuple(b for b in st.wing_batches if b.index != batch.index),
+            wing_legs=tuple(lg for lg in st.wing_legs if lg.batch != batch.index),
+            print_through=_replace_pt(st.print_through, idx, shortfall=int(trig.count - filled_lots),
+                                      roundtrip_cost=roundtrip, resolved=True, resolution=resolution,
+                                      resolved_ts=now))
     if legs_sell:
         actions.append(_mk(V33ActionKind.UNWIND_WINGS, st.shakedown, legs=tuple(legs_sell),
-                           count=int(shortfall)))
+                           count=max(l.count for l in legs_sell)))
     return st, actions
 
 
@@ -1480,40 +1621,90 @@ def _pt_fail_closed(
     params: V33Params, st: V33State, batch_index: int, now: float
 ) -> tuple[V33State, list[V33Action]]:
     """A pre-emptive wing leg did NOT fully fill (the ask moved past our tight limit) -> FAIL CLOSED
-    (the one-legged risk the falsifier counts). Cancel the pre-hedged rests, unwind whatever wing filled,
-    and stand the hour down. Simple and safe: never retry, never place again this window."""
+    (the one-legged risk the falsifier counts). Cancel the pre-hedged rests, unwind ONLY the wing that
+    actually filled (F1 -- never sell the leg we never bought), and stand the hour down. Never retry,
+    never place again this window."""
     actions: list[V33Action] = []
     idx = next((i for i, t in enumerate(st.print_through) if t.batch_index == batch_index
                 and not t.resolved), None)
     if idx is None:
         return st, actions
     trig = st.print_through[idx]
-    st, ca = _pt_cancel_unfilled_rungs(params, st, trig, now)
+    st, ca, _oids = _pt_cancel_unfilled_rungs(params, st, trig, now)
     actions += ca
-    # sell back any wing leg that DID fill (best-effort); mark the whole batch one_legged + resolved.
-    st = replace(st, wing_batches=_replace_batch(st.wing_batches, batch_index, one_legged=True))
-    st, ua = _pt_unwind(params, st, idx, trig.count - len([c for c in trig.rung_coids
-                                                           if c in trig.filled_coids]),
-                        now, resolution="partial")
+    st, ua = _pt_unwind(params, st, idx, now, resolution="partial")   # F1: filled legs only
     actions += ua
-    st = replace(st, pt_stood_down=True, stood_down=True)
+    st = replace(st, pt_stood_down=True, stood_down=True, pt_one_legged=True)
     st, sd = _standdown(st, "print_through_partial")
     st = _sync_wing_mirrors(st)
     return st, actions + sd
 
 
+def _pt_apply_complete_fill(
+    params: V33Params, st: V33State, event: Fill, now: float
+) -> tuple[V33State, list[V33Action]] | None:
+    """F3: book an ARMED ``complete`` taker fill from the IOC response. Returns (st, actions) if ``event``
+    is a complete taker fill for a trigger's ``complete_coid``, else None. A fill SHORTFALL (the marketable
+    IOC did not fully fill) leaves ``shortfall - got`` un-hedged wings -> sell them back (F1) + stand down
+    (journalled ``print_through_complete_short``)."""
+    for i, t in enumerate(st.print_through):
+        if t.complete_coid is None or t.complete_coid != event.client_order_id:
+            continue
+        got = int(event.count)
+        price = event.price if event.price is not None else (t.complete_price or _ZERO)
+        st = _pt_book_taker_complete(params, st, i, price, got, now)
+        st = replace(st, print_through=_replace_pt(st.print_through, i, complete_coid=None))
+        batch = next((b for b in st.wing_batches if b.index == t.batch_index), None)
+        short = int(t.shortfall) - got
+        actions: list[V33Action] = []
+        if short > 0 and batch is not None:
+            # the un-hedged wings for the missed lots: shrink the batch to what is hedged and sell them.
+            hedged = batch.total_count                         # filled_lots + got
+            yes_bid, no_bid = _pt_wing_bids(st)
+            legs_sell: list[LegOrder] = []
+            roundtrip = t.roundtrip_cost or _ZERO
+            for lg in _batch_legs(st, batch.index):
+                if lg.status != "filled":
+                    continue
+                bid = yes_bid if lg.side == BUY_YES else no_bid
+                paid = lg.fill_price if lg.fill_price is not None else lg.limit
+                if bid is not None:
+                    legs_sell.append(LegOrder(lg.ticker, lg.side, "sell", int(short), bid))
+                    roundtrip += ((paid + fee(paid)) - (bid - fee(bid))) * Decimal(int(short))
+                else:
+                    roundtrip += (paid + fee(paid)) * Decimal(int(short))
+            new_legs = tuple(replace(lg, count=hedged) if (lg.batch == batch.index
+                                                           and lg.status == "filled") else lg
+                             for lg in st.wing_legs)
+            st = replace(st, wing_legs=new_legs,
+                         wing_batches=_replace_batch(st.wing_batches, batch.index, taken_count=hedged),
+                         print_through=_replace_pt(st.print_through, i, roundtrip_cost=roundtrip),
+                         pt_stood_down=True, stood_down=True, pt_one_legged=True)
+            if legs_sell:
+                actions.append(_mk(V33ActionKind.UNWIND_WINGS, st.shakedown, legs=tuple(legs_sell),
+                                   count=int(short)))
+            st, csd = _standdown(st, "print_through_complete_short")
+            actions += csd
+        st = _maybe_close_set(st, t.batch_index)
+        st = _pt_latch_if_done(params, st)
+        return _sync_wing_mirrors(st), actions
+    return None
+
+
 def _pt_stall_step(
     params: V33Params, st: V33State, now: float
 ) -> tuple[V33State, list[V33Action]]:
-    """Resolve every active print-through trigger whose pre-hedged rung(s) have not filled within
-    ``print_through_stall_ms`` (the stall policy), and fail-closed any whose wings did not both fill."""
+    """Begin the stall policy for every active print-through trigger whose pre-hedged rung(s) have not
+    filled within ``print_through_stall_ms``, and fail-closed any whose wings did not both fill. A trigger
+    already in the cancel-confirm wait (``stall_pending``) is left alone -- it finalises when its cancels
+    confirm (``_pt_on_cancel_confirmed``)."""
     if not params.print_through or not st.print_through:
         return st, []
     actions: list[V33Action] = []
     stall_s = params.print_through_stall_ms / 1000.0
     for idx in range(len(st.print_through)):
         t = st.print_through[idx]
-        if t.resolved:
+        if t.resolved or t.stall_pending:
             continue
         batch = next((b for b in st.wing_batches if b.index == t.batch_index), None)
         if batch is None or batch.completed:
@@ -1528,7 +1719,7 @@ def _pt_stall_step(
             st, fa = _pt_fail_closed(params, st, batch.index, now)
             actions += fa
             continue
-        st, sa = _pt_resolve_stall(params, st, idx, now)
+        st, sa = _pt_begin_stall(params, st, idx, now)
         actions += sa
     return st, actions
 

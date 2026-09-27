@@ -617,7 +617,9 @@ def _compute_v33_money(driver: V33Driver) -> dict[str, Any]:
         # PRINT-THROUGH (2026-09-26): trigger/stall receipts (0 unless the feature is enabled).
         "print_through_triggers": len(driver.state.print_through),
         "print_through_completes": int(getattr(driver.executor, "pt_bucket_no_takes", 0)),
+        "print_through_complete_fills": int(getattr(driver.executor, "pt_bucket_no_fills", 0)),
         "print_through_unwinds": int(getattr(driver.executor, "pt_unwinds", 0)),
+        "print_through_unwind_shortfalls": int(getattr(driver.executor, "pt_unwind_shortfalls", 0)),
     }
     return {**money, **counters}
 

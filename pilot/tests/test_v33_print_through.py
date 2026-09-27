@@ -1,29 +1,33 @@
 """PRINT-THROUGH WINGS (Brad, 2026-09-26): the early-hedge trigger for the V3.3 ladder.
 
 The feature ships OFF (``print_through`` false) -> the ladder is byte-identical (proved by the whole
-existing suite passing unchanged). These tests ENABLE it via ``replace(params, print_through=True, ...)``
-and prove:
+existing suite passing unchanged). These tests ENABLE it via ``replace(params, print_through=True, ...)``.
 
-  * the trigger fires only on a qualifying bucket YES print toward a resting rung's offer (within
-    ``print_through_ticks``), not on a print away from it, and not when no rest is live;
-  * the fill-after-trigger path attributes the pre-emptive wing batch ONCE (no coalesce, no second take);
-  * a completed print-through set counts and the ledger attributes it;
-  * STALL -> complete when the taker lock clears the floor; STALL -> unwind otherwise;
-  * a partial wing fill fails closed (cancel the rests, unwind, stand down);
-  * dry-mode simulates the trigger faithfully (the driver's dry_sim books the crossing rung after the
-    pre-emptive take).
+Round-2 semantics (after the adversarial review, findings F1-F7):
+  * F5: a print pre-hedges a rung only when it is APPROACHING that rung's offer from BELOW, within
+    ``print_through_ticks`` -- the print sits in [offer - ticks*1c, offer - 1c]. A lone deep print no
+    longer pre-hedges the whole cheaper ladder.
+  * F6: the pre-emptive trigger fires only inside the live quoting window, and only on a live-resting rung.
+  * F2: a stall CANCELS the unfilled rests first and finalises (complete/unwind) only once those cancels
+    confirm -- a racing fill attributes to the same batch (no second take, no double-buy).
+  * F1: the fail-closed / unwind path sells ONLY the wing that actually filled (never a naked short).
+  * F3/F4: a complete books the taker bucket-NO from the IOC response; a complete/unwind shortfall stands
+    the window down.
 
 No network, no disk beyond the shipped policy. Holdout / seal are never touched.
 """
 
 from __future__ import annotations
 
+import json
+import os
+from collections import deque
 from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
-from service._simlaw import fee
+from service._simlaw import fee  # noqa: F401
 from service.book import TopOfBook
 from service.v33 import (
     ActionKind,
@@ -31,13 +35,14 @@ from service.v33 import (
     ClockTick,
     Fill,
     OrderAck,
+    OrderCancelled,
     Trade,
     V33State,
     decide_v33,
     load_v33_params,
 )
-from service.v33.actions import V33ActionKind
-from service.v33.core import lock_value, print_through_summary
+from service.v33.actions import LegOrder, V33Action, V33ActionKind
+from service.v33.core import lock_value, print_through_summary  # noqa: F401
 
 CLOSE = "2026-09-04T20:00:00Z"
 T = 1_000_000
@@ -95,7 +100,7 @@ def _feed_all(p, st, events):
 
 def _bring_up(p, st, now):
     st, acts = _feed_all(p, st, _books(now))
-    places = [a for a in acts if a.kind == ActionKind.PLACE_REST]
+    places = [a for a in acts if a.kind in (ActionKind.PLACE_REST, ActionKind.WOULD_PLACE_REST)]
     assert places
     for a in places:
         st, _ = _feed(p, st, OrderAck(a.client_order_id, f"OID-{a.client_order_id}", now))
@@ -103,12 +108,8 @@ def _bring_up(p, st, now):
     return st
 
 
-def _state(p):
-    return V33State.new(CLOSE, T, BK, p)
-
-
-def _wing_leg_coids(st, batch_index):
-    return [lg.client_order_id for lg in st.wing_legs if lg.batch == batch_index]
+def _state(p, *, shakedown=False):
+    return V33State.new(CLOSE, T, BK, p, shakedown=shakedown)
 
 
 def _fill_wings(p, st, batch_index, now):
@@ -119,84 +120,106 @@ def _fill_wings(p, st, batch_index, now):
 
 
 # ===========================================================================
-# Trigger firing
+# F5 -- the distance band: fire only when APPROACHING the offer from below within ticks
 # ===========================================================================
-def test_trigger_fires_on_qualifying_print_toward_offer():
-    p = _params()
+def test_trigger_fires_one_tick_below_offer():
+    p = _params(print_through_ticks=1)
     st = _bring_up(p, _state(p), T - 600)
-    # a print at 0.51 is within 1 tick of the top rung's offer (0.50); it reaches offers <= 0.52 ->
-    # rungs at n 0.50/0.49/0.48 (offers 0.50/0.51/0.52).
-    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
+    # ticks=1: a print at 0.49 is exactly one tick below the top rung's offer (0.50 -> n 0.50). ONE rung.
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
     takes = [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
-    assert len(takes) == 1
-    assert len(st.print_through) == 1
-    trig = st.print_through[0]
-    assert trig.count == 3 and set(trig.rung_prices) == {Decimal("0.50"), Decimal("0.49"), Decimal("0.48")}
-    assert takes[0].count == 3
-    # the pre-emptive wing batch exists, taken, sized to 3, no rung fill yet (rungs still resting).
-    b = st.wing_batches[0]
-    assert b.print_through and b.taken and b.taken_count == 3 and b.total_count == 0
+    assert len(takes) == 1 and len(st.print_through) == 1
+    assert st.print_through[0].rung_prices == (Decimal("0.50"),) and st.print_through[0].count == 1
     assert st.rungs_filled == 0 and len(st.ladder) == 11   # nothing filled/removed on the print itself
 
 
-def test_no_trigger_on_print_away_from_offer():
-    p = _params()
+def test_trigger_band_widens_with_ticks():
+    p = _params(print_through_ticks=3)
     st = _bring_up(p, _state(p), T - 600)
-    # a print at 0.40 is >1 tick below every offer (min offer 0.50) -> no trigger.
+    # ticks=3, print 0.49 -> offers 0.50/0.51/0.52 (n 0.50/0.49/0.48) qualify; 0.53 (n 0.47) does NOT.
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
+    assert set(st.print_through[0].rung_prices) == {Decimal("0.50"), Decimal("0.49"), Decimal("0.48")}
+
+
+def test_no_trigger_on_lone_deep_print_far_above_offer():
+    # F5: a lone high print (0.65, far above every offer) no longer pre-hedges the whole cheaper ladder.
+    p = _params(print_through_ticks=1)
+    st = _bring_up(p, _state(p), T - 600)
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.65"), "yes", Decimal(5), T - 599))
+    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS] and st.print_through == ()
+
+
+def test_no_trigger_on_print_below_band():
+    p = _params(print_through_ticks=1)
+    st = _bring_up(p, _state(p), T - 600)
+    # 0.40 is >1 tick below every offer (min offer 0.50) -> no trigger.
     st, acts = _feed(p, st, Trade(B_SD, Decimal("0.40"), "yes", Decimal(5), T - 599))
-    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
-    assert st.print_through == ()
+    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS] and st.print_through == ()
 
 
 def test_no_trigger_when_no_rest_live():
     p = _params()
     st = _state(p)  # no ladder placed
-    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.99"), "yes", Decimal(5), T - 599))
-    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
-    assert st.print_through == ()
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
+    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS] and st.print_through == ()
 
 
 def test_no_trigger_when_feature_off():
     p = replace(load_v33_params(), tol=Decimal("0.01"), deb_ms=0,
                 freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)  # print_through False
     st = _bring_up(p, _state(p), T - 600)
-    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.99"), "yes", Decimal(5), T - 599))
-    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
-    assert st.print_through == ()
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
+    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS] and st.print_through == ()
 
 
 def test_no_side_taker_does_not_trigger():
     p = _params()
     st = _bring_up(p, _state(p), T - 600)
-    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.99"), "no", Decimal(5), T - 599))
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.49"), "no", Decimal(5), T - 599))
     assert st.print_through == ()
+
+
+# ===========================================================================
+# F6 -- window / live-resting gate
+# ===========================================================================
+def test_no_trigger_after_quote_end():
+    p = _params(print_through_ticks=1)
+    st = _bring_up(p, _state(p), T - 600)
+    # a print AFTER quote-end (T - quote_end_s = T-300; use T-200 -> t_to_close 200 < 300) does not fire.
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 200))
+    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS] and st.print_through == ()
+
+
+def test_no_trigger_before_quote_start():
+    p = _params(print_through_ticks=1)
+    st = _bring_up(p, _state(p), T - 600)
+    # a print BEFORE quote-start (T - quote_start_s = T-900; use T-950 -> t_to_close 950 > 900) does not fire.
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 950))
+    assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
 
 
 # ===========================================================================
 # Attribution (no double take)
 # ===========================================================================
 def test_fill_after_trigger_attributes_batch_once():
-    p = _params()
+    p = _params(print_through_ticks=3)
     st = _bring_up(p, _state(p), T - 600)
-    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
-    trig = st.print_through[0]
-    covered = trig.rung_coids
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
+    covered = st.print_through[0].rung_coids
     # fill one pre-hedged rung -> it attaches to the SAME batch; no new coalesce group, no second take.
     o = next(x for x in st.ladder if x.client_order_id == covered[0])
     st, acts = _feed(p, st, Fill(o.order_id, o.client_order_id, Decimal(1), o.price, "no", T - 598))
     assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]   # NO second take
-    assert st.coalesce_open is None                                    # not coalesced separately
-    assert len(st.wing_batches) == 1
-    assert st.wing_batches[0].total_count == 1                         # the fill attached to the batch
+    assert st.coalesce_open is None and len(st.wing_batches) == 1
+    assert st.wing_batches[0].total_count == 1
     assert st.rungs_filled == 1 and len(st.ladder) == 10
 
 
 def test_completed_print_through_set_counts_and_books():
-    p = _params()
+    p = _params(print_through_ticks=3)
     st = _bring_up(p, _state(p), T - 600)
-    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
     b_idx = st.wing_batches[0].index
-    # fill the wings (IOC completing at our early limits), then all 3 pre-hedged rungs.
     st = _fill_wings(p, st, b_idx, T - 598)
     for coid in st.print_through[0].rung_coids:
         o = next(x for x in st.ladder if x.client_order_id == coid)
@@ -206,105 +229,145 @@ def test_completed_print_through_set_counts_and_books():
 
 
 # ===========================================================================
-# Stall policy
+# F2 -- stall cancel-race: a fill racing the cancel attributes to the batch, no second take
 # ===========================================================================
-def test_stall_completes_when_lock_clears_floor():
-    # completing via a bucket-NO TAKER at the current ask is costlier than the maker rung would have been,
-    # so its lock is typically negative; a floor of -$0.50 admits it (the branch-selection is the point).
-    p = _params(print_through_stall_ms=1500, print_through_min_lock_c=-50)
-    st = _bring_up(p, _state(p), T - 600)
-    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
-    b_idx = st.wing_batches[0].index
-    st = _fill_wings(p, st, b_idx, T - 598.9)   # wings in hand, rungs NOT filled
-    # advance past the stall window without any rung fill -> complete (bucket-NO taker at no_ask 0.65).
-    st, acts = _feed(p, st, ClockTick(T - 597))   # ~1.9 s later > 1.5 s stall
-    completes = [a for a in acts if a.kind == V33ActionKind.TAKE_BUCKET_NO]
-    assert len(completes) == 1 and completes[0].count == 3
+def test_stall_cancel_race_no_double_take():
+    p = _params(print_through_ticks=1, print_through_stall_ms=1000, print_through_min_lock_c=-50)
+    st = _bring_up(p, _state(p, shakedown=True), T - 600)   # shakedown so finalise resolves synchronously
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
     trig = st.print_through[0]
+    rung = next(o for o in st.ladder if o.client_order_id == trig.rung_coids[0])
+    rung_oid = rung.order_id
+    b_idx = st.wing_batches[0].index
+    st = _fill_wings(p, st, b_idx, T - 598.9)
+    # stall: begin cancels the unfilled rest, waits for the confirm (does NOT complete yet).
+    st, acts = _feed(p, st, ClockTick(T - 597))
+    assert st.print_through[0].stall_pending and not st.print_through[0].resolved
+    assert [a for a in acts if a.kind == ActionKind.WOULD_CANCEL_REST]
+    assert not [a for a in acts if a.kind in (V33ActionKind.WOULD_TAKE_BUCKET_NO,
+                                              V33ActionKind.TAKE_BUCKET_NO)]   # NOT completed yet
+    # now the pre-hedged rung FILLS in the race (its cancel confirm carries filled_before_cancel=1).
+    st, acts2 = _feed(p, st, OrderCancelled(rung_oid, T - 596, filled_count_before_cancel=Decimal(1)))
+    # the racing fill attributed to the SAME batch -> shortfall 0 -> resolved filled; NO taker, NO 2nd take.
+    assert len(st.wing_batches) == 1
+    assert st.wing_batches[0].completed and st.sets_done == 1
+    assert st.print_through[0].resolution == "filled"
+    assert st.rungs_filled == 1                     # exposure == the one real set (no double bucket-NO)
+    assert not [a for a in acts2 if a.kind in (V33ActionKind.WOULD_TAKE_BUCKET_NO,
+                                               ActionKind.TAKE_WINGS, ActionKind.WOULD_TAKE_WINGS)]
+
+
+# ===========================================================================
+# Stall policy (via the dry driver -- cancels auto-confirm through the FrozenExecutor)
+# ===========================================================================
+class _J:
+    def __init__(self):
+        self.recs = []
+
+    def append(self, k, o, t):
+        self.recs.append((k, o))
+
+    def kinds(self):
+        return [k for k, _ in self.recs]
+
+
+def _dry(p):
+    import service.run_v33 as RUN
+    from service.run_v32 import FrozenExecutor
+    st = V33State.new(CLOSE, T, BK, p, shakedown=True)
+    drv = RUN.V33Driver(p, st, _J(), FrozenExecutor(BK), dry_sim=True, clock=lambda: 0.0)
+    t0 = T - 600
+    for m, tb in ((B_SD, ("0.35", "0.36")), (STK_SU, ("0.36", "0.37")), (STK_SD, ("0.75", "0.76"))):
+        drv.on_book_update(m, _top(*tb), t0)
+    assert len(drv.state.ladder) == 11 and drv.state.n_top == Decimal("0.50")
+    return drv, t0
+
+
+def test_stall_completes_when_lock_clears_floor():
+    # completing via a bucket-NO TAKER at the ask is costlier than the maker rung; a -$0.50 floor admits it.
+    drv, t0 = _dry(_params(print_through_ticks=1, print_through_stall_ms=1000,
+                           print_through_min_lock_c=-50))
+    drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": "0.49", "count_fp": "1.00"}, t0 + 1)
+    assert len(drv.state.print_through) == 1 and drv.state.rungs_filled == 0   # 0.49 does not cross
+    drv.on_clock_tick(t0 + 3)   # 2 s > 1 s stall -> begin -> cancel auto-confirms -> finalise -> complete
+    trig = drv.state.print_through[0]
     assert trig.resolved and trig.resolution == "complete" and trig.complete_price == Decimal("0.65")
-    assert st.wing_batches[0].completed and st.sets_done == 3
-    # the un-filled rests were cancelled first.
-    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert "would_print_through_complete" in drv.journal.kinds()
+    assert drv.state.sets_done == 1
 
 
 def test_stall_unwinds_when_lock_below_floor():
-    # an impossibly high min-lock floor forces the unwind branch on a stall with nothing filled.
-    p = _params(print_through_stall_ms=1500, print_through_min_lock_c=100)
-    st = _bring_up(p, _state(p), T - 600)
-    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
-    b_idx = st.wing_batches[0].index
-    st = _fill_wings(p, st, b_idx, T - 598.9)
-    st, acts = _feed(p, st, ClockTick(T - 597))
-    assert [a for a in acts if a.kind == V33ActionKind.UNWIND_WINGS]
-    assert not [a for a in acts if a.kind == V33ActionKind.TAKE_BUCKET_NO]
-    trig = st.print_through[0]
+    drv, t0 = _dry(_params(print_through_ticks=1, print_through_stall_ms=1000,
+                           print_through_min_lock_c=100))   # impossibly high floor -> unwind
+    drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": "0.49", "count_fp": "1.00"}, t0 + 1)
+    drv.on_clock_tick(t0 + 3)
+    trig = drv.state.print_through[0]
     assert trig.resolved and trig.resolution == "unwind" and trig.roundtrip_cost is not None
-    # the unwound batch + its legs are dropped (flat) so the ledger never counts them as held.
-    assert st.wing_batches == () and st.wing_legs == ()
-    assert st.sets_done == 0
-    assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
+    assert "would_print_through_unwind" in drv.journal.kinds()
+    assert drv.state.wing_batches == () and drv.state.sets_done == 0
+    assert "print_through_complete" not in drv.journal.kinds()
 
 
-def test_policy_unwind_forces_unwind_even_when_lock_ok():
-    p = _params(print_through_stall_ms=1500, print_through_policy="unwind")
-    st = _bring_up(p, _state(p), T - 600)
-    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
-    st = _fill_wings(p, st, st.wing_batches[0].index, T - 598.9)
-    st, acts = _feed(p, st, ClockTick(T - 597))
-    assert [a for a in acts if a.kind == V33ActionKind.UNWIND_WINGS]
-    assert st.print_through[0].resolution == "unwind"
+def test_policy_unwind_forces_unwind():
+    drv, t0 = _dry(_params(print_through_ticks=1, print_through_stall_ms=1000,
+                           print_through_policy="unwind"))
+    drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": "0.49", "count_fp": "1.00"}, t0 + 1)
+    drv.on_clock_tick(t0 + 3)
+    assert drv.state.print_through[0].resolution == "unwind"
 
 
 # ===========================================================================
-# Partial wing fill -> fail closed
+# F1 -- partial wing fill fails closed and sells ONLY the filled wing (no naked short)
 # ===========================================================================
-def test_partial_wing_fill_fails_closed():
-    p = _params()
+def test_partial_wing_fill_fails_closed_sells_only_filled_leg():
+    p = _params(print_through_ticks=1)
     st = _bring_up(p, _state(p), T - 600)
-    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
     b_idx = st.wing_batches[0].index
     legs = [l for l in st.wing_legs if l.batch == b_idx]
     yes_leg = next(l for l in legs if l.side == "yes")
     no_leg = next(l for l in legs if l.side == "no")
-    # yes wing fills; no wing comes back UNFILLED (count 0 -> ask moved past our tight limit).
+    # YES wing fills; NO wing comes back UNFILLED (ask moved past our tight limit).
     st, _ = _feed(p, st, Fill(None, yes_leg.client_order_id, Decimal(yes_leg.count),
                               yes_leg.limit, "yes", T - 598))
     st, acts = _feed(p, st, Fill(None, no_leg.client_order_id, Decimal(0), no_leg.limit, "no", T - 598))
-    # fail closed: cancel the pre-hedged rests, unwind the filled wing, stand down.
+    # fail closed: cancel the rest, stand down, and unwind ONLY the YES leg we actually hold.
     assert [a for a in acts if a.kind == ActionKind.CANCEL_REST]
-    assert [a for a in acts if a.kind == V33ActionKind.UNWIND_WINGS]
     assert [a for a in acts if a.kind == ActionKind.STAND_DOWN]
-    assert st.stood_down and st.pt_stood_down
+    unwinds = [a for a in acts if a.kind == V33ActionKind.UNWIND_WINGS]
+    assert len(unwinds) == 1
+    sell_legs = unwinds[0].legs
+    # exactly ONE sell leg: the YES wing (the one that filled). NEVER the never-filled NO wing.
+    assert len(sell_legs) == 1
+    assert sell_legs[0].side == "yes" and sell_legs[0].action == "sell"
+    assert sell_legs[0].count == int(yes_leg.count)
+    assert st.stood_down and st.pt_stood_down and st.one_legged
     assert st.print_through[0].resolution == "partial"
 
 
 def test_stand_down_blocks_further_triggers():
-    p = _params()
+    p = _params(print_through_ticks=1)
     st = _bring_up(p, _state(p), T - 600)
-    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
     no_leg = next(l for l in st.wing_legs if l.side == "no")
     st, _ = _feed(p, st, Fill(None, no_leg.client_order_id, Decimal(0), no_leg.limit, "no", T - 598))
     assert st.pt_stood_down
-    # a second qualifying print does not fire a new trigger while stood down.
-    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.55"), "yes", Decimal(5), T - 597))
+    st, acts = _feed(p, st, Trade(B_SD, Decimal("0.48"), "yes", Decimal(5), T - 597))
     assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
 
 
 def test_print_through_summary_shape():
-    p = _params()
+    p = _params(print_through_ticks=3)
     st = _bring_up(p, _state(p), T - 600)
-    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.51"), "yes", Decimal(5), T - 599))
+    st, _ = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
     s = print_through_summary(st)
     assert len(s) == 1 and s[0]["count"] == 3 and s[0]["resolved"] is False
-    assert s[0]["yes_print"] == "0.51" and s[0]["lock_at_trigger"] is not None
+    assert s[0]["yes_print"] == "0.49" and s[0]["lock_at_trigger"] is not None
 
 
 # ===========================================================================
-# Golden fixture replays: a 10:00Z-style FAST sweep, and a SLOW-sweep STALL
+# Golden fixture replays: a FAST sweep (pre-hedge + complete at pre-jump ask), a SLOW STALL
 # ===========================================================================
-import json  # noqa: E402
-import os  # noqa: E402
-
 _FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "v33",
                     "print_through_sweeps.json")
 
@@ -320,95 +383,56 @@ def test_fixture_not_holdout_or_seal():
     assert _fixture()["close_time"] == "2026-09-26T22:00:00Z"   # not 2026-08-* holdout/seal
 
 
-def test_golden_fast_sweep_prehedges_and_completes_at_pre_jump_ask():
-    """The 10:00Z-style FAST sweep: the FIRST print of the burst fires the wing take at the ask the sweep
-    STARTED from (before the jump); the rung fills land right behind it and attach to the SAME batch."""
-    fix = _fixture()
-    p = _params(print_through_stall_ms=1500)
+def test_golden_fast_sweep_prehedges_at_pre_jump_ask_and_completes():
+    """A FAST sweep climbs one tick at a time; each print pre-hedges the rung one tick above it at the ask
+    the sweep started from, and the next print (the cross) fills that rung and attributes to the batch."""
+    _fixture()
+    p = _params(print_through_ticks=1, print_through_stall_ms=5000)
     st = _bring_up(p, _state(p), T - 600)
-    t0 = T - 590
-    prints = fix["fast_sweep"]["prints"]
-    # the first print fires print-through; capture the wing limits it locked (the PRE-jump ask).
-    dt, yp, _cnt = prints[0]
-    st, acts = _feed(p, st, Trade(B_SD, Decimal(yp), "yes", Decimal(int(float(_cnt))), t0 + dt))
-    assert len(st.print_through) == 1
-    trig = st.print_through[0]
-    early_yes_ask = trig.yes_ask_at_trigger
-    b_idx = st.wing_batches[0].index
-    early_limits = {lg.side: lg.limit for lg in st.wing_legs if lg.batch == b_idx}
-    # the wings fill at the early ask (IOC completing), then the rungs the burst crosses fill right behind.
-    st = _fill_wings(p, st, b_idx, t0 + prints[0][0] + 0.001)
-    for dt, yp, cnt in prints:
-        ypd = Decimal(yp)
-        for o in [x for x in st.ladder if x.client_order_id in trig.rung_coids
-                  and x.client_order_id not in st.print_through[0].filled_coids
-                  and ypd + _EPS >= (_ONE - x.price)]:
+    early_yes_ask = None
+    seq = [Decimal("0.49"), Decimal("0.50"), Decimal("0.51")]
+    ts = T - 590
+    for k, yp in enumerate(seq):
+        st, acts = _feed(p, st, Trade(B_SD, yp, "yes", Decimal(50), ts + k * 0.02))
+        if [a for a in acts if a.kind == ActionKind.TAKE_WINGS] and early_yes_ask is None:
+            early_yes_ask = st.print_through[-1].yes_ask_at_trigger
+        for b in list(st.wing_batches):
+            st = _fill_wings(p, st, b.index, ts + k * 0.02 + 0.001)
+        for o in [x for x in st.ladder if yp + _EPS >= (_ONE - x.price)]:
             st, _ = _feed(p, st, Fill(o.order_id, o.client_order_id, Decimal(1), o.price, "no",
-                                      t0 + dt))
-    # every pre-hedged rung the burst crossed filled and attached to the pre-emptive batch (ONE batch).
-    assert len(st.wing_batches) == 1
-    b = st.wing_batches[0]
-    assert b.print_through and b.completed and b.total_count == trig.count
-    assert st.sets_done == trig.count
-    # the lock was struck at the early (pre-jump) ask, not a jumped one.
-    assert early_limits["yes"] == early_yes_ask
-    assert st.print_through[0].resolution == "filled"
+                                      ts + k * 0.02 + 0.002))
+    filled = [t for t in st.print_through if t.resolution == "filled"]
+    assert filled, "at least one pre-hedged rung filled behind the sweep"
+    assert st.sets_done >= 1 and early_yes_ask == Decimal("0.76")
 
 
 def test_golden_slow_sweep_stalls_and_unwinds():
-    """The SLOW sweep: the print climbs to within a tick of the top offer (fires print-through) then
-    STALLS -- no crossing print -> the pre-emptive hedge unwinds (lock below the high floor)."""
     fix = _fixture()
-    p = _params(print_through_stall_ms=int(fix["slow_sweep"]["stall_after_s"] * 1000) - 500,
-                print_through_min_lock_c=100)   # high floor -> unwind on stall
-    st = _bring_up(p, _state(p), T - 600)
-    t0 = T - 590
-    for dt, yp, cnt in fix["slow_sweep"]["prints"]:
-        st, acts = _feed(p, st, Trade(B_SD, Decimal(yp), "yes", Decimal(int(float(cnt))), t0 + dt))
-    # a trigger fired on the within-a-tick print (0.49 -> top offer 0.50) but no rung crossed.
-    assert len(st.print_through) == 1 and st.rungs_filled == 0
-    b_idx = st.wing_batches[0].index
-    st = _fill_wings(p, st, b_idx, t0 + 0.31)     # wings filled, rungs still resting
-    # nothing crosses; advance past the stall window.
-    st, acts = _feed(p, st, ClockTick(t0 + float(fix["slow_sweep"]["stall_after_s"])))
-    assert [a for a in acts if a.kind == V33ActionKind.UNWIND_WINGS]
-    assert st.print_through[0].resolution == "unwind"
-    assert st.wing_batches == ()   # unwound -> flat, nothing left as held
+    stall_ms = int(fix["slow_sweep"]["stall_after_s"] * 1000) - 500
+    drv, t0 = _dry(_params(print_through_ticks=1, print_through_stall_ms=stall_ms,
+                           print_through_min_lock_c=100))
+    drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": "0.49", "count_fp": "20.00"}, t0 + 1)
+    assert len(drv.state.print_through) == 1 and drv.state.rungs_filled == 0
+    drv.on_clock_tick(t0 + 1 + float(fix["slow_sweep"]["stall_after_s"]))   # trigger_ts + stall_after_s
+    trig = drv.state.print_through[0]
+    assert trig.resolved and trig.resolution == "unwind"
+    assert drv.state.wing_batches == ()
 
 
 # ===========================================================================
 # Dry-mode faithfulness (the driver simulates the trigger)
 # ===========================================================================
 def test_dry_mode_simulates_trigger_and_attributes():
-    import service.run_v33 as RUN
-    from service.run_v32 import FrozenExecutor
-
-    class J:
-        def __init__(self):
-            self.recs = []
-
-        def append(self, k, o, t):
-            self.recs.append((k, o))
-
-        def kinds(self):
-            return [k for k, _ in self.recs]
-
-    p = _params(print_through_stall_ms=1500)
-    cts = T
-    st = V33State.new(CLOSE, cts, BK, p, shakedown=True)   # DRY -> WOULD_* twins
-    drv = RUN.V33Driver(p, st, J(), FrozenExecutor(BK), dry_sim=True, clock=lambda: 0.0)
-    t0 = cts - 600
-    for m, tb in ((B_SD, ("0.35", "0.36")), (STK_SU, ("0.36", "0.37")), (STK_SD, ("0.75", "0.76"))):
-        drv.on_book_update(m, _top(*tb), t0)
-    assert len(drv.state.ladder) == 11 and drv.state.n_top == Decimal("0.50")
-    # a bucket YES print that crosses the WHOLE ladder (offers 0.50..0.60): print-through pre-hedges all 11,
-    # then dry_sim fills them; the set completes on the (synthetic) wing fills. Sends nothing real.
-    drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": "0.65", "count_fp": "1.00"}, t0 + 1)
-    assert len(drv.state.print_through) == 1 and drv.state.print_through[0].count == 11
-    assert drv.state.rungs_filled == 11 and drv._dry_sim_fills == 11
-    b = drv.state.wing_batches[0]
-    assert b.print_through and b.completed and drv.state.sets_done == 11
-    assert len(drv.state.wing_batches) == 1     # one pre-emptive batch, not coalesced batches
+    drv, t0 = _dry(_params(print_through_ticks=1, print_through_stall_ms=5000))
+    # print 0.49 pre-hedges the top rung (offer 0.50) but does NOT cross it (no dry_sim fill yet).
+    drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": "0.49", "count_fp": "1.00"}, t0 + 1)
+    assert len(drv.state.print_through) == 1 and drv.state.print_through[0].count == 1
+    assert drv.state.rungs_filled == 0 and drv._dry_sim_fills == 0
+    # the crossing print at 0.50 fills the pre-hedged rung (attributes) -> the set completes.
+    drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": "0.50", "count_fp": "1.00"}, t0 + 2)
+    assert drv._dry_sim_fills >= 1 and drv.state.sets_done >= 1
+    filled = [t for t in drv.state.print_through if t.resolution == "filled"]
+    assert filled
     kinds = set(drv.journal.kinds())
     assert "would_take_wings" in kinds and "dry_sim_fill" in kinds
     for real in ("take_wings", "place_rest", "print_through_complete", "print_through_unwind"):
@@ -416,11 +440,11 @@ def test_dry_mode_simulates_trigger_and_attributes():
 
 
 # ===========================================================================
-# Executor mechanics (fake writer): complete (bucket-NO taker) + unwind (sell) + twin refusal
+# Executor mechanics (fake writer): complete book-from-response, unwind reconcile, twin refusal
 # ===========================================================================
-def _exec(enable=True):
-    from collections import deque
+def _exec(enable=True, *, post_queue=None):
     from service.proxy_writer import WriteResponse
+
     from service.v33.executor import V33LiveExecutor
 
     class FakeJournal:
@@ -436,7 +460,7 @@ def _exec(enable=True):
     class FakeWriter:
         def __init__(self):
             self.posts = []
-            self.post_queue = deque()
+            self.post_queue = deque(post_queue or [])
 
         def rest_post(self, path, body):
             self.posts.append((path, body))
@@ -461,33 +485,54 @@ def _exec(enable=True):
     return ex, w, j
 
 
-def test_executor_take_bucket_no_sends_ioc_buy():
-    from service.v33.actions import LegOrder, V33Action
-    ex, w, j = _exec()
+def test_executor_take_bucket_no_books_from_response():
+    from service.proxy_writer import WriteResponse
+    # one batch of 2 chunks (wing_cap=2, count 3) returning 2 + 1 fills -> aggregate Fill of 3.
+    resp = WriteResponse(200, {"orders": [
+        {"order_id": "o1", "client_order_id": "v33-wc-1", "fill_count": "2.00", "yes_price": "35"},
+        {"order_id": "o2", "client_order_id": "v33-wc-2", "fill_count": "1.00", "yes_price": "35"},
+    ]}, True)
+    ex, w, j = _exec(post_queue=[resp])
     a = V33Action(kind=V33ActionKind.TAKE_BUCKET_NO, ticker=B_SD, side="no", action="buy", count=3,
-                  price=Decimal("0.65"), legs=(LegOrder(B_SD, "no", "buy", 3, Decimal("0.65")),))
-    ex.on_action(a, None, T - 500)
-    assert ex.pt_bucket_no_takes == 1
+                  price=Decimal("0.65"), client_order_id="v33-cc-1",
+                  legs=(LegOrder(B_SD, "no", "buy", 3, Decimal("0.65")),))
+    events = ex.on_action(a, None, T - 500)
+    assert ex.pt_bucket_no_takes == 1 and ex.pt_bucket_no_fills == 3
     assert "print_through_complete" in j.kinds()
-    assert w.posts, "a bucket-NO IOC was posted"
-    # chunked at wing_cap=2 -> two chunks (2 + 1) for count 3 -> a batch post.
-    _, body = w.posts[0]
-    assert "orders" in body or body.get("time_in_force") == "immediate_or_cancel"
+    # book-from-response: one aggregate Fill for the core's complete_coid with the true filled count.
+    assert len(events) == 1 and events[0].client_order_id == "v33-cc-1" and int(events[0].count) == 3
 
 
-def test_executor_unwind_sends_sells():
-    from service.v33.actions import LegOrder, V33Action
-    ex, w, j = _exec()
-    legs = (LegOrder(STK_SD, "yes", "sell", 2, Decimal("0.40")),
-            LegOrder(STK_SU, "no", "sell", 2, Decimal("0.30")))
-    a = V33Action(kind=V33ActionKind.UNWIND_WINGS, legs=legs, count=2)
+def test_executor_take_bucket_no_short_signals_core():
+    from service.proxy_writer import WriteResponse
+    resp = WriteResponse(200, {"orders": [
+        {"order_id": "o1", "client_order_id": "v33-wc-1", "fill_count": "2.00", "yes_price": "35"},
+        {"order_id": "o2", "client_order_id": "v33-wc-2", "fill_count": "0.00", "yes_price": "35"},
+    ]}, True)
+    ex, w, j = _exec(post_queue=[resp])
+    a = V33Action(kind=V33ActionKind.TAKE_BUCKET_NO, ticker=B_SD, side="no", action="buy", count=3,
+                  price=Decimal("0.65"), client_order_id="v33-cc-1",
+                  legs=(LegOrder(B_SD, "no", "buy", 3, Decimal("0.65")),))
+    events = ex.on_action(a, None, T - 500)
+    assert ex.pt_bucket_no_fills == 2 and "print_through_complete_short" in j.kinds()
+    assert int(events[0].count) == 2   # the core books 2 and unwinds the 1 un-hedged wing
+
+
+def test_executor_unwind_short_stands_down():
+    from service.proxy_writer import WriteResponse
+    # sell 2 requested (one leg), venue only bought back 1 -> shortfall -> stand down.
+    resp = WriteResponse(200, {"order": {"order_id": "o1", "client_order_id": "v33-wc-1",
+                                         "fill_count": "1.00", "yes_price": "40"}}, True)
+    ex, w, j = _exec(post_queue=[resp])
+    a = V33Action(kind=V33ActionKind.UNWIND_WINGS, count=2,
+                  legs=(LegOrder(STK_SD, "yes", "sell", 2, Decimal("0.40")),))
     ex.on_action(a, None, T - 500)
-    assert ex.pt_unwinds == 1 and "print_through_unwind" in j.kinds()
-    assert w.posts
+    assert ex.pt_unwinds == 1 and ex.pt_unwind_shortfalls == 1
+    assert "print_through_unwind_short" in j.kinds()
+    assert ex.stand_down_reason == "print_through_unwind_short"
 
 
 def test_executor_refuses_would_twin():
-    from service.v33.actions import V33Action
     ex, _, _ = _exec()
     with pytest.raises(AssertionError):
         ex.on_action(V33Action(kind=V33ActionKind.WOULD_TAKE_BUCKET_NO, ticker=B_SD, count=1),
@@ -498,7 +543,7 @@ def test_executor_refuses_would_twin():
 # Report section
 # ===========================================================================
 def test_report_print_through_section():
-    from service.v33.report import build_print_through, _render_print_through
+    from service.v33.report import _render_print_through, build_print_through
 
     def _win(pt):
         return {"roster": "DegeneracyV3_3", "close_time": "2026-09-26T22:00:00Z", "mode": "armed",
@@ -515,7 +560,6 @@ def test_report_print_through_section():
     assert pt["windows_with_triggers"] == 3 and pt["triggers"] == 5
     assert pt["contracts_prehedged"] == 12
     assert pt["resolutions"] == {"filled": 1, "complete": 1, "unwind": 1, "partial": 1, "open": 1}
-    # mean lock at trigger for the filled one: 0.18 / 3 contracts * 100 = 6.0c/contract.
     assert pt["mean_trigger_lock_c"] == Decimal("6")
     assert pt["mean_completion_lock_c"] == Decimal("-5")
     assert pt["unwind_roundtrip_cost"] == Decimal("0.14")

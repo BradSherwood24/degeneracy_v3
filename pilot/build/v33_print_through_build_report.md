@@ -140,3 +140,68 @@ These are distinct from PR #93's recorder-deadline changes; merge should be clea
    stand-down. Want a 1c slack (limit = ask + 1c) to trade a hair of edge for far fewer fail-closed hours?
 4. Should V3.2 (frozen) get print-through via a dated Registration line, or does it retire as-is with V3.3
    taking over the armed slot (per the V3.3 plan Q4 flip)?
+
+---
+
+## Round 2 (2026-09-26): adversarial review fixes (F1-F8)
+
+Review `dv3_wt_review/pilot/build/v33_print_through_review.md` verdict was BLOCK-for-arming (OFF-path clean).
+All findings fixed on `feat/print-through-wings` as a second commit. Suite from `pilot/`:
+**1292 passed, 1 skipped** (1264 baseline + 28 print-through tests; the OFF-path stays byte-identical).
+
+- **F1 [HIGH] fail-closed unwind sold the never-filled wing (naked short).** `_pt_unwind` now sells ONLY
+  legs whose `status == "filled"`, each sized to what we actually hold (`_batch_wpaid_held` counts filled
+  legs only, so the round-trip no longer charges an unfilled leg's limit). Two shapes: both wings filled ->
+  sell the un-hedged remainder and keep any filled sets; only one wing filled (fail-closed) -> sell that one
+  leg's held count and drop the batch. New test `test_partial_wing_fill_fails_closed_sells_only_filled_leg`
+  asserts the EXACT emitted sell legs (one YES sell, count == the YES leg's fill; never a NO sell).
+
+- **F2 [MED-HIGH] stall-complete + racing fill double-committed.** The stall is now TWO-PHASE: `_pt_begin_stall`
+  cancels the unfilled rests and marks the trigger `stall_pending`, and `_pt_finalize_stall` runs only once
+  those cancels confirm (`_pt_on_cancel_confirmed`, wired into `_apply_cancelled`). A fill racing the cancel
+  arrives as `OrderCancelled(filled>0)`, is booked via `cancel_ctx`, and (because the trigger is still
+  unresolved) attributes to the SAME pre-emptive batch -- so the complete size is the TRUE remaining
+  shortfall (0 if the race filled everything -> resolution "filled", no taker, no second wing batch). New
+  test `test_stall_cancel_race_no_double_take` asserts one wing batch, `sets_done == 1`, `rungs_filled == 1`,
+  and no TAKE_BUCKET_NO / second TAKE_WINGS.
+
+- **F3 [MED] complete booked before the IOC confirmed.** ARMED completes now BOOK FROM RESPONSE: the core
+  emits `TAKE_BUCKET_NO` with a `complete_coid`; the executor returns one aggregate `Fill(complete_coid, got)`
+  with the venue's true filled count; `_pt_apply_complete_fill` books `got` taker lots and, on a shortfall,
+  sells the `shortfall - got` un-hedged wings back (F1 path) + stands down (`print_through_complete_short`).
+  DRY still books optimistically (no venue). The report surfaces taker-complete fills vs attempts
+  (`pt_bucket_no_take`/`pt_bucket_no_fill`). Tests: `test_executor_take_bucket_no_books_from_response`,
+  `test_executor_take_bucket_no_short_signals_core`.
+
+- **F4 [MED] unwind dropped flat before the sell confirmed.** `_unwind_wings` now reconciles the sell fill
+  count; a shortfall journals `print_through_unwind_short`, increments `pt_unwind_shortfalls`, and sets
+  `stand_down_reason` (propagated to the core by the driver's existing executor-standdown hook). Test
+  `test_executor_unwind_short_stands_down`.
+
+- **F5 [LOW] no upper-distance bound.** The trigger now fires only when the print is APPROACHING a rung's
+  offer from below within `print_through_ticks` -- the print must sit in `[offer - ticks*1c, offer - 1c]`.
+  A lone deep print no longer pre-hedges the whole cheaper ladder. Tests: `test_trigger_fires_one_tick_
+  below_offer`, `test_trigger_band_widens_with_ticks`, `test_no_trigger_on_lone_deep_print_far_above_offer`.
+  NOTE: this makes print-through a pure LEADING-edge signal (fire one-to-ticks cents early, before the cross);
+  the cross itself fills the rung and attributes to the batch. A single big print that jumps from below to
+  above a rung's offer in one tick will NOT pre-hedge that rung (it is out of the band) -- that rung fills
+  and the normal fill-triggered take runs. See open question 3 (slack/ticks tuning).
+
+- **F6 [LOW] no window/settle gate.** The pre-emptive trigger now requires `_in_window` (T-quote_start ..
+  T-quote_end) and a live, acked, resting rung (never a pending create / cancel-in-flight). Tests:
+  `test_no_trigger_after_quote_end`, `test_no_trigger_before_quote_start`.
+
+- **F7 [LOW] lots_per_rung>1 re-hedge.** `_pt_covered_coids` now covers EVERY rung_coid of an unresolved
+  trigger (not only not-yet-filled ones), and `_pt_trigger_index_for_coid` attributes any rung_coid fill to
+  its unresolved trigger -- so a partially-filled rung's remainder can never be re-hedged. Inert at the
+  pinned `lots_per_rung=1`; correct for a future increase.
+
+- **F8 [NIT] pre-emptive take pacing.** Already priority-paced: the pre-emptive take routes through the
+  inherited `_take_wings`, which acquires write tokens with `priority=True` (`executor.py` ~line 501). No
+  change needed; noted.
+
+Also (review note on defaults): `print_through_slack_c=0` is kept as the shipped default (Brad decides),
+and the fail-closed path is now TRULY FLAT for the wings we hold -- it sells only filled legs, never opens a
+naked short (F1), and stands the window down. The residual one-legged risk is the FILLED rungs' bucket-NO
+after a missing wing; that is the honest one-legged the falsifier counts (`pt_one_legged` latches it so the
+mirror survives the dropped batch).

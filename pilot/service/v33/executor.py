@@ -271,8 +271,9 @@ class V33LiveExecutor(LiveExecutor):
         # inherited TAKE_WINGS path; these counters/handlers cover only the stall complete/unwind.
         self.enable_print_through = bool(enable_print_through)
         self.pt_bucket_no_takes = 0          # complete: IOC bucket-NO taker orders sent
-        self.pt_bucket_no_fills = 0          # of those, lots that actually filled (reconciliation)
+        self.pt_bucket_no_fills = 0          # of those, lots that actually filled (reconciliation, F3)
         self.pt_unwinds = 0                  # unwind / fail-closed: wing sell-back bursts sent
+        self.pt_unwind_shortfalls = 0        # unwinds that did not fully sell back -> stood down (F4)
 
     # =====================================================================
     # on_action — intercept PLACE_REST to record the target price for the K-aware invariant
@@ -314,18 +315,23 @@ class V33LiveExecutor(LiveExecutor):
         return body
 
     def _take_bucket_no(self, action, now: float) -> list[Any]:
-        """COMPLETE branch: buy the bucket-NO ourselves as an IOC taker at the current NO ask (chunked to
-        wing_cap), completing the set the pre-taken wings were waiting on. The core already booked the
-        completion optimistically (honest taker cost), so this SENDS + reconciles: it feeds no event back;
-        a shortfall vs the intended count is ALARMED for the operator (never silently naked)."""
+        """COMPLETE branch (F3): buy the bucket-NO ourselves as an IOC taker at the current NO ask (chunked
+        to wing_cap). BOOK-FROM-RESPONSE: return ONE aggregate ``Fill`` for the core's ``complete_coid`` with
+        the ACTUAL filled count (weighted-average price), so the core books the taker leg from the venue's
+        fill -- not optimistically. A shortfall (``got < want``) is journalled ``print_through_complete_short``
+        and the core unwinds the un-hedged wings + stands down."""
+        coid = action.client_order_id
         ticker = (action.legs[0].ticker if action.legs else action.ticker) or ""
         limit = action.legs[0].limit if action.legs else action.price
         want = int(action.count or (action.legs[0].count if action.legs else 0))
         exch = self._exch(ticker)
         if exch is None or limit is None or want <= 0:
             self._record_alarm("print_through_complete_unrouted", {"ticker": ticker, "count": want})
-            return []
+            # tell the core nothing filled so it unwinds the wings + stands down (never silently naked).
+            return [Fill(order_id=None, client_order_id=coid, count=Decimal(0), price=(limit or Decimal(0)),
+                         side=BUY_NO, server_ts=now)] if coid else []
         got = 0
+        notional = Decimal(0)
         n_chunks = ceil(want / self.wing_cap)
         entries: list[dict[str, Any]] = []
         for c in range(n_chunks):
@@ -334,6 +340,7 @@ class V33LiveExecutor(LiveExecutor):
                                                 self._mint_wing_coid()))
         self._pacer.acquire(COST_CREATE * len(entries), "print_through_complete", priority=True)
         self.pt_bucket_no_takes += 1
+        self._bump("pt_bucket_no_take")
         self.journal.append("print_through_complete",
                             {"ticker": ticker, "limit": str(limit), "count": want,
                              "chunks": len(entries)}, self.clock())
@@ -343,44 +350,74 @@ class V33LiveExecutor(LiveExecutor):
         else:
             resp = self.writer.rest_post(REL_BATCH_CREATE, build_batch(entries))
             parsed = parse_batch_response(resp.body) if resp.ok else []
+        from service.orders.envelope import normalize_fill_to_side
         for r in parsed:
-            if r is not None and not r.error and r.fill_count and r.fill_count > 0:
-                got += int(r.fill_count)
+            if r is None or r.error or not r.fill_count or r.fill_count <= 0:
+                continue
+            nr = normalize_fill_to_side(r, BUY_NO)
+            fc = int(nr.fill_count)
+            price = nr.average_fill_price if nr.average_fill_price is not None else limit
+            got += fc
+            notional += Decimal(price) * fc
         self.pt_bucket_no_fills += got
+        self._bump("pt_bucket_no_fill", got)
+        avg = (notional / got) if got else limit
         if got < want:
-            self._record_alarm("print_through_complete_partial",
+            self._bump("pt_bucket_no_short")
+            self._record_alarm("print_through_complete_short",
                                {"ticker": ticker, "wanted": want, "filled": got})
-        return []
+            self.journal.append("print_through_complete_short",
+                                {"ticker": ticker, "wanted": want, "filled": got}, self.clock())
+        # book-from-response: the core books ``got`` taker lots and unwinds the (want-got) un-hedged wings.
+        return [Fill(order_id=None, client_order_id=coid, count=Decimal(got), price=avg, side=BUY_NO,
+                     server_ts=now)] if coid else []
 
     def _unwind_wings(self, action, now: float) -> list[Any]:
-        """UNWIND / fail-closed branch: sell the pre-taken wings back as IOC takers at the current bids.
-        Best-effort + journaled (the core has already dropped the batch and recorded the round-trip cost);
-        a leg that cannot route is alarmed. Feeds no event back to the core."""
+        """UNWIND / fail-closed branch (F4): sell the pre-taken wings back as IOC takers at the current
+        bids. RECONCILE the sell fill counts against what we intended to sell; if the venue did not fully
+        buy them back, the position is NOT flat -> journal ``print_through_unwind_short`` and STAND THE
+        WINDOW DOWN (via ``stand_down_reason``, propagated by the driver). Feeds no event back to the core
+        (the core already recorded the round-trip / dropped the batch); the stand-down is the safety."""
         entries: list[dict[str, Any]] = []
-        routed = 0
+        want = 0
         for lg in action.legs:
             exch = self._exch(lg.ticker)
             if exch is None or lg.count <= 0:
                 self._record_alarm("print_through_unwind_unrouted",
                                    {"ticker": lg.ticker, "side": lg.side, "count": lg.count})
                 continue
+            want += int(lg.count)
             n_chunks = ceil(int(lg.count) / self.wing_cap)
             for c in range(n_chunks):
                 cnt = min(self.wing_cap, int(lg.count) - c * self.wing_cap)
                 entries.append(self._pt_taker_entry(lg.ticker, lg.side, "sell", cnt, lg.limit, exch,
                                                     self._mint_wing_coid()))
-                routed += 1
         if not entries:
             return []
         self._pacer.acquire(COST_CREATE * len(entries), "print_through_unwind", priority=True)
         self.pt_unwinds += 1
+        self._bump("pt_unwind")
         self.journal.append("print_through_unwind",
                             {"legs": [{"ticker": e.get("ticker"), "count": e.get("count")}
                                       for e in entries], "chunks": len(entries)}, self.clock())
         if len(entries) == 1:
-            self.writer.rest_post(REL_SINGLE_CREATE, entries[0])
+            resp = self.writer.rest_post(REL_SINGLE_CREATE, entries[0])
+            parsed = [parse_single_response(resp.body, side=BUY_NO)] if resp.ok else []
         else:
-            self.writer.rest_post(REL_BATCH_CREATE, build_batch(entries))
+            resp = self.writer.rest_post(REL_BATCH_CREATE, build_batch(entries))
+            parsed = parse_batch_response(resp.body) if resp.ok else []
+        sold = 0
+        for r in parsed:
+            if r is not None and not r.error and r.fill_count and r.fill_count > 0:
+                sold += int(r.fill_count)
+        if sold < want:
+            # a partial unwind leaves real wings held while the core believes it is flat -> stand down.
+            self.pt_unwind_shortfalls += 1
+            self._bump("pt_unwind_short")
+            self._record_alarm("print_through_unwind_short", {"wanted": want, "sold": sold})
+            self.journal.append("print_through_unwind_short", {"wanted": want, "sold": sold}, self.clock())
+            if self.stand_down_reason is None:
+                self.stand_down_reason = "print_through_unwind_short"
         return []
 
     # =====================================================================
