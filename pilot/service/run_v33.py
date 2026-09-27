@@ -69,7 +69,8 @@ from service.v33 import (
     decide_v33,
     load_v33_params,
 )
-from service.v33.actions import ActionKind
+from service.v33.actions import ActionKind, V33ActionKind
+from service.v33.core import print_through_summary
 from service.v33.executor import V33LiveExecutor, cancel_stale_open_orders
 from service.v33.shadow import DeepObservationLadder, ideal_rung_crosses
 from service.v33.ledger import (
@@ -190,6 +191,7 @@ def build_executor_v33(
             wing_cap=wing_cap, write_tokens_per_s=params.write_tokens_per_s,
             write_bucket_size=params.write_bucket_size,
             write_reserve_tokens=params.write_reserve_tokens,
+            enable_print_through=params.print_through,
         )
     return R.FrozenExecutor(bucket_map)
 
@@ -460,6 +462,18 @@ class V33Driver:
                 payload = {"reason": a.reason}
                 self._last_stand_down_reason = a.reason
                 self._real_stand_downs += 1
+        elif k in (V33ActionKind.TAKE_BUCKET_NO, V33ActionKind.WOULD_TAKE_BUCKET_NO):
+            # PRINT-THROUGH complete branch: buy the bucket-NO ourselves (IOC taker) to finish the set.
+            rk = ("would_print_through_complete" if k == V33ActionKind.WOULD_TAKE_BUCKET_NO
+                  else "print_through_complete")
+            payload = {"ticker": a.ticker, "side": a.side, "count": a.count, "price": a.price}
+        elif k in (V33ActionKind.UNWIND_WINGS, V33ActionKind.WOULD_UNWIND_WINGS):
+            # PRINT-THROUGH unwind / fail-closed: sell the pre-taken wings back (IOC).
+            rk = ("would_print_through_unwind" if k == V33ActionKind.WOULD_UNWIND_WINGS
+                  else "print_through_unwind")
+            legs = [{"ticker": lg.ticker, "side": lg.side, "action": lg.action, "count": lg.count,
+                     "limit": lg.limit} for lg in a.legs]
+            payload = {"legs": legs, "count": a.count}
         elif k == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW:
             rk = "shadow_fill_outside_window"
             payload = {"E": a.shadow_E, "offer": a.offer, "print": a.print_price, "count": a.count,
@@ -601,6 +615,12 @@ def _compute_v33_money(driver: V33Driver) -> dict[str, Any]:
         "rest_invariant_dup_price": int(getattr(driver.executor, "rest_invariant_dup_price", 0)),
         "batch_creates": int(getattr(driver.executor, "batch_creates", 0)),
         "dry_sim_fills": int(driver._dry_sim_fills),
+        # PRINT-THROUGH (2026-09-26): trigger/stall receipts (0 unless the feature is enabled).
+        "print_through_triggers": len(driver.state.print_through),
+        "print_through_completes": int(getattr(driver.executor, "pt_bucket_no_takes", 0)),
+        "print_through_complete_fills": int(getattr(driver.executor, "pt_bucket_no_fills", 0)),
+        "print_through_unwinds": int(getattr(driver.executor, "pt_unwinds", 0)),
+        "print_through_unwind_shortfalls": int(getattr(driver.executor, "pt_unwind_shortfalls", 0)),
     }
     return {**money, **counters}
 
@@ -631,6 +651,7 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         one_legged=m.get("one_legged"), realized_unsettled=m.get("realized_unsettled", False),
         lots_filled=m.get("lots_filled", 0), m15_tickers=list(m15_tickers or []),
         m15_frames=shared.m15_frames, deep_obs=driver.deep_obs.summary(),
+        print_through=print_through_summary(driver.state),
     )
     append_v33_ledger_row(row, ledger_path)
     summary = {
