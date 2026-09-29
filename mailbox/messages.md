@@ -1324,3 +1324,31 @@ sweep walked 0.46 -> 0.67, V3.2 rested 2 lots at exactly 0.67 five seconds early
 rungs for 62c, and the 0.62 level printed NOTHING -- an empty level, first by price priority. Capture 12/20. Brad also closed the 01:40 console
 by accident (relaunched by hand, no coverage lost) -- the failure mode the supervisor removes.
 -- Claude
+
+---
+
+**2026-09-29 ~19:30Z -- Claude -> house: the week the episode ended, and what the ladder is really made of (pre-compact)**
+
+Brad -- for the record before I compact.
+
+*Money.* V3.2 armed at size 2: 22 sets since re-arm, 19 winners, +$2.88 realized, about +22c per armed day, balance $55.84. The three
+losers all fell on Sept 26. The replay of all 245 armed-era windows showed why: Sept 14-23, 186 sim fills, zero negative; Sept 25-26,
+32 fills, 24 negative, wing jumps of 12-20c arriving in the same 50 ms as the sweep. Sept 27 onward: back to +9-10c means, zero
+negatives. You called it an episode. The tripwire agrees (OK, 7-day mean +4.4c on 94 fills).
+
+*Merged this week, all on your word:* #93 recorder hang fix (the run that outlived its window and cost 11 hours), #94 print-through wing
+trigger (ships OFF; at ticks=1 it fires on neither of the Sept 26 losses; ticks>=2 needed), #95 daily replay + tripwire (task
+DegeneracyReplayDaily, 10:10Z, ops/replay_tripwire.txt -- it has run itself two mornings now), #96 supervisor one-run-per-close (it had
+been respawning the stand-down child ~1.5x/s every evening at 20:40Z, 1,691 spawns on the worst night) + the ledger dedupe (4,004 -> 96).
+
+*What the ladder is made of.* 161 dry rung fills traced back to the margin each rung was PLACED at. The wings move against a rung by
+~5c median between placement and fill, at every depth. So a rung earns its placed margin minus ~5-7c: 5-7c rungs are coin flips,
+14-16c rungs win 86% (100% outside the episode) and return 0.77c per lot-window against 0.21c at 10c. Deep rungs fill nearly as often
+as shallow ones because sweeps that reach the ladder run through it. Your reframe stands: V3.3 scales the edge, it does not find one,
+and the marginal dollar is worth most deep, then at 10c, then shallow.
+
+*Queued on your "get those two builds going":* (1) params-only shift of the ladder to 8-18c, dry a week; (2) per-rung lot weights in
+the core so capital can be tilted by level. V3.2's 10c stays untouched. Your levers still open: supervisor registration (safe now),
+NTP sync, power cord, amend cap.
+
+-- Claude
