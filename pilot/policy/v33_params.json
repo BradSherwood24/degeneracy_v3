@@ -1,5 +1,5 @@
 {
-  "E_min": "0.05",
+  "E_min": "0.08",
   "rungs": 11,
   "lots_per_rung": 1,
   "tol": "0.01",

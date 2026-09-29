@@ -66,7 +66,16 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # many cents; 0 = at the ask), ``print_through_stall_ms`` (no rung fill within this of the trigger -> the
 # stall policy runs), ``print_through_min_lock_c`` (the min lock in cents for the ``complete`` stall branch),
 # ``print_through_policy`` (the stall policy string: complete_else_unwind / complete / unwind) -> re-pinned.
-FROZEN_V33_PARAMS_SHA256 = "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
+# L4 (2026-09-29): ladder shift 5..15c -> 8..18c, Brad's rung-allocation ruling. Changed ONLY ``E_min``
+# 0.05 -> 0.08 in policy/v33_params.json (everything else byte-identical); the ladder now rests its 11
+# rungs at margins 8..18c (was 5..15c), same depth (rungs=11), same allotment (11 lots). WHY: a 09-29
+# study of 161 dry rung fills measured return per lot-window by PLACED margin -- 14-16c rungs +0.77c
+# (86% positive), 8-10c +0.21c, 5-7c +0.11c -- while wing slippage placement->fill is ~-5c median at
+# every depth, so the shallow 5-7c rungs were coin flips. Shifting the whole ladder 3c deeper drops the
+# lowest-edge rungs and keeps the depth. shadow_Es (0.08/0.10/0.12) stay inside the new margin range
+# [0.08, 0.18]; deep_obs_rungs 10 now observes margins 19..28c (was 16..25c; observation only). V3.3
+# STAYS DRY -- this is a params-only re-pin, not a mode flip. -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
 # History (add-only law). Kept DEFINED so prior-regime ledger rows stay identifiable.
 PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
 PREVIOUS_V33_PARAMS_SHA256_L1_R2 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
@@ -75,6 +84,8 @@ PREVIOUS_V33_PARAMS_SHA256_L2_R2 = "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334
 PREVIOUS_V33_PARAMS_SHA256_L3 = "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
 PREVIOUS_V33_PARAMS_SHA256_FLAP_R1 = "3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac"
 PREVIOUS_V33_PARAMS_SHA256_FLAP_R2 = "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78"
+# The sha the print-through re-pin (2026-09-26) froze; superseded by the L4 ladder shift (2026-09-29).
+PREVIOUS_V33_PARAMS_SHA256_PRINT_THROUGH = "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
 
 # Valid stall-policy strings (print-through). ``complete_else_unwind`` (default): take the bucket-NO
 # ourselves at the current NO ask if the resulting lock >= the floor, else unwind the pre-taken wings.
