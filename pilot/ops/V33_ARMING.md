@@ -81,6 +81,10 @@ The hour's exposure cap becomes the CONTRACT allotment `sum(rung_lots)`; before 
 > 1, confirm the proxy `MAX_CONTRACTS_PER_ORDER` covers `max(rung_lots)` (a weight-w rung rests w lots in
 one order). Setting `rung_lots` is a params amendment: re-pin the canonical sha (its own dated
 Registration entry), never a code change and never an agent's hand.
+Note on `max_sets_per_hour` under L5: it is now purely a FILL-EVENT latch (`rest_allotment_done` once
+`rungs_filled` reaches it); the resting/initial-placement cap is the contract allotment `sum(rung_lots)`.
+At the shipped uniform policy (max_sets == rungs == sum == 11) the two coincide. Live-only (never in dry):
+weighted partial fills each count one event, so the latch can trip early -> under-fill, never over-fill.
 
 ---
 
