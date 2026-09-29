@@ -59,7 +59,13 @@ def _top(bid: str, ask: str, *, suspect: bool = False) -> TopOfBook:
 
 
 def _params(**over) -> V33Params:
-    p = load_v33_params()
+    # L4 (2026-09-29): the SHIPPED policy shifted to E_min 0.08 (ladder 8..18c), lowering n_top by 3c
+    # everywhere. These are CONTROLLED-ladder mechanism tests whose synthetic books, inline comments and
+    # hard-coded price assertions (n_top 0.50, ladder 0.50..0.40, ...) were authored around the 5..15c
+    # anchor. The ladder mechanism (K consecutive cents from n_top, the roll, n_min truncation, the cap) is
+    # E_min-invariant, so we PIN E_min to 0.05 here to keep every price assertion exact; the shipped
+    # E_min 0.08 / sha are asserted in test_v33_params.py and test_v33_hardening.py.
+    p = replace(load_v33_params(), E_min=Decimal("0.05"))
     return replace(p, **over) if over else p
 
 
@@ -152,6 +158,37 @@ def test_places_k_consecutive_rungs_from_n_top():
     assert prices == [Decimal("0.50") - i * Decimal("0.01") for i in range(11)]
     assert all(a.side == BUY_NO and a.action == "buy" and a.count == 1 for a in places)
     assert all(a.expiration_epoch == T - p.quote_end_s for a in places)
+
+
+def test_shipped_policy_rests_ladder_3c_below_the_5_15c_golden_end_to_end():
+    """L4 review (2026-09-29): the mechanism tests above PIN E_min to 0.05, so nothing else in this file
+    exercises the SHIPPED policy (E_min 0.08) through the real core. This test does: it loads the REAL
+    policy file (asserting its frozen sha, so it is the shipped object, not a fabricated one), brings the
+    ladder up on the SAME synthetic book the 5..15c goldens use, and asserts the shipped ladder rests
+    exactly 3c LOWER at every rung than the pre-shift 5..15c ladder -- the end-to-end proof that the
+    E_min 0.05 -> 0.08 shift lands on the rested prices, not just in params."""
+    from service.v33.params import FROZEN_V33_PARAMS_SHA256
+
+    ship = replace(load_v33_params(), tol=Decimal("0.01"), deb_ms=0)   # REAL shipped E_min 0.08
+    assert ship.sha256 == FROZEN_V33_PARAMS_SHA256 and ship.E_min == Decimal("0.08")
+    old = replace(ship, E_min=Decimal("0.05"))                          # the pre-shift 5..15c ladder
+
+    now = T - 600
+    st_ship, _ = _bring_up_ladder(ship, _state(ship), now)
+    st_old, _ = _bring_up_ladder(old, _state(old), now)
+
+    # same book -> the pre-shift ladder is the familiar golden: n_top 0.50, rungs 0.50..0.40.
+    assert st_old.n_top == Decimal("0.50")
+    assert _prices(st_old) == [Decimal("0.50") - i * Decimal("0.01") for i in range(11)]
+
+    # the SHIPPED ladder rests 3c lower everywhere: n_top 0.47, rungs 0.47..0.37.
+    assert st_ship.n_top == Decimal("0.47") == st_old.n_top - Decimal("0.03")
+    assert _prices(st_ship) == [p_old - Decimal("0.03") for p_old in _prices(st_old)]
+    assert _prices(st_ship) == [Decimal("0.47") - i * Decimal("0.01") for i in range(11)]
+
+    # count/allotment unchanged; realised margins are the new 8..18c band.
+    assert len(st_ship.ladder) == ship.rungs == 11
+    assert _margins(ship, st_ship) == list(range(8, 19))
 
 
 def test_placement_counts_as_one_replace_not_k():

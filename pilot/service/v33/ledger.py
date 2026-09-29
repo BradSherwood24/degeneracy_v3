@@ -334,7 +334,7 @@ def build_v33_ledger_row(
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
     (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row.
-    ``deep_obs`` is the SO-3 deep-end observation ladder summary (16..25c; observation only)."""
+    ``deep_obs`` is the SO-3 deep-end observation ladder summary (19..28c; observation only)."""
     money = {
         "rung_fills": rung_fills or [],
         "wing_batch_sets": wing_batch_sets or [],

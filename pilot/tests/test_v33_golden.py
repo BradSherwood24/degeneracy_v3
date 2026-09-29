@@ -101,8 +101,12 @@ def _sweep_books(now: float):
 def _sweep_params():
     # relax the freshness bounds for the multi-minute print replay (the fixture carries prints, not a
     # dense book tape); freshness has dedicated unit tests. n_top holds at the sweep-instant 0.45.
+    # L4 (2026-09-29): PIN E_min to 0.05. This golden proves PARITY against the 2026-09-20T04:00Z armed
+    # hour's 5..15c ideal study (v33_ladder_ideal.json, absolute per-rung locks at prices 0.45..0.35).
+    # The shipped policy is now E_min 0.08 (8..18c); there is no 8..18c ideal study for this window, so the
+    # golden stays at the study's E_min 0.05 to remain a meaningful reference. Mechanism is E_min-invariant.
     return dreplace(
-        load_v33_params(), tol=Decimal("0.01"), deb_ms=0,
+        load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
         freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
         # goldens assert the immediate bucket-switch mechanics; the debounce/hysteresis has its own tests.
         bucket_switch_deb_ms=0, bucket_switch_hysteresis_usd=0,

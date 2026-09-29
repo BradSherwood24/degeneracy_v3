@@ -230,7 +230,7 @@ class V33Driver:
         self._real_stand_downs: int = 0
         self._quote_end_cancel: bool = False
         self._dry_sim_fills: int = 0        # count of simulated rung fills (dry only)
-        # SO-3 deep-end observation ladder (16..25c): observation-only, runs in EVERY mode, never places.
+        # SO-3 deep-end observation ladder (19..28c): observation-only, runs in EVERY mode, never places.
         self.deep_obs = DeepObservationLadder(params, state.close_epoch)
 
     # --- clock source ---
@@ -262,7 +262,7 @@ class V33Driver:
         # yes_price >= 1 - n. Fill each crossed LIVE rung on the ladder's bucket. Sends nothing.
         if self.dry_sim:
             self._simulate_ladder_fills(market, ev, self._last_server_ts)
-        # SO-3 deep-end observation (16..25c), observation-only, EVERY mode. Sends nothing.
+        # SO-3 deep-end observation (19..28c), observation-only, EVERY mode. Sends nothing.
         self._observe_deep(market, ev, self._last_server_ts)
 
     def on_clock_tick(self, server_ts: float) -> None:
@@ -353,7 +353,7 @@ class V33Driver:
             self._pump([Fill(order_id=o.order_id, client_order_id=o.client_order_id,
                              count=Decimal(int(o.count)), price=o.price, side="no", server_ts=now)])
 
-    # --- SO-3 deep-end observation (16..25c; observation only, all modes) ---
+    # --- SO-3 deep-end observation (19..28c; observation only, all modes) ---
     def _observe_deep(self, market: str, trade: Trade, now: float) -> None:
         """Fold a spot-bucket YES-taker print inside the quoting window into the deep observation ladder.
         Gated to the ladder's spot bucket and the live quoting window T-quote_start .. T-quote_end, so the

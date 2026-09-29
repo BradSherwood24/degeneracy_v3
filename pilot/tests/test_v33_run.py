@@ -107,7 +107,10 @@ def test_params_sha_mismatch_stands_down(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 def _dry_driver():
     fix = _load_fixture()
-    p = dr(load_v33_params(), tol=Decimal("0.01"), deb_ms=0,
+    # L4 (2026-09-29): PIN E_min to 0.05 -- this replays the 2026-09-20 golden and asserts the 5..15c
+    # study locks (prices 0.45..0.35, n_top 0.45). Shipped policy is E_min 0.08 (8..18c); no 8..18c study
+    # exists for this window, so the dry-run parity stays at the study's E_min. Mechanism is E_min-invariant.
+    p = dr(load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
            freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)
     cts = fix["close_epoch"]
     st = V33State.new(fix["close_time"], cts, BK, p, shakedown=True)  # DRY -> WOULD_* twins

@@ -2,7 +2,7 @@
 
 Two observations run over the SAME live tape the live ladder trades on:
 
-(1) The IDEAL K-rung ladder shadow at the LIVE margins (E_min .. E_min+rungs-1 = 5..15c). This is NOT
+(1) The IDEAL K-rung ladder shadow at the LIVE margins (E_min .. E_min+rungs-1 = 8..18c). This is NOT
     rebuilt here (don't build it twice, per the L3 brief). In DRY it IS the ``dry_sim`` the ``run_v33``
     driver already books (``V33Driver._simulate_ladder_fills``); in ARMED the realised-vs-ideal comparison
     is the per-rung ``lock_solved`` (the ideal price/W value) vs ``realized_lock`` (wings actually paid)
@@ -11,7 +11,7 @@ Two observations run over the SAME live tape the live ladder trades on:
     ``dry_sim_equivalence_rungs`` re-derives which live rungs a print set of the golden fixture would fill
     so a test can assert the driver's dry_sim == this ideal rule (SHADOW == DRY_SIM equivalence).
 
-(2) SO-3 — the DEEP-END observation ladder at margins E_min+rungs .. +deep_obs_rungs-1 (= 16..25c).
+(2) SO-3 — the DEEP-END observation ladder at margins E_min+rungs .. +deep_obs_rungs-1 (= 19..28c).
     Observation ONLY, in EVERY mode: for each deep rung it records whether the tape REACHED it (a YES
     taker lifted at/through the rung's NO price while the rung was placeable, i.e. its solved n >= n_min),
     the IDEAL lock there (``lock_value(deep_price, W_at_reach)``), and the ABSORPTION — how many lots the
@@ -64,16 +64,16 @@ class DeepRungObs:
 
 
 class DeepObservationLadder:
-    """SO-3: the deep-end observation ladder (16..25c by default). Fed every spot-bucket YES-taker print
+    """SO-3: the deep-end observation ladder (19..28c by default). Fed every spot-bucket YES-taker print
     inside the quoting window; records per deep rung whether the tape reached it, the ideal lock there,
     and the absorption. Observation only — it NEVER emits a Fill or touches an order path."""
 
     def __init__(self, params: Any, close_epoch: int) -> None:
         self.close_epoch = int(close_epoch)
         self.e_min_c = int((Decimal(str(params.E_min)) / _CENT).to_integral_value())
-        top_margin_c = self.e_min_c + int(params.rungs) - 1            # 15 (the deepest LIVE rung margin)
+        top_margin_c = self.e_min_c + int(params.rungs) - 1            # 18 (the deepest LIVE rung margin)
         depth = int(getattr(params, "deep_obs_rungs", 0))
-        self.margins: list[int] = list(range(top_margin_c + 1, top_margin_c + 1 + depth))  # 16..25
+        self.margins: list[int] = list(range(top_margin_c + 1, top_margin_c + 1 + depth))  # 19..28
         self.n_min = Decimal(str(params.n_min))
         self.obs: dict[int, DeepRungObs] = {m: DeepRungObs(margin_c=m) for m in self.margins}
         self.deepest_yes_print = Decimal(0)

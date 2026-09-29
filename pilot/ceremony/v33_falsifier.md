@@ -23,8 +23,13 @@ to arm on it (an agent can never arm V3.3 by editing code).
   merged to `main` by Brad (Phase H #82-#84, L1 #85, L2 #87; L3 this branch). Live V3.2 untouched
   throughout (V3.3 lives in `service/v33/`, its own params / ledger / mode file).
 - Policy: roster `DegeneracyV3_3`, `pilot/policy/v33_params.json`, canonical sha
-  `2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e` (pinned in code as
+  `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def` (pinned in code as
   `service.v33.params.FROZEN_V33_PARAMS_SHA256`; the loader self-verifies and refuses drift).
+  - 2026-09-29 RE-PIN (L4 ladder shift 5..15c -> 8..18c, Brad's rung-allocation ruling): changed ONLY
+    `E_min` 0.05 -> 0.08 (everything else byte-identical); the ladder now rests its 11 rungs at margins
+    8..18c. See the "L4 amendment (2026-09-29)" section below for the reason. Prior sha (print-through)
+    `2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e` kept in code as
+    `PREVIOUS_V33_PARAMS_SHA256_PRINT_THROUGH`. V3.3 STAYS DRY -- params-only re-pin, not a mode flip.
   - 2026-09-26 RE-PIN (print-through wings, Brad's idea): added the print-through levers
     (`print_through` false, `print_through_ticks` 1, `print_through_slack_c` 0, `print_through_stall_ms`
     1500, `print_through_min_lock_c` 0, `print_through_policy` complete_else_unwind). `print_through` ships
@@ -32,16 +37,17 @@ to arm on it (an agent can never arm V3.3 by editing code).
     change + this sha re-pin, Brad's hand) arms the early-hedge trigger. Prior sha (FLAP-R2)
     `20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78` kept in code as
     `PREVIOUS_V33_PARAMS_SHA256_FLAP_R2`. DRAFT falsifier -- frozen only on Brad's verbatim go.
-- Evidence: `pilot/build/mc/v33_ladder_ideal.*` (167 armed windows 2026-09-14..21, ideal fills): the
-  ladder 5..15c at 1 lot per rung = 1806c over 188 contracts / 28 pump windows (9.6c/contract); every one
-  of the 12 live V3.2 sweeps was a FULL sweep (median depth 22c). The seal (2026-08-02..18) and the
-  holdout (2026-08-20..29) were NEVER read.
+- Evidence (original build, PRIOR 5..15c ladder): `pilot/build/mc/v33_ladder_ideal.*` (167 armed windows
+  2026-09-14..21, ideal fills): the 5..15c ladder at 1 lot per rung = 1806c over 188 contracts / 28 pump
+  windows (9.6c/contract); every one of the 12 live V3.2 sweeps was a FULL sweep (median depth 22c). These
+  are the pre-shift (5..15c) numbers, kept as history (see the L4 amendment); they are NOT re-labelled to
+  the 8..18c ladder. The seal (2026-08-02..18) and the holdout (2026-08-20..29) were NEVER read.
 
 ## What is being judged
 
 The ROLLING K-rung ladder pump-fader (roster `DegeneracyV3_3`): rest K = 11 [pin] one-lot bucket-NO bids
-on consecutive cents, anchored at the top rung `n_top = n(E_min, W)` (E_min = 0.05), rung k at
-`n_top - k` cents (realised margin `E_min + k` = 5..15c). On each rung fill, take both pin wings as a
+on consecutive cents, anchored at the top rung `n_top = n(E_min, W)` (E_min = 0.08), rung k at
+`n_top - k` cents (realised margin `E_min + k` = 8..18c). On each rung fill, take both pin wings as a
 taker sized to the coalesced fill (Q2, `wing_coalesce_ms` 150). As W moves, a CONVERGENCE rolls the
 ladder one order per 1c (amend-first, cancel->create fallback), up to `max_amends_in_flight` = 3 at a
 time; the other rungs keep queue. Full spec: `pilot/PLAN_V33.md` sec 1.
@@ -49,12 +55,14 @@ time; the other rungs keep queue. Full spec: `pilot/PLAN_V33.md` sec 1.
 Judged quantity: the REALISED lock PER CONTRACT PER RUNG on LIVE fills vs the in-process ideal ladder.
 Each rung fill's SOLVED reference is `lock_value(price, W_at_fill)` (the price/W economic value at the
 fill), NOT the integer `E_rung` label -- the label is the rung's nominal position; the true solved margin
-is W-dependent (at the golden W the deepest rung's label is 15c while its realised lock is +16.03c). Per
+is W-dependent (in the prior 5..15c ideal study, at the golden W the deepest rung's label was 15c while
+its realised lock was +16.03c -- the same label < realised-lock relationship carries to the 8..18c
+ladder; the concrete +16.03c is the 5..15c-era number and is not re-labelled to the new ladder). Per
 `n` counts CONTRACTS: a full K-rung sweep contributes K toward `n`.
 
 ## Policy (roster `DegeneracyV3_3`, `pilot/policy/v33_params.json`, sha-pinned; loader refuses drift)
 
-sha `2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e`. Values: E_min 0.05, rungs 11
+sha `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def`. Values: E_min 0.08, rungs 11
 (K), lots_per_rung 1, tol 0.01, deb_ms 5000 (start-of-convergence debounce), max_amends_in_flight 3,
 quote_start_s 900 (T-15), quote_end_s 300 (T-5), wing_margin 0.02, lock_floor -0.10,
 no_orders_after_s_to_settle 1, freshness_max_age_s 1.0, bucket_freshness_max_age_s 30.0 [pin],
@@ -62,6 +70,25 @@ wing_coalesce_ms 150, refill_in_window false (Q3 no re-place inside the window),
 n_min 0.05, replace_rate_alarm_per_min 120, bucket_width 100 ($250/$500 hours stand down),
 max_contracts_per_order_hint 11, write_tokens_per_s 100, write_bucket_size 100, write_reserve_tokens 30,
 order_poll_batched true, deep_obs_rungs 10 (SO-3, observation only), shadow_Es {0.08, 0.10, 0.12}.
+
+## L4 amendment (2026-09-29) -- ladder shift 5..15c -> 8..18c (DRAFT edit; gates unchanged)
+
+Brad's rung-allocation ruling. The ONLY change is `E_min` 0.05 -> 0.08 in the policy JSON (everything
+else byte-identical, sha re-pinned to `295590ce...`); the ladder still rests 11 rungs at 1 lot each, now
+at margins 8..18c (was 5..15c), and `deep_obs_rungs` 10 now observes 19..28c (was 16..25c, observation
+only). shadow_Es {0.08, 0.10, 0.12} remain inside the new live range [0.08, 0.18].
+
+Reason: a 2026-09-29 study of 161 dry V3.3 rung fills measured return per lot-window by PLACED margin --
+14-16c rungs +0.77c (86% positive), 8-10c +0.21c, 5-7c +0.11c -- while wing slippage placement->fill is
+~-5c median at EVERY depth, so the shallow 5-7c rungs were coin flips whose thin edge the slippage ate.
+Shifting the whole ladder 3c deeper drops those lowest-edge rungs and keeps the depth and allotment, to
+scale the edge rather than the capital.
+
+History NOT mixed: the L1 5..15c dry sample (22 entry windows, 161 rung fills, 2026-09-23..09-29) and the
+5..15c ideal MC study (167 windows, `mc/v33_ladder_ideal.*`) are KEPT as history and are NOT combined with
+the 8..18c sample for the `n >= 30` verdict / kill / promotion gate counting; the gate counters count only
+8..18c fills from here. The gates themselves (mean lock +6.0c, per-rung shortfall, % positive, capture
+ratio, one-legged, roll integrity, kill and promotion pins) are UNCHANGED. V3.3 stays DRY.
 
 ## Proposed pre-registered thresholds (the verdict)
 
@@ -134,9 +161,9 @@ settlement and flag `one_legged`.
 
 ## Promotion
 
-Nothing here promotes automatically. What would JUSTIFY 2 lots per rung, OR rungs deeper than 15c live
+Nothing here promotes automatically. What would JUSTIFY 2 lots per rung, OR rungs deeper than 18c live
 (Brad's dated word, informed by SO-3's measured deep-end absorption): ALIVE at `n >= 30` [pin]
-(`V33_PROMOTION_MIN_N`) completed rung-fills. The SO-3 deep observation ladder (16..25c, observation only)
+(`V33_PROMOTION_MIN_N`) completed rung-fills. The SO-3 deep observation ladder (19..28c, observation only)
 measures the deep end's absorption before anyone sizes into it (sec 8, PLAN_V33). The proxy cap
 `MAX_CONTRACTS_PER_ORDER` (2 or 11) stands regardless.
 
@@ -173,7 +200,7 @@ acceptance or queue position -- the MUST CONFIRM list below stands for the first
 
 (empty -- awaiting Brad's freeze. Brad ALONE flips `STATUS: DRAFT -- NOT FROZEN` to exactly
 `STATUS: FROZEN` on his verbatim go and appends it here with the roster sha
-`2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e`. An agent never flips it.)
+`295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def`. An agent never flips it.)
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
@@ -181,8 +208,8 @@ acceptance or queue position -- the MUST CONFIRM list below stands for the first
 The in-process shadow re-solves and scores E in {0.08, 0.10, 0.12} every tick inside the quoting window
 T-15..T-5 (the V3.2 shadow, forked byte-identically). Recorded per report alongside the live ladder.
 
-### SO-3 -- deep-end observation ladder (16..25c), registered with this draft
-`deep_obs_rungs` = 10 observation-only rungs BELOW the live ladder (margins 16..25c). For every
+### SO-3 -- deep-end observation ladder (19..28c), registered with this draft
+`deep_obs_rungs` = 10 observation-only rungs BELOW the live ladder (margins 19..28c). For every
 spot-bucket YES-taker print inside the quoting window, record per deep rung whether the tape REACHED it
 (a print at/through the rung's NO price while the rung is placeable, solved n >= n_min), the IDEAL lock
 there (`lock_value(deep_price, W_at_reach)`), and the ABSORPTION (lots the tape printed at/through the
