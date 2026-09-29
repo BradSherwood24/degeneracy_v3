@@ -11,7 +11,11 @@ WHAT CHANGED vs V3.2 (see pilot/build/v33_l1_core_build_report.md):
     one-lot NO bids at consecutive cents from ``n_top = n(E_min, W)`` down; rung k has margin
     ``E_min + k`` cents.
   * ``contracts`` (order size) -> ``lots_per_rung`` (lots on EACH rung; 1). The whole allotment is
-    ``rungs * lots_per_rung``.
+    ``rungs * lots_per_rung`` (uniform) OR ``sum(rung_lots)`` when the OPTIONAL per-rung weight
+    vector ``rung_lots`` is set (L5, 2026-09-29). ``rung_lots`` is a list of ``rungs`` non-negative
+    ints, index k = rung k (k=0 = top rung at margin E_min, k=K-1 = deepest); a 0 means that rung is
+    never placed. When ABSENT (as in the shipped policy) it defaults to ``[lots_per_rung] * rungs`` and
+    the core is byte-identical. ``lots_per_rung`` remains the default weight and is still required.
   * NEW: ``rungs`` (ladder depth K), ``wing_coalesce_ms`` (rung fills within this of the first coalesce
     into one wing pair, Q2), ``refill_in_window`` (a filled rung is NOT re-placed inside the window, Q3).
   * ``E`` in ``shadow_Es`` invariant becomes: every shadow E must lie WITHIN the live ladder's margin
@@ -138,6 +142,10 @@ class V33Params:
     E_min: Decimal
     rungs: int
     lots_per_rung: int
+    # L5 (2026-09-29): the RESOLVED per-rung lot weights (index k = rung k, k=0 top .. K-1 deepest).
+    # Absent in JSON -> ``(lots_per_rung,) * rungs`` (uniform, byte-identical). A 0 entry means that rung
+    # is never placed. ``sum(rung_lots)`` is the hour's contract allotment (the true exposure cap).
+    rung_lots: tuple[int, ...]
     tol: Decimal
     deb_ms: int
     quote_start_s: int
@@ -229,11 +237,47 @@ def load_v33_params(
             f"v33 policy at {path} is invalid: max_amends_in_flight="
             f"{raw['max_amends_in_flight']} must be >= 1 (at least one convergence amend at a time)"
         )
-    # L2 R2: the wing-take chunk cap upper bound must cover at least one lot per rung.
-    if int(raw["max_contracts_per_order_hint"]) < int(raw["lots_per_rung"]):
+    # L5 (2026-09-29): resolve the OPTIONAL per-rung lot weights. Absent -> uniform [lots_per_rung]*K
+    # (byte-identical to the pre-L5 core). Present -> exactly ``rungs`` non-negative ints, at least one
+    # > 0 (else the ladder never rests anything). The loader NEVER KeyErrors on the absent key.
+    lots_per_rung = int(raw["lots_per_rung"])
+    raw_rung_lots = raw.get("rung_lots")
+    if raw_rung_lots is None:
+        rung_lots = tuple(lots_per_rung for _ in range(rungs))
+    else:
+        if not isinstance(raw_rung_lots, (list, tuple)):
+            raise V33ParamsInvalid(
+                f"v33 policy at {path} is invalid: rung_lots must be a list of {rungs} ints, "
+                f"got {type(raw_rung_lots).__name__}"
+            )
+        if len(raw_rung_lots) != rungs:
+            raise V33ParamsInvalid(
+                f"v33 policy at {path} is invalid: rung_lots has {len(raw_rung_lots)} entries, "
+                f"must equal rungs={rungs} (index k = rung k, k=0 top .. K-1 deepest)"
+            )
+        lots_list: list[int] = []
+        for k, x in enumerate(raw_rung_lots):
+            xk = int(x)
+            if xk < 0:
+                raise V33ParamsInvalid(
+                    f"v33 policy at {path} is invalid: rung_lots[{k}]={xk} must be >= 0 "
+                    f"(0 means that rung is never placed)"
+                )
+            lots_list.append(xk)
+        if not any(l > 0 for l in lots_list):
+            raise V33ParamsInvalid(
+                f"v33 policy at {path} is invalid: rung_lots is all zero; at least one rung must "
+                f"be placed (some entry > 0)"
+            )
+        rung_lots = tuple(lots_list)
+    # L2 R2 (extended L5): the wing-take chunk cap upper bound must cover the LARGEST per-rung weight
+    # (a wing take is chunked to <= this, and a rung of weight w fills up to w lots at once). With
+    # rung_lots absent this is exactly the old ``>= lots_per_rung`` check (max of a uniform vector).
+    max_rung_lots = max(rung_lots)
+    if int(raw["max_contracts_per_order_hint"]) < max_rung_lots:
         raise V33ParamsInvalid(
             f"v33 policy at {path} is invalid: max_contracts_per_order_hint="
-            f"{raw['max_contracts_per_order_hint']} < lots_per_rung {raw['lots_per_rung']}"
+            f"{raw['max_contracts_per_order_hint']} < max(rung_lots)={max_rung_lots}"
         )
     if int(raw["write_tokens_per_s"]) < 1 or int(raw["write_bucket_size"]) < 1:
         raise V33ParamsInvalid(
@@ -312,7 +356,8 @@ def load_v33_params(
     return V33Params(
         E_min=E_min,
         rungs=rungs,
-        lots_per_rung=int(raw["lots_per_rung"]),
+        lots_per_rung=lots_per_rung,
+        rung_lots=rung_lots,
         tol=Decimal(str(raw["tol"])),
         deb_ms=int(raw["deb_ms"]),
         quote_start_s=int(raw["quote_start_s"]),
