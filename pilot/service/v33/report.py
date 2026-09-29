@@ -146,6 +146,7 @@ def build_v33_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "windows": windows,
         "scoreboard": build_ladder_scoreboard(rows),
+        "allocation": build_allocation_table(rows),
         "gate_table": build_falsifier_gate_table(rows),
         "deep_end": build_deep_end(rows),
         "print_through": build_print_through(rows),
@@ -284,6 +285,59 @@ def build_ladder_scoreboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "per_day": per_day(dry)},
         "capture_10c": {"margin_c": V33_FALSIFIER_CAPTURE_MARGIN_C, "live": cap_num, "shadow": cap_den,
                         "ratio": cap_ratio},
+    }
+
+
+# ---------------------------------------------------------------------------
+# ALLOCATION TABLE (L5, 2026-09-29) — per PLACED margin, by SOLVED lock
+# ---------------------------------------------------------------------------
+def _allocation_levels(rung_fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per PLACED-margin (E_rung label at fill, whole cents) allocation stats over a flat list of rung
+    fills, using the SOLVED lock (``lock_solved`` = lock_value(price, W_at_fill), available for EVERY
+    fill — not just completed sets). Columns Brad reads the weighted allocation from: level (c), fills
+    (fill events), contracts (Σ count), weight (the configured rung_lots at that level, if present),
+    mean lock/contract (cents, count-weighted), %pos (% contracts with solved lock > 0), total lock
+    (cents, Σ count*lock_solved)."""
+    by: dict[int, dict[str, Any]] = defaultdict(
+        lambda: {"fills": 0, "contracts": 0, "solved_c": [], "weight": None})
+    for rf in rung_fills:
+        m = _margin_c(rf)
+        if m is None:
+            continue
+        cnt = int(rf.get("count", 1) or 1)
+        by[m]["fills"] += 1
+        by[m]["contracts"] += cnt
+        w = rf.get("weight")
+        if w is not None:
+            by[m]["weight"] = int(w)
+        ls = _dec(rf.get("lock_solved"))
+        if ls is not None:
+            by[m]["solved_c"].extend([ls * 100] * cnt)
+    out: list[dict[str, Any]] = []
+    for m in sorted(by):
+        solved = by[m]["solved_c"]
+        mean = (sum(solved, _ZERO) / Decimal(len(solved))) if solved else None
+        total = sum(solved, _ZERO) if solved else _ZERO
+        pos = sum(1 for x in solved if x > 0)
+        pctp = (Decimal(pos) * 100 / Decimal(len(solved))) if solved else None
+        out.append({
+            "level_c": m, "fills": by[m]["fills"], "contracts": by[m]["contracts"],
+            "weight": by[m]["weight"], "mean_lock_c": mean, "pct_positive": pctp,
+            "total_lock_c": total,
+        })
+    return out
+
+
+def build_allocation_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The L5 ALLOCATION RESULT: per-PLACED-margin solved-lock stats for REALISED and (separately) DRY
+    rows, so Brad reads which levels the weighted ladder actually landed contracts on and the maker edge
+    (solved lock) each level locked. Solved lock is wing-completion-independent, so it scores the
+    allocation itself. dry_sim rows are NEVER pooled into realised."""
+    realised = [rf for r in rows if _is_realised(r) for rf in _row_rung_fills(r)]
+    dry = [rf for r in rows if _is_dry(r) for rf in _row_rung_fills(r)]
+    return {
+        "realised": _allocation_levels(realised),
+        "dry": _allocation_levels(dry),
     }
 
 
@@ -639,6 +693,31 @@ def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_allocation(al: dict[str, Any]) -> list[str]:
+    lines = ["", "ALLOCATION TABLE (L5, per PLACED margin -- solved maker lock; the rung_lots result)",
+             "-" * 92]
+
+    def _section(title: str, levels: list[dict[str, Any]]) -> None:
+        lines.append("")
+        lines.append(f"  [{title}]")
+        if not levels:
+            lines.append("    (no rung fills)")
+            return
+        lines.append("    " + "level".rjust(7) + "weight".rjust(8) + "fills".rjust(7)
+                     + "contracts".rjust(11) + "meanLock".rjust(10) + "%pos".rjust(7)
+                     + "totLock".rjust(11))
+        for d in levels:
+            wt = str(d["weight"]) if d["weight"] is not None else "-"
+            lines.append("    " + f"{d['level_c']}c".rjust(7) + wt.rjust(8)
+                         + str(d["fills"]).rjust(7) + str(d["contracts"]).rjust(11)
+                         + _cc(d["mean_lock_c"]).rjust(10) + _pctv(d["pct_positive"]).rjust(7)
+                         + _cc(d["total_lock_c"]).rjust(11))
+
+    _section("REALISED (armed, real money)", al["realised"])
+    _section("DRY (dry_sim -- simulated ideal fills, NEVER realised)", al["dry"])
+    return lines
+
+
 def _render_gate_table(gt: dict[str, Any]) -> list[str]:
     lines = ["", "FALSIFIER GATE TABLE (DegeneracyV3_3, sec 6 -- computed from REALISED rows only) "
              "-- [pin]",
@@ -731,6 +810,7 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
         f"(>= 90% is the roll-integrity gate)")
 
     lines.extend(_render_scoreboard(report["scoreboard"]))
+    lines.extend(_render_allocation(report["allocation"]))
     lines.extend(_render_gate_table(report["gate_table"]))
     lines.extend(_render_deep_end(report["deep_end"]))
     lines.extend(_render_print_through(report["print_through"]))

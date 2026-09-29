@@ -68,13 +68,21 @@ def v33_day_guard_path(ops_dir: str, utc_day: str) -> str:
 # ---------------------------------------------------------------------------
 # S5 caps agreement (the proxy /health caps must allow what V3.3 will send)
 # ---------------------------------------------------------------------------
-def v33_caps_agree(health: Any, lots_per_rung: int, k_rungs: int = 1) -> tuple[bool, str]:
+def v33_caps_agree(
+    health: Any, lots_per_rung: int, k_rungs: int = 1, *, rung_lots: Any = None
+) -> tuple[bool, str]:
     """The /health caps + budget agree with the V3.3 order profile. Requires: ``orders_enabled`` true;
-    ``max_contracts_per_order`` in [lots_per_rung, K*lots_per_rung] (MUST-FIX-1: a rung needs cap >= one
-    lot; a COALESCED wing take is chunked to <= cap, so any cap >= lots_per_rung works — Brad may set the
-    proxy cap to 2 (wings go as ceil(K/2) chunks) or to 11 (wings go as 2 orders), and BOTH must arm); the
-    ticker prefixes cover BOTH ``KXBTC-...`` and ``KXBTCD-...`` (via startswith, exactly as the proxy);
-    ``orders_remaining_today`` >= ``V33_MIN_ORDER_BUDGET_AT_ARM``."""
+    ``max_contracts_per_order`` in [min_cap, ceiling] (MUST-FIX-1: a rung needs cap >= its own lots; a
+    COALESCED wing take is chunked to <= cap, so any cap in range works — Brad may set the proxy cap to 2
+    (wings go as chunks) or to the full ceiling (wings go as 2 orders), and BOTH must arm); the ticker
+    prefixes cover BOTH ``KXBTC-...`` and ``KXBTCD-...`` (via startswith, exactly as the proxy);
+    ``orders_remaining_today`` >= ``V33_MIN_ORDER_BUDGET_AT_ARM``.
+
+    L5 (2026-09-29): when the RESOLVED per-rung weight vector ``rung_lots`` is supplied, the per-order cap
+    must cover the LARGEST single rung ``max(rung_lots)`` (a rung of weight w is PLACED as ONE order of w
+    lots — the venue rejects the place if the cap is below it) and stay within the largest coalesced wing
+    take ``sum(rung_lots)`` (the allotment, chunked to <= cap). Absent (uniform) -> the identical
+    ``[lots_per_rung, K*lots_per_rung]`` bounds — this is exactly the pre-L5 check."""
     if not isinstance(health, dict):
         return False, "no /health payload"
     if not health.get("orders_enabled"):
@@ -86,12 +94,23 @@ def v33_caps_agree(health: Any, lots_per_rung: int, k_rungs: int = 1) -> tuple[b
         proxy_max = int(caps.get("max_contracts_per_order"))
     except (TypeError, ValueError):
         return False, "proxy max_contracts_per_order missing/non-numeric"
-    if proxy_max < int(lots_per_rung):
-        return False, f"proxy max_contracts_per_order {proxy_max} < lots_per_rung {lots_per_rung}"
-    ceiling = int(k_rungs) * int(lots_per_rung)
+    # L5: derive the [min_cap, ceiling] band from the per-rung weights when supplied (max/sum), else from
+    # the uniform lots_per_rung (identical numbers at weight 1). ``min_cap`` is the largest single-rung
+    # PLACE size; ``ceiling`` is the largest coalesced wing take.
+    if rung_lots is not None and len(rung_lots) > 0:
+        weights = [int(x) for x in rung_lots]
+        min_cap = max(weights)
+        ceiling = sum(weights)
+        low_label, high_label = f"max(rung_lots)={min_cap}", f"sum(rung_lots)={ceiling}"
+    else:
+        min_cap = int(lots_per_rung)
+        ceiling = int(k_rungs) * int(lots_per_rung)
+        low_label, high_label = f"lots_per_rung {min_cap}", f"K*lots_per_rung={ceiling}"
+    if proxy_max < min_cap:
+        return False, f"proxy max_contracts_per_order {proxy_max} < {low_label}"
     if proxy_max > ceiling:
         return False, (f"proxy max_contracts_per_order {proxy_max} > V3.3 ceiling "
-                       f"K*lots_per_rung={ceiling}")
+                       f"{high_label}")
     prefixes = caps.get("ticker_prefixes")
     if not isinstance(prefixes, (list, tuple)):
         return False, "proxy ticker_prefixes missing"
@@ -114,17 +133,19 @@ class V33ArmDecision:
 
 
 def v33_arming_check(
-    falsifier_path: str, health: Any, params_verified: bool, lots_per_rung: int, k_rungs: int = 1
+    falsifier_path: str, health: Any, params_verified: bool, lots_per_rung: int, k_rungs: int = 1,
+    *, rung_lots: Any = None
 ) -> V33ArmDecision:
     """S5. armed=True ONLY if the falsifier is FROZEN, the params sha is verified, and the /health caps
-    + budget agree (``v33_caps_agree``). Any failure -> refuse with the reasons."""
+    + budget agree (``v33_caps_agree``). Any failure -> refuse with the reasons. L5: ``rung_lots`` (the
+    resolved per-rung weight vector) tightens the cap band to [max(rung_lots), sum(rung_lots)]."""
     reasons: list[str] = []
     if not params_verified:
         reasons.append("params sha not verified against the frozen pin")
     if not falsifier_is_frozen(falsifier_path):
         reasons.append(f"falsifier STATUS line is not exactly '{_FROZEN_LINE}' at "
                        f"{os.path.basename(falsifier_path)}")
-    caps_ok, caps_reason = v33_caps_agree(health, lots_per_rung, k_rungs)
+    caps_ok, caps_reason = v33_caps_agree(health, lots_per_rung, k_rungs, rung_lots=rung_lots)
     if not caps_ok:
         reasons.append(caps_reason)
     return V33ArmDecision(armed=not reasons, reasons=tuple(reasons))
@@ -192,6 +213,7 @@ def decide_v33_arming(
     day_guard: DayGuard,
     s4: Any = None,
     k_rungs: int = 1,
+    rung_lots: Any = None,
 ) -> V33ArmingOutcome:
     """The single arm-or-degrade gate (mirrors ``decide_v32_arming``). Only ``resolved_mode == "armed"``
     is a candidate; anything else passes through unarmed. An armed candidate must clear ALL of: the day
@@ -208,7 +230,8 @@ def decide_v33_arming(
         latched = v33_latched_stop_kind(day_guard)
         if latched is not None:
             reasons.append(f"day-halting stop already latched today: {latched}")
-    dec = v33_arming_check(falsifier_path, health, params_verified, lots_per_rung, k_rungs)
+    dec = v33_arming_check(falsifier_path, health, params_verified, lots_per_rung, k_rungs,
+                           rung_lots=rung_lots)
     reasons.extend(dec.reasons)
     clean, detail = reconcile_positions_clean(positions)
     if not clean:

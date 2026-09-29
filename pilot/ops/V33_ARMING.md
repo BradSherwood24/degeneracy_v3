@@ -70,6 +70,22 @@ dry rather than sizing wings against a guess. Any miss => the window runs DRY an
 An OPTIONAL smaller first armed step is `rungs` 3 (~$6 in flight) -- a params amendment (its own dated
 Registration entry + a new pinned sha), not a mode flip.
 
+**Per-rung lot weights (L5, 2026-09-29).** To rest UNEQUAL lots per rung (Brad's "scale the edge, not
+100% at 10c"), add an OPTIONAL `rung_lots` key to `policy/v33_params.json`: a list of exactly `rungs`
+non-negative ints, index k = rung k (k=0 = top rung at margin `E_min`, k=K-1 = deepest); a 0 means that
+rung is never placed, and at least one entry must be > 0. Absent (the current shipped policy) = uniform
+`[lots_per_rung]*rungs` = byte-identical to today. Example (illustration, NOT a recommendation):
+`"rung_lots": [0,0,1,1,2,2,2,3,3,3,3]` puts most lots on the deep rungs. Constraints the loader enforces
+(fail-closed): length == `rungs`; each >= 0; some > 0; `max_contracts_per_order_hint >= max(rung_lots)`.
+The hour's exposure cap becomes the CONTRACT allotment `sum(rung_lots)`; before ARMING with any weight
+> 1, confirm the proxy `MAX_CONTRACTS_PER_ORDER` covers `max(rung_lots)` (a weight-w rung rests w lots in
+one order). Setting `rung_lots` is a params amendment: re-pin the canonical sha (its own dated
+Registration entry), never a code change and never an agent's hand.
+Note on `max_sets_per_hour` under L5: it is now purely a FILL-EVENT latch (`rest_allotment_done` once
+`rungs_filled` reaches it); the resting/initial-placement cap is the contract allotment `sum(rung_lots)`.
+At the shipped uniform policy (max_sets == rungs == sum == 11) the two coincide. Live-only (never in dry):
+weighted partial fills each count one event, so the latch can trip early -> under-fill, never over-fill.
+
 ---
 
 ## B. The flip (Brad's hands only, in a :02-:33 UTC window; NEVER between :38 and :59)

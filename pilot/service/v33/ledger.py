@@ -9,7 +9,8 @@ sealed file.
 
 WHAT IS RUNG-AWARE (vs V3.2's single-set money math):
   * Per FILL EVENT (a rung fill): ``rung`` + ``E_rung`` (the derived margin label), ``price`` (the
-    resting n), ``count``, ``W_at_fill``, ``n_top`` (captured on the RungFill), ``lock_solved`` =
+    resting n), ``count`` (lots this event), ``weight`` (L5: the rung's configured lot size rung_lots[rung];
+    None pre-L5), ``W_at_fill``, ``n_top`` (captured on the RungFill), ``lock_solved`` =
     ``lock_value(price, W_at_fill)`` (the falsifier's per-rung SOLVED reference — the price/W economic
     value, NOT the integer label, per the L1 R4 contract note), and ``realized_lock`` (per contract,
     using the WINGS ACTUALLY PAID for that fill's coalesced batch).
@@ -217,6 +218,10 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
             "E_rung": str(rf.E_rung),
             "price": str(rf.price),
             "count": int(rf.count),
+            # L5 (2026-09-29): the rung's configured lot WEIGHT (rung_lots[rung]) at fill; None pre-L5 or
+            # for a stranded/out-of-range margin. ``count`` is lots filled this event (<= weight on a
+            # partial). Backward compatible: absent on rows written before L5.
+            "weight": (int(rf.weight) if getattr(rf, "weight", None) is not None else None),
             "server_ts": rf.server_ts,
             "W_at_fill": (str(w) if w is not None else None),
             "n_top": (str(rf.n_top) if rf.n_top is not None else None),
