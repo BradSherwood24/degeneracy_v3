@@ -50,6 +50,26 @@ WHAT V3.3 CHANGES (Brad, PLAN_V33 sec 1) — the ROLLING LADDER and THE ROLL:
   * The T-``quote_end_s`` cancel-all, freshness stand-down (W missing -> stand down), and the S-stop
     hooks are V3.2's, generalised from one order to K.
 
+L5 AMENDMENT (2026-09-29) — PER-RUNG LOT WEIGHTS (``rung_lots``; Brad's "scale the edge, not 100% at
+10c"). Each rung may rest a DIFFERENT number of lots. ``params.rung_lots[k]`` is the configured weight of
+rung k (k=0 top .. K-1 deepest); absent in JSON -> ``(lots_per_rung,)*K`` (uniform -> byte-identical).
+A 0-weight rung is state "no order" (never placed/targeted). The hour's exposure cap is the CONTRACT
+allotment ``sum(rung_lots)`` (``max_sets_per_hour`` stays the coarse rung/fill-event gate).
+
+  THE ROLL / RE-SIZE DECISION. The open margin slots are ANONYMOUS and the convergence pairs a live
+  order to a vacant target by minimal price movement (Brad's one-order roll keeps queue). With unequal
+  weights an order's slot changes as n_top drifts, so per-slot exactness and the cheap one-order roll are
+  in tension. We choose the cheap roll: an order carries the lots it was PLACED with (a slot's weight)
+  and KEEPS that count through every roll (the AMEND re-prices, never re-sizes; the amend->cancel->create
+  fallback re-places the SAME remaining count, so both roll paths share one end state). Re-sizing to a
+  slot's weight happens ONLY when a FRESH order is created for that slot: the initial placement, a
+  bucket-change re-place, or a released-slot vacant-create. Consequence: after n_top drifts the middle
+  orders keep their placed counts while their slot labels shift ("weight smearing"); the INITIAL
+  allocation (the full ladder laid down with per-rung weights) dominates, and n_top moves only a few
+  cents per window. The strict "count == weight(current slot)" cannot be a step invariant under any
+  cheap-roll scheme (a 1c shift would re-size every order); the asserted invariants are instead
+  ``1 <= count <= max(rung_lots)`` per order and ``filled + resting contracts <= sum(rung_lots)``.
+
 The FALSIFIER quantities (PLAN_V33 sec 6) are all derivable from state/events: per-rung SOLVED lock
 ``2 - n - fee(n) - W`` (via ``lock_value`` at the rung's n and the W at fill), the rung fill's
 ``E_rung``, ``rungs_filled`` / ``roll_count``, and the single-order-roll ratio
@@ -163,6 +183,10 @@ class RungFill:
     # PRINT-THROUGH (2026-09-26): a bucket-NO leg bought as an IOC TAKER by the `complete` stall branch
     # (not a maker rung fill). The ledger applies the taker fee to a taker leg (a maker rung fill is fee 0).
     taker: bool = False
+    # L5 (2026-09-29): the CONFIGURED lot weight of this fill's rung (rung_lots[rung]) at fill time, for
+    # the ledger/report allocation table. ``count`` is the lots filled in THIS event (may be < weight on a
+    # partial); ``weight`` is the rung's full configured size. None when the fill's margin is out of range.
+    weight: int | None = None
 
 
 @dataclass(frozen=True)
@@ -387,8 +411,13 @@ class V33State:
         # margin array: indices 0..(E_min_c + K - 1); 0 below E_min, 1 (open order wanted) for the K
         # slots at margins [E_min_c, E_min_c + K - 1].
         e_min_c = _emin_cents(params)
-        margin_state = tuple(1 if e_min_c <= m <= e_min_c + params.rungs - 1 else 0
-                             for m in range(e_min_c + params.rungs))
+        # L5: a rung with weight 0 is state "no order" (0), never "open order wanted" (1), so the
+        # convergence never places, targets, or stalls on it (the open span is naturally non-contiguous).
+        margin_state = tuple(
+            1 if (e_min_c <= m <= e_min_c + params.rungs - 1
+                  and _weight_of_rung(params, m - e_min_c) > 0) else 0
+            for m in range(e_min_c + params.rungs)
+        )
         return cls(
             close_time=close_time,
             close_epoch=int(close_epoch),
@@ -418,13 +447,23 @@ class V33State:
           sweep must never regrow the ladder past K - filled)."""
         lad = self.ladder
         assert len(lad) <= params.rungs, f"ladder has {len(lad)} > K={params.rungs} rests"
-        assert self.rungs_filled + len(lad) <= params.rungs, (
-            f"window exposure {self.rungs_filled} filled + {len(lad)} resting > K={params.rungs}"
+        # L5: the true exposure cap is in CONTRACTS (sum of the per-rung weights), not rung units, because
+        # a weighted ladder rests unequal lots per rung and a rung may partially fill. At weight 1 this is
+        # exactly the old rung-unit assert (filled + resting <= K). ``rungs_filled`` (fill-EVENT count) is
+        # kept as the coarse ``max_sets_per_hour`` gate, not the exposure invariant.
+        allot = _allotment(params)
+        assert _filled_contracts(self) + _resting_contracts(self) <= allot, (
+            f"window exposure {_filled_contracts(self)} filled + {_resting_contracts(self)} resting "
+            f"contracts > allotment sum(rung_lots)={allot}"
         )
         prices = [o.price for o in lad]
         assert len(set(prices)) == len(prices), f"two rests on one price: {sorted(prices)}"
+        max_w = max(params.rung_lots)
         for o in lad:
-            assert o.count == params.lots_per_rung, f"rung count {o.count} != {params.lots_per_rung}"
+            # L5: an order carries the lots it was PLACED with (a slot's weight), less any partial fill,
+            # so it is a rung weight at most and >= 1 while resting (it drops at 0). It is NOT re-derived
+            # from the current slot (rolls keep count -> smearing; see the module "L5" note).
+            assert 1 <= o.count <= max_w, f"rung count {o.count} not in [1, max(rung_lots)={max_w}]"
             assert isinstance(o.rung, int), f"bad rung index {o.rung!r}"
             assert o.price == o.price.quantize(_CENT), f"rung price {o.price} not a whole cent"
             assert o.price >= params.n_min, f"rung price {o.price} < n_min {params.n_min}"
@@ -525,6 +564,36 @@ def _price_of_margin(params: V33Params, n_top: Decimal, m: int) -> Decimal:
 def _open_slots(st: V33State) -> list[int]:
     """The OPEN SPAN S = margin indices whose desired state is 1 (order wanted, not filled/below-E_min)."""
     return [m for m, s in enumerate(st.margin_state) if s == 1]
+
+
+# --- L5 (2026-09-29): per-rung lot weights ---------------------------------------------------------
+# ``params.rung_lots`` is the RESOLVED weight vector (index k = rung k, k=0 top .. K-1 deepest; a 0 means
+# that rung is never placed). Absent in JSON -> ``(lots_per_rung,)*K`` (uniform, byte-identical). The
+# CONTRACT allotment ``sum(rung_lots)`` is the true exposure cap; ``max_sets_per_hour`` stays in RUNG
+# (fill-event) units. See the module docstring "L5" note for the roll/re-size decision.
+def _weight_of_rung(params: V33Params, k: int) -> int:
+    """The configured lot weight for rung index ``k`` (k=0 top .. K-1 deepest); 0 out of range."""
+    return params.rung_lots[k] if 0 <= k < len(params.rung_lots) else 0
+
+
+def _weight_of_margin(params: V33Params, m: int) -> int:
+    """The configured lot weight for margin slot ``m`` (m = E_min_c is the top rung)."""
+    return _weight_of_rung(params, m - _emin_cents(params))
+
+
+def _allotment(params: V33Params) -> int:
+    """The hour's CONTRACT allotment = sum of the per-rung weights (the true exposure cap)."""
+    return sum(params.rung_lots)
+
+
+def _resting_contracts(st: V33State) -> int:
+    """Contracts currently live/pending on the resting rungs (sum of the ladder order counts)."""
+    return sum(int(o.count) for o in st.ladder)
+
+
+def _filled_contracts(st: V33State) -> int:
+    """Contracts filled this hour (sum of every booked rung-fill count, incl. taker completes)."""
+    return sum(int(f.count) for f in st.rest_fills)
 
 
 def _sync_wing_mirrors(st: V33State) -> V33State:
@@ -848,12 +917,15 @@ def _apply_cancelled(
                if event.order_id is not None and r.order_id == event.order_id), None)
     if rp is not None:
         # FALLBACK: the amend failed and the executor cancelled -> drop the old order and place a fresh
-        # one at the roll's target (same end state as a successful amend, fresh queue). Skip the re-place
-        # if the order fully filled before the cancel (nothing left to move).
+        # one at the roll's target (same end state as a successful amend, fresh queue). L5: re-place the
+        # moving order's REMAINING resting lots (``mover.count``, already reduced by any partial booked
+        # above) — the roll KEEPS count, so the fallback matches the amend end-state (not the slot weight).
+        # Skip the re-place if the order fully filled before the cancel (nothing left to move).
+        mover = next((o for o in st.ladder if o.client_order_id == rp.old_coid), None)
+        replace_count = int(mover.count) if mover is not None else 0
         st = _drop_roll(st, rp.old_coid)
         st = replace(st, ladder=_drop_order(st.ladder, rp.old_coid))
-        still_resting = st.rest_booked_by_coid.get(rp.new_coid, st.rest_booked_by_coid.get(
-            rp.old_coid, 0)) < params.lots_per_rung
+        still_resting = replace_count > 0
         # NIT #9: re-check the cap on the fallback re-place (no_ask may have dropped since emit). Clamp to
         # the cap and drop if that pushes below n_min. Derive rung/E_rung from the CURRENT n_top.
         target = rp.target_price
@@ -861,9 +933,9 @@ def _apply_cancelled(
             target = st.cap
         if (not st.rest_allotment_done and still_resting and _in_window(params, st, now)
                 and target >= params.n_min and st.n_top is not None
-                and len(st.ladder) + st.rungs_filled < params.rungs):
+                and _filled_contracts(st) + _resting_contracts(st) + replace_count <= _allotment(params)):
             r_rung, r_E = _rung_of(st.n_top, target), _e_rung(params, st.n_top, target)
-            st, pa = _place_one(params, st, target, r_rung, r_E, now)
+            st, pa = _place_one(params, st, target, r_rung, r_E, now, count=replace_count)
             actions += pa
         st, ra = _converge(params, st, now)
         return st, actions + ra
@@ -964,11 +1036,15 @@ def _book_rung_fill(
     fill_bucket_ticker = st.bucket_tickers.get(fill_Sd) if fill_Sd is not None else None
     fill_Su = (fill_Sd + params.bucket_width) if fill_Sd is not None else None
     if order is not None:
-        remaining = order.count - booked[coid]
+        # L5: subtract THIS event's ``delta`` from the order's CURRENT resting count (not the cumulative
+        # ``booked``, which double-counts across successive partials — a latent bug harmless at weight 1
+        # where a rung fills in exactly one event). A weight-w rung filling c < w keeps w-c resting; the
+        # exposure invariant (filled + resting contracts) is conserved through each partial.
+        remaining = int(order.count) - int(delta)
         if remaining <= 0:
             ladder = _drop_order(ladder, coid)
         else:
-            # a partial fill of a rung (only possible if lots_per_rung > 1): keep the remainder resting.
+            # a partial fill of a rung (only when the rung's weight > 1): keep the remainder resting.
             ladder = _replace_order(ladder, coid, count=remaining)
     # DERIVE the fill's margin from the price vs the current n_top (the passed rung/E_rung are the caller's
     # fallback label when n_top is momentarily unknown). This is the literal "index derived from price".
@@ -980,7 +1056,8 @@ def _book_rung_fill(
         m = _emin_cents(params) + rung
     rf = RungFill(rung=rung, E_rung=E_rung, price=price, count=int(delta), server_ts=now,
                   coid=coid, order_id=order_id, W=st.W, n_top=st.n_top,
-                  bucket_ticker=fill_bucket_ticker, bucket_Sd=fill_Sd, bucket_Su=fill_Su)
+                  bucket_ticker=fill_bucket_ticker, bucket_Sd=fill_Sd, bucket_Su=fill_Su,
+                  weight=(_weight_of_rung(params, rung) if 0 <= rung < len(params.rung_lots) else None))
     # MARGIN ARRAY (Brad R4): mark this fill's margin as consumed (state 2) and tie the 2-slot to THIS
     # fill (``filled_at``). A rare fill on a STRANDED order (margin outside the nominal array) is still
     # booked (rungs_filled ++, the exposure cap holds) but leaves the array untouched — the exposure
@@ -1414,7 +1491,9 @@ def _pt_book_taker_complete(
     rf = RungFill(rung=rung_lbl, E_rung=e_lbl, price=price, count=int(count), server_ts=now,
                   coid=None, order_id=None, W=st.W, n_top=st.n_top, bucket_ticker=bt,
                   bucket_Sd=rest_sd, bucket_Su=(rest_sd + params.bucket_width) if rest_sd is not None
-                  else None, taker=True)
+                  else None, taker=True,
+                  weight=(_weight_of_rung(params, rung_lbl)
+                          if 0 <= rung_lbl < len(params.rung_lots) else None))
     st = replace(st, rest_fills=st.rest_fills + (rf,), rungs_filled=st.rungs_filled + 1,
                  wing_batches=_replace_batch(st.wing_batches, batch.index, fills=batch.fills + (rf,)))
     return st
@@ -1797,27 +1876,32 @@ def _standdown(st: V33State, reason: str) -> tuple[V33State, list[V33Action]]:
     return st, [V33Action(kind=ActionKind.STAND_DOWN, reason=reason)]
 
 
-def _place_action(st: V33State, params: V33Params, coid: str, n: Decimal) -> V33Action:
+def _place_action(st: V33State, params: V33Params, coid: str, n: Decimal, count: int) -> V33Action:
     exp = st.close_epoch - params.quote_end_s
     return _mk(
         ActionKind.PLACE_REST, st.shakedown,
         ticker=st.bucket_tickers.get(st.spot_Sd, ""), side=BUY_NO, action="buy",
-        count=params.lots_per_rung, price=n, expiration_epoch=exp, client_order_id=coid,
+        count=count, price=n, expiration_epoch=exp, client_order_id=coid,
     )
 
 
 def _place_one(
-    params: V33Params, st: V33State, price: Decimal, rung: int, E_rung: Decimal, now: float
+    params: V33Params, st: V33State, price: Decimal, rung: int, E_rung: Decimal, now: float,
+    *, count: int | None = None,
 ) -> tuple[V33State, list[V33Action]]:
-    """Emit ONE PLACE_REST rung at ``price`` and add it (pending) to the ladder. Used by the bucket /
-    first placement (each rung) and by the roll's cancel->create fallback."""
+    """Emit ONE PLACE_REST rung at ``price`` and add it (pending) to the ladder. ``count`` is the lots to
+    rest: L5 -> the rung's configured weight ``rung_lots[rung]`` for a FRESH slot placement (default), or
+    an explicit remaining count for the roll's cancel->create fallback (which re-places what was still
+    resting, matching the amend end-state). Used by the bucket / first placement (each rung), the
+    vacant-create, and the roll fallback."""
+    c = int(count) if count is not None else _weight_of_rung(params, rung)
     coid, st = _mint_coid(st)
     order = RestOrder(
-        client_order_id=coid, order_id=None, price=price, count=params.lots_per_rung,
+        client_order_id=coid, order_id=None, price=price, count=c,
         placed_ts=now, live=False, pending=True, bucket_Sd=st.spot_Sd, rung=rung, E_rung=E_rung,
     )
     st = replace(st, ladder=st.ladder + (order,))
-    return st, [_place_action(st, params, coid, price)]
+    return st, [_place_action(st, params, coid, price, c)]
 
 
 def _placeable_open_slots(params: V33Params, st: V33State) -> list[tuple[int, Decimal]]:
@@ -1833,22 +1917,30 @@ def _placeable_open_slots(params: V33Params, st: V33State) -> list[tuple[int, De
 
 
 def _place_all(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V33Action]]:
-    """Place one order at EACH placeable OPEN slot in the margin array (Brad's model, R4). After a partial
-    sweep of margins 5..k, this places the REMAINING open margins (k+1..15) on the new/first ticker — NOT
-    the nominal top K−filled — and the open-span size is exactly K − filled_in_range, so exposure
-    (rungs_filled + placed) <= K. If the allotment is already spent (no open placeable slot and filled >=
-    max_sets), latch ``rest_allotment_done``. Counts as ONE ladder placement (the debounce anchor)."""
+    """Place one order at EACH placeable OPEN slot in the margin array (Brad's model, R4), each sized to
+    its rung's configured WEIGHT (L5). After a partial sweep of margins 5..k, this places the REMAINING
+    open margins on the new/first ticker; the CONTRACT allotment ``sum(rung_lots)`` bounds the total
+    resting lots (a slot whose weight would overrun the remaining allotment is skipped). If the allotment
+    is already spent (no open placeable slot and filled >= max_sets), latch ``rest_allotment_done``.
+    Counts as ONE ladder placement (the debounce anchor)."""
     assert st.n_top is not None
     actions: list[V33Action] = []
     slots = _placeable_open_slots(params, st)
-    # never exceed the remaining allotment (belt-and-braces to the open-span sizing).
-    budget = params.max_sets_per_hour - st.rungs_filled
-    if budget <= 0 or (not slots and st.rungs_filled >= params.max_sets_per_hour):
+    # never exceed the remaining CONTRACT allotment (L5). ``_place_all`` is only called with an empty
+    # ladder, so ``resting`` is 0 here; the belt-and-braces subtracts it anyway. The coarse rung-unit
+    # ``max_sets_per_hour`` latch is kept as a separate gate (unchanged from the pre-L5 behaviour).
+    budget = _allotment(params) - _filled_contracts(st) - _resting_contracts(st)
+    if budget <= 0 or st.rungs_filled >= params.max_sets_per_hour:
         return replace(st, rest_allotment_done=True), actions
-    for m, price in slots[:budget]:
+    used = 0
+    for m, price in slots:
+        w = _weight_of_margin(params, m)
+        if w <= 0 or used + w > budget:
+            continue  # weight-0 slot (never state 1, defensive) or would overrun the allotment
         rung = m - _emin_cents(params)
-        st, a = _place_one(params, st, price, rung, params.E_min + rung * _CENT, now)
+        st, a = _place_one(params, st, price, rung, params.E_min + rung * _CENT, now, count=w)
         actions += a
+        used += w
     if actions:
         times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
         st = replace(
@@ -1864,7 +1956,9 @@ def _emit_roll(
 ) -> tuple[V33State, RollPending, V33Action]:
     """Build ONE convergence amend moving ``order`` to ``target_price``. Mints a new coid (a price change
     forfeits queue). Returns the new state, the RollPending to register, and the AMEND action. Counted on
-    CONFIRM (``_apply_amended``). The caller registers the roll + emits."""
+    CONFIRM (``_apply_amended``). The caller registers the roll + emits. L5: the amend re-prices but KEEPS
+    the order's count (``order.count``) — a roll never re-sizes; re-sizing to a slot weight happens only
+    on a FRESH order (place-all / vacant-create / roll fallback re-place)."""
     new_coid, st = _mint_coid(st)
     rp = RollPending(
         order_id=order.order_id, old_coid=order.client_order_id, new_coid=new_coid,
@@ -1874,7 +1968,7 @@ def _emit_roll(
     action = _mk(
         ActionKind.AMEND_REST, st.shakedown,
         order_id=order.order_id, ticker=st.bucket_tickers.get(st.spot_Sd, ""), side=BUY_NO,
-        action="buy", count=params.lots_per_rung, price=target_price, expiration_epoch=exp,
+        action="buy", count=int(order.count), price=target_price, expiration_epoch=exp,
         client_order_id=order.client_order_id, updated_client_order_id=new_coid,
     )
     return st, rp, action
@@ -2000,9 +2094,13 @@ def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, li
     # PRE-HEDGED by an active print-through trigger is NEVER rolled (its wings are committed at its offer;
     # rolling would rotate its coid and break the pre-hedge attribution) -- it simply rests until it fills.
     pt_covered = _pt_covered_coids(st)
+    # L5: a PARTIALLY-FILLED rung (booked > 0) still resting is NEVER rolled — its slot is consumed
+    # (state 2) and its remainder must stay put to complete that rung; rolling it would disturb a fill in
+    # progress. (No-op at weight 1, where a resting order never has a booked partial.)
     OUT = [o for o in st.ladder if o.live and o.order_id is not None
            and o.client_order_id not in inflight_old and o.price not in target
-           and o.client_order_id not in pt_covered]
+           and o.client_order_id not in pt_covered
+           and st.rest_booked_by_coid.get(o.client_order_id, 0) == 0]
     # VACANT = target prices with no committed order (live/pending price or in-flight target).
     VACANT = sorted(p for p in target if p not in occupied and p not in inflight_targets)
 
@@ -2059,13 +2157,19 @@ def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, li
                          outstanding_cancels=st.outstanding_cancels + (1 if o.order_id else 0))
             extra_times.append(now)
     elif remaining > 0 and len(VACANT) > pairs:
-        # extra VACANT with no OUT order (a suppressed slot became placeable) -> CREATE, but never past K.
+        # extra VACANT with no OUT order (a suppressed slot became placeable) -> CREATE, sized to the
+        # slot's WEIGHT, but never past the CONTRACT allotment (L5). Each target is a distinct open slot
+        # (<= K), so price-slot uniqueness is guaranteed; the allotment is the binding cap.
+        allot = _allotment(params)
         for tprice in VACANT[pairs:pairs + remaining]:
-            if len(st.ladder) + st.rungs_filled >= params.rungs:
-                break
             m = target[tprice]
+            w = _weight_of_margin(params, m)
+            if w <= 0:
+                continue
+            if _filled_contracts(st) + _resting_contracts(st) + w > allot:
+                break
             rung = m - _emin_cents(params)
-            st, pa = _place_one(params, st, tprice, rung, params.E_min + rung * _CENT, now)
+            st, pa = _place_one(params, st, tprice, rung, params.E_min + rung * _CENT, now, count=w)
             actions += pa
             extra_times.append(now)
 
