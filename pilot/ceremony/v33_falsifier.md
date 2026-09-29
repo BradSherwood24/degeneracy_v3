@@ -189,3 +189,21 @@ there (`lock_value(deep_price, W_at_reach)`), and the ABSORPTION (lots the tape 
 rung). It NEVER places an order and NEVER holds a position -- it MEASURES the deep end (whose absorption
 the ideal study could only INFER) before anyone sizes into it, informing the Promotion clause. Surfaced
 in the report's "DEEP END (SO-3, observation only)" block.
+
+## L5 amendment (2026-09-29) -- per-rung lot weights (`rung_lots`)
+
+MECHANISM ONLY; changes NOTHING in the frozen quantities above. The ladder core now accepts an OPTIONAL
+policy key `rung_lots`: a list of `rungs` non-negative ints, index k = rung k (k=0 top rung at margin
+`E_min`, k=K-1 deepest); a 0 means that rung is never placed. When ABSENT (as in the currently shipped
+policy) it defaults to `[lots_per_rung] * rungs` -- ALL ONES -- and the core is byte-identical to the
+pre-L5 ladder (the existing goldens are untouched and still pass). The hour's exposure cap becomes the
+CONTRACT allotment `sum(rung_lots)`; `max_sets_per_hour` stays the coarse rung/fill-event gate.
+
+The weights are BRAD'S LEVER: he sets them (after a dry week, per his "scale the edge -- not 100% capital
+at 10c") by editing `pilot/policy/v33_params.json` and RE-PINNING the canonical sha in a params PR (the
+loader refuses any drift, S5). No agent sets the weights. The falsifier's per-rung SOLVED-lock and
+`E_rung` quantities are unchanged; the ledger's `rung_fills` rows now also carry the rung's `weight`, and
+the report gains an "ALLOCATION TABLE (per placed margin)" so the weighted allocation's result is
+readable. The roll/re-size rule (a roll KEEPS the moving order's count; re-sizing to a slot's weight
+happens only on a fresh placement) is documented in `service/v33/core.py`'s module docstring and
+`pilot/build/v33_rung_lots_build_report.md`.
