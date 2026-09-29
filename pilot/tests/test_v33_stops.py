@@ -69,6 +69,54 @@ def test_caps_reject_missing_prefix():
     assert not ok and "prefixes" in why
 
 
+# --- L5 (2026-09-29): the cap band tightens to [max(rung_lots), sum(rung_lots)] with weights ----------
+_W = (0, 0, 1, 1, 2, 2, 2, 3, 3, 3, 3)  # max 3, sum 20 (the illustrative shape)
+
+
+def test_caps_weighted_requires_cap_ge_max_rung_lots():
+    # A weight-3 rung is PLACED as ONE 3-lot order; a proxy cap of 2 would have the venue reject the
+    # place. The uniform check (>= lots_per_rung=1) would WRONGLY arm; the weight-aware check refuses.
+    ok, why = v33_caps_agree(_health(maxc=2), lots_per_rung=1, k_rungs=11, rung_lots=_W)
+    assert not ok and "max(rung_lots)=3" in why
+    # the pre-L5 (weight-blind) call still arms at cap 2 -> proves the gap this fix closes.
+    ok0, _ = v33_caps_agree(_health(maxc=2), lots_per_rung=1, k_rungs=11)
+    assert ok0
+
+
+def test_caps_weighted_accepts_cap_equal_max():
+    ok, why = v33_caps_agree(_health(maxc=3), lots_per_rung=1, k_rungs=11, rung_lots=_W)
+    assert ok, why
+
+
+def test_caps_weighted_accepts_cap_up_to_sum():
+    ok, why = v33_caps_agree(_health(maxc=20), lots_per_rung=1, k_rungs=11, rung_lots=_W)
+    assert ok, why
+
+
+def test_caps_weighted_rejects_above_sum_ceiling():
+    ok, why = v33_caps_agree(_health(maxc=21), lots_per_rung=1, k_rungs=11, rung_lots=_W)
+    assert not ok and "sum(rung_lots)=20" in why
+
+
+def test_caps_uniform_rung_lots_identical_to_absent():
+    # a resolved uniform vector (all ones) must give the SAME band as the absent (lots_per_rung) path.
+    ones = (1,) * 11
+    for maxc in (0, 1, 2, 11, 12):
+        a_ok, _ = v33_caps_agree(_health(maxc=maxc), lots_per_rung=1, k_rungs=11)
+        b_ok, _ = v33_caps_agree(_health(maxc=maxc), lots_per_rung=1, k_rungs=11, rung_lots=ones)
+        assert a_ok == b_ok, f"maxc={maxc}: absent={a_ok} vs uniform-vector={b_ok}"
+
+
+def test_arming_check_threads_rung_lots(tmp_path):
+    # v33_arming_check forwards rung_lots to the caps check: a weight-3 shape at cap 2 refuses to arm.
+    fpath = tmp_path / "v33_falsifier.md"
+    fpath.write_text("STATUS: not frozen\n", encoding="utf-8")
+    dec = v33_arming_check(str(fpath), _health(maxc=2), params_verified=True, lots_per_rung=1,
+                           k_rungs=11, rung_lots=_W)
+    assert not dec.armed
+    assert any("max(rung_lots)=3" in r for r in dec.reasons)
+
+
 def test_s4_cap_is_three_dollars():
     assert V33_S4_DAY_LOSS_CAP_DOLLARS == Decimal("3.00")
 

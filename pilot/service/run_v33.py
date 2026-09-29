@@ -816,7 +816,7 @@ def main(argv: list[str] | None = None) -> int:
         outcome = decide_v33_arming(
             resolved_mode=resolved_mode, falsifier_path=args.falsifier, health=health,
             positions=positions, params_verified=True, lots_per_rung=params.lots_per_rung,
-            day_guard=day_guard, s4=s4, k_rungs=params.rungs)
+            day_guard=day_guard, s4=s4, k_rungs=params.rungs, rung_lots=params.rung_lots)
         effective_mode = outcome.effective_mode
         if not outcome.armed:
             degrade = "degrade_to_dry"
