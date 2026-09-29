@@ -77,7 +77,11 @@ def _books(now: float, sd_ask: str = "0.76", *, b_bid: str = "0.35", su_bid: str
 
 
 def _params(**over):
-    p = load_v33_params()
+    # L4 (2026-09-29): PIN E_min to 0.05 (controlled ladder). The shipped policy is E_min 0.08 (8..18c),
+    # which lowers n_top 3c; these tests' hard-coded rung prices (n_top 0.50, offers 0.50/0.51/0.52, ...)
+    # were authored around the 5..15c anchor and the mechanism is E_min-invariant. Shipped E_min asserted
+    # in test_v33_params.py / test_v33_hardening.py.
+    p = replace(load_v33_params(), E_min=Decimal("0.05"))
     base = dict(print_through=True, tol=Decimal("0.01"), deb_ms=0,
                 freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)
     base.update(over)
@@ -165,7 +169,9 @@ def test_no_trigger_when_no_rest_live():
 
 
 def test_no_trigger_when_feature_off():
-    p = replace(load_v33_params(), tol=Decimal("0.01"), deb_ms=0,
+    # L4 (2026-09-29): PIN E_min 0.05 (controlled ladder, n_top 0.50) -- this builds params directly rather
+    # than via _params(), so it needs the same pin; print_through stays False (feature-off check).
+    p = replace(load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
                 freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)  # print_through False
     st = _bring_up(p, _state(p), T - 600)
     st, acts = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))

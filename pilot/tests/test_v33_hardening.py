@@ -258,16 +258,21 @@ def test_params_sha_repinned_and_previous_defined():
         PREVIOUS_V33_PARAMS_SHA256_L3 as PREV_L3,
         PREVIOUS_V33_PARAMS_SHA256_FLAP_R1 as PREV_FLAP_R1,
         PREVIOUS_V33_PARAMS_SHA256_FLAP_R2 as PREV_FLAP_R2,
+        PREVIOUS_V33_PARAMS_SHA256_PRINT_THROUGH as PREV_PRINT_THROUGH,
     )
-    # PRINT-THROUGH WINGS (2026-09-26): re-pinned over the FLAP-R2 sha (now kept as PREVIOUS_..._FLAP_R2).
-    assert PIN == "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
+    # L4 LADDER SHIFT (2026-09-29): re-pinned over the print-through sha (now kept as
+    # PREVIOUS_..._PRINT_THROUGH); E_min 0.05 -> 0.08, ladder 8..18c.
+    assert PIN == "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
+    assert PREV_PRINT_THROUGH == "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
     assert PREV_FLAP_R2 == "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78"
     assert PREV_FLAP_R1 == "3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac"
     assert PREV_L3 == "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
     assert PREV_L2 == "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
-    assert PIN != PREV_FLAP_R2 != PREV_FLAP_R1 != PREV_L3 != PREV_L2
+    assert PIN != PREV_PRINT_THROUGH != PREV_FLAP_R2 != PREV_FLAP_R1 != PREV_L3 != PREV_L2
+    assert PIN not in (PREV_PRINT_THROUGH, PREV_FLAP_R2, PREV_FLAP_R1, PREV_L3, PREV_L2)
     p = load_v33_params()
     assert p.sha256 == PIN and p.write_reserve_tokens == 30 and p.deep_obs_rungs == 10
+    assert p.E_min == Decimal("0.08")
     assert (p.bucket_switch_deb_ms == 3000 and p.bucket_switch_hysteresis_usd == 15
             and p.stand_down_hold_ms == 1500 and p.bucket_switch_max_pending_ms == 15000)
     # print-through levers present, feature OFF by default (byte-identical ladder until Brad flips it).
@@ -301,7 +306,7 @@ def test_armed_executor_carries_the_reserve():
 
 def test_ledger_row_carries_deep_obs():
     from service.v33.ledger import build_v33_ledger_row
-    deep = {"margins_c": list(range(16, 26)), "reached_count": 3, "rungs": []}
+    deep = {"margins_c": list(range(19, 29)), "reached_count": 3, "rungs": []}  # L4: 8..18c ladder -> deep 19..28c
     row = build_v33_ledger_row(
         close_time="2026-09-24T04:00:00Z", resolved_mode="dry", effective_mode="dry", degrade=None,
         params=load_v33_params(), state=None, driver_counts={}, executor_counts={}, ws_counts={},

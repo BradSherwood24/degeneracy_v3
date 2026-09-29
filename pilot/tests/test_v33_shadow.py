@@ -1,4 +1,4 @@
-"""V3.3 observation ladders (L3): the SO-3 deep-end observation ladder (16..25c) and the SHADOW==DRY_SIM
+"""V3.3 observation ladders (L3): the SO-3 deep-end observation ladder (19..28c) and the SHADOW==DRY_SIM
 equivalence. FAKES ONLY -- no network, no proxy, no sealed/holdout read. The deep-end integration replays
 the 2026-09-20T04:00Z golden fixture through the real V33Driver (in dry) and checks the deep rungs the
 sweep reached + their absorption."""
@@ -100,32 +100,32 @@ def test_shadow_equals_dry_sim_on_the_golden_prints():
 # ---------------------------------------------------------------------------
 # SO-3 DeepObservationLadder -- direct unit
 # ---------------------------------------------------------------------------
-def test_deep_ladder_margins_are_16_to_25():
+def test_deep_ladder_margins_are_19_to_28():
     lad = DeepObservationLadder(load_v33_params(), close_epoch=1789876800)
-    assert lad.margins == list(range(16, 26))   # E_min_c(5) + rungs(11) = 16 .. 16+10-1 = 25
+    assert lad.margins == list(range(19, 29))   # L4: E_min_c(8) + rungs(11) = 19 .. 19+10-1 = 28
 
 
 def test_deep_ladder_records_reach_lock_and_absorption():
     p = load_v33_params()
     lad = DeepObservationLadder(p, close_epoch=1000)
-    n_top = Decimal("0.45")     # deep rung m=16 -> price 0.34 (YES ask 0.66); m=25 -> 0.25 (ask 0.75)
+    n_top = Decimal("0.45")     # L4: deep rung m=19 -> price 0.34 (YES ask 0.66); m=28 -> 0.25 (ask 0.75)
     W = Decimal("1.4737")
-    # a 0.66 print reaches ONLY the shallowest deep rung (m=16, price 0.34); deeper rungs need >= 0.67..
+    # a 0.66 print reaches ONLY the shallowest deep rung (m=19, price 0.34); deeper rungs need >= 0.67..
     lad.observe(taker_side="yes", yes_price=Decimal("0.66"), count=Decimal(3), n_top=n_top, W=W,
                 server_ts=500)   # t_minus 500, inside T-15..T-5
-    o16 = lad.obs[16]
-    assert o16.reached and o16.prints_through == 1 and o16.absorption_lots == Decimal(3)
-    assert not lad.obs[17].reached
+    o19 = lad.obs[19]
+    assert o19.reached and o19.prints_through == 1 and o19.absorption_lots == Decimal(3)
+    assert not lad.obs[20].reached
     # its ideal lock = lock_value(0.34, W)
     from service.v33.core import lock_value
-    assert Decimal(o16.first["lock_solved"]) == lock_value(Decimal("0.34"), W)
+    assert Decimal(o19.first["lock_solved"]) == lock_value(Decimal("0.34"), W)
     # a 0.99 print reaches ALL deep rungs and adds absorption
     lad.observe(taker_side="yes", yes_price=Decimal("0.99"), count=Decimal(5), n_top=n_top, W=W,
                 server_ts=490)
-    assert all(lad.obs[m].reached for m in range(16, 26))
-    assert lad.obs[16].absorption_lots == Decimal(8)   # 3 + 5
+    assert all(lad.obs[m].reached for m in range(19, 29))
+    assert lad.obs[19].absorption_lots == Decimal(8)   # 3 + 5
     s = lad.summary()
-    assert s["reached_count"] == 10 and s["margins_c"] == list(range(16, 26))
+    assert s["reached_count"] == 10 and s["margins_c"] == list(range(19, 29))
 
 
 def test_deep_ladder_skips_below_n_min_and_no_side():
@@ -138,7 +138,7 @@ def test_deep_ladder_skips_below_n_min_and_no_side():
     # at a very low n_top the deep rungs fall below n_min (0.05) and are skipped
     lad.observe(taker_side="yes", yes_price=Decimal("0.999"), count=Decimal(5),
                 n_top=Decimal("0.10"), W=Decimal("1.8"), server_ts=500)
-    # n_top 0.10: m=16 -> 0.10-11c = -0.01 < n_min -> skipped; nothing reachable
+    # n_top 0.10: m=19 -> 0.10-11c = -0.01 < n_min -> skipped; nothing reachable
     assert lad.summary()["reached_count"] == 0
 
 
@@ -152,12 +152,13 @@ def test_driver_deep_obs_reached_and_absorption_on_golden_sweep():
         drv.on_trade(B_SD, {"taker_side": "yes", "yes_price_dollars": yp_s, "count_fp": cnt},
                      cts + float(dt))
     s = drv.deep_obs.summary()
-    assert s["margins_c"] == list(range(16, 26))
-    # the golden sweep prints to yes 0.98, so every deep rung (down to 0.25 = ask 0.75) is reached
+    assert s["margins_c"] == list(range(19, 29))
+    # L4: shipped E_min 0.08 -> n_top 0.42 here; the golden sweep prints to yes 0.98, so every deep rung
+    # (down to 0.22 = ask 0.78) is reached
     assert s["reached_count"] == 10
     # absorption at the shallowest deep rung is > 0 (real lots printed through it)
-    r16 = next(r for r in s["rungs"] if r["margin_c"] == 16)
-    assert Decimal(r16["absorption_lots"]) > 0 and r16["reached"] and r16["first"] is not None
+    r19 = next(r for r in s["rungs"] if r["margin_c"] == 19)
+    assert Decimal(r19["absorption_lots"]) > 0 and r19["reached"] and r19["first"] is not None
 
 
 def test_deep_ladder_reach_with_unknown_W_records_none_lock():
@@ -165,8 +166,8 @@ def test_deep_ladder_reach_with_unknown_W_records_none_lock():
     lad = DeepObservationLadder(p, close_epoch=1000)
     lad.observe(taker_side="yes", yes_price=Decimal("0.99"), count=Decimal(2),
                 n_top=Decimal("0.45"), W=None, server_ts=500)   # W unknown -> lock_solved None
-    o16 = lad.obs[16]
-    assert o16.reached and o16.first["lock_solved"] is None and o16.first["W"] is None
+    o19 = lad.obs[19]
+    assert o19.reached and o19.first["lock_solved"] is None and o19.first["W"] is None
 
 
 def test_deep_ladder_disabled_when_depth_zero():

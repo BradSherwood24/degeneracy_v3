@@ -59,7 +59,13 @@ def _top(bid: str, ask: str, *, suspect: bool = False) -> TopOfBook:
 
 
 def _params(**over) -> V33Params:
-    p = load_v33_params()
+    # L4 (2026-09-29): the SHIPPED policy shifted to E_min 0.08 (ladder 8..18c), lowering n_top by 3c
+    # everywhere. These are CONTROLLED-ladder mechanism tests whose synthetic books, inline comments and
+    # hard-coded price assertions (n_top 0.50, ladder 0.50..0.40, ...) were authored around the 5..15c
+    # anchor. The ladder mechanism (K consecutive cents from n_top, the roll, n_min truncation, the cap) is
+    # E_min-invariant, so we PIN E_min to 0.05 here to keep every price assertion exact; the shipped
+    # E_min 0.08 / sha are asserted in test_v33_params.py and test_v33_hardening.py.
+    p = replace(load_v33_params(), E_min=Decimal("0.05"))
     return replace(p, **over) if over else p
 
 

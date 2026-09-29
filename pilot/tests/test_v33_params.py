@@ -27,7 +27,7 @@ from service.v33.params import (
 def test_params_load_and_sha_pin():
     p = load_v33_params()
     assert p.sha256 == FROZEN_V33_PARAMS_SHA256
-    assert p.E_min == Decimal("0.05")
+    assert p.E_min == Decimal("0.08")   # L4 (2026-09-29): ladder shift 5..15c -> 8..18c
     assert p.rungs == 11
     assert p.lots_per_rung == 1
     assert p.tol == Decimal("0.01")
@@ -45,6 +45,22 @@ def test_params_load_and_sha_pin():
     assert p.write_bucket_size == 100
     assert p.order_poll_batched is True
     assert p.shadow_Es == (Decimal("0.08"), Decimal("0.10"), Decimal("0.12"))
+
+
+def test_l4_ladder_shift_8_to_18():
+    """L4 (2026-09-29): the shipped ladder rests margins 8..18c. Assert E_min 0.08, K=11, the live margin
+    range [0.08, 0.18] = [E_min, E_min+(rungs-1)c], every shadow E inside it, and the SO-3 deep-obs band
+    19..28c (E_min_c+rungs .. +rungs+deep_obs_rungs-1)."""
+    p = load_v33_params()
+    assert p.E_min == Decimal("0.08")
+    assert p.rungs == 11
+    E_max = p.E_min + (p.rungs - 1) * Decimal("0.01")
+    assert (p.E_min, E_max) == (Decimal("0.08"), Decimal("0.18"))       # ladder margins 8..18c
+    assert all(p.E_min <= E <= E_max for E in p.shadow_Es)              # shadows track live rungs
+    assert p.shadow_Es == (Decimal("0.08"), Decimal("0.10"), Decimal("0.12"))
+    # SO-3 deep-observation band follows automatically: margins E_min_c+rungs .. +rungs+deep_obs_rungs-1.
+    E_min_c = int(p.E_min * 100)
+    assert (E_min_c + p.rungs, E_min_c + p.rungs + p.deep_obs_rungs - 1) == (19, 28)
 
 
 def test_hint_below_lots_per_rung_fails_closed(tmp_path):
@@ -115,11 +131,11 @@ def test_shadow_E_outside_ladder_range_fails_closed(tmp_path):
 def test_shadow_E_at_ladder_bottom_edge_ok(tmp_path):
     with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
         raw = json.load(f)
-    raw["shadow_Es"] = ["0.05", "0.15"]  # exactly the ladder endpoints -> valid
+    raw["shadow_Es"] = ["0.08", "0.18"]  # L4: exactly the new ladder endpoints [E_min, E_min+(rungs-1)c] -> valid
     q = tmp_path / "v33_params.json"
     q.write_text(json.dumps(raw), encoding="utf-8")
     p = load_v33_params(str(q), expected_sha=None)
-    assert p.shadow_Es == (Decimal("0.05"), Decimal("0.15"))
+    assert p.shadow_Es == (Decimal("0.08"), Decimal("0.18"))
 
 
 def test_rungs_below_one_fails_closed(tmp_path):
