@@ -9,7 +9,7 @@
   * the FALSIFIER GATE TABLE (§6) computed live from realised rows: each gate -> value/threshold/status;
   * the SIDE-BY-SIDE block (Brad's watch-and-compare): per hour V3.2 vs V3.3, day totals, and the
     windows where V3.3 (dry) would have entered and V3.2 did not, and vice versa;
-  * the DEEP END (SO-3, observation only) block: the deep 16..25c rungs the tape reached + absorption.
+  * the DEEP END (SO-3, observation only) block: the deep 19..28c rungs the tape reached + absorption.
 
 Reads ONLY ``ledger/v33_ledger.jsonl`` (and, for the side-by-side, ``ledger/v32_ledger.jsonl``) plus the
 frozen V3.3 params (for n_min) — no network, no sealed file, no orders. The V3.2 report is unchanged and
@@ -392,7 +392,7 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
 # DEEP END (SO-3, observation only)
 # ---------------------------------------------------------------------------
 def build_deep_end(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate the SO-3 deep-observation ladder (16..25c) across windows: for each deep margin, the
+    """Aggregate the SO-3 deep-observation ladder (19..28c) across windows: for each deep margin, the
     windows the tape reached it, the mean ideal lock at first reach, and total absorption (lots the tape
     printed at/through the rung). Observation only — this never reflects a position we held."""
     by: dict[int, dict[str, Any]] = {}
@@ -659,7 +659,12 @@ def _render_gate_table(gt: dict[str, Any]) -> list[str]:
 
 
 def _render_deep_end(de: dict[str, Any]) -> list[str]:
-    lines = ["", "DEEP END (SO-3, observation only -- 16..25c; measures the deep rungs before sizing)",
+    # Band is DERIVED from the observed margins (E_min+rungs .. +deep_obs_rungs-1) so it stays honest
+    # across any future ladder shift -- do not hard-code it (L4 review 2026-09-29: it read 16..25c after
+    # the 8..18c shift moved the deep band to 19..28c).
+    _m = de.get("margins") or []
+    band = f"{_m[0]['margin_c']}..{_m[-1]['margin_c']}c" if _m else "below the live ladder"
+    lines = ["", f"DEEP END (SO-3, observation only -- {band}; measures the deep rungs before sizing)",
              "-" * 92,
              f"  windows with deep observation = {de['windows_with_deep_obs']}"]
     if not de["margins"]:

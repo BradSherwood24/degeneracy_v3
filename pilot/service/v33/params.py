@@ -48,7 +48,7 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # L3 (2026-09-23): ADDED ``write_reserve_tokens`` (the pacer headroom a priority cancel/wing burst always
 # keeps; a non-priority create/amend never draws the bucket below it -- L2 review R2-N1) and
 # ``deep_obs_rungs`` (the SO-3 deep-observation ladder depth below the live ladder, margins
-# E_min_c+rungs .. E_min_c+rungs+deep_obs_rungs-1 = 16..25c; observation only, never placed) -> re-pinned.
+# E_min_c+rungs .. E_min_c+rungs+deep_obs_rungs-1 = 19..28c; observation only, never placed) -> re-pinned.
 # BUCKET-FLAP FIX (2026-09-23, first DRY window 07:00Z): ADDED ``bucket_switch_deb_ms`` (a spot-bucket
 # change is acted on only after the new bucket is the resolved spot continuously for >= this),
 # ``bucket_switch_hysteresis_usd`` (the implied spot must sit >= this many $ inside the new bucket at least
@@ -187,7 +187,7 @@ class V33Params:
                                        # keeps; a non-priority create/amend never draws below it (30)
     order_poll_batched: bool           # one /portfolio/orders?ticker= poll vs per-rung GETs (default true)
     deep_obs_rungs: int                # L3 (SO-3): observation-only rungs BELOW the live ladder (margins
-                                       # E_min_c+rungs .. +deep_obs_rungs-1 = 16..25c); never placed (10)
+                                       # E_min_c+rungs .. +deep_obs_rungs-1 = 19..28c); never placed (10)
     # PRINT-THROUGH WINGS (2026-09-26): fire the wing takes EARLY off a bucket TRADE print, before our own
     # rung fill confirms, so the wings are IN HAND at the ask the sweep started from (not the ask it jumped
     # to in the same ~50 ms). All OFF by default (``print_through`` False) -> the ladder is byte-identical.

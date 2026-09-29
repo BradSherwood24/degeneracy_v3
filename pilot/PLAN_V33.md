@@ -23,7 +23,7 @@ Two things, shipped as one roster change:
 K one-lot NO bids on K consecutive cents, anchored at the top rung `n_top = n(E_min, W)` (solved exactly
 as V3.2 solves n: largest cent with `n + fee(n) <= 2 - E_min - W`, floor `n_min`, cap `no_ask - 1c`).
 Rung k sits at `n_top - k cents` (k = 0..K-1); its realised margin is `E_min + k` cents (give or take the
-fee-reserve rounding). Default K = 11, E_min = 5 -> rungs at 5..15c. A YES-taker sweep walks the ladder
+fee-reserve rounding). Default K = 11, E_min = 8 -> rungs at 8..18c (L4 2026-09-29; was E_min = 5 -> 5..15c). A YES-taker sweep walks the ladder
 from the top: shallow pumps fill 1-4 rungs, full sweeps fill all K (measured: every one of the 12 live
 V3.2 sets was a full sweep; sweep depth median 22c).
 
@@ -221,4 +221,4 @@ Per Brad's sizing philosophy (2026-09-18): n answers slippage and edge-case ques
 ## 8. Not in V3.3
 
 The Render move itself (env vars and service creation only, after V3.3), ETH or any second series, lots
-per rung > 1, rungs deeper than 15c live (observation only), the 15M, refills (Q3), ETH recorder.
+per rung > 1, rungs deeper than 18c live (observation only), the 15M, refills (Q3), ETH recorder.

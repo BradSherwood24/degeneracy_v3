@@ -46,7 +46,7 @@ V33_KILL_MIN_N = 15                                    # [pin] ... already at n 
 
 # --- Promotion (Brad's dated word required; these are the necessary conditions) -------------------
 V33_PROMOTION_MIN_N = 30                                # [pin] alive at n >= 30 rung-fills, AND
-# a promotion is 2 lots per rung, OR rungs deeper than 15c live, informed by SO-3's measured deep-end
+# a promotion is 2 lots per rung, OR rungs deeper than 18c live, informed by SO-3's measured deep-end
 # absorption (PLAN_V33 sec 6 / sec 8). No automatic promotion; Brad's dated go, like V3.2's.
 
 # Power note (documented, not a threshold): every completed ladder set pays $2/contract at settlement, so
