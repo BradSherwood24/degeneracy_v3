@@ -89,6 +89,11 @@ class ProxyWriter:
         self._auth = proxy_auth or ProxyAuth(base_url=base_url)
         self._http_post = http_post or self._default_post
         self._http_delete = http_delete or self._default_delete
+        # Track whether the default (requests-backed) callables are in use. Only the default path threads
+        # the optional per-call ``headers`` (e.g. X-DV3-Class from the async writer) so the injected-callable
+        # contract (``(url, body, timeout)`` / ``(url, timeout)``) stays unchanged for the two test injectors.
+        self._http_post_is_default = http_post is None
+        self._http_delete_is_default = http_delete is None
         self._sleep = sleep
 
     # === GET (delegated to ProxyAuth's bounded retry) ===
@@ -97,16 +102,24 @@ class ProxyWriter:
         return self._auth.rest_get(path, params)
 
     # === POST create (NEVER retried) ===
-    def rest_post(self, path: str, body: dict[str, Any]) -> WriteResponse:
+    def rest_post(self, path: str, body: dict[str, Any],
+                  headers: dict[str, str] | None = None) -> WriteResponse:
         """POST {base}/trade-api/v2{path} with ``body`` (JSON). Sent ONCE — never retried (a lost
         response on a server-side success would duplicate the order; the body's client_order_id is the
-        idempotency key). Any transport error is returned as a non-ok WriteResponse, not raised."""
+        idempotency key). Any transport error is returned as a non-ok WriteResponse, not raised.
+
+        ``headers`` (optional) are EXTRA localhost-hop headers (e.g. ``X-DV3-Class`` from the V3.3 async
+        writer) merged over the DV3 token header on the default requests path; they are ignored when a
+        custom ``http_post`` callable is injected (its ``(url, body, timeout)`` contract is unchanged)."""
         # Idempotent composition: an already-prefixed /trade-api/v2/... path is NOT
         # re-prefixed (the 2026-09-14 doubled-prefix create-404). compose_rest_url
         # also validates the leading '/' and asserts a single prefix.
         url = compose_rest_url(self._base, path)
         try:
-            resp = self._http_post(url, body, POST_TIMEOUT)
+            if self._http_post_is_default:
+                resp = self._default_post(url, body, POST_TIMEOUT, headers)
+            else:
+                resp = self._http_post(url, body, POST_TIMEOUT)
         except Exception as e:  # noqa: BLE001 — POST is never retried; a transport error is a no-send
             logger.warning("[PROXY-WRITE] POST %s transport error: %s", url, e)
             return WriteResponse(status_code=None, body={}, ok=False,
@@ -114,16 +127,22 @@ class ProxyWriter:
         return self._classify(resp, verb="POST", url=url)
 
     # === DELETE cancel (bounded retry — idempotent) ===
-    def rest_delete(self, path: str) -> WriteResponse:
+    def rest_delete(self, path: str, headers: dict[str, str] | None = None) -> WriteResponse:
         """DELETE {base}/trade-api/v2{path} (bounded retry on 429/5xx/connection blips; DELETE is
         idempotent). A 404 is returned to the caller (not retried) — the cancel path classifies a
-        not_found body as terminal-success."""
+        not_found body as terminal-success.
+
+        ``headers`` (optional): EXTRA localhost-hop headers merged on the default requests path only
+        (ignored when a custom ``http_delete`` callable is injected — its ``(url, timeout)`` is unchanged)."""
         url = compose_rest_url(self._base, path)
         backoff = _INITIAL_BACKOFF
         last: WriteResponse | None = None
         for attempt in range(_DELETE_RETRY_ATTEMPTS):
             try:
-                resp = self._http_delete(url, DELETE_TIMEOUT)
+                if self._http_delete_is_default:
+                    resp = self._default_delete(url, DELETE_TIMEOUT, headers)
+                else:
+                    resp = self._http_delete(url, DELETE_TIMEOUT)
             except Exception as e:  # noqa: BLE001
                 last = WriteResponse(None, {}, False, f"delete_exception:{type(e).__name__}")
                 if attempt < _DELETE_RETRY_ATTEMPTS - 1:
@@ -162,11 +181,14 @@ class ProxyWriter:
         return WriteResponse(status_code=status, body=body, ok=ok, error=error)
 
     @staticmethod
-    def _default_post(url: str, body: dict[str, Any], timeout: float) -> Any:
+    def _default_post(url: str, body: dict[str, Any], timeout: float,
+                      headers: dict[str, str] | None = None) -> Any:
         import requests  # local import so importing this module never requires the network
-        return requests.post(url, json=body, timeout=timeout, headers=_dv3_token_headers())
+        merged = {**_dv3_token_headers(), **(headers or {})}
+        return requests.post(url, json=body, timeout=timeout, headers=merged)
 
     @staticmethod
-    def _default_delete(url: str, timeout: float) -> Any:
+    def _default_delete(url: str, timeout: float, headers: dict[str, str] | None = None) -> Any:
         import requests
-        return requests.delete(url, timeout=timeout, headers=_dv3_token_headers())
+        merged = {**_dv3_token_headers(), **(headers or {})}
+        return requests.delete(url, timeout=timeout, headers=merged)
