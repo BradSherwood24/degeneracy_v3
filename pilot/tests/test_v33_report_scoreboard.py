@@ -76,9 +76,9 @@ def test_capture_ratio_at_10c():
 # gate table
 # ---------------------------------------------------------------------------
 def test_gate_table_n_too_small_pending():
-    gt = build_falsifier_gate_table([_sweep_row("2026-09-24T04:00:00Z")])   # n=11 < 30
+    gt = build_falsifier_gate_table([_sweep_row("2026-09-24T04:00:00Z")])   # n=11 < 15
     assert gt["n_rung_fills"] == 11
-    assert gt["verdict"].startswith("n<30 pending")
+    assert gt["verdict"].startswith("n<15 pending")
     mean_gate = next(g for g in gt["gates"] if g["gate"] == "mean true lock")
     assert mean_gate["status"] == "n-too-small"
 
@@ -180,8 +180,8 @@ def test_capture_excludes_below_n_min_shadow_fill():
 
 
 def test_gate_capture_none_fails_closed_at_n_over_30():
-    """F1 (fail-closed): at n >= 30 an UNMEASURABLE capture (no valid shadow availability, ratio None) is
-    a FAIL, not a pass -- and the verdict is NOT ALIVE. Below n >= 30 it stays n-too-small."""
+    """F1 (fail-closed): at n >= 15 an UNMEASURABLE capture (no valid shadow availability, ratio None) is
+    a FAIL, not a pass -- and the verdict is NOT ALIVE. Below n >= 15 it stays n-too-small."""
     rows = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=8, shadow_10=None) for h in range(3)]
     gt = build_falsifier_gate_table(rows)                       # n=33, no shadow
     cap_gate = next(g for g in gt["gates"] if g["gate"].startswith("capture ratio"))
@@ -192,7 +192,7 @@ def test_gate_capture_none_fails_closed_at_n_over_30():
 def test_gate_capture_none_is_n_too_small_below_min_n():
     gt = build_falsifier_gate_table([_sweep_row("2026-09-24T04:00:00Z", realised_c=8, shadow_10=None)])
     cap_gate = next(g for g in gt["gates"] if g["gate"].startswith("capture ratio"))
-    assert gt["n_rung_fills"] == 11                              # < 30
+    assert gt["n_rung_fills"] == 11                              # < 15
     assert cap_gate["status"] == "n-too-small"                  # below MIN_N: unmeasured, not yet a FAIL
 
 
@@ -236,22 +236,24 @@ def test_full_report_has_all_blocks(capsys, tmp_path):
 def test_build_v33_report_includes_new_sections():
     rep = build_v33_report([_sweep_row("2026-09-24T04:00:00Z")])
     assert "scoreboard" in rep and "gate_table" in rep and "deep_end" in rep
-    assert rep["gate_table"]["verdict"].startswith("n<30 pending")
+    assert rep["gate_table"]["verdict"].startswith("n<15 pending")
 
 
 # ---------------------------------------------------------------------------
 # gate boundaries + finer gate behaviour
 # ---------------------------------------------------------------------------
 def test_gate_mean_lock_boundary_pass_and_fail():
-    # mean exactly +6.0c at n>=30 -> PASS; +5c -> FAIL (mean-lock gate is >= not >)
-    at6 = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=6, solved_c=8) for h in range(3)]
-    gt6 = build_falsifier_gate_table(at6)
-    mg = next(g for g in gt6["gates"] if g["gate"] == "mean true lock")
-    assert mg["status"] == "PASS" and gt6["verdict"] == "ALIVE-so-far"
-    at5 = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=5, solved_c=6) for h in range(3)]
-    gt5 = build_falsifier_gate_table(at5)
-    mg5 = next(g for g in gt5["gates"] if g["gate"] == "mean true lock")
-    assert mg5["status"] == "FAIL" and gt5["verdict"].startswith("KILL")
+    # L6 (Brad 2026-09-30): the mean-lock bar dropped +6.0c -> +4.0c.
+    # mean exactly +4.0c at n>=15 -> PASS; +3c -> FAIL (mean-lock gate is >= not >; +3c is above the
+    # +2.0c early kill, so it fails on the verdict mean-lock gate, not the early kill).
+    at4 = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=4, solved_c=6) for h in range(3)]
+    gt4 = build_falsifier_gate_table(at4)
+    mg = next(g for g in gt4["gates"] if g["gate"] == "mean true lock")
+    assert mg["status"] == "PASS" and gt4["verdict"] == "ALIVE-so-far"
+    at3 = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=3, solved_c=6) for h in range(3)]
+    gt3 = build_falsifier_gate_table(at3)
+    mg3 = next(g for g in gt3["gates"] if g["gate"] == "mean true lock")
+    assert mg3["status"] == "FAIL" and gt3["verdict"].startswith("KILL")
 
 
 def test_shortfall_gate_ignores_rungs_with_few_fills():

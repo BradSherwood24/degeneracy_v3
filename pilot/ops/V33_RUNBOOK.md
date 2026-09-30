@@ -280,8 +280,10 @@ It prints, in order:
    `dry_sim_fill` records, no `place_rest`/`amend_rest`/`take_wings`; `/health` `orders_remaining_today`
    unchanged before/after the window.
 
-The GATE TABLE will read `n<30 pending` / `n-too-small` throughout the dry period (dry produces no
-REALISED rung-fills) -- that is expected; the realised gates come alive only after the flip.
+The GATE TABLE will read `n<15 pending` / `n-too-small` throughout the dry period (dry produces no
+REALISED rung-fills) -- that is expected; the realised gates come alive only after the flip. (L6, Brad
+2026-09-30: the verdict n dropped 30 -> 15, the mean-lock bar to +4.0c, and an S4 day-loss latch on any
+armed day is a campaign KILL.)
 
 ### L3 pre-arm hardening (all in code as of this phase; see `ceremony/v33_falsifier.md` + `V33_ARMING.md`)
 - **pacer headroom reserve** (`write_reserve_tokens` = 30): a non-priority create/amend never draws the

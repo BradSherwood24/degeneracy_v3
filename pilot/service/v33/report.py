@@ -24,6 +24,7 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from service.stops import read_day_guard
 from service.v33.falsifier_pins import (
     V33_CAPTURE_RATIO_MIN,
     V33_FALSIFIER_CAPTURE_MARGIN_C,
@@ -37,10 +38,13 @@ from service.v33.falsifier_pins import (
     V33_FALSIFIER_SHADOW_GAP_E,
     V33_KILL_MEAN_LOCK_CENTS,
     V33_KILL_MIN_N,
+    V33_KILL_ON_S4_DAY_LOSS,
 )
 from service.v33.ledger import DEFAULT_V33_LEDGER_PATH, load_v33_rows
 from service.v33.params import load_v33_params
+from service.v33.stops import S4_DAY_LOSS, v33_day_guard_path
 from service.v32.ledger import DEFAULT_V32_LEDGER_PATH, load_v32_rows
+from service.paths import checkout_ops_dir, data_dir, ops_dir_v33
 
 _ZERO = Decimal(0)
 _ONE = Decimal(1)
@@ -104,9 +108,13 @@ def _shadow_below_min(sub: dict[str, Any], n_min: Decimal) -> bool:
 # ---------------------------------------------------------------------------
 # per-window ladder lines + totals (L2 shape kept; the tests pin these)
 # ---------------------------------------------------------------------------
-def build_v33_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def build_v33_report(rows: list[dict[str, Any]],
+                     ops_dir: str | None = None) -> dict[str, Any]:
     """Fold the V3.3 window rows into per-window LADDER lines + totals + the ladder scoreboard, the
-    falsifier gate table, and the deep-end (SO-3) summary (pure; the CLI renders it)."""
+    falsifier gate table, and the deep-end (SO-3) summary (pure; the CLI renders it).
+
+    ``ops_dir`` (L6) is threaded to the gate table for the S4 day-loss campaign kill (the day-guard scan);
+    None keeps the gate table file-free."""
     windows: list[dict[str, Any]] = []
     tot_rungs = 0
     tot_contracts = 0
@@ -147,7 +155,7 @@ def build_v33_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "windows": windows,
         "scoreboard": build_ladder_scoreboard(rows),
         "allocation": build_allocation_table(rows),
-        "gate_table": build_falsifier_gate_table(rows),
+        "gate_table": build_falsifier_gate_table(rows, ops_dir),
         "deep_end": build_deep_end(rows),
         "print_through": build_print_through(rows),
         "totals": {
@@ -342,11 +350,56 @@ def build_allocation_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# S4 day-loss campaign kill (L6, Brad 2026-09-30) — reads the V3.3 day-guard files
+# ---------------------------------------------------------------------------
+def _resolve_v33_guard_path(ops_dir: str, utc_day: str) -> str:
+    """The V3.3 day-guard file for ``utc_day``, mirroring ``run_v33._resolve_v33_guard_path``: when
+    ``DV3_DATA_DIR`` is set but the data-dir guard is missing while the checkout copy exists, read the
+    checkout guard (mid-day-cutover safety). When the caller passes an EXPLICIT ops_dir (a test tmp dir,
+    != the resolved data/checkout dirs), that dir is used verbatim -- the fallback only applies to the
+    live resolved ops dir."""
+    primary = v33_day_guard_path(ops_dir, utc_day)
+    if data_dir() is None or ops_dir != ops_dir_v33():
+        return primary
+    checkout = v33_day_guard_path(checkout_ops_dir(), utc_day)
+    if primary != checkout and not os.path.exists(primary) and os.path.exists(checkout):
+        return checkout
+    return primary
+
+
+def _s4_kill_days(rows: list[dict[str, Any]], ops_dir: str | None) -> list[str]:
+    """The UTC days the report covers whose V3.3 day guard has LATCHED S4 (day balance loss >= the
+    unchanged $3.00 cap). L6 (Brad 2026-09-30): an S4 latch on ANY armed day of the campaign is an
+    immediate campaign KILL, not only a day halt. Returns the sorted latched days; empty when
+    ``ops_dir`` is None (the pure, file-free code path the unit tests use), or no guard latched S4.
+
+    Reads ``ops/v33_stops_YYYY-MM-DD.json`` for each report day via ``read_day_guard``. A MISSING guard
+    is a fresh empty guard (no latch); a CORRUPT guard yields no ``latched`` entries here (the report is
+    descriptive -- the fail-closed-on-corrupt discipline lives in the arming gate ``decide_v33_arming``,
+    not in this scoreboard)."""
+    if ops_dir is None or not V33_KILL_ON_S4_DAY_LOSS:
+        return []
+    days = sorted({str(r.get("close_time", ""))[:10]
+                   for r in rows if _is_window_row(r) and str(r.get("close_time", ""))[:10]})
+    hits: list[str] = []
+    for day in days:
+        guard = read_day_guard(_resolve_v33_guard_path(ops_dir, day), day)
+        if any(e.get("kind") == S4_DAY_LOSS for e in guard.latched):
+            hits.append(day)
+    return hits
+
+
+# ---------------------------------------------------------------------------
 # FALSIFIER GATE TABLE (§6) — realised rows only
 # ---------------------------------------------------------------------------
-def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def build_falsifier_gate_table(rows: list[dict[str, Any]],
+                               ops_dir: str | None = None) -> dict[str, Any]:
     """The §6 gate table computed LIVE from realised rows. Each gate -> value, threshold, PASS/FAIL/
-    n-too-small; the n>=30 rung-fill counter; the kill conditions. Realised (armed, not dry_sim) only."""
+    n-too-small; the n>=MIN_N rung-fill counter; the kill conditions. Realised (armed, not dry_sim) only.
+
+    ``ops_dir`` (L6): when given, the S4 day-loss CAMPAIGN kill scans that ops dir's V3.3 day-guard files
+    over the report's day range; an S4 latch on any day forces the verdict to KILL regardless of n. When
+    None (the default, and the pure unit-test path) the S4 scan is skipped -- no file is read."""
     realised = [r for r in rows if _is_realised(r)]
     all_rf = [rf for r in realised for rf in _row_rung_fills(r)]
     n = sum(int(rf.get("count", 1) or 1) for rf in all_rf)                 # rung-fill contracts
@@ -417,8 +470,12 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
         (roll_ratio is not None and roll_ratio >= V33_FALSIFIER_MIN_SINGLE_ORDER_ROLL_RATIO),
         tot_rolls > 0)
 
-    # verdict + kill (kills apply even before n>=30).
+    # verdict + kill (kills apply even before the verdict n; the S4 day-loss kill fires at any n,
+    # including n=0, when a day guard latched the $3.00 cap -- L6, Brad 2026-09-30).
     kills: list[str] = []
+    s4_days = _s4_kill_days(rows, ops_dir)
+    for day in s4_days:
+        kills.append(f"S4 day-loss latched on {day}")
     if mean_lock is not None and n >= V33_KILL_MIN_N and mean_lock < V33_KILL_MEAN_LOCK_CENTS:
         kills.append(f"mean lock {mean_lock:.2f}c < +{V33_KILL_MEAN_LOCK_CENTS}c at n={n} "
                      f"(>= {V33_KILL_MIN_N})")
@@ -438,7 +495,7 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "worst_shortfall_margin_c": worst_margin,
         "capture_live": cap_num, "capture_shadow": cap_den, "capture_ratio": cap_ratio,
         "one_legged": one_legged, "roll_count": tot_rolls, "roll_single_order_ratio": roll_ratio,
-        "gates": gates, "verdict": verdict,
+        "s4_kill_days": s4_days, "gates": gates, "verdict": verdict,
     }
 
 
@@ -733,7 +790,11 @@ def _render_gate_table(gt: dict[str, Any]) -> list[str]:
         lines.append("  " + str(g["gate"]).ljust(34) + vs.rjust(12) + str(g["threshold"]).rjust(14)
                      + "  " + g["status"])
     lines.append(f"  VERDICT: {gt['verdict']}   (kill: mean < +{V33_KILL_MEAN_LOCK_CENTS}c at "
-                 f"n >= {V33_KILL_MIN_N}, or one-legged > {V33_FALSIFIER_MAX_ONE_LEGGED})")
+                 f"n >= {V33_KILL_MIN_N}, one-legged > {V33_FALSIFIER_MAX_ONE_LEGGED}, "
+                 f"or S4 day-loss latched on any armed day)")
+    s4d = gt.get("s4_kill_days") or []
+    if s4d:
+        lines.append(f"  S4 day-loss latched (campaign KILL, L6): {', '.join(s4d)}")
     return lines
 
 
@@ -850,12 +911,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--days", type=int, default=None, help="Only the most recent N UTC days.")
     ap.add_argument("--ledger", default=DEFAULT_V33_LEDGER_PATH)
     ap.add_argument("--v32-ledger", default=DEFAULT_V32_LEDGER_PATH)
+    ap.add_argument("--ops-dir", default=None,
+                    help="V3.3 ops dir holding v33_stops_*.json (default: the resolved live ops dir); "
+                         "the L6 S4 day-loss campaign kill scans it over the report's day range.")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
+    ops_dir = args.ops_dir if args.ops_dir is not None else ops_dir_v33()
     v33_rows = _recent_days(load_v33_rows(args.ledger), args.days)
     v32_rows = _recent_days(load_v32_rows(args.v32_ledger), args.days)
-    report = build_v33_report(v33_rows)
+    report = build_v33_report(v33_rows, ops_dir)
     sxs = build_side_by_side(v33_rows, v32_rows)
     if args.json:
         print(json.dumps({"report": report, "side_by_side": sxs}, sort_keys=True,

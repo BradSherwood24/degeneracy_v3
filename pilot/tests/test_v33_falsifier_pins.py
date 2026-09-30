@@ -22,6 +22,7 @@ from service.v33.falsifier_pins import (
     V33_FALSIFIER_MIN_SINGLE_ORDER_ROLL_RATIO,
     V33_KILL_MEAN_LOCK_CENTS,
     V33_KILL_MIN_N,
+    V33_KILL_ON_S4_DAY_LOSS,
     V33_PROMOTION_MIN_N,
 )
 from service.v33.params import load_v33_params
@@ -71,8 +72,32 @@ def test_kill_pins_match_doc():
 
 def test_promotion_pin_matches_doc():
     doc = _doc()
-    assert f"`n >= {V33_PROMOTION_MIN_N}` [pin]" in doc               # `n >= 30` [pin]
-    assert V33_PROMOTION_MIN_N == 30
+    assert f"`n >= {V33_PROMOTION_MIN_N}` [pin]" in doc               # `n >= 15` [pin]
+    assert V33_PROMOTION_MIN_N == 15
+
+
+def test_verdict_min_n_is_15_and_in_doc():
+    """L6 (Brad 2026-09-30): the verdict/promotion n dropped 30 -> 15; no '30' verdict n survives."""
+    doc = _doc()
+    assert V33_FALSIFIER_MIN_N == 15
+    assert f"`n >= {V33_FALSIFIER_MIN_N}` [pin]" in doc               # `n >= 15` [pin]
+    assert f"`n<{V33_FALSIFIER_MIN_N} pending`" in doc                # the report string
+    # no stale "n >= 30" / "n<30 pending" verdict wording in the live thresholds/kill/promotion text
+    # (the L4/L5 historical amendments keep their own dated prose).
+    for section in ("## Proposed pre-registered thresholds", "## Kill (early / immediate)",
+                    "## Promotion"):
+        start = doc.index(section)
+        end = doc.index("\n## ", start + 1)
+        body = doc[start:end]
+        assert "n >= 30" not in body and "n<30" not in body and "n=30" not in body, section
+
+
+def test_s4_day_loss_kill_pin_matches_doc():
+    """L6: an S4 day-loss latch on any armed day is a campaign KILL (V33_KILL_ON_S4_DAY_LOSS)."""
+    doc = _doc()
+    assert V33_KILL_ON_S4_DAY_LOSS is True
+    assert "`V33_KILL_ON_S4_DAY_LOSS` = True [pin]" in doc
+    assert "S4 day loss >= $3.00 [pin] latched on any armed day -> KILL" in doc
 
 
 def test_stop_pins_and_sha_match_doc():
@@ -116,7 +141,7 @@ def test_arming_refuses_while_draft():
 
 
 def test_promotion_and_kill_constants_values():
-    assert V33_FALSIFIER_MIN_MEAN_LOCK_CENTS == Decimal("6.0")
+    assert V33_FALSIFIER_MIN_MEAN_LOCK_CENTS == Decimal("4.0")
     assert V33_CAPTURE_RATIO_MIN == Decimal("0.50")
     assert V33_KILL_MEAN_LOCK_CENTS == Decimal("2.0")
     assert V33_FALSIFIER_MIN_SINGLE_ORDER_ROLL_RATIO == Decimal("0.90")
