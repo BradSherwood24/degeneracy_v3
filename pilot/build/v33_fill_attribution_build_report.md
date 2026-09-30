@@ -134,3 +134,62 @@ automatically, because `RungFill.bucket_ticker` is now the correctly-attributed 
   seam, not the writer transport. Resolve by keeping both: the async-writer's transport edits and these
   count/attribution edits are orthogonal.
 - Executor follow-up (item 1) should land on whichever branch owns `executor.py` after this merges.
+
+---
+
+## Round 2 (review verdict REQUEST CHANGES -> addressed; F1 executor wing-send already merged @ ebcd957)
+
+Reviewer doc: `pilot/build/v33_fill_attribution_review.md`. Full suite after round 2: **1401 passed, 5
+skipped** (was 1392/5 at the review; +9: 6 fill-discovery pipeline, 3 wing-netting). V3.2 byte-identity
+re-confirmed (`test_v32_executor.py` 21 passed; the full v32/v33/executor set green).
+
+### F2 [BLOCKING, fixed] — fill DISCOVERY no longer truncates count_fp to int (the incident's own path)
+The inherited V2 executor stamped `OrderStatus.filled_count: int` and the cancel/ poll paths re-`int()`-ed,
+so a 0.44 leg reached the core as `Decimal(0)` and was LOST on the cancel-confirm/poll paths — even after
+the core D3 fix. Fixed V3.3-SCOPED, V3.2 byte-identical:
+- `service/v32/executor.py`: added `OrderStatus.filled_count_fp: Decimal` (parsed alongside the unchanged
+  int), a class flag `LiveExecutor._fractional_counts = False`, and threaded an optional Decimal
+  `filled_fp` through `_finish_cancel` / `_resolve_cancel_success` / `_resolve_cancel_from_status` / the
+  rest-invariant fill branch + `_confirm_cancel_filled`. With the flag OFF (V3.2) every value, journal and
+  event is byte-identical to before (verified by the v32 suite); ON (V3.3) the OrderCancelled and the
+  `cancel_confirmed` journal carry the exact fraction.
+- `service/v33/executor.py`: `V33LiveExecutor._fractional_counts = True`; `poll_orders_for_bucket` now
+  returns `dict[str, Decimal]` (no `int()`).
+- `service/run_v33.py`: the poll call sites drop `int()` and feed the Decimal (batched) /
+  `stt.filled_count_fp` (per-rung) to `on_poll_fill`.
+- Test `tests/test_v33_fill_discovery_fractional.py` (6): the exact-fraction parse; the cancel confirm
+  surfacing 0.44 (via status AND via `reduced_by`); the poll returning Decimal; the V3.2 gate staying
+  int/byte-identical; and an END-TO-END pipeline (executor-produced `OrderCancelled(0.44)` -> core ->
+  RungFill 0.44 -> wings sized 0.44 on the fill's bucket strikes).
+
+### D5 [NEW, Brad's question, implemented] — netted wings across adjacent buckets
+When set A's NO@Su-strike and set B's YES@Sd-strike are one market (adjacent buckets), the venue nets the
+pair to flat and credits $1/contract. Implemented:
+- `service/v33/core.py`: `WingLeg.netted: Decimal`, `NettedPair`, `V33State.netted_pairs`, and
+  `_net_wings` (called from `_apply_fill` when a wing leg fills) — nets `min(counts)` of an opposite-side
+  FILLED leg on the SAME ticker, books the pair CLOSED, records `NettedPair` (realised = count*(1 - yes_cost
+  - no_cost)), and emits an INFORMATIONAL `V33ActionKind.WING_NETTED` (no venue order). Handles PARTIAL
+  overlap (1.44 NO vs 2.00 YES -> 1.44 netted, 0.56 YES held). Dormant in single-bucket operation (no
+  opposite-side leg shares a strike), so every existing test is unaffected.
+- `service/run_v33.py`: journals `wing_netted`; the pump does NOT route it to the executor.
+- `service/v33/ledger.py`: a fully-netted wing leg is excluded from `held_legs` / `unsettled_legs` (no
+  settlement lookup), the netted $1/contract is added to `floor_booked`, and a `netted_sets` block is
+  carried on the row; the per-batch SOLVED `realized_lock` is unchanged (both batches complete).
+  Also fixed two residual `int(lots_filled)` truncations in `build_v33_ledger_row` (D3).
+- `service/v33/report.py`: per-row `[NETTED n = ...]` tag + a totals line.
+- Test `tests/test_v33_wing_netting.py` (3): full netting (1 lot each) closes the shared strike (not in
+  unsettled) with realised == Σ both sets' solved locks; partial overlap leaves 0.56 held.
+
+### F3 [implemented] — the report now flags a bucket mismatch
+`service/v33/report.py::_row_bucket_mismatch` + a `[BUCKET MISMATCH]` tag: a row where any
+`rung_fills[].bucket_ticker` differs from the held bucket-NO leg ticker is flagged. Pre-fix incident rows
+carry no `bucket_ticker`, so they are (honestly) NOT flagged — only a NEW divergence is.
+
+### F4 [done] — deleted the dead `_pt_wing_asks` (D2 replaced its only caller).
+### F5 [done] — moved `run_v33._count_out`/`_count_dec` out from between imports to the module body.
+
+### Build-report note for the async twin (do NOT touch that branch)
+`feat/v33-async-writer:pilot/service/v33/async_executor.py` carries the same F1 `int(lg.count)` wing-send
+truncation (`:618/623/658/671`, `:245`, `:516`, `:788`) AND, separately, will need the F2 fill-DISCOVERY
+fix if it has its own status/poll/cancel parse. Port both at integration. The transport-side wing
+retry-storm belt (one in-flight IOC per (batch,side)) composes safely with the core D4 250 ms floor.
