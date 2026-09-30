@@ -252,6 +252,20 @@ stays DRY -- this is a falsifier amendment, not a mode flip.
   changes and this entry are Claude's mechanical work on the go above. The flip (v33 -> armed, v32 -> dry, in ONE
   :02-:33 window) remains Brad's separate lever and gets its own dated entry here.
 
+- 2026-09-30 12:30:26Z -- THE FLIP (Brad's hand). Brad ran, as typed commands in the session, `Set-Content ops/v33_mode.txt armed`
+  and `Set-Content ops/v32_mode.txt dry` (both read back; inside the 12:02-12:33 window). V3.3 ARMED from the 13:00:00Z close
+  (launch 12:40Z; the window log reads `mode=armed effective=armed`, i.e. S5 passed on the frozen doc, sha 295590ce..., proxy
+  /health orders_enabled with cap 2 / prefixes incl. KXBTC / budget 8000, clean v33 guard, no inherited KXBTC* position).
+  V3.2 runs DRY beside it from the same close (its 13:00Z journal reads resolved_mode dry). Preconditions at the flip: live
+  tree main af0981b (1385 passed / 1 skipped); crypto-side balance $42.60; V3.2's last armed set 2026-09-29 23:00Z (12
+  armed windows since with 0 sets); V3.3's overnight DRY rows 05:00Z..12:00Z: 6 rung fills in 3 windows, dry realised
+  +2.3c / -10.6c / -9.5c / -2.0c / -1.0c / 0.0c (margin labels at fill 6c, -7c, -6c, 1c, 2c, 3c: wings had moved before
+  the bucket print reached the rung) -- disclosed to Brad before the first armed window. First-window observations (venue
+  order list, 12:47-12:53Z): 11 single-lot NO rests accepted (must-confirm 1), always on ONE bucket; spot trended
+  84,750 -> 85,350 in ~5 min so the ladder was cancelled and re-placed on each bucket change (11 creates per switch,
+  ~450 creates in the window's first 9 quoting minutes; the daily create budget, not money, is the binding limit at this
+  rate); no fills by 12:54Z. The window's ledger/journal accounting against the six MUST CONFIRM items gets its own entry.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
