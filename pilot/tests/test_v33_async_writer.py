@@ -786,6 +786,44 @@ def test_async_concurrent_places_use_own_price_not_shared_field():
     assert not any(isinstance(e, OrderAck) for e in b_ev)
 
 
+def test_async_three_concurrent_places_one_true_dup_two_legit():
+    """FINDING A1 (round 2, THREE-way): three PLACE_REST coroutines dispatched concurrently while a rung at
+    0.30 is already resting — one is a TRUE dup (0.30, must be caught, no OrderAck), two are legitimate
+    (0.44 and 0.45, must both be placed). Pre-fix, whichever coroutine set ``_pending_place_price`` last
+    decided the dup verdict for ALL three across the GET await, so a legit rung was killed and/or the real
+    dup slipped through. With the price threaded per-place each is judged on its OWN price."""
+    from service.v32.executor import OPEN_ORDERS_PATH
+
+    fake = FakeProxyWriter(get_latency=0.03)  # slow GET maximises the interleave window across all three
+
+    async def go():
+        ex, aw = _aexec(fake, k=11)
+        try:
+            await ex.on_action_async(_place("v33-dup", "0.30"), _state(), CTS - 600)
+            oid_dup = ex.rest_book["v33-dup"].order_id
+            fake.get_map[OPEN_ORDERS_PATH] = {"orders": [
+                {"order_id": oid_dup, "client_order_id": "v33-dup", "exchange_index": 2, "ticker": "X"}]}
+            evs = await asyncio.gather(
+                ex.on_action_async(_place("v33-A", "0.45"), _state(), CTS - 590),   # legit
+                ex.on_action_async(_place("v33-B", "0.30"), _state(), CTS - 590),   # TRUE dup
+                ex.on_action_async(_place("v33-C", "0.44"), _state(), CTS - 590))   # legit
+            return ex, dict(zip(("A", "B", "C"), evs))
+        finally:
+            aw.close()
+
+    ex, evs = asyncio.run(go())
+    # both legit rungs placed on their own price — never collateral of B's dup verdict.
+    for coid, price in (("v33-A", "0.45"), ("v33-C", "0.44")):
+        assert coid in ex.rest_book and ex.rest_book[coid].status == "live", f"{coid} not live"
+        assert ex.rest_book[coid].price == Decimal(price)
+    assert any(isinstance(e, OrderAck) for e in evs["A"])
+    assert any(isinstance(e, OrderAck) for e in evs["C"])
+    # the true dup at the resting 0.30 is caught: no OrderAck, never a live rung, and the hour stands down.
+    assert not any(isinstance(e, OrderAck) for e in evs["B"])
+    assert "v33-B" not in ex.rest_book
+    assert ex.stand_down_reason == "rest_invariant_violation"
+
+
 def test_pacer_priority_not_blocked_behind_nonpriority_sleep():
     """FINDING A2: a PRIORITY acquire (wing take / cancel-all) must not wait behind a non-priority write's
     pacing sleep. Pre-fix ``acquire_async`` held ``_alock`` across the ``asyncio.sleep``, so a priority

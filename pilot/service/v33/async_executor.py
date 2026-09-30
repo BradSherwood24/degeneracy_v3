@@ -297,7 +297,13 @@ class V33AsyncExecutor(V33LiveExecutor):
         ``place_price`` (THIS place's price) is threaded EXPLICITLY into ``_invariant_verdict`` so two
         concurrently-dispatched places never read each other's price off the shared
         ``_pending_place_price`` field across the open-orders GET await (review finding A1). Falls back to
-        the instance field only if a caller omits it."""
+        the instance field only if a caller omits it.
+
+        REVIEW NOTE (B1): this is a BELT that reads venue truth, not the K GATE. Because the read->place is
+        not atomic across the GET await, two concurrently-dispatched FIRST-TIME places can each see venue
+        ``< K`` and both proceed; the invariant cannot serialize them. The real K-limiter is the CORE (it
+        emits at most K place actions), so total resting stays ``<= K`` in practice — do not rely on this
+        belt to CATCH a concurrency overflow, only a core/venue disagreement already resting at the venue."""
         if place_price is None:
             place_price = self._pending_place_price
         first = await self._venue_resting_ours_async(self._last_confirmed_gone_oid)

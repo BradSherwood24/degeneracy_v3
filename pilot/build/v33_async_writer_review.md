@@ -130,3 +130,73 @@ merge it again over `_dv3_token_headers()`. Harmless (same value), noted for cle
 11. **`ops/proxy_throttle.md`** — tier model (RATE=100, SIZE=100, create/amend=10, cancel=2, batch=10·N,
     GET=0) matches the `executor.py` pacer constants; PROPOSAL only, does not touch `degeneracy-proxy/`. PASS.
 12. **Full suite** — 1404 passed, 5 skipped after fixes (no failures).
+
+---
+
+## Round 2 (Opus 4.8, 2026-09-30) — VERDICT: APPROVE
+
+Re-reviewed `feat/v33-async-writer` as merged (HEAD `1788bd5`, the round-1 fix fast-forwarded in;
+live-tree suite 1408/1). Focused pass on the coordinator's four items.
+
+### (1) A1 and A2 re-verified against the merged branch — hold
+- A1 fix present: `_pre_place_invariant_async(..., place_price=action.price)` (async_executor L220) and
+  `place_price=a.price` (L701); `_invariant_verdict(first|reread, place_price)` (L309/L321); the inherited
+  `_invariant_verdict(resting, place_price=None)` falls back to the instance field only for the sync path.
+- A2 fix present: `acquire_async` reserves the cost atomically under `_alock` then sleeps with the lock
+  released (executor L228).
+- **New adversarial THREE-way interleaving** (`test_async_three_concurrent_places_one_true_dup_two_legit`):
+  a rung rests at 0.30; three places dispatched concurrently — 0.30 (true dup), 0.44 and 0.45 (legit). With
+  the fix: both legit rungs go live on their own price, the 0.30 dup is caught (no OrderAck, not in
+  `rest_book`, `stand_down_reason=rest_invariant_violation`). Proven to have teeth against a FAITHFUL
+  pre-fix simulation (verdict reads `self._pending_place_price`): pre-fix the true dup **slips through**
+  (`B_dup_placed=True, stand_down=None`) — the dangerous "miss a real duplicate rung" (21-order) mode — so
+  the test fails pre-fix and passes post-fix.
+
+### (2) Instance-field audit — every field the async executor reads across an `await`
+Method calls excluded; only mutable DATA fields. Verdict per field:
+- `_pending_place_price` — **SAFE (A1 fixed).** Async path passes the price explicitly; the remaining read
+  (L302) is the sync fallback and is before any await. The L196/L700 writes are now inert for the verdict.
+- `_last_confirmed_gone_oid` — **BENIGN.** Read at L303 and again at L315 across the recheck `asyncio.sleep`
+  as the *exclude-oid* for the venue read; a concurrent cancel (L408) may change it between. It only
+  chooses which single just-cancelled oid to skip; correctness rests on `_filter_phantoms`
+  (`cancel_confirmed_ts`), not this hint. Pre-existing single-value behavior (sync overwrites it too), not
+  introduced by async.
+- `_consecutive_rejects` — **BENIGN.** Set=0 on a successful place (sync), incremented in the inherited
+  `_reject_place` (pure sync, no await between read and write). A best-effort stand-down counter, not a
+  safety invariant; a raced miscount cannot naked-a-rung.
+- `stand_down_reason` — **BENIGN.** `if ... is None: ... = <reason>` is check-then-set with no await between;
+  two coroutines could both latch (last write wins). Any reason latches the hour identically; the exact
+  string is cosmetic.
+- `_wing_inflight_legs` — **SAFE (by design).** Claim is check-and-add with no await between (atomic on the
+  loop); released in `finally`. It is the belt that also guarantees one `_take_wings_send` per leg key.
+- `_wing_filled` / `_wing_notional` — **SAFE.** `remaining` is read before the pacer/HTTP awaits and
+  mutated after; the belt guarantees no second `_take_wings_send` for the same `(batch,side)` runs
+  concurrently, so no same-key read-stale/double-count.
+- `rest_book[coid]`, `_by_order_id[oid]` — **SAFE.** Written after the create await under a coid/oid unique
+  to that rung; no two coroutines touch the same key.
+- `booked_rest_oids`, `fills`, `wing_coids`, all `+= 1` counters (`cancels_*`, `rests_placed`, `amends_*`,
+  `rest_invariant_*`, `pt_*`, `wing_*`, `async_rate_limited`, `wing_retries_dropped`, `fills_on_amend`, …) —
+  **SAFE.** Each is a single read-modify-write statement (or set/list/dict op) with no await in between;
+  atomic on the single loop thread. Interleaving reorders but never tears them; all are telemetry/dedup
+  keyed by id, not decision-carrying-across-an-await.
+- Config/immutable (`wing_cap`, `k_rungs`, `COID_PREFIX`, `batch_create_max`, `clock`, `journal`, `_pacer`,
+  `_aw`, `writer`, `sleep`) — **SAFE.** Read-only, never mutated in-window.
+
+Conclusion: `_pending_place_price` was the only field whose cross-await read was a correctness bug (fixed);
+no other field exhibits the same read-after-await-of-another-coroutine's-write hazard.
+
+### (3) B1 note — added in code
+`_pre_place_invariant_async` docstring now states the belt-not-gate caveat (the venue-truth invariant cannot
+serialize concurrent first-time places across the GET await; the CORE is the real ≤K limiter).
+
+### (4) Full suite — 1405 passed, 5 skipped (this worktree env; +1 round-2 test). No failures.
+
+### fix/v33-fill-attribution
+Still **not on origin** (`git ls-remote` shows no such ref). Belt composition unchanged from round 1: the
+transport belt frees each `(batch,side)` leg when its IOC round trip returns, so it composes with a
+core-side re-emission floor with no un-retried-until-cutoff gap and no double-gating. Re-flag if/when that
+branch is pushed.
+
+**Round-2 verdict: APPROVE.** The two round-1 findings are fixed and merged; the three-way interleaving and
+the full instance-field audit surface no further cross-await state race; B1 is documented in code. Standing
+caveat (the builder's own): shake the async path down dry-adjacent before arming with it.
