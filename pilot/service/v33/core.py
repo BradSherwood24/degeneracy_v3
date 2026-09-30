@@ -225,6 +225,11 @@ class WingLeg:
     # D4 (2026-09-30): when this leg last had a RETRY_WING emitted for it. The retry is gated to no more
     # often than ``WING_RETRY_MIN_INTERVAL_MS``; ``None`` = never retried (the initial take is unbounded).
     last_retry_ts: float | None = None
+    # D5 (2026-09-30, Brad): lots of this leg NETTED against an opposite-side filled leg on the SAME
+    # market (adjacent-bucket overlap: A's NO@Su-strike and B's YES@Sd-strike are one ticker). The venue
+    # nets +YES/+NO to flat and credits $1/contract immediately; ``netted`` is closed (realised now, NOT
+    # held to settlement). ``count - netted`` is the portion still held.
+    netted: Decimal = _ZERO
 
 
 @dataclass(frozen=True)
@@ -268,6 +273,25 @@ class WingBatch:
         """The count the wing legs were sized to: ``taken_count`` for a print-through batch (pre-hedged
         before fills exist), else ``total_count`` (the sum of the rung fills it coalesced)."""
         return self.taken_count if self.print_through else self.total_count
+
+
+@dataclass(frozen=True)
+class NettedPair:
+    """D5 (2026-09-30, Brad): a YES leg and a NO leg on the SAME market that the venue netted to flat. It
+    arises across ADJACENT buckets — set A (on ``[Sd_A, Su_A)``) holds NO on the ``Su_A`` strike; set B
+    (one bucket up, ``[Su_A, Su_A+w)``) takes YES on B's ``Sd`` strike, which IS the ``Su_A`` strike. The
+    pair always pays exactly $1/contract, so the venue credits $1 and zeroes the position immediately.
+    We book the pair CLOSED (realised now, no settlement lookup) and keep each set's other legs held.
+    ``realised`` = ``count * (1 - yes_cost - no_cost)`` where the costs include fees."""
+
+    ticker: str
+    count: Decimal
+    yes_cost: Decimal            # per-contract YES fill price + fee
+    no_cost: Decimal             # per-contract NO fill price + fee
+    realised: Decimal            # total realised = count * (1 - yes_cost - no_cost)
+    yes_batch: int
+    no_batch: int
+    server_ts: float
 
 
 @dataclass(frozen=True)
@@ -409,6 +433,10 @@ class V33State:
     next_batch_index: int = 0
     sets_done: int = 0
     one_legged: bool = False                            # mirror: any batch flagged one_legged
+    # D5 (2026-09-30, Brad): YES/NO wing legs the venue netted to flat across adjacent buckets (each pays
+    # $1/contract, booked CLOSED now). The ledger books their realised $1 and NEVER lists them in the
+    # settlement backfill (a netted market shows position 0).
+    netted_pairs: tuple[NettedPair, ...] = ()
 
     # PRINT-THROUGH WINGS (2026-09-26): the active/resolved early-hedge triggers. A pre-hedged rung's coid
     # is carried here so its fill attaches to the pre-emptive batch (no double take) and a stall / partial
@@ -1028,6 +1056,11 @@ def _apply_fill(
             if event.count <= _ZERO and b is not None and b.print_through and not b.resolved:
                 st, fa = _pt_fail_closed(params, st, b.index, now)
                 return st, actions + fa
+            # D5: a newly-filled wing leg may net against an opposite-side filled leg on the SAME market
+            # (adjacent-bucket overlap). Book the netted $1 pair(s) before closing the set.
+            if event.count > _ZERO:
+                st, na = _net_wings(st, event.client_order_id, now)
+                actions += na
             st = _maybe_close_set(st, leg.batch)
             return st, actions
 
@@ -1403,6 +1436,52 @@ def _retry_batch(
     return st, actions
 
 
+def _net_wings(st: V33State, coid: str, now: float) -> tuple[V33State, list[V33Action]]:
+    """D5 (2026-09-30, Brad): net the just-filled wing leg ``coid`` against any OPPOSITE-side FILLED wing
+    leg on the SAME market. This happens across ADJACENT buckets: set A's NO@Su-strike and set B's
+    YES@Sd-strike are ONE ticker. The venue nets +YES/+NO to flat and credits $1/contract immediately, so
+    we book the overlapping lots CLOSED (realised now, never held to settlement) — the ledger/report/
+    backfill then price only the un-netted held legs and add the netted $1. Handles PARTIAL overlap (a
+    1.44 NO vs a 2.00 YES nets 1.44, the 0.56 YES stays held). Dormant in single-bucket operation (no
+    opposite-side leg ever shares a strike), so every existing test is unaffected."""
+    actions: list[V33Action] = []
+    guard = 0
+    while True:
+        guard += 1
+        if guard > 64:
+            break
+        L = next((l for l in st.wing_legs if l.client_order_id == coid), None)
+        if L is None or L.status != "filled" or L.fill_price is None:
+            break
+        avail_L = L.count - L.netted
+        if avail_L <= 0:
+            break
+        M = next((l for l in st.wing_legs
+                  if l.ticker == L.ticker and l.side != L.side and l.status == "filled"
+                  and l.fill_price is not None and (l.count - l.netted) > 0), None)
+        if M is None:
+            break
+        q = _q_count(min(avail_L, M.count - M.netted))
+        if q <= 0:
+            break
+        yes_leg, no_leg = (L, M) if L.side == BUY_YES else (M, L)
+        yes_cost = yes_leg.fill_price + fee(yes_leg.fill_price)
+        no_cost = no_leg.fill_price + fee(no_leg.fill_price)
+        realised = q * (_ONE - yes_cost - no_cost)
+        pair = NettedPair(ticker=L.ticker, count=q, yes_cost=yes_cost, no_cost=no_cost,
+                          realised=realised, yes_batch=yes_leg.batch, no_batch=no_leg.batch,
+                          server_ts=now)
+        both = {L.client_order_id, M.client_order_id}
+        new_legs = tuple(replace(l, netted=_q_count(l.netted + q)) if l.client_order_id in both else l
+                         for l in st.wing_legs)
+        st = replace(st, wing_legs=new_legs, netted_pairs=st.netted_pairs + (pair,))
+        legs = (LegOrder(yes_leg.ticker, BUY_YES, "net", q, yes_leg.fill_price),
+                LegOrder(no_leg.ticker, BUY_NO, "net", q, no_leg.fill_price))
+        actions.append(_mk(V33ActionKind.WING_NETTED, st.shakedown, legs=legs, ticker=L.ticker,
+                           count=q, lock=realised))
+    return st, actions
+
+
 def _maybe_close_set(st: V33State, index: int) -> V33State:
     """Both wings of BATCH ``index`` filled -> count it as ``leg_count`` completed sets and mark done.
 
@@ -1476,12 +1555,6 @@ def _pt_mark_resolution(st: V33State, batch_index: int, resolution: str, now: fl
             out[i] = replace(t, resolved=True, resolution=resolution, resolved_ts=now)
             return replace(st, print_through=tuple(out))
     return st
-
-
-def _pt_wing_asks(st: V33State, now: float, params: V33Params) -> tuple[Decimal, Decimal] | None:
-    """The current wing asks (YES@Sd, NO@Su) used to price the pre-emptive take -- the SAME
-    ``_wing_prices`` gate the normal take uses (fresh strike books required)."""
-    return _wing_prices(st, now, params)
 
 
 def _pt_wing_bids(st: V33State) -> tuple[Decimal | None, Decimal | None]:

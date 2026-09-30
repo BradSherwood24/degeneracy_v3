@@ -157,11 +157,12 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
     rest_fills = list(getattr(state, "rest_fills", ()) or ())
     wing_legs = list(getattr(state, "wing_legs", ()) or ())
     wing_batches = list(getattr(state, "wing_batches", ()) or ())
+    netted_pairs = list(getattr(state, "netted_pairs", ()) or ())     # D5: venue-netted wing pairs
     if not rest_fills:
         return {"dry_sim": bool(dry_sim), "rung_fills": [], "wing_batch_sets": [],
                 "held_legs": [], "floor_booked": None, "realized_delta": None, "realized_lock": None,
                 "one_legged": bool(getattr(state, "one_legged", False)), "realized_unsettled": False,
-                "lots_filled": 0}
+                "lots_filled": 0, "netted_sets": []}
 
     # index the batch a rung fill belongs to (by identity of the RungFill in the batch's .fills).
     batch_of_fill: dict[int, int] = {}
@@ -193,10 +194,17 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
             held.append({"ticker": bt, "side": "no", "count": _co(b.total_count)})
         for lg in legs:
             if lg.status == "filled":
-                held_this += 1
-                held.append({"ticker": lg.ticker, "side": lg.side, "count": _co(lg.count)})
+                # w_paid is the per-contract wing cost that priced the PIN — the netting changes the EXIT,
+                # not what we paid, so every filled leg contributes (D5).
                 if lg.fill_price is not None:
                     w_paid += lg.fill_price + _fee(lg.fill_price)
+                # D5: a wing leg NETTED against an opposite leg on the same market is CLOSED (realised $1
+                # now) -> only the UN-netted portion is HELD to settlement / listed in unsettled_legs.
+                held_ct = _dc(getattr(lg, "count", 0)) - _dc(getattr(lg, "netted", 0))
+                if held_ct <= 0:
+                    continue
+                held_this += 1
+                held.append({"ticker": lg.ticker, "side": lg.side, "count": _co(held_ct)})
         batch_wpaid[b.index] = w_paid
         floor += v33_set_floor_dollars(held_this, _dc(b.total_count))
         # per-batch realized lock (Σ per rung fill count * lock_value(price, w_paid)) when completed.
@@ -255,7 +263,23 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
             cost += _fee_total(rf.price, rf.count)
     for lg in wing_legs:
         if lg.status == "filled" and lg.fill_price is not None:
+            # the FULL filled cost (incl. the netted portion) — we paid for it; the netting credits $1 back.
             cost += lg.fill_price * _dc(lg.count) + _fee_total(lg.fill_price, lg.count)
+    # D5: each netted YES/NO pair on one market pays exactly $1/contract, credited NOW (position flat).
+    # The pair's legs' costs are already in ``cost``; add the $1 revenue to the floor and record the set so
+    # the report shows it and the settlement backfill NEVER looks the netted (position-0) market up.
+    netted_sets: list[dict[str, Any]] = []
+    netted_credit = _ZERO
+    for np in netted_pairs:
+        c = _dc(getattr(np, "count", 0))
+        netted_credit += c                      # $1 per contract guaranteed
+        netted_sets.append({
+            "ticker": np.ticker, "count": _co(c),
+            "yes_cost": str(getattr(np, "yes_cost", _ZERO)),
+            "no_cost": str(getattr(np, "no_cost", _ZERO)),
+            "realised": str(getattr(np, "realised", _ZERO)),
+        })
+    floor += netted_credit
     realized_delta = floor - cost
     lots_filled = sum((_dc(rf.count) for rf in rest_fills), _ZERO)
     return {
@@ -269,6 +293,7 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
         "one_legged": bool(getattr(state, "one_legged", False)),
         "realized_unsettled": bool(held) and not bool(dry_sim),   # dry_sim never awaits settlement
         "lots_filled": _co(lots_filled),
+        "netted_sets": netted_sets,             # D5: venue-netted wing pairs (realised $1/contract now)
     }
 
 
@@ -349,6 +374,7 @@ def build_v33_ledger_row(
     m15_frames: int = 0,
     deep_obs: dict[str, Any] | None = None,
     print_through: list[Any] | None = None,
+    netted_sets: list[Any] | None = None,
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
     (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row.
@@ -356,7 +382,7 @@ def build_v33_ledger_row(
     money = {
         "rung_fills": rung_fills or [],
         "wing_batch_sets": wing_batch_sets or [],
-        "lots_filled": int(lots_filled),
+        "lots_filled": _co(lots_filled),   # D3: fractional-safe (was int())
     }
     ladder = _ladder_summary(state, money, driver_counts, executor_counts) if state is not None else {}
     row: dict[str, Any] = {
@@ -405,9 +431,10 @@ def build_v33_ledger_row(
         "realized_delta": (str(realized_delta) if realized_delta is not None else None),
         "realized_lock": (str(realized_lock) if realized_lock is not None else None),
         "one_legged": one_legged,
-        "lots_filled": int(lots_filled),
+        "lots_filled": _co(lots_filled),   # D3: fractional-safe (was int())
         "realized_unsettled": bool(realized_unsettled),
         "unsettled_legs": (held_legs or []) if realized_unsettled else [],
+        "netted_sets": netted_sets or [],   # D5: venue-netted wing pairs (realised $1/contract, closed)
         "settlement": settlement,
         "realized_delta_note": (REALIZED_DELTA_NOTE if realized_delta is not None else None),
         "deep_obs": deep_obs or {},

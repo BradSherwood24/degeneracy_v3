@@ -43,6 +43,11 @@ class V33ActionKind(str, enum.Enum):
     UNWIND_WINGS = "UNWIND_WINGS"              # unwind / fail-closed: sell the pre-taken wings back IOC
     WOULD_TAKE_BUCKET_NO = "WOULD_TAKE_BUCKET_NO"
     WOULD_UNWIND_WINGS = "WOULD_UNWIND_WINGS"
+    # D5 (2026-09-30, Brad): INFORMATIONAL only -- the venue netted a YES/NO wing pair on one market to
+    # flat (adjacent-bucket overlap) and credited $1/contract. No order is sent (the venue already did it);
+    # the driver journals ``wing_netted`` and the ledger books the realised $1. No WOULD_ twin -- it is a
+    # record of a venue event, not one of our order intents (it journals the same in every mode).
+    WING_NETTED = "WING_NETTED"
 
 
 _V33_WOULD_TWIN: dict[V33ActionKind, V33ActionKind] = {

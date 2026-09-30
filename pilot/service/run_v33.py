@@ -72,23 +72,6 @@ from service.v33 import (
 from service.v33.actions import ActionKind, V33ActionKind
 from service.v33.core import _q_count, print_through_summary
 from service.v33.events import V33Fill
-
-
-def _count_out(c: Any) -> Any:
-    """D3: serialise a lot count for the journal/ledger — an INTEGRAL count as a bare int (so a dry
-    1-lot window stays byte-identical), a fractional count (e.g. 0.44) as the 2dp Decimal (str-encoded by
-    the journal's ``_json_default``). Old integer rows already parse as ints; new fractional rows parse
-    as Decimal strings."""
-    d = _q_count(Decimal(str(c)))
-    return int(d) if d == d.to_integral_value() else d
-
-
-def _count_dec(raw: Any) -> Decimal:
-    """Parse a raw count/count_fp value to a 2dp Decimal (0 on any parse failure)."""
-    try:
-        return _q_count(Decimal(str(raw)))
-    except (TypeError, ValueError, ArithmeticError):
-        return Decimal(0)
 from service.v33.executor import V33LiveExecutor, cancel_stale_open_orders
 from service.v33.shadow import DeepObservationLadder, ideal_rung_crosses
 from service.v33.ledger import (
@@ -125,6 +108,24 @@ from service.stops import ensure_balance_start, parse_balance, read_day_guard
 import service.run_v32 as R
 
 logger = logging.getLogger(__name__)
+
+
+def _count_out(c: Any) -> Any:
+    """D3: serialise a lot count for the journal/ledger — an INTEGRAL count as a bare int (so a dry
+    1-lot window stays byte-identical), a fractional count (e.g. 0.44) as the 2dp Decimal (str-encoded by
+    the journal's ``_json_default``). Old integer rows already parse as ints; new fractional rows parse
+    as Decimal strings."""
+    d = _q_count(Decimal(str(c)))
+    return int(d) if d == d.to_integral_value() else d
+
+
+def _count_dec(raw: Any) -> Decimal:
+    """Parse a raw count/count_fp value to a 2dp Decimal (0 on any parse failure)."""
+    try:
+        return _q_count(Decimal(str(raw)))
+    except (TypeError, ValueError, ArithmeticError):
+        return Decimal(0)
+
 
 VALID_MODES_V33 = ("shakedown", "dry", "armed")
 STRIKE_SERIES = R.STRIKE_SERIES
@@ -433,11 +434,13 @@ class V33Driver:
                 q.extend(self.executor.place_batch(places, ts))
                 for a in others:
                     self._journal_action(a, ts)
-                    q.extend(self.executor.on_action(a, self.state, ts))
+                    if a.kind != V33ActionKind.WING_NETTED:   # D5: informational, no venue order
+                        q.extend(self.executor.on_action(a, self.state, ts))
             else:
                 for a in actions:
                     self._journal_action(a, ts)
-                    q.extend(self.executor.on_action(a, self.state, ts))
+                    if a.kind != V33ActionKind.WING_NETTED:   # D5: informational, no venue order
+                        q.extend(self.executor.on_action(a, self.state, ts))
             self._apply_executor_standdown(ts)
             self._maybe_eval(getattr(ev, "server_ts", None))
 
@@ -510,6 +513,12 @@ class V33Driver:
             legs = [{"ticker": lg.ticker, "side": lg.side, "action": lg.action,
                      "count": _count_out(lg.count), "limit": lg.limit} for lg in a.legs]
             payload = {"legs": legs, "count": _count_out(a.count)}
+        elif k == V33ActionKind.WING_NETTED:
+            # D5: the venue netted a YES/NO wing pair on one market to flat (+$1/contract). Informational.
+            rk = "wing_netted"
+            legs = [{"ticker": lg.ticker, "side": lg.side, "count": _count_out(lg.count),
+                     "fill_price": lg.price} for lg in a.legs]
+            payload = {"legs": legs, "count": _count_out(a.count), "realised": a.lock}
         elif k == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW:
             rk = "shadow_fill_outside_window"
             payload = {"E": a.shadow_E, "offer": a.offer, "print": a.print_price, "count": a.count,
@@ -588,7 +597,7 @@ async def _order_status_poll_v33(
                         tickers.add(tk)
             if not tickers:
                 continue
-            filled_by_oid: dict[str, int] = {}
+            filled_by_oid: dict[str, Decimal] = {}
             for tk in tickers:
                 try:
                     filled_by_oid.update(executor.poll_orders_for_bucket(tk))
@@ -599,8 +608,9 @@ async def _order_status_poll_v33(
                 if not o.live or o.order_id is None:
                     continue
                 fc = filled_by_oid.get(str(o.order_id))
+                # D3: fc is the cumulative Decimal fill; on_poll_fill parses it Decimal and feeds the delta.
                 if fc and fc > 0:
-                    driver.on_poll_fill(o.order_id, int(fc), driver.server_now() or clock())
+                    driver.on_poll_fill(o.order_id, fc, driver.server_now() or clock())
             continue
         for o in list(st.ladder):
             if not o.live or o.order_id is None:
@@ -610,8 +620,9 @@ async def _order_status_poll_v33(
             except Exception as e:  # noqa: BLE001
                 logger.warning("[V33] order-status poll error: %s", e)
                 continue
-            if stt.available and stt.filled_count > 0:
-                driver.on_poll_fill(o.order_id, int(stt.filled_count), driver.server_now() or clock())
+            # D3: the EXACT fractional fill (fill_count_fp), not the int-truncated filled_count.
+            if stt.available and stt.filled_count_fp > 0:
+                driver.on_poll_fill(o.order_id, stt.filled_count_fp, driver.server_now() or clock())
 
 
 async def run_v33_window(
@@ -688,6 +699,7 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         lots_filled=m.get("lots_filled", 0), m15_tickers=list(m15_tickers or []),
         m15_frames=shared.m15_frames, deep_obs=driver.deep_obs.summary(),
         print_through=print_through_summary(driver.state),
+        netted_sets=m.get("netted_sets"),   # D5: venue-netted wing pairs
     )
     append_v33_ledger_row(row, ledger_path)
     summary = {

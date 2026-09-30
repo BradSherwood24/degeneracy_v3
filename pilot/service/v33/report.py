@@ -104,6 +104,23 @@ def _row_rung_fills(r: dict[str, Any]) -> list[dict[str, Any]]:
     return rf if isinstance(rf, list) else []
 
 
+def _row_bucket_mismatch(r: dict[str, Any]) -> bool:
+    """F3 (review 2026-09-30): True when a rung fill's OWN bucket ticker (``rung_fills[].bucket_ticker``,
+    present since the D1 fix) differs from the window's held bucket-NO leg ticker — i.e. a fill was
+    attributed to one bucket while the held NO leg (and settlement backfill) sit on another. The pre-fix
+    incident row carries NO ``bucket_ticker`` on its rung_fills, so it is (honestly) NOT flagged — an
+    operator cannot rely on the report to catch a repeat of the *old* bug, only a *new* divergence."""
+    fill_tks = {rf.get("bucket_ticker") for rf in _row_rung_fills(r) if rf.get("bucket_ticker")}
+    if not fill_tks:
+        return False
+    held = r.get("unsettled_legs") or r.get("held_legs") or []
+    no_tks = {lg.get("ticker") for lg in held
+              if isinstance(lg, dict) and lg.get("side") == "no" and lg.get("ticker")}
+    if not no_tks:
+        return False
+    return not (fill_tks <= no_tks)   # any fill's bucket not among the held NO bucket tickers
+
+
 def _margin_c(rf: dict[str, Any]) -> int | None:
     """A rung fill's margin in whole cents = round(E_rung * 100). E_rung is the derived margin label
     (E_min + (n_top - price)); the 10c rung is margin_c 10, etc."""
@@ -140,6 +157,8 @@ def build_v33_report(rows: list[dict[str, Any]],
     tot_single = 0
     tot_dry_sim_fills = 0
     tot_stand_downs = 0
+    tot_netted = 0
+    tot_netted_realised = _ZERO
     for r in rows:
         if not _is_window_row(r):
             continue
@@ -153,6 +172,10 @@ def build_v33_report(rows: list[dict[str, Any]],
         tot_dry_sim_fills += int((r.get("synth_counts") or {}).get("dry_sim_fill", 0) or 0)
         if r.get("stand_down"):
             tot_stand_downs += 1
+        netted = r.get("netted_sets") or []      # D5: venue-netted wing pairs
+        row_netted_realised = sum((_dec(n.get("realised")) or _ZERO for n in netted), _ZERO)
+        tot_netted += len(netted)
+        tot_netted_realised += row_netted_realised
         windows.append({
             "close_time": r.get("close_time"),
             "mode": r.get("effective_mode") or r.get("mode"),
@@ -166,6 +189,9 @@ def build_v33_report(rows: list[dict[str, Any]],
             "roll_count": lad.get("roll_count", 0),
             "roll_single_order_ratio": lad.get("roll_single_order_ratio"),
             "stand_down_reason": r.get("stand_down_reason"),
+            "bucket_mismatch": _row_bucket_mismatch(r),   # F3: fill bucket != held NO-leg bucket
+            "netted_sets": len(netted),                   # D5: venue-netted wing pairs this window
+            "netted_realised": row_netted_realised,
         })
     roll_ratio = (Decimal(tot_single) / Decimal(tot_rolls)) if tot_rolls else None
     return {
@@ -185,6 +211,8 @@ def build_v33_report(rows: list[dict[str, Any]],
             "roll_single_order_ratio": roll_ratio,
             "dry_sim_fills": tot_dry_sim_fills,
             "stand_downs": tot_stand_downs,
+            "netted_sets": tot_netted,                 # D5: venue-netted wing pairs
+            "netted_realised": tot_netted_realised,
         },
     }
 
@@ -927,6 +955,10 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
         line = "  ".join(row)
         if w.get("stand_down_reason"):
             line += f"   [stand down: {w['stand_down_reason']}]"
+        if w.get("bucket_mismatch"):
+            line += "   [BUCKET MISMATCH]"
+        if w.get("netted_sets"):
+            line += f"   [NETTED {w['netted_sets']} = {_c(w.get('netted_realised'))}]"
         lines.append(line)
     t = report["totals"]
     lines.append("-" * len(lines[0]))
@@ -939,6 +971,10 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
         f"  rolls={t['roll_count']}  single-order={t['roll_single_order_count']}  "
         f"single-order-ratio={'n/a' if rr is None else f'{rr * 100:.1f}%'} "
         f"(>= 90% is the roll-integrity gate)")
+    if t.get("netted_sets"):
+        lines.append(
+            f"  netted wing pairs (D5, adjacent-bucket overlap, $1/contract realised now) = "
+            f"{t['netted_sets']}  realised={_c(t.get('netted_realised'))}")
 
     lines.extend(_render_scoreboard(report["scoreboard"]))
     lines.extend(_render_allocation(report["allocation"]))
