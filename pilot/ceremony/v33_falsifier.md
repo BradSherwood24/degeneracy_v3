@@ -266,6 +266,28 @@ stays DRY -- this is a falsifier amendment, not a mode flip.
   ~450 creates in the window's first 9 quoting minutes; the daily create budget, not money, is the binding limit at this
   rate); no fills by 12:54Z. The window's ledger/journal accounting against the six MUST CONFIRM items gets its own entry.
 
+- 2026-09-30 21:50:55Z -- FIRST LIVE FILL = INCIDENT; MUST CONFIRM item 6 FAILED; V3.3 -> DRY 22:02:07Z (Brad, verbatim:
+  "Set it back to dry, and lets address what weve learned"). Window 22:00Z. Chain, from the journal: (1) 21:50:54.9Z a
+  stale-wing cancel-all (the self-inflicted loop registered above) tore the ladder down and the resume re-placed 11 rungs
+  on KXBTC-26SEP3018-B83650 (bucket_Sd 83600) into a sweep in progress; rungs -312 (0.47) and -313 (0.46) filled at the
+  venue within ~0.1 s of placement, FRACTIONALLY (count_fp 0.44 and 1.00 = 1.44 NO). (2) ~1.7 s later the effective spot
+  bucket committed to 83700 and the bucket-change cancel-all removed every rung (incl. the two already-filled ones) from
+  the ladder state; the cancel-confirm path surfaced the fills at 21:51:04Z. (3) `_book_rung_fill` (core.py ~L1034) could
+  no longer find the order in the ladder, `rest_bucket_Sd` was None (awaiting_replace), and it FELL BACK to the CURRENT
+  `spot_Sd` = 83700: the RungFill was attributed to B83750 and the wings were solved for Sd/Su 83700/83800 -> YES 2 @0.40
+  on T83699.99 (21:51:04Z) and NO 2 @0.96 on T83799.99 (21:52:40Z, after 967 per-tick IOC retries at limit 0.95 that
+  also blocked the event loop for ~60 s; the WS fill notice for the rungs arrived 109 s late for that reason). The held
+  NO leg was on [83600,83700) while the wings hedged [83700,83800): NOT a $1 floor. Payoff by settle: <83600 +$0.05;
+  [83600,83700) -$1.39; [83700,83800) +$2.05; >=83800 +$0.05. BTC settled in [83700,83800): revenue $5.44 on $3.39 cost,
+  +$2.05 (balance $42.60 -> $44.60). Luck, not the lock. Ledger shows realized_lock +27.6c on the wrong bucket; the
+  falsifier counts these 2 contracts as n=2 with the TRUE realised lock to be restated once the attribution fix lands
+  (the report must price the NO leg on B83650). (4) fractional fills: `run_v33.on_fill` parses count as int (0.44 -> the
+  rung's full lot) so wings were sized 2 for 1.44 filled. DEFECTS REGISTERED (no [pin]/threshold/sha/STATUS touched):
+  D1 fill-to-bucket attribution must come from the ORDER'S OWN bucket (retained through cancel-all until the cancel is
+  confirmed) or from the fill's market ticker, never from the current spot bucket; D2 wing strikes keyed to the filled
+  rung's bucket; D3 fractional counts parsed exactly (count_fp), wings sized to the filled amount; D4 wing retry cadence
+  bounded (not every tick). Fix branch + review to follow; V3.3 stays DRY until merged and re-armed by Brad's hand.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
