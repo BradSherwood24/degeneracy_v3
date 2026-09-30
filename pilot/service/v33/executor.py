@@ -254,7 +254,10 @@ class V33LiveExecutor(LiveExecutor):
         self._pending_place_price: Decimal | None = None
         # per (batch_index, side) lots already TAKEN across chunks + retries, so a chunked wing take never
         # over-hedges: it only ever sends chunks for the remaining count (retries mint a new coid).
-        self._wing_filled: dict[tuple[int, str], int] = defaultdict(int)
+        # D3 (review, 2026-09-30): lots taken are Decimal — a fractional fill (count_fp 1.44) hedges a
+        # fractional wing; the pre-review ``int(lg.count)`` truncated the hedge to whole lots (a 1.44 fill
+        # would send only 1 wing lot and leave 0.44 NAKED once V3.3 re-arms).
+        self._wing_filled: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal(0))
         # R2-N3: notional (price*count) taken per (batch, side) CUMULATIVELY across the original take AND
         # every retry chunk, so a leg that completes over multiple takes reports the true weighted-average
         # price (not just the last take's average).
@@ -297,12 +300,26 @@ class V33LiveExecutor(LiveExecutor):
     # =====================================================================
     # PRINT-THROUGH stall policy (Brad, 2026-09-26): complete via bucket-NO taker, or unwind the wings
     # =====================================================================
-    def _pt_taker_entry(self, ticker: str, side: str, act: str, count: int, limit: Decimal,
+    @staticmethod
+    def _dc(count: Any) -> Decimal:
+        """D3 (review): a lot count as Decimal, accepting int, Decimal, or numeric string (fractional-safe)."""
+        return count if isinstance(count, Decimal) else Decimal(str(count))
+
+    @classmethod
+    def _count_body_str(cls, count: Any) -> str:
+        """D3 (review): the 2dp decimal string the venue accepts for ``count`` (e.g. '1.44'); a whole lot
+        stays byte-identical ('2.00'). This OVERRIDES ``to_v2_order``'s ``f"{int(count):.2f}"`` (which
+        truncated 0.44 -> '0.00' and 1.44 -> '1.00'), exactly as the wing/taker bodies already override
+        ``price``. The proxy's ``max_contracts_per_order`` cap compares numerically, so a sub-cap fractional
+        count passes."""
+        return str(cls._dc(count).quantize(Decimal("0.01")))
+
+    def _pt_taker_entry(self, ticker: str, side: str, act: str, count: Any, limit: Decimal,
                         exch: int, coid: str) -> dict[str, Any]:
         """One IOC taker order body (buy or sell) for the print-through stall policy. YES-space 4-dp price;
         the buy/sell book-side flip is ``to_v2_order``'s job (its direction guard is the only automated
-        check on a sell)."""
-        legacy = {"ticker": ticker, "side": side, "action": act, "count": int(count),
+        check on a sell). D3 (review): ``count`` is Decimal and the wire ``count`` is written fractional."""
+        legacy = {"ticker": ticker, "side": side, "action": act, "count": count,
                   "time_in_force": "immediate_or_cancel", "self_trade_prevention_type": "taker_at_cross",
                   "client_order_id": coid, "exchange_index": int(exch)}
         if side == "yes":
@@ -310,6 +327,7 @@ class V33LiveExecutor(LiveExecutor):
         else:
             legacy["no_price"] = int((Decimal(limit) * 100).to_integral_value())
         body = to_v2_order(legacy)
+        body["count"] = self._count_body_str(count)          # D3: fractional-safe wire count
         p = Decimal(limit) if side == "yes" else (Decimal(1) - Decimal(limit))
         body["price"] = str(p.quantize(Decimal("0.0001")))
         return body
@@ -323,26 +341,31 @@ class V33LiveExecutor(LiveExecutor):
         coid = action.client_order_id
         ticker = (action.legs[0].ticker if action.legs else action.ticker) or ""
         limit = action.legs[0].limit if action.legs else action.price
-        want = int(action.count or (action.legs[0].count if action.legs else 0))
+        # D3 (review): ``want`` is Decimal (fractional-safe); chunk as ceil(want/cap) with the LAST chunk
+        # carrying the fractional remainder (Σ chunk counts == want).
+        want = self._dc(action.count or (action.legs[0].count if action.legs else 0))
         exch = self._exch(ticker)
         if exch is None or limit is None or want <= 0:
-            self._record_alarm("print_through_complete_unrouted", {"ticker": ticker, "count": want})
+            self._record_alarm("print_through_complete_unrouted", {"ticker": ticker, "count": str(want)})
             # tell the core nothing filled so it unwinds the wings + stands down (never silently naked).
             return [Fill(order_id=None, client_order_id=coid, count=Decimal(0), price=(limit or Decimal(0)),
                          side=BUY_NO, server_ts=now)] if coid else []
-        got = 0
+        got = Decimal(0)
         notional = Decimal(0)
         n_chunks = ceil(want / self.wing_cap)
         entries: list[dict[str, Any]] = []
+        _sum_chunks = Decimal(0)
         for c in range(n_chunks):
-            cnt = min(self.wing_cap, want - c * self.wing_cap)
+            cnt = min(Decimal(self.wing_cap), want - c * self.wing_cap)
+            _sum_chunks += cnt
             entries.append(self._pt_taker_entry(ticker, BUY_NO, "buy", cnt, limit, exch,
                                                 self._mint_wing_coid()))
+        assert _sum_chunks == want, f"pt-complete chunk sum {_sum_chunks} != want {want}"
         self._pacer.acquire(COST_CREATE * len(entries), "print_through_complete", priority=True)
         self.pt_bucket_no_takes += 1
         self._bump("pt_bucket_no_take")
         self.journal.append("print_through_complete",
-                            {"ticker": ticker, "limit": str(limit), "count": want,
+                            {"ticker": ticker, "limit": str(limit), "count": str(want),
                              "chunks": len(entries)}, self.clock())
         if len(entries) == 1:
             resp = self.writer.rest_post(REL_SINGLE_CREATE, entries[0])
@@ -355,7 +378,7 @@ class V33LiveExecutor(LiveExecutor):
             if r is None or r.error or not r.fill_count or r.fill_count <= 0:
                 continue
             nr = normalize_fill_to_side(r, BUY_NO)
-            fc = int(nr.fill_count)
+            fc = self._dc(nr.fill_count)
             price = nr.average_fill_price if nr.average_fill_price is not None else limit
             got += fc
             notional += Decimal(price) * fc
@@ -365,11 +388,11 @@ class V33LiveExecutor(LiveExecutor):
         if got < want:
             self._bump("pt_bucket_no_short")
             self._record_alarm("print_through_complete_short",
-                               {"ticker": ticker, "wanted": want, "filled": got})
+                               {"ticker": ticker, "wanted": str(want), "filled": str(got)})
             self.journal.append("print_through_complete_short",
-                                {"ticker": ticker, "wanted": want, "filled": got}, self.clock())
+                                {"ticker": ticker, "wanted": str(want), "filled": str(got)}, self.clock())
         # book-from-response: the core books ``got`` taker lots and unwinds the (want-got) un-hedged wings.
-        return [Fill(order_id=None, client_order_id=coid, count=Decimal(got), price=avg, side=BUY_NO,
+        return [Fill(order_id=None, client_order_id=coid, count=got, price=avg, side=BUY_NO,
                      server_ts=now)] if coid else []
 
     def _unwind_wings(self, action, now: float) -> list[Any]:
@@ -379,19 +402,23 @@ class V33LiveExecutor(LiveExecutor):
         WINDOW DOWN (via ``stand_down_reason``, propagated by the driver). Feeds no event back to the core
         (the core already recorded the round-trip / dropped the batch); the stand-down is the safety."""
         entries: list[dict[str, Any]] = []
-        want = 0
+        want = Decimal(0)
         for lg in action.legs:
             exch = self._exch(lg.ticker)
-            if exch is None or lg.count <= 0:
+            lg_count = self._dc(lg.count)                      # D3 (review): fractional-safe
+            if exch is None or lg_count <= 0:
                 self._record_alarm("print_through_unwind_unrouted",
-                                   {"ticker": lg.ticker, "side": lg.side, "count": lg.count})
+                                   {"ticker": lg.ticker, "side": lg.side, "count": str(lg_count)})
                 continue
-            want += int(lg.count)
-            n_chunks = ceil(int(lg.count) / self.wing_cap)
+            want += lg_count
+            n_chunks = ceil(lg_count / self.wing_cap)
+            _sum_chunks = Decimal(0)
             for c in range(n_chunks):
-                cnt = min(self.wing_cap, int(lg.count) - c * self.wing_cap)
+                cnt = min(Decimal(self.wing_cap), lg_count - c * self.wing_cap)
+                _sum_chunks += cnt
                 entries.append(self._pt_taker_entry(lg.ticker, lg.side, "sell", cnt, lg.limit, exch,
                                                     self._mint_wing_coid()))
+            assert _sum_chunks == lg_count, f"unwind chunk sum {_sum_chunks} != leg {lg_count}"
         if not entries:
             return []
         self._pacer.acquire(COST_CREATE * len(entries), "print_through_unwind", priority=True)
@@ -406,16 +433,17 @@ class V33LiveExecutor(LiveExecutor):
         else:
             resp = self.writer.rest_post(REL_BATCH_CREATE, build_batch(entries))
             parsed = parse_batch_response(resp.body) if resp.ok else []
-        sold = 0
+        sold = Decimal(0)
         for r in parsed:
             if r is not None and not r.error and r.fill_count and r.fill_count > 0:
-                sold += int(r.fill_count)
+                sold += self._dc(r.fill_count)
         if sold < want:
             # a partial unwind leaves real wings held while the core believes it is flat -> stand down.
             self.pt_unwind_shortfalls += 1
             self._bump("pt_unwind_short")
-            self._record_alarm("print_through_unwind_short", {"wanted": want, "sold": sold})
-            self.journal.append("print_through_unwind_short", {"wanted": want, "sold": sold}, self.clock())
+            self._record_alarm("print_through_unwind_short", {"wanted": str(want), "sold": str(sold)})
+            self.journal.append("print_through_unwind_short",
+                                {"wanted": str(want), "sold": str(sold)}, self.clock())
             if self.stand_down_reason is None:
                 self.stand_down_reason = "print_through_unwind_short"
         return []
@@ -480,16 +508,21 @@ class V33LiveExecutor(LiveExecutor):
             if exch is None:
                 self._record_alarm("wing_no_exchange_index", {"ticker": lg.ticker, "side": lg.side})
                 continue
-            remaining = int(lg.count) - self._wing_filled.get(key, 0)
+            # D3 (review): remaining is Decimal (a 1.44 fill hedges 1.44 lots, not int(1.44)=1). Chunk as
+            # ceil(remaining/cap) with the LAST chunk carrying the fractional remainder (Σ chunks == remaining).
+            remaining = self._dc(lg.count) - self._wing_filled.get(key, Decimal(0))
             if remaining <= 0:
                 continue
             n_chunks = ceil(remaining / self.wing_cap)
+            _sum_chunks = Decimal(0)
             for c in range(n_chunks):
-                cnt = min(self.wing_cap, remaining - c * self.wing_cap)
+                cnt = min(Decimal(self.wing_cap), remaining - c * self.wing_cap)
+                _sum_chunks += cnt
                 chunk_coid, = (self._mint_wing_coid(),)
                 entries.append(self._wing_chunk_entry(lg, exch, cnt, chunk_coid))
                 chunk_owner[chunk_coid] = key
                 self.wing_coids.add(chunk_coid)
+            assert _sum_chunks == remaining, f"wing chunk sum {_sum_chunks} != remaining {remaining}"
         # a leg we could not route at all -> report unfilled (count 0) so the core retries next tick.
         for lg in pending:
             if (lg.batch, lg.side) not in {v for v in chunk_owner.values()} and self._exch(lg.ticker) is None:
@@ -512,7 +545,7 @@ class V33LiveExecutor(LiveExecutor):
             resp = self.writer.rest_post(REL_BATCH_CREATE, build_batch(entries))
             parsed = parse_batch_response(resp.body) if resp.ok else []
         # aggregate chunk fills per original leg (weighted-average NO/side price for the leg's fill_price).
-        agg_count: dict[tuple[int, str], int] = defaultdict(int)
+        agg_count: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal(0))
         agg_notional: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal(0))
         from service.orders.envelope import normalize_fill_to_side
         by_coid = {r.client_order_id: r for r in parsed if r.client_order_id in chunk_owner}
@@ -523,7 +556,7 @@ class V33LiveExecutor(LiveExecutor):
             side = key[1]
             nr = normalize_fill_to_side(r, side)
             price = nr.average_fill_price if nr.average_fill_price is not None else leg_by_key[key].limit
-            fc = int(nr.fill_count)
+            fc = self._dc(nr.fill_count)          # D3 (review): fractional-safe chunk fill
             agg_count[key] += fc
             agg_notional[key] += Decimal(price) * fc
             # money-math capture (armed; the ledger uses STATE, this is the reconciliation trail).
@@ -536,15 +569,15 @@ class V33LiveExecutor(LiveExecutor):
         # self._wing_filled makes the retry send only the remainder, tracked per (batch, side)).
         for lg in pending:
             key = (lg.batch, lg.side)
-            got = agg_count.get(key, 0)
+            got = agg_count.get(key, Decimal(0))
             self._wing_filled[key] += got
             self._wing_notional[key] += agg_notional.get(key, Decimal(0))
             total = self._wing_filled[key]
-            if total >= int(lg.count) and got > 0:
+            if total >= self._dc(lg.count) and got > 0:
                 # cumulative weighted average across the original take + every retry chunk (never just
                 # this call's average — a leg completed over two takes reports the true blended price).
                 avg = (self._wing_notional[key] / total) if total else lg.limit
-                events.append(Fill(order_id=None, client_order_id=lg.client_order_id, count=Decimal(total),
+                events.append(Fill(order_id=None, client_order_id=lg.client_order_id, count=total,
                                    price=avg, side=lg.side, server_ts=now))
             elif key in leg_by_key:
                 # remainder outstanding (a chunk rejected / IOC-unfilled) -> core emits RETRY_WING.
@@ -556,9 +589,9 @@ class V33LiveExecutor(LiveExecutor):
         self._wing_coid_seq = getattr(self, "_wing_coid_seq", 0) + 1
         return f"v33-wc-{self._wing_coid_seq}"
 
-    def _wing_chunk_entry(self, leg, exch: int, count: int, coid: str) -> dict[str, Any]:
+    def _wing_chunk_entry(self, leg, exch: int, count: Any, coid: str) -> dict[str, Any]:
         from service.orders.translate import to_v2_order
-        legacy = {"ticker": leg.ticker, "side": leg.side, "action": "buy", "count": int(count),
+        legacy = {"ticker": leg.ticker, "side": leg.side, "action": "buy", "count": count,
                   "time_in_force": "immediate_or_cancel", "self_trade_prevention_type": "taker_at_cross",
                   "client_order_id": coid, "exchange_index": int(exch)}
         if leg.side == "yes":
@@ -566,6 +599,7 @@ class V33LiveExecutor(LiveExecutor):
         else:
             legacy["no_price"] = int((Decimal(leg.limit) * 100).to_integral_value())
         body = to_v2_order(legacy)
+        body["count"] = self._count_body_str(count)          # D3 (review): fractional-safe wire count
         p = Decimal(leg.limit) if leg.side == "yes" else (Decimal(1) - Decimal(leg.limit))
         body["price"] = str(p.quantize(Decimal("0.0001")))
         return body

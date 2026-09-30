@@ -287,6 +287,11 @@ stays DRY -- this is a falsifier amendment, not a mode flip.
   confirmed) or from the fill's market ticker, never from the current spot bucket; D2 wing strikes keyed to the filled
   rung's bucket; D3 fractional counts parsed exactly (count_fp), wings sized to the filled amount; D4 wing retry cadence
   bounded (not every tick). Fix branch + review to follow; V3.3 stays DRY until merged and re-armed by Brad's hand.
+- 2026-09-30 (review, `review/v33-fill-attribution`) -- CORRECTION to the 21:50:55Z entry (original left intact
+  above; this appends only): the per-coid count_fp pairing is reversed. The journal (fixture
+  `tests/fixtures/v33/incident_20260930T220000Z_slice.jsonl`) shows coid -312 @0.47 filled count_fp **1.00** and
+  coid -313 @0.46 filled count_fp **0.44** -- i.e. -312=1.00, -313=0.44. The entry's "(count_fp 0.44 and 1.00)"
+  has the two the wrong way round; the total (1.44 NO) and every other fact in the entry are unchanged.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
