@@ -1,6 +1,6 @@
 # V3.3 FALSIFIER -- rolling K-rung ladder spot-bucket pump-fader (maker rest ladder, taker completion)
 
-STATUS: DRAFT -- NOT FROZEN
+STATUS: FROZEN
 
 This file is a DRAFT. It becomes FROZEN only when Brad ALONE, on his verbatim go, changes the line above
 to exactly `STATUS: FROZEN` and appends the go under Registration. An agent NEVER flips it. Until then
@@ -234,9 +234,23 @@ stays DRY -- this is a falsifier amendment, not a mode flip.
 
 ## Registration (append-only; the freeze line, Brad's verbatim go, and every verdict go here)
 
-(empty -- awaiting Brad's freeze. Brad ALONE flips `STATUS: DRAFT -- NOT FROZEN` to exactly
-`STATUS: FROZEN` on his verbatim go and appends it here with the roster sha
-`295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def`. An agent never flips it.)
+- 2026-09-30 ~03:26Z -- FROZEN on Brad's order. Brad, verbatim (2026-09-30, after reading the full layout of the
+  judged quantity, policy, verdict, alarms/stops, kill, promotion, flip protocol and MUST CONFIRM, and after his
+  three L6 amendments landed on main as PR #101): "You have my go to freeze dat hoe" (earlier the same night:
+  "All looks good, let me know when ready"; the L6 amendment words: "Lets drop that realised lock to +4.0c, and
+  lets add that daily loss of $3.00 as a early kill. Then lets also not lock any decision to an n over 15 fills.").
+  Thresholds frozen AS AMENDED by L6: verdict at `n >= 15`, mean true lock >= +4.0c, S4 day loss >= $3.00 = campaign
+  KILL, promotion at `n >= 15`; every other [pin] as proposed above. Roster `DegeneracyV3_3`, params sha
+  `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def` (L4 ladder 8..18c, 11 rungs, 1 lot per rung;
+  `rung_lots` ABSENT = uniform). Preconditions at freeze: live tree main ff385df (1384 passed / 1 skipped); smoke
+  window 2026-09-30 01:00Z ran DRY at 8..18c (sha match, n_top 0.44 at W 1.4585, 11 rungs of count 1, 184/184
+  single-order rolls, only `would_*` records, no fills); proxy restarted 01:16Z (pid 25712) with
+  DAILY_ORDER_BUDGET 8000, MAX_CONTRACTS_PER_ORDER 2, ticker prefixes incl. KXBTC, orders_enabled true; crypto-side
+  (exchange_index 2) balance $42.60 at 01:35Z (gate 4c >= $35 met; a full 11-rung sweep ties ~$20.57); V3.2 stays
+  ARMED at size 2 until the flip; `ops/v33_mode.txt` = dry at the freeze. The STATUS line was edited by Brad's OWN
+  typed command (a python one-liner on this branch's copy of the file, 03:25:51Z), not by an agent; the test
+  changes and this entry are Claude's mechanical work on the go above. The flip (v33 -> armed, v32 -> dry, in ONE
+  :02-:33 window) remains Brad's separate lever and gets its own dated entry here.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
