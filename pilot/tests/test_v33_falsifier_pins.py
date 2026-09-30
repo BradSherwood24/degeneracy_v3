@@ -42,11 +42,18 @@ def _doc() -> str:
         return f.read()
 
 
-def test_draft_status_line_and_not_frozen():
-    """The DRAFT status line is exact and the file is NOT frozen (an agent never flips it)."""
-    lines = _doc().splitlines()
-    assert lines[2].strip() == "STATUS: DRAFT -- NOT FROZEN"
-    assert falsifier_is_frozen(_DOC) is False
+def test_falsifier_is_frozen_with_registration():
+    """FROZEN on Brad's verbatim go (2026-09-30). The freeze line must be exact and the Registration
+    section must carry the go -- a FROZEN line without a registered go is a defect (V3.2 precedent)."""
+    doc = _doc()
+    lines = doc.splitlines()
+    assert lines[2].strip() == "STATUS: FROZEN"
+    assert "STATUS: DRAFT" not in doc
+    reg = doc.split("## Registration", 1)[1].split("## Pre-registered shadow observations", 1)[0]
+    assert "FROZEN on Brad's order" in reg and "my go to freeze" in reg
+    assert "(empty -- awaiting Brad's freeze" not in reg
+    assert FROZEN_V33_PARAMS_SHA256 in reg
+    assert falsifier_is_frozen(_DOC) is True
 
 
 def test_verdict_pins_match_doc():
@@ -130,14 +137,26 @@ def _health(*, maxc=2, prefixes=("KXBTC", "KXBTCD"), enabled=True, remaining=400
             "orders_remaining_today": remaining}
 
 
-def test_arming_refuses_while_draft():
-    """S5 refuses to arm V3.3 while the falsifier is a DRAFT, even with a perfect /health + clean guard."""
+def test_arming_refuses_on_a_draft_doc(tmp_path):
+    """S5 refuses to arm V3.3 on a DRAFT falsifier, even with a perfect /health + clean guard (the
+    pre-freeze discipline, kept as a regression against any future re-draft)."""
+    draft = tmp_path / "v33_falsifier_draft.md"
+    draft.write_text("# draft\n\nSTATUS: DRAFT -- NOT FROZEN\n", encoding="utf-8")
     outcome = decide_v33_arming(
-        resolved_mode="armed", falsifier_path=_DOC, health=_health(), positions=[],
+        resolved_mode="armed", falsifier_path=str(draft), health=_health(), positions=[],
         params_verified=True, lots_per_rung=1, day_guard=DayGuard("2026-09-23", None, [], False),
         s4=None, k_rungs=11)
     assert outcome.armed is False
     assert any("falsifier" in r.lower() for r in outcome.reasons)
+
+
+def test_arming_proceeds_on_the_frozen_doc():
+    """With the REAL frozen falsifier, a perfect /health, verified params and a clean guard, S5 arms."""
+    outcome = decide_v33_arming(
+        resolved_mode="armed", falsifier_path=_DOC, health=_health(), positions=[],
+        params_verified=True, lots_per_rung=1, day_guard=DayGuard("2026-09-30", None, [], False),
+        s4=None, k_rungs=11)
+    assert outcome.armed is True, outcome.reasons
 
 
 def test_promotion_and_kill_constants_values():
