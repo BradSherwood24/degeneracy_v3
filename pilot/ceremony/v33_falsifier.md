@@ -89,28 +89,31 @@ History NOT mixed: the L1 5..15c dry sample (22 entry windows, 161 rung fills, 2
 the 8..18c sample for the `n >= 30` verdict / kill / promotion gate counting; the gate counters count only
 8..18c fills from here. The gates themselves (mean lock +6.0c, per-rung shortfall, % positive, capture
 ratio, one-legged, roll integrity, kill and promotion pins) are UNCHANGED. V3.3 stays DRY.
+_(Dated L4 record: the `n >= 30` verdict n and the +6.0c mean-lock bar named in this paragraph are
+SUPERSEDED by L6, 2026-09-30 -- the live gate is now `n >= 15` and +4.0c; see the L6 amendment section
+below.)_
 
 ## Proposed pre-registered thresholds (the verdict)
 
-Judged on LIVE fills. The verdict is decided only once there are `n >= 30` [pin] realised rung-fills (n
-counts contracts; a full sweep contributes K); before that the scoreboard prints `n<30 pending`. At
-`n >= 30`:
+Judged on LIVE fills. The verdict is decided only once there are `n >= 15` [pin] realised rung-fills (n
+counts contracts; a full sweep contributes K); before that the scoreboard prints `n<15 pending`. At
+`n >= 15`:
 
 - ALIVE iff ALL of:
-  - ladder mean true lock (realised, per contract) >= +6.0c [pin], AND
+  - ladder mean true lock (realised, per contract) >= +4.0c [pin], AND
   - per-rung shortfall (solved E - realised lock) <= 3.0c [pin] at every rung with >= 3 [pin] fills, AND
   - % positive >= 80% [pin], AND
   - capture ratio at the 10c margin >= 0.50 [pin] (= 50%; same definition as V3.2 Registration 3 --
     live completed 10c-rung sets / ideal-shadow E=0.10 fills inside the quoting window, over armed+bucket
-    windows). FAIL-CLOSED: at `n >= 30` an UNMEASURABLE capture (no valid ideal-shadow E=0.10 availability
+    windows). FAIL-CLOSED: at `n >= 15` an UNMEASURABLE capture (no valid ideal-shadow E=0.10 availability
     to measure execution against, ratio None) is a MISS, not a pass -- exactly as V3.2's verdict logic
-    treats a None ratio. (Below `n >= 30` the gate reads `n-too-small`.) AND
+    treats a None ratio. (Below `n >= 15` the gate reads `n-too-small`.) AND
   - one-legged <= 2 [pin] contracts, AND
   - roll integrity: >= 90% [pin] of rolls move exactly one order (journal-counted).
-- KILL iff ANY of those thresholds is missed at `n >= 30`. No re-spec on the same evaluation window
+- KILL iff ANY of those thresholds is missed at `n >= 15`. No re-spec on the same evaluation window
   (the registered-specs rule): a miss is a kill, not a re-parameterisation.
 
-The report computes this verdict (`ALIVE-so-far` / `KILL` / `n<30 pending`) directly from the `[pin]`
+The report computes this verdict (`ALIVE-so-far` / `KILL` / `n<15 pending`) directly from the `[pin]`
 constants in `service.v33.falsifier_pins` -- see the FALSIFIER GATE TABLE + LADDER SCOREBOARD blocks in
 `python -m service.v33.report`.
 
@@ -156,13 +159,19 @@ settlement and flag `one_legged`.
 ## Kill (early / immediate)
 
 - mean lock < +2.0c [pin] (`V33_KILL_MEAN_LOCK_CENTS`) already at `n >= 15` [pin]
-  (`V33_KILL_MIN_N`) -> KILL without waiting for n=30 (the ladder's premise is broken on real fills).
+  (`V33_KILL_MIN_N`) -> KILL the moment `n >= 15` regardless of the other gates (the ladder's premise is
+  broken on real fills).
 - one-legged > 2 [pin] contracts -> KILL (the taker completion is systematically failing at K rungs).
+- S4 day loss >= $3.00 [pin] latched on any armed day -> KILL (Brad 2026-09-30: the strategy should not
+  lose; a day at the cap is not an exception to explain, it is the campaign's stop). The report reads the
+  V3.3 day-guard files (`ops/v33_stops_YYYY-MM-DD.json`) over its day range and treats an S4 latch as a
+  kill entry "S4 day-loss latched on YYYY-MM-DD" (`V33_KILL_ON_S4_DAY_LOSS` = True [pin]); this fires at
+  any n, including n=0.
 
 ## Promotion
 
 Nothing here promotes automatically. What would JUSTIFY 2 lots per rung, OR rungs deeper than 18c live
-(Brad's dated word, informed by SO-3's measured deep-end absorption): ALIVE at `n >= 30` [pin]
+(Brad's dated word, informed by SO-3's measured deep-end absorption): ALIVE at `n >= 15` [pin]
 (`V33_PROMOTION_MIN_N`) completed rung-fills. The SO-3 deep observation ladder (19..28c, observation only)
 measures the deep end's absorption before anyone sizes into it (sec 8, PLAN_V33). The proxy cap
 `MAX_CONTRACTS_PER_ORDER` (2 or 11) stands regardless.
@@ -195,6 +204,33 @@ acceptance or queue position -- the MUST CONFIRM list below stands for the first
 6. PER-RUNG BUCKET CORRECT ACROSS A CHANGE: a rest-and-fill spanning a mid-window bucket change lands the
    held bucket-NO leg on the RIGHT market (`RungFill.bucket_ticker`), and the batched order poll covers
    BOTH buckets (R2-N4) so a prior-bucket rung's fill is never missed.
+
+## L6 amendment (2026-09-30, pre-freeze) -- Brad's verbatim words
+
+DRAFT edit, pre-freeze. Brad's verbatim words 2026-09-30: "Lets drop that realised lock to +4.0c, and
+lets add that daily loss of $3.00 as a early kill. Then lets also not lock any decision to an n over 15
+fills."
+
+Three changes (old -> new):
+
+1. Verdict mean true-lock bar: `V33_FALSIFIER_MIN_MEAN_LOCK_CENTS` +6.0c -> +4.0c. The early-kill line
+   (mean < +2.0c at `n >= 15`) is UNCHANGED. Rationale: the completed set pays $2/contract at settlement,
+   so the lock is STRUCTURAL -- +4.0c sits above the +2.0c early kill and below the 8c shallowest rung's
+   label after ~5c placement->fill slippage, so it catches a broken premise without demanding the full
+   rung label.
+2. S4 day loss >= $3.00 (`V33_S4_DAY_LOSS_CAP_DOLLARS`, UNCHANGED) becomes an EARLY / IMMEDIATE campaign
+   KILL, not only a day halt: an S4 latch on ANY armed UTC day of the campaign forces the report's verdict
+   to KILL, regardless of n (`V33_KILL_ON_S4_DAY_LOSS` = True [pin]). The S4 day-stop under Stops still
+   halts the day exactly as before; this adds the campaign verdict on top. Rationale: a $3.00 day is the
+   campaign's stop, not a data point to explain away.
+3. Verdict / promotion n: `V33_FALSIFIER_MIN_N` and `V33_PROMOTION_MIN_N` 30 -> 15 (`V33_KILL_MIN_N` stays
+   15). Rationale: the lock is structural, so 15 realised contracts answer the execution / slippage
+   question the verdict asks; no decision is held for an n above 15 fills.
+
+The per-rung shortfall's "`>= 3` fills per rung" pin, the % positive (80%), the capture ratio (0.50 at the
+10c margin), the one-legged tolerance (<= 2), the roll-integrity (>= 90%) and the S4 cap dollars ($3.00),
+budget and S1_LEGGED pins are all UNCHANGED. The 5..15c and 8..18c history stays as recorded (L4/L5). V3.3
+stays DRY -- this is a falsifier amendment, not a mode flip.
 
 ## Registration (append-only; the freeze line, Brad's verbatim go, and every verdict go here)
 

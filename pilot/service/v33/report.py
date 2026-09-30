@@ -19,11 +19,15 @@ keeps printing for the V3.2 rows.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
+import os
+import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from service.stops import read_day_guard
 from service.v33.falsifier_pins import (
     V33_CAPTURE_RATIO_MIN,
     V33_FALSIFIER_CAPTURE_MARGIN_C,
@@ -37,10 +41,13 @@ from service.v33.falsifier_pins import (
     V33_FALSIFIER_SHADOW_GAP_E,
     V33_KILL_MEAN_LOCK_CENTS,
     V33_KILL_MIN_N,
+    V33_KILL_ON_S4_DAY_LOSS,
 )
 from service.v33.ledger import DEFAULT_V33_LEDGER_PATH, load_v33_rows
 from service.v33.params import load_v33_params
+from service.v33.stops import _DAY_GUARD_PREFIX_V33, S4_DAY_LOSS, v33_day_guard_path
 from service.v32.ledger import DEFAULT_V32_LEDGER_PATH, load_v32_rows
+from service.paths import checkout_ops_dir, data_dir, ops_dir_v33
 
 _ZERO = Decimal(0)
 _ONE = Decimal(1)
@@ -104,9 +111,13 @@ def _shadow_below_min(sub: dict[str, Any], n_min: Decimal) -> bool:
 # ---------------------------------------------------------------------------
 # per-window ladder lines + totals (L2 shape kept; the tests pin these)
 # ---------------------------------------------------------------------------
-def build_v33_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def build_v33_report(rows: list[dict[str, Any]],
+                     ops_dir: str | None = None) -> dict[str, Any]:
     """Fold the V3.3 window rows into per-window LADDER lines + totals + the ladder scoreboard, the
-    falsifier gate table, and the deep-end (SO-3) summary (pure; the CLI renders it)."""
+    falsifier gate table, and the deep-end (SO-3) summary (pure; the CLI renders it).
+
+    ``ops_dir`` (L6) is threaded to the gate table for the S4 day-loss campaign kill (the day-guard scan);
+    None keeps the gate table file-free."""
     windows: list[dict[str, Any]] = []
     tot_rungs = 0
     tot_contracts = 0
@@ -147,7 +158,7 @@ def build_v33_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "windows": windows,
         "scoreboard": build_ladder_scoreboard(rows),
         "allocation": build_allocation_table(rows),
-        "gate_table": build_falsifier_gate_table(rows),
+        "gate_table": build_falsifier_gate_table(rows, ops_dir),
         "deep_end": build_deep_end(rows),
         "print_through": build_print_through(rows),
         "totals": {
@@ -342,11 +353,91 @@ def build_allocation_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# S4 day-loss campaign kill (L6, Brad 2026-09-30) — reads the V3.3 day-guard files
+# ---------------------------------------------------------------------------
+def _resolve_v33_guard_path(ops_dir: str, utc_day: str) -> str:
+    """The V3.3 day-guard file for ``utc_day``, mirroring ``run_v33._resolve_v33_guard_path``: when
+    ``DV3_DATA_DIR`` is set but the data-dir guard is missing while the checkout copy exists, read the
+    checkout guard (mid-day-cutover safety). When the caller passes an EXPLICIT ops_dir (a test tmp dir,
+    != the resolved data/checkout dirs), that dir is used verbatim -- the fallback only applies to the
+    live resolved ops dir."""
+    primary = v33_day_guard_path(ops_dir, utc_day)
+    if data_dir() is None or ops_dir != ops_dir_v33():
+        return primary
+    checkout = v33_day_guard_path(checkout_ops_dir(), utc_day)
+    if primary != checkout and not os.path.exists(primary) and os.path.exists(checkout):
+        return checkout
+    return primary
+
+
+_GUARD_DAY_RE = re.compile(re.escape(_DAY_GUARD_PREFIX_V33) + r"(\d{4}-\d{2}-\d{2})\.json$")
+
+
+def _guard_days_in_dir(ops_dir: str) -> set[str]:
+    """Every UTC day for which a ``v33_stops_YYYY-MM-DD.json`` file exists in ``ops_dir`` (by filename;
+    the file is not read here). Empty if the dir does not exist / cannot be listed."""
+    out: set[str] = set()
+    for path in glob.glob(os.path.join(ops_dir, f"{_DAY_GUARD_PREFIX_V33}*.json")):
+        m = _GUARD_DAY_RE.search(os.path.basename(path))
+        if m:
+            out.add(m.group(1))
+    return out
+
+
+def _s4_scan(rows: list[dict[str, Any]], ops_dir: str | None) -> tuple[list[str], list[str]]:
+    """Scan the V3.3 day guards over the report's day RANGE for the S4 day-loss campaign kill (L6, Brad
+    2026-09-30): an S4 latch on ANY armed day is an immediate campaign KILL, not only a day halt.
+
+    Returns ``(s4_days, corrupt_days)`` -- both sorted. ``s4_days`` are the days whose guard latched S4
+    (day balance loss >= the unchanged $3.00 cap); ``corrupt_days`` are days in range whose guard exists
+    but is unreadable/malformed (S4 state UNKNOWN). Both empty when ``ops_dir`` is None (the pure,
+    file-free unit-test path) or the pin is False.
+
+    Day set = the report's [min row day, max row day] range, and inside it EVERY ``v33_stops_*.json`` file
+    present (not only days with a ledger row) -- a day that latched S4 but wrote no ledger row (process
+    died after latching, or the row was deduped) would otherwise be invisible. When the live checkout
+    fallback is active (``DV3_DATA_DIR`` set, live ops dir) the checkout dir's guard files are unioned in
+    too; each candidate day is then read via ``_resolve_v33_guard_path`` so the right file wins.
+
+    A MISSING guard is a fresh empty guard (no latch, not corrupt). A CORRUPT guard is SURFACED here as an
+    UNKNOWN, not silently dropped: the report is descriptive, so it warns rather than force-killing (the
+    fail-closed-on-corrupt discipline that refuses to ARM lives in ``decide_v33_arming``), but the warning
+    taints an otherwise-clean verdict so it can never read all-clear over an unreadable stop file."""
+    if ops_dir is None or not V33_KILL_ON_S4_DAY_LOSS:
+        return [], []
+    row_days = sorted({str(r.get("close_time", ""))[:10]
+                       for r in rows if _is_window_row(r) and str(r.get("close_time", ""))[:10]})
+    if not row_days:
+        return [], []
+    lo, hi = row_days[0], row_days[-1]
+    candidates = set(row_days) | _guard_days_in_dir(ops_dir)
+    if data_dir() is not None and ops_dir == ops_dir_v33():
+        candidates |= _guard_days_in_dir(checkout_ops_dir())
+    candidates = {d for d in candidates if lo <= d <= hi}
+    hits: list[str] = []
+    corrupt: list[str] = []
+    for day in sorted(candidates):
+        guard = read_day_guard(_resolve_v33_guard_path(ops_dir, day), day)
+        if guard.corrupt:
+            corrupt.append(day)
+            continue
+        if any(e.get("kind") == S4_DAY_LOSS for e in guard.latched):
+            hits.append(day)
+    return hits, corrupt
+
+
+# ---------------------------------------------------------------------------
 # FALSIFIER GATE TABLE (§6) — realised rows only
 # ---------------------------------------------------------------------------
-def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def build_falsifier_gate_table(rows: list[dict[str, Any]],
+                               ops_dir: str | None = None) -> dict[str, Any]:
     """The §6 gate table computed LIVE from realised rows. Each gate -> value, threshold, PASS/FAIL/
-    n-too-small; the n>=30 rung-fill counter; the kill conditions. Realised (armed, not dry_sim) only."""
+    n-too-small; the n>=MIN_N rung-fill counter; the kill conditions. Realised (armed, not dry_sim) only.
+
+    ``ops_dir`` (L6): when given, the S4 day-loss CAMPAIGN kill scans that ops dir's V3.3 day-guard files
+    over the report's day range; an S4 latch on any day forces the verdict to KILL regardless of n, and a
+    CORRUPT guard in range is surfaced as a WARNING on the verdict (S4 state UNKNOWN). When None (the
+    default, and the pure unit-test path) the S4 scan is skipped -- no file is read."""
     realised = [r for r in rows if _is_realised(r)]
     all_rf = [rf for r in realised for rf in _row_rung_fills(r)]
     n = sum(int(rf.get("count", 1) or 1) for rf in all_rf)                 # rung-fill contracts
@@ -417,8 +508,12 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
         (roll_ratio is not None and roll_ratio >= V33_FALSIFIER_MIN_SINGLE_ORDER_ROLL_RATIO),
         tot_rolls > 0)
 
-    # verdict + kill (kills apply even before n>=30).
+    # verdict + kill (kills apply even before the verdict n; the S4 day-loss kill fires at any n,
+    # including n=0, when a day guard latched the $3.00 cap -- L6, Brad 2026-09-30).
     kills: list[str] = []
+    s4_days, s4_corrupt_days = _s4_scan(rows, ops_dir)
+    for day in s4_days:
+        kills.append(f"S4 day-loss latched on {day}")
     if mean_lock is not None and n >= V33_KILL_MIN_N and mean_lock < V33_KILL_MEAN_LOCK_CENTS:
         kills.append(f"mean lock {mean_lock:.2f}c < +{V33_KILL_MEAN_LOCK_CENTS}c at n={n} "
                      f"(>= {V33_KILL_MIN_N})")
@@ -431,6 +526,12 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
     else:
         fails = [g["gate"] for g in gates if g["status"] == "FAIL"]
         verdict = "ALIVE-so-far" if not fails else ("KILL: " + "; ".join(fails))
+    # A CORRUPT guard in range means the S4 state of that day is UNKNOWN -- surface it so an otherwise
+    # clean verdict can never read all-clear over an unreadable stop file (L6 review; descriptive warning,
+    # not a force-kill -- the fail-closed KILL lives in the arming gate decide_v33_arming).
+    if s4_corrupt_days:
+        verdict += (f" -- WARNING: guard CORRUPT on {', '.join(s4_corrupt_days)} "
+                    f"(S4 state UNKNOWN; verify)")
 
     return {
         "n_rung_fills": n, "min_n": V33_FALSIFIER_MIN_N, "mean_lock_c": mean_lock,
@@ -438,6 +539,7 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "worst_shortfall_margin_c": worst_margin,
         "capture_live": cap_num, "capture_shadow": cap_den, "capture_ratio": cap_ratio,
         "one_legged": one_legged, "roll_count": tot_rolls, "roll_single_order_ratio": roll_ratio,
+        "s4_kill_days": s4_days, "s4_corrupt_days": s4_corrupt_days,
         "gates": gates, "verdict": verdict,
     }
 
@@ -733,7 +835,14 @@ def _render_gate_table(gt: dict[str, Any]) -> list[str]:
         lines.append("  " + str(g["gate"]).ljust(34) + vs.rjust(12) + str(g["threshold"]).rjust(14)
                      + "  " + g["status"])
     lines.append(f"  VERDICT: {gt['verdict']}   (kill: mean < +{V33_KILL_MEAN_LOCK_CENTS}c at "
-                 f"n >= {V33_KILL_MIN_N}, or one-legged > {V33_FALSIFIER_MAX_ONE_LEGGED})")
+                 f"n >= {V33_KILL_MIN_N}, one-legged > {V33_FALSIFIER_MAX_ONE_LEGGED}, "
+                 f"or S4 day-loss latched on any armed day)")
+    s4d = gt.get("s4_kill_days") or []
+    if s4d:
+        lines.append(f"  S4 day-loss latched (campaign KILL, L6): {', '.join(s4d)}")
+    s4c = gt.get("s4_corrupt_days") or []
+    if s4c:
+        lines.append(f"  WARNING: V3.3 day-guard CORRUPT (S4 state UNKNOWN, verify): {', '.join(s4c)}")
     return lines
 
 
@@ -850,12 +959,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--days", type=int, default=None, help="Only the most recent N UTC days.")
     ap.add_argument("--ledger", default=DEFAULT_V33_LEDGER_PATH)
     ap.add_argument("--v32-ledger", default=DEFAULT_V32_LEDGER_PATH)
+    ap.add_argument("--ops-dir", default=None,
+                    help="V3.3 ops dir holding v33_stops_*.json (default: the resolved live ops dir); "
+                         "the L6 S4 day-loss campaign kill scans it over the report's day range.")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
+    ops_dir = args.ops_dir if args.ops_dir is not None else ops_dir_v33()
     v33_rows = _recent_days(load_v33_rows(args.ledger), args.days)
     v32_rows = _recent_days(load_v32_rows(args.v32_ledger), args.days)
-    report = build_v33_report(v33_rows)
+    report = build_v33_report(v33_rows, ops_dir)
     sxs = build_side_by_side(v33_rows, v32_rows)
     if args.json:
         print(json.dumps({"report": report, "side_by_side": sxs}, sort_keys=True,

@@ -145,9 +145,9 @@ by the arming step, in the same :02-:33 window V3.2 flips to dry, by Brad's hand
   contracts 10 and V3.2 to 0. Just to watch and compare. Make sure V3.3 is running exactly as expected
   before $20+ are on the line"). At the flip, `ops/v32_mode.txt` -> dry and `ops/v33_mode.txt` -> armed in
   one :02-:33 window; V3.2 keeps running + reporting with NO orders. V3.2's record at close: n=<n> live
-  completed sets, <record> (e.g. "11/11 positive, real -$0.98 net across the armed campaign"); the n>=30
-  verdict is NOT reached and is SUPERSEDED by V3.3 (different mechanics -- V3.3's 10c rung is NOT pooled
-  into V3.2's n). No [pin], the params sha, or -- other than the roster now running dry -- the STATUS line
+  completed sets, <record> (e.g. "11/11 positive, real -$0.98 net across the armed campaign"); the V3.3
+  n>=15 verdict (L6 2026-09-30; was n>=30) is NOT reached by V3.2 and is SUPERSEDED by V3.3 (different
+  mechanics -- V3.3's 10c rung is NOT pooled into V3.2's n). No [pin], the params sha, or -- other than the roster now running dry -- the STATUS line
   is touched by this entry; it is a Registration record of the supersession, not a threshold change.
 ```
 

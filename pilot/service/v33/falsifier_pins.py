@@ -26,8 +26,8 @@ from decimal import Decimal
 from service.v33.params import FROZEN_V33_PARAMS_SHA256  # noqa: F401  (re-exported for the pins test)
 
 # --- Verdict at n >= MIN_N rung-fills (contracts) -------------------------------------------------
-V33_FALSIFIER_MIN_N = 30                                # [pin] realised rung-fills (contracts) before a verdict
-V33_FALSIFIER_MIN_MEAN_LOCK_CENTS = Decimal("6.0")     # [pin] mean realised true lock >= +6.0c
+V33_FALSIFIER_MIN_N = 15                                # [pin] realised rung-fills (contracts) before a verdict
+V33_FALSIFIER_MIN_MEAN_LOCK_CENTS = Decimal("4.0")     # [pin] mean realised true lock >= +4.0c
 V33_FALSIFIER_MAX_RUNG_SHORTFALL_CENTS = Decimal("3.0")  # [pin] (solved E - realised lock) per rung
 V33_FALSIFIER_MIN_RUNG_FILLS_FOR_SHORTFALL = 3         # [pin] a rung is judged for shortfall at >= 3 fills
 V33_FALSIFIER_MIN_PCT_POSITIVE = Decimal("80")         # [pin] % of rung fills with positive realised lock
@@ -44,8 +44,14 @@ V33_KILL_MEAN_LOCK_CENTS = Decimal("2.0")              # [pin] mean lock < +2.0c
 V33_KILL_MIN_N = 15                                    # [pin] ... already at n >= 15 rung-fills -> KILL
 # one-legged > MAX_ONE_LEGGED is also an immediate kill (shares V33_FALSIFIER_MAX_ONE_LEGGED).
 
+# L6 amendment (Brad 2026-09-30, pre-freeze): an S4 day-loss latch is a CAMPAIGN kill, not only a day
+# halt. If the V3.3 day guard has latched S4 (day balance loss >= V33_S4_DAY_LOSS_CAP_DOLLARS, unchanged
+# in service.v33.stops) on ANY armed UTC day the report covers, the verdict reads KILL immediately,
+# regardless of n. The report reads the ops/v33_stops_YYYY-MM-DD.json guard files to detect the latch.
+V33_KILL_ON_S4_DAY_LOSS = True                         # [pin] any-day S4 day-loss latch -> KILL
+
 # --- Promotion (Brad's dated word required; these are the necessary conditions) -------------------
-V33_PROMOTION_MIN_N = 30                                # [pin] alive at n >= 30 rung-fills, AND
+V33_PROMOTION_MIN_N = 15                                # [pin] alive at n >= 15 rung-fills, AND
 # a promotion is 2 lots per rung, OR rungs deeper than 18c live, informed by SO-3's measured deep-end
 # absorption (PLAN_V33 sec 6 / sec 8). No automatic promotion; Brad's dated go, like V3.2's.
 
