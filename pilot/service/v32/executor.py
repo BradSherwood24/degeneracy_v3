@@ -219,6 +219,10 @@ class OrderStatus:
     filled_count: int
     remaining_count: int | None
     available: bool
+    # V3.3 D3 (2026-09-30): the EXACT fractional fill (``fill_count_fp``) alongside the int.
+    # ``filled_count`` is unchanged (the int V3.2 has always used). A V3.3-scoped caller reads
+    # ``filled_count_fp`` so a 0.44 crypto fill is never truncated to 0. Defaults to 0 (fail-closed).
+    filled_count_fp: Decimal = Decimal(0)
 
 
 def parse_order_status(body: dict[str, Any], order_id: str) -> OrderStatus:
@@ -245,6 +249,14 @@ def parse_order_status(body: dict[str, Any], order_id: str) -> OrderStatus:
         except Exception:  # noqa: BLE001
             return None
 
+    def _d(v: Any) -> Decimal | None:
+        if v is None:
+            return None
+        try:
+            return Decimal(str(v))
+        except Exception:  # noqa: BLE001
+            return None
+
     status = order.get("status")
     # documented (fixed-point) fields first, legacy names as a fallback.
     remaining = _i(order.get("remaining_count_fp"))
@@ -265,12 +277,37 @@ def parse_order_status(body: dict[str, Any], order_id: str) -> OrderStatus:
         filled = max(0, initial - remaining)
     if filled is None:
         filled = 0
+    # V3.3 D3: the EXACT fractional fill, mirroring the int resolution but keeping the decimal (0.44).
+    rem_fp = _d(order.get("remaining_count_fp"))
+    if rem_fp is None:
+        rem_fp = _d(order.get("remaining_count"))
+    init_fp = _d(order.get("initial_count_fp"))
+    if init_fp is None:
+        init_fp = _d(order.get("place_count"))
+    filled_fp = _d(order.get("fill_count_fp"))
+    if filled_fp is None:
+        filled_fp = _d(order.get("fill_count"))
+    if filled_fp is None:
+        mk = _d(order.get("maker_fill_count")) or Decimal(0)
+        tk = _d(order.get("taker_fill_count")) or Decimal(0)
+        if mk or tk:
+            filled_fp = mk + tk
+    if filled_fp is None and init_fp is not None and rem_fp is not None:
+        filled_fp = max(Decimal(0), init_fp - rem_fp)
+    if filled_fp is None:
+        filled_fp = Decimal(filled)
     return OrderStatus(order_id=order.get("order_id") or order_id, status=status,
-                       filled_count=int(filled), remaining_count=remaining, available=True)
+                       filled_count=int(filled), remaining_count=remaining, available=True,
+                       filled_count_fp=filled_fp)
 
 
 class LiveExecutor:
     """The armed maker executor. See module docstring for the law."""
+
+    # V3.3 D3 (2026-09-30): a roster opt-in to fractional-count cancel resolution. FALSE here so V3.2's
+    # cancel-confirm path is byte-identical (int filled, int journal). ``V33LiveExecutor`` sets it True to
+    # thread the EXACT ``fill_count_fp`` (0.44) into the OrderCancelled + journal — the incident's own path.
+    _fractional_counts: bool = False
 
     def __init__(
         self,
@@ -318,6 +355,7 @@ class LiveExecutor:
         self.rest_invariant_phantoms = 0    # resting-list entries filtered as read-path phantoms (not real)
         self.rest_invariant_rechecks = 0    # times the invariant re-read the list before declaring a stray
         self._last_confirmed_gone_oid: str | None = None  # excluded from the pre-PLACE invariant
+        self._last_confirm_status_fp: Decimal = Decimal(0)  # V3.3 D3: last cancel-poll fractional fill
         # amend-first replace counters (Brad 2026-09-15) — surfaced on the ledger row next to replaces.
         self.amends_attempted = 0         # AMEND_REST actions that reached a POST (or the no-oid fallback)
         self.amends_confirmed = 0         # amends that returned 2xx
@@ -642,8 +680,10 @@ class LiveExecutor:
                 rec = self.attribute(order_id=oid)
                 if rec is not None:
                     self._last_confirmed_gone_oid = oid
+                    filled_fp = (st.filled_count_fp if (self._fractional_counts and st.available)
+                                 else None)
                     fill_events += self._finish_cancel(rec, oid, filled, wr.status_code, None, now,
-                                                       via="invariant_fill")
+                                                       via="invariant_fill", filled_fp=filled_fp)
                 else:
                     unbooked_fill = True
                     self._record_alarm("rest_invariant_unbooked_fill",
@@ -733,7 +773,14 @@ class LiveExecutor:
         filled = max(filled_delete or 0, filled_status)
         self.cancels_confirmed += 1
         self._last_confirmed_gone_oid = oid
-        return self._finish_cancel(rec, oid, filled, wr.status_code, rb, now)
+        # V3.3 D3: the EXACT fractional fill = max(placed - reduced_by, status fp). ``reduced_by`` (0.56)
+        # and ``fill_count_fp`` keep the fraction the int path truncated (1 - int(0.56) = 1, the bug).
+        filled_fp = None
+        if self._fractional_counts:
+            fp_delete = (max(Decimal(0), Decimal(rec.count) - rb)
+                         if (rb is not None and rec is not None) else Decimal(0))
+            filled_fp = max(fp_delete, self._last_confirm_status_fp)
+        return self._finish_cancel(rec, oid, filled, wr.status_code, rb, now, filled_fp=filled_fp)
 
     def _cancel_nonok(self, wr, rec, oid: str, exch: int | None, coid, now: float) -> list[Any]:
         """A non-2xx DELETE (incl 404) is NOT proof the order is gone AND is not proof it still rests —
@@ -802,39 +849,52 @@ class LiveExecutor:
         else:
             self.cancels_via_status += 1
             via = "status"
-        return self._finish_cancel(rec, oid, int(st.filled_count), delete_status, None, now, via=via)
+        filled_fp = st.filled_count_fp if self._fractional_counts else None
+        return self._finish_cancel(rec, oid, int(st.filled_count), delete_status, None, now, via=via,
+                                   filled_fp=filled_fp)
 
     def _finish_cancel(self, rec, oid: str, filled: int, delete_status, rb, now: float,
-                       *, via: str = "delete") -> list[Any]:
+                       *, via: str = "delete", filled_fp: Decimal | None = None) -> list[Any]:
         """Common cancel resolution: mark the RestRecord (RETAINED for late-fill attr, F-1), book a
         race fill into money-math if one slipped in (maker fee 0, de-duped by order_id), journal
-        ``cancel_confirmed``, and hand the core an OrderCancelled carrying the filled count."""
+        ``cancel_confirmed``, and hand the core an OrderCancelled carrying the filled count.
+
+        V3.3 D3: ``filled_fp`` (Decimal) is the EXACT fractional fill. When None (V3.2) the int ``filled``
+        is used exactly as before (byte-identical). When provided (V3.3, ``_fractional_counts``) the
+        OrderCancelled, the ``cancel_confirmed`` journal and the race-fill count carry the decimal so a
+        0.44 leg is not truncated — this is the incident's own surfacing path."""
+        val = filled_fp if filled_fp is not None else filled          # journal + race-fill count value
+        event_filled = filled_fp if filled_fp is not None else Decimal(filled)
         if rec is not None:
-            rec.status = "filled" if filled > 0 else "cancelled"
+            rec.status = "filled" if event_filled > 0 else "cancelled"
             rec.cancel_confirmed_ts = now  # engine-truth confirm time; a later resting-LIST read still
             # showing this order within CANCEL_SETTLE_S is a phantom (2026-09-15 read-path-lag fix).
-            if filled > 0 and rec.order_id is not None and rec.order_id not in self.booked_rest_oids:
+            if event_filled > 0 and rec.order_id is not None and rec.order_id not in self.booked_rest_oids:
                 self.booked_rest_oids.add(rec.order_id)
                 self.fills.append({"leg": "rest", "side": "no", "ticker": rec.ticker,
                                    "price": rec.price, "exec_price": None, "fee": Decimal(0),
-                                   "count": int(filled), "bucket_Sd": rec.bucket_Sd,
+                                   "count": (val if filled_fp is not None else int(filled)),
+                                   "bucket_Sd": rec.bucket_Sd,
                                    "path": "cancel_race", "client_order_id": rec.client_order_id})
         self.journal.append("cancel_confirmed",
                             {"order_id": oid, "delete_status": delete_status,
                              "reduced_by": (str(rb) if rb is not None else None),
-                             "filled_before_cancel": filled, "via": via}, self.clock())
+                             "filled_before_cancel": val, "via": via}, self.clock())
         return [OrderCancelled(order_id=oid, server_ts=now,
-                               filled_count_before_cancel=Decimal(filled))]
+                               filled_count_before_cancel=event_filled)]
 
     def _confirm_cancel_filled(self, order_id: str, now: float) -> int:
         """Poll order-status up to CANCEL_CONFIRM_POLLS times; return filled_count_before_cancel.
         The status is authoritative for the race; an unreadable status yields 0 (fail toward re-solve,
-        journaled by the caller)."""
+        journaled by the caller). V3.3 D3: also stashes the EXACT fractional fill in
+        ``self._last_confirm_status_fp`` for the fractional cancel resolution (V3.2 ignores it)."""
         filled = 0
+        self._last_confirm_status_fp = Decimal(0)
         for i in range(CANCEL_CONFIRM_POLLS):
             st = self.order_status(order_id)
             if st.available:
                 filled = st.filled_count
+                self._last_confirm_status_fp = st.filled_count_fp
                 # once the order is off the book (not resting) the count is final.
                 if st.status not in ("resting", None) or st.remaining_count == 0:
                     return filled

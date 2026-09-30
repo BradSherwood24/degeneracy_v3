@@ -206,6 +206,9 @@ class V33LiveExecutor(LiveExecutor):
     create). Every other order path is inherited unchanged."""
 
     COID_PREFIX = _V33_COID_PREFIX
+    # V3.3 D3 (2026-09-30 incident): resolve cancels with the EXACT fractional fill (fill_count_fp) so a
+    # 0.44 leg surfaced by the cancel confirm is not truncated to 0. V3.2 keeps the int path.
+    _fractional_counts = True
 
     def __init__(
         self,
@@ -607,11 +610,12 @@ class V33LiveExecutor(LiveExecutor):
     # =====================================================================
     # batched order-status poll (NIT-d): one GET /portfolio/orders?ticker= vs per-rung GETs
     # =====================================================================
-    def poll_orders_for_bucket(self, ticker: str) -> dict[str, int]:
+    def poll_orders_for_bucket(self, ticker: str) -> dict[str, Decimal]:
         """ARMED batched poll: GET /portfolio/orders?ticker=<bucket> once and return {order_id:
         cumulative_filled_count} for OUR (v33-*) orders on that bucket. Replaces K per-rung status GETs
         (11 GETs/s at K=11). Per-order dedup stays the driver's job (it feeds the DELTA over what the core
-        booked). Fail-closed to {} on any error."""
+        booked). Fail-closed to {} on any error. D3 (2026-09-30): the cumulative fill is a DECIMAL
+        (``fill_count_fp``), not int-truncated — a 0.44 poll-discovered fill must not vanish."""
         try:
             body = self.writer.rest_get(OPEN_ORDERS_PATH, {"ticker": ticker})
         except Exception as e:  # noqa: BLE001
@@ -620,7 +624,7 @@ class V33LiveExecutor(LiveExecutor):
         orders = (body or {}).get("orders") if isinstance(body, dict) else None
         if not isinstance(orders, list):
             return {}
-        out: dict[str, int] = {}
+        out: dict[str, Decimal] = {}
         for o in orders:
             if not isinstance(o, dict):
                 continue
@@ -632,9 +636,9 @@ class V33LiveExecutor(LiveExecutor):
             if fc is None:
                 fc = o.get("fill_count")
             try:
-                out[str(oid)] = int(Decimal(str(fc))) if fc is not None else 0
+                out[str(oid)] = Decimal(str(fc)) if fc is not None else Decimal(0)
             except Exception:  # noqa: BLE001
-                out[str(oid)] = 0
+                out[str(oid)] = Decimal(0)
         return out
 
     # =====================================================================
