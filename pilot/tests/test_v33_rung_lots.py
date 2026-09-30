@@ -40,7 +40,7 @@ from service.v33.core import (
     _resting_contracts,
     _weight_of_rung,
 )
-from service.v33.params import DEFAULT_V33_PARAMS_PATH, V33ParamsInvalid
+from service.v33.params import DEFAULT_V33_PARAMS_PATH, FROZEN_V33_PARAMS_SHA256, V33ParamsInvalid
 from service.v33.report import build_allocation_table
 import service.run_v33 as RUN
 
@@ -67,7 +67,11 @@ def _top(bid: str, ask: str) -> TopOfBook:
 
 
 def _params(weights=WEIGHTS, **over) -> V33Params:
-    base = dict(tol=Decimal("0.01"), deb_ms=0,
+    # E_min pinned at 0.05 (the L1 controlled ladder: sd_ask 0.76 -> n_top 0.50, rungs 0.50..0.40) so the
+    # absolute prices below stay meaningful after the L4 shift to E_min 0.08 -- the same pin the other
+    # mechanism/parity helpers use (test_v33_core._params, test_v33_golden._sweep_params). The weighting
+    # mechanism is E_min-invariant; the SHIPPED 8..18c ladder is asserted end-to-end in test_v33_core.
+    base = dict(E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
                 freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)
     base.update(over)
     p = replace(load_v33_params(), **base)
@@ -179,10 +183,15 @@ def test_not_a_list_fails_closed(tmp_path):
         load_v33_params(q, expected_sha=None)
 
 
-def test_sha_unchanged_by_this_build():
-    # the shipped JSON has NO rung_lots key, so its canonical sha is untouched by L5.
+def test_shipped_policy_has_no_rung_lots_key_and_loads_at_the_pinned_sha():
+    # L5 adds no key to the shipped JSON: rung_lots is ABSENT (uniform default) and the file loads at the
+    # code-pinned sha (whatever regime pinned it -- L4 re-pinned to 8..18c the same day; the literal old
+    # sha is history, not a test oracle).
+    raw = json.loads(open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8").read())
+    assert "rung_lots" not in raw
     p = load_v33_params()
-    assert p.sha256 == "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
+    assert p.sha256 == FROZEN_V33_PARAMS_SHA256
+    assert p.rung_lots == (p.lots_per_rung,) * p.rungs
 
 
 # =====================================================================================
