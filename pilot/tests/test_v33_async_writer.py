@@ -19,6 +19,7 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -286,6 +287,267 @@ def test_writer_stats_recorded():
     assert summ["by_class"][CLASS_CANCEL] == 1
     assert summ["latency_ms_max"] is not None and summ["latency_ms_max"] >= 0.0
     assert summ["max_inflight"] >= 1
+
+
+# ===========================================================================
+# V33AsyncExecutor — the off-loop armed executor (async twins of the sync paths)
+# ===========================================================================
+import random  # noqa: E402
+
+from service.v32.actions import ActionKind, V32Action  # noqa: E402
+from service.v32.events import OrderAck, OrderAmended, OrderCancelled  # noqa: E402
+from service.v32.executor import OPEN_ORDERS_PATH, RestRecord  # noqa: E402
+from service.v33 import V33State, WingLeg, load_v33_params  # noqa: E402
+from service.v33.async_executor import V33AsyncExecutor, cancel_stale_open_orders_async  # noqa: E402
+from tests.test_v33_executor import B, BUCKET_MAP, CLOSE, CTS, EXCH, FakeJournal  # noqa: E402
+
+
+def _aexec(fake, journal=None, *, k=11, wing_cap=2, batch_create=False):
+    aw = AsyncOrderWriter(fake, wing_workers=6, cancel_workers=12, normal_workers=12)
+    ex = V33AsyncExecutor(aw, fake, BUCKET_MAP, EXCH, journal or FakeJournal(), CTS, 300,
+                          k_rungs=k, clock=lambda: 0.0, sleep=lambda _s: None, wing_cap=wing_cap,
+                          batch_create=batch_create)
+    return ex, aw
+
+
+def _place(coid="v33-c1", n="0.45"):
+    return V32Action(kind=ActionKind.PLACE_REST, ticker=B, side="no", action="buy", count=1,
+                     price=Decimal(n), expiration_epoch=CTS - 300, client_order_id=coid)
+
+
+def _state():
+    return V33State.new(CLOSE, CTS, BUCKET_MAP, load_v33_params())
+
+
+def test_async_place_records_rung_and_acks():
+    fake = FakeProxyWriter()
+
+    async def go():
+        ex, aw = _aexec(fake)
+        try:
+            events = await ex.on_action_async(_place("v33-r0", "0.45"), _state(), CTS - 600)
+            return events, ex
+        finally:
+            aw.close()
+
+    events, ex = asyncio.run(go())
+    assert any(isinstance(e, OrderAck) for e in events)
+    rec = ex.rest_book["v33-r0"]
+    assert rec.status == "live" and rec.price == Decimal("0.45")
+    posts = [c for c in fake.calls if c.verb == "post"]
+    assert posts[0].klass == CLASS_REST and posts[0].body["post_only"] is True
+
+
+def test_async_roll_amend_persists_order_id():
+    fake = FakeProxyWriter()
+
+    async def go():
+        ex, aw = _aexec(fake)
+        try:
+            await ex.on_action_async(_place("v33-r0", "0.45"), _state(), CTS - 600)
+            oid = ex.rest_book["v33-r0"].order_id
+            fake.post_queue.append(WriteResponse(200, {"order": {"order_id": oid,
+                                                                "client_order_id": "v33-r0b",
+                                                                "fill_count": "0.00",
+                                                                "remaining_count": "1.00"}}, True))
+            amend = V32Action(kind=ActionKind.AMEND_REST, order_id=oid, ticker=B, side="no",
+                              action="buy", count=1, price=Decimal("0.44"), client_order_id="v33-r0",
+                              updated_client_order_id="v33-r0b")
+            events = await ex.on_action_async(amend, _state(), CTS - 590)
+            return events, ex, oid
+        finally:
+            aw.close()
+
+    events, ex, oid = asyncio.run(go())
+    assert any(isinstance(e, OrderAmended) and e.order_id == oid for e in events)
+    assert ex.rest_book["v33-r0b"].order_id == oid and ex.amends_confirmed == 1
+    amends = [c for c in fake.calls if c.verb == "post" and "/amend" in c.path]
+    assert amends and amends[0].klass == "roll"
+
+
+def test_async_amend_failure_falls_back_to_cancel_create():
+    fake = FakeProxyWriter()
+
+    async def go():
+        ex, aw = _aexec(fake)
+        try:
+            await ex.on_action_async(_place("v33-r0", "0.45"), _state(), CTS - 600)
+            oid = ex.rest_book["v33-r0"].order_id
+            fake.post_queue.append(WriteResponse(403, {"error": "amend blocked"}, False, "http_403"))
+            amend = V32Action(kind=ActionKind.AMEND_REST, order_id=oid, ticker=B, side="no",
+                              action="buy", count=1, price=Decimal("0.44"), client_order_id="v33-r0",
+                              updated_client_order_id="v33-r0b")
+            events = await ex.on_action_async(amend, _state(), CTS - 590)
+            return events, ex
+        finally:
+            aw.close()
+
+    events, ex = asyncio.run(go())
+    assert ex.amends_failed == 1 and ex.amend_fallbacks == 1
+    assert any(isinstance(e, OrderCancelled) for e in events)
+    assert any(c.verb == "delete" for c in fake.calls)
+
+
+def test_async_pre_place_invariant_overflow_stands_down():
+    fake = FakeProxyWriter()
+    k = 3
+    fake.get_map[OPEN_ORDERS_PATH] = {"orders": [
+        {"order_id": f"oid-{i}", "client_order_id": f"v33-old{i}", "exchange_index": 2, "ticker": B}
+        for i in range(k)]}
+
+    async def go():
+        ex, aw = _aexec(fake, k=k)
+        try:
+            for i in range(k):
+                ex.rest_book[f"v33-old{i}"] = RestRecord(
+                    client_order_id=f"v33-old{i}", order_id=f"oid-{i}", price=Decimal("0.40"),
+                    count=1, ticker=B, bucket_Sd=80400, placed_ts=0.0, status="live", exchange_index=2)
+                ex._by_order_id[f"oid-{i}"] = f"v33-old{i}"
+            events = await ex.on_action_async(_place("v33-new", "0.45"), _state(), CTS - 600)
+            return events, ex
+        finally:
+            aw.close()
+
+    events, ex = asyncio.run(go())
+    assert ex.stand_down_reason == "rest_invariant_violation"
+    assert ex.rest_invariant_overflow == 1
+    assert not any(c.verb == "post" and c.body.get("client_order_id") == "v33-new" for c in fake.calls)
+    assert any(isinstance(e, OrderCancelled) for e in events)
+
+
+def test_async_unknown_outcome_never_replaced_over():
+    fake = FakeProxyWriter()
+    fake.post_queue.append(WriteResponse(503, {}, False, "http_503"))
+
+    async def go():
+        ex, aw = _aexec(fake)
+        try:
+            e1 = await ex.on_action_async(_place("v33-u1", "0.45"), _state(), CTS - 600)
+            posts_before = len([c for c in fake.calls if c.verb == "post"])
+            return e1, ex, posts_before
+        finally:
+            aw.close()
+
+    e1, ex, posts_before = asyncio.run(go())
+    assert ex.stand_down_reason == "post_unknown_outcome"
+    assert "v33-u1" in ex.rest_book and ex.rest_book["v33-u1"].status == "unknown"
+    assert posts_before == 1
+
+
+def test_async_429_on_wing_retried_on_wing_lane():
+    fake = FakeProxyWriter()
+    fake.post_queue.append(WriteResponse(429, {}, False, "http_429"))
+
+    async def go():
+        from dataclasses import replace as dc_replace
+        st = _state()
+        leg = WingLeg(ticker=B, side="yes", count=1, limit=Decimal("0.03"),
+                      client_order_id="v33-w0", batch=0)
+        st = dc_replace(st, wing_legs=(leg,))
+        ex, aw = _aexec(fake, wing_cap=2)
+        try:
+            await ex.on_action_async(
+                V32Action(kind=ActionKind.TAKE_WINGS, legs=[], count=1), st, CTS - 500)
+            return ex
+        finally:
+            aw.close()
+
+    ex = asyncio.run(go())
+    wing_posts = [c for c in fake.calls if c.verb == "post" and c.klass == CLASS_WING]
+    assert len(wing_posts) == 2
+    assert ex.async_rate_limited == 1
+
+
+class FakeVenue:
+    """Stateful in-process venue: a create adds a resting order (our coid), a cancel removes it, a GET
+    returns the resting list / one order's status. Each call sleeps a random latency on its worker thread.
+    Tracks the max simultaneous count of OUR rests (the K-invariant witness)."""
+
+    def __init__(self, seed):
+        self.rng = random.Random(seed)
+        self._lock = threading.Lock()
+        self.resting = {}
+        self._oid = 0
+        self.max_ours = 0
+
+    def _sleep(self):
+        time.sleep(self.rng.uniform(0.0, 0.006))
+
+    def rest_post(self, path, body, headers=None):
+        self._sleep()
+        coid = body.get("client_order_id") or ""
+        with self._lock:
+            self._oid += 1
+            oid = f"oid-{self._oid}"
+            if body.get("post_only"):
+                self.resting[oid] = {"coid": coid, "ticker": body.get("ticker")}
+                ours = sum(1 for r in self.resting.values() if str(r["coid"]).startswith("v33-"))
+                self.max_ours = max(self.max_ours, ours)
+            return WriteResponse(200, {"order": {"order_id": oid, "client_order_id": coid,
+                                                 "fill_count": "0.00", "remaining_count": "1.00"}}, True)
+
+    def rest_delete(self, path, headers=None):
+        self._sleep()
+        oid = path.split("/")[-1].split("?")[0]
+        with self._lock:
+            self.resting.pop(oid, None)
+        return WriteResponse(200, {"reduced_by": "1.00"}, True)
+
+    def rest_get(self, path, params=None):
+        self._sleep()
+        with self._lock:
+            if path == OPEN_ORDERS_PATH:
+                orders = [{"order_id": oid, "client_order_id": r["coid"], "exchange_index": 2,
+                           "ticker": r["ticker"]} for oid, r in self.resting.items()]
+                return {"orders": orders}
+            oid = path.split("/")[-1]
+            if oid in self.resting:
+                return {"order": {"order_id": oid, "status": "resting", "fill_count_fp": "0.00",
+                                  "remaining_count_fp": "1.00"}}
+            return {"order": {"order_id": oid, "status": "canceled", "fill_count_fp": "0.00",
+                              "remaining_count_fp": "0.00"}}
+
+
+def test_property_never_more_than_k_rests_under_random_latencies():
+    K = 4
+    for seed in range(12):
+        venue = FakeVenue(seed)
+
+        async def go():
+            ex, aw = _aexec(venue, k=K)
+            try:
+                for i in range(K):
+                    await ex.on_action_async(_place(f"v33-r{i}", f"0.4{i}"), _state(), CTS - 600)
+                await asyncio.gather(*[
+                    ex.on_action_async(_place(f"v33-x{j}", "0.30"), _state(), CTS - 590)
+                    for j in range(4)])
+                return ex
+            finally:
+                aw.close()
+
+        asyncio.run(go())
+        assert venue.max_ours <= K, f"seed {seed}: venue held {venue.max_ours} > K={K}"
+
+
+def test_async_startup_sweep_scoped_to_v33():
+    fake = FakeProxyWriter()
+    fake.get_map[OPEN_ORDERS_PATH] = {"orders": [
+        {"order_id": "oid-a", "client_order_id": "v33-old", "ticker": B, "exchange_index": 2},
+        {"order_id": "oid-b", "client_order_id": "v32-live", "ticker": B, "exchange_index": 2},
+    ]}
+    journal = FakeJournal()
+
+    async def go():
+        aw = AsyncOrderWriter(fake, wing_workers=2, cancel_workers=2, normal_workers=2)
+        try:
+            return await cancel_stale_open_orders_async(aw, journal, lambda: 0.0)
+        finally:
+            aw.close()
+
+    result = asyncio.run(go())
+    assert result["found"] == 1 and result["cancelled"] == 1 and result["skipped_foreign"] == 1
+    assert any(c.verb == "delete" and "oid-a" in c.path for c in fake.calls)
+    assert not any(c.verb == "delete" and "oid-b" in c.path for c in fake.calls)
 
 
 if __name__ == "__main__":  # pragma: no cover

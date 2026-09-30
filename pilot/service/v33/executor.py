@@ -199,6 +199,38 @@ class WriteTokenBucket:
         self.tokens -= cost
         return wait
 
+    async def acquire_async(self, cost: int, kind: str, *, priority: bool = False) -> float:
+        """The ASYNC twin of ``acquire`` for the off-loop writer (2026-09-30): identical token accounting,
+        but the pacing wait is ``await asyncio.sleep`` (which YIELDS the loop) instead of a blocking
+        ``time.sleep`` that would freeze the feed. Serialized by ``_alock`` so concurrent creates/rolls
+        never both pass the ``tokens < cost + floor`` check across the await and overspend the bucket."""
+        import asyncio
+        lock = getattr(self, "_alock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._alock = lock
+        async with lock:
+            self._refill()
+            wait = 0.0
+            floor = 0.0 if priority else self.reserve
+            if not priority and self.tokens < cost + floor:
+                wait = (cost + floor - self.tokens) / self.rate if self.rate > 0 else 0.0
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    self.total_wait_s += wait
+                    self.paced_waits += 1
+                    if self._journal is not None:
+                        try:
+                            self._journal.append("write_paced",
+                                                 {"kind": kind, "cost": cost, "reserve": self.reserve,
+                                                  "wait_s": round(wait, 4), "async": True},
+                                                 self._clock())
+                        except Exception:  # noqa: BLE001 — pacing telemetry must never break the send
+                            pass
+                    self._refill()
+            self.tokens -= cost
+            return wait
+
 
 class V33LiveExecutor(LiveExecutor):
     """The armed maker executor for the K-rung ladder. Subclasses ``LiveExecutor`` and overrides only
