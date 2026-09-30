@@ -28,7 +28,12 @@ from service.v33 import (
     load_v33_params,
 )
 from service.v33.actions import V33ActionKind
-from service.v33.ledger import compute_ladder_money_math
+from service.v33.ledger import (
+    build_v33_ledger_row,
+    compute_ladder_money_math,
+    v33_settlement_backfill_sweep,
+)
+from service.ledger import settlement_payoff
 
 CLOSE = "2026-09-04T20:00:00Z"
 T = 1_000_000
@@ -217,3 +222,49 @@ def test_partial_overlap_nets_the_smaller_and_leaves_the_remainder_held():
     held_79700 = [h for h in m["held_legs"] if h["ticker"] == STK_79700]
     assert len(held_79700) == 1                        # only B's 0.56 YES remainder is held
     assert Decimal(str(held_79700[0]["count"])) == Decimal("0.56")
+
+
+# ===========================================================================
+# review r2: the netted $1 must SURVIVE the settlement backfill (regression)
+# ===========================================================================
+def _row_from(st, m):
+    return build_v33_ledger_row(
+        close_time=CLOSE, resolved_mode="armed", effective_mode="armed", armed=True, dry_sim=False,
+        params=None, strike_count=3, bucket_count=3, rung_fills=m["rung_fills"],
+        wing_batch_sets=m["wing_batch_sets"], held_legs=m["held_legs"], floor_booked=m["floor_booked"],
+        realized_delta=m["realized_delta"], realized_lock=m["realized_lock"], one_legged=m["one_legged"],
+        lots_filled=m["lots_filled"], realized_unsettled=m["realized_unsettled"], state=st,
+        driver_counts={}, executor_counts={}, ws_counts={}, netted_sets=m["netted_sets"], record_count=0,
+        degrade=False, journal_path="x", stand_down_reason=None, now=1.0, params_sha="s",
+    )
+
+
+def test_netted_dollar_survives_the_settlement_backfill():
+    """review r2 BUG: ``floor_booked`` includes the netted $1, but the netted market is EXCLUDED from the
+    settlement legs, so the backfill correction ``payoff - floor_booked`` silently removed the dollar. The
+    backfill must add the netted credit back to the settlement payoff so the window's TOTAL realised
+    (close estimate + settlement correction) keeps it."""
+    p = _params()
+    st, _ = _drive_two_sets(p)
+    m = compute_ladder_money_math(st, dry_sim=False)
+    row = _row_from(st, m)
+    settle = {B_A: "no", B_B: "yes", STK_79600: "yes", STK_79800: "no"}  # settle in bucket B [79700,79800)
+    bf = v33_settlement_backfill_sweep([row], lambda tk: settle.get(tk), now=1.0)
+    assert len(bf) == 1
+    held = row["unsettled_legs"]
+    held_payoff = settlement_payoff(held, {h["ticker"]: settle[h["ticker"]] for h in held})
+    netted = sum((Decimal(str(n["count"])) for n in m["netted_sets"]), Decimal(0))
+    assert netted == Decimal("1")
+    # the backfill payoff INCLUDES the netted credit (pre-fix it equalled held_payoff, losing the $1).
+    assert Decimal(str(bf[0]["settlement_payoff"])) == held_payoff + netted
+    # the window's TOTAL realised = close estimate + settlement correction, and equals
+    # held_payoff + netted - total_cost (the netted $1 is retained, not double-removed).
+    total = Decimal(str(m["realized_delta"])) + Decimal(str(bf[0]["realized_delta"]))
+    cost = Decimal(0)
+    for rf in m["rung_fills"]:
+        cost += Decimal(str(rf["price"])) * Decimal(str(rf["count"]))
+    from service.v33.ledger import _fee_total
+    for lg in st.wing_legs:
+        if lg.status == "filled" and lg.fill_price is not None:
+            cost += lg.fill_price * Decimal(str(lg.count)) + _fee_total(lg.fill_price, lg.count)
+    assert total == held_payoff + netted - cost

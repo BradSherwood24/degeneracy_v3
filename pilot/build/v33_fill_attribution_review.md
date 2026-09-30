@@ -127,3 +127,81 @@ no deadlock. Confirm at integration with both gates live.
 network/proxy; no process kills; params JSON/sha, falsifier STATUS and everything above `## Registration`
 untouched; the only live-tree access was READ-ONLY (ledger copied to scratchpad; `async_executor.py`
 fetched read-only, not merged). No push to `main`.
+
+---
+
+# Round 2 review (fix @ `7d37c0f`; review branch `review/v33-fill-attribution-r2`)
+
+Reviewed b100da3 (F2 fill-discovery Decimal), 64ac380 (D5 netting + F3/F4/F5), 7d37c0f (tests + report).
+My r1 fix (`ebcd957`) is merged. Full suite on my r2 branch: **1402 passed / 5 skipped** (builder was
+1401/5; +1 my D5 backfill regression test).
+
+## VERDICT: REQUEST CHANGES — one verified money bug in D5 (fixed on this branch), everything else APPROVED
+
+F2, F3, F4, F5 and the V3.2 byte-identity are all correctly addressed. The NEW D5 netting feature has a
+settlement-accounting bug that loses exactly the netted $1/contract at backfill. I fixed it on
+`review/v33-fill-attribution-r2` with a regression test; it must be merged before D5 is trusted (armed).
+
+### R2-F1 — [BUG, fixed on this branch] D5 netted $1 is lost at the settlement backfill
+`compute_ladder_money_math` adds the netted credit to `floor` (→ the row's `floor_booked`), but the
+netted market is EXCLUDED from `held_legs`/`unsettled_legs`. The backfill books the correction
+`realized = settlement_payoff(held_legs) - floor_booked`, and since `floor_booked` includes the $1 while
+`payoff` does not, the correction silently removes it. I traced a 1-lot adjacent-bucket net end to end:
+- close `floor_booked = 3` (two 2-leg boxes @ $1 + $1 netted), `realized_delta(close) = -1.0004` (= 3 − cost 4.0004);
+- held-leg settlement payoff = **3.00**, backfill `floor_netted = 3`, so `realized_delta(bf) = 3.00 − 3 = 0.00`;
+- window total = close + correction = **−1.0004**, but the TRUE economics are held $3 + netted $1 − cost $4.0004 = **−0.0004**. Off by exactly the netted $1.
+
+Fix (`service/v33/ledger.py::v33_settlement_backfill_sweep`): add the row's `netted_sets` count back to
+the settlement payoff before the correction (the netted markets never settle for us, so the credit is
+fixed, not a lookup). After the fix the same trace gives `realized_delta(bf) = 1.00`, total = **−0.0004**
+— correct. Regression test `tests/test_v33_wing_netting.py::test_netted_dollar_survives_the_settlement_backfill`
+drives the state through close + backfill and asserts the backfill payoff includes the netted credit and
+the window total = `held_payoff + netted − cost`.
+
+### F2 — [APPROVED] fill DISCOVERY now Decimal end-to-end, V3.2 byte-identical
+- `parse_order_status` adds `filled_count_fp: Decimal` alongside the UNCHANGED `filled_count: int`; I
+  verified the int `filled` resolution block is textually unchanged from main (the diff only appends the
+  fp block + field) so `filled_count` is identical for every input (fractional "0.44"→int 0, "1.00"→1,
+  old-shape `fill_count` with no `_fp`→2, "1.44"→1). Old-shape (no `fill_count_fp`) falls back correctly.
+- `_fractional_counts` gate: FALSE on `LiveExecutor` (V3.2), TRUE on `V33LiveExecutor`. With it OFF,
+  `_finish_cancel`'s `val = filled_fp if not None else filled` is the bare int and the OrderCancelled is
+  `Decimal(filled)` — byte-identical to main (I read the journal branch by hand; the v32 suite's
+  `test_v32_cancel_confirm_stays_int_byte_identical` asserts `isinstance(...,int)`; full v32 suite green).
+  A V3.2 cancel carrying `fill_count_fp "0.44"` yields `filled=0` → OrderCancelled(0), journal 0 — exactly
+  main's behaviour.
+- `poll_orders_for_bucket` returns `dict[str, Decimal]`; `run_v33` poll call sites drop `int()` and feed
+  `fc` / `stt.filled_count_fp`. The end-to-end test drives the fraction from a FAKE PROXY response (not an
+  injected event) through the executor's cancel → OrderCancelled(0.44) → core → RungFill 0.44 → wings 0.44
+  on the FILL's bucket strikes. Thorough.
+
+### D5 netting — other checks (APPROVED beyond R2-F1)
+- (a) Partial overlap: `_net_wings` nets `min(avail_L, avail_M)`; 1.44 NO vs 2.00 YES → 1.44 netted, 0.56
+  YES held (test + ledger `held_ct = count − netted`).
+- (b) A netted leg keeps `status == "filled"` (only the separate `netted` field grows), so the one-leg
+  retry (`_retry_batch`, gated on `status == "unfilled"`) and print-through complete/unwind never re-take
+  it, and `_maybe_close_set` counts it filled. No path reads `netted` to re-take. Netting only ever fires
+  across ADJACENT buckets (Su_A == Sd_B, opposite sides) — within one bucket YES@Sd and NO@Su are
+  different tickers — so it is dormant single-bucket (every existing test unaffected; full suite green).
+- (c) Fees: the taker fee on BOTH wing buys is in `cost` (`_fee_total`, exact per-fill), so the realised
+  money (`floor − cost`, now correctly incl. the netted $1) is net of fees. The informational
+  `NettedPair.realised = q*(1 − yes_cost − no_cost)` includes a per-contract `fee()` approximation; the
+  money truth is `floor − cost` — no double-count of the netted legs' fees.
+- (d) Reconcile/stops: netted markets are position-0 and excluded from `held_legs`/`unsettled_legs`, so
+  the backfill never looks them up and `v33_pending_credit` (the S4 band) never counts them as pending (a
+  netted $1 is realised, not pending — correct). There is no V3.3 venue-position reconcile that would flag
+  a flat market as inherited/unknown (grep: the only "reconcile" refs are core rung/n_top, not positions).
+- (e) Window boundary: `netted_pairs` lives on the per-window `V33State` (fresh each window) and both sets
+  are in the SAME window (bucket moved mid-window); hours settle at close, so no cross-window netting.
+
+### F3 / F4 / F5 — [APPROVED]
+- F3: `report._row_bucket_mismatch` + `[BUCKET MISMATCH]` flags a row whose `rung_fills[].bucket_ticker`
+  is not among the held NO bucket tickers, with an honest caveat that pre-fix rows carry no bucket_ticker
+  so only a NEW divergence is flagged. It does not false-flag D5 netting (the bucket-NO range legs are
+  never netted, only the strike-wing legs).
+- F4: `_pt_wing_asks` deleted (grep clean).
+- F5: `_count_out`/`_count_dec` moved below the `logger` definition, out from between the imports.
+
+House law kept (r2): `python` only; no `.env`/`*.pem`/`sealed_eval`; SEAL untouched; no network/proxy; no
+kills; the only fix touches `service/v33/ledger.py` (V3.3 backfill) + a test — not the live-shared V2
+executor path, not params/sha/STATUS. Worktree left detached + clean; pushed to
+`review/v33-fill-attribution-r2`.

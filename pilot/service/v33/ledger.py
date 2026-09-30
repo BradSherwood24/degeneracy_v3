@@ -564,11 +564,22 @@ def v33_settlement_backfill_sweep(rows: list[dict[str, Any]], fetch_result, now:
         if incomplete:
             continue
         payoff = settlement_payoff(legs, results)
+        # D5 (review r2): a venue-netted YES/NO pair paid $1/contract at close and its market was EXCLUDED
+        # from ``legs`` (position 0, never looked up). The close ``floor_booked`` INCLUDES that $1, so the
+        # settlement payoff of the HELD legs must add it back or the correction ``payoff - floor_booked``
+        # silently removes the netted dollar (verified: a 1-lot adjacent-bucket net lost exactly $1). The
+        # netted markets never settle for us, so this credit is fixed, not a settlement lookup.
+        netted_credit = _ZERO
+        for ns in (entry.get("netted_sets") or []):
+            netted_credit += _dc(ns.get("count", 0) if isinstance(ns, dict) else 0)
+        payoff = Decimal(str(payoff)) + netted_credit
         floor = _v33_floor_booked_for_entry(entry, legs)
         note = ("floor_booked (explicit)" if entry.get("floor_booked") is not None
                 else ("reconstructed from wing_batch_sets"
                       if isinstance(entry.get("wing_batch_sets"), list) and entry.get("wing_batch_sets")
                       else "reconstructed from legs (fail-closed)"))
+        if netted_credit > 0:
+            note = f"{note}; +{netted_credit} netted credit"
         out.append(build_v33_backfill_row(entry, results, payoff, floor, now,
                                           legs_priced=len(legs), backfill_note=note))
     return out
