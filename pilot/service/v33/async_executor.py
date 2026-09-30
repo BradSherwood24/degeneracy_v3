@@ -217,7 +217,7 @@ class V33AsyncExecutor(V33LiveExecutor):
         exch = self._exch(ticker)
         if exch is None:
             return self._reject_place(coid, ticker, now, {"reason": "no_exchange_index"})
-        violation = await self._pre_place_invariant_async(coid, now)
+        violation = await self._pre_place_invariant_async(coid, now, place_price=action.price)
         if violation is not None:
             return violation
         body = self._rest_body(action, coid, exch)
@@ -287,18 +287,26 @@ class V33AsyncExecutor(V33LiveExecutor):
             out.append({"order_id": oid, "client_order_id": coid, "exchange_index": exch})
         return out
 
-    async def _pre_place_invariant_async(self, coid: str, now: float) -> list[Any] | None:
+    async def _pre_place_invariant_async(self, coid: str, now: float,
+                                         place_price: Any = None) -> list[Any] | None:
         """Async twin of V33LiveExecutor._pre_place_invariant. First read decides on a healthy partial
         ladder with NO sleep; an anomaly triggers one ``await asyncio.sleep`` recheck; strays are cancelled
         and the place proceeds; a real overflow/dup stands the hour down (all logic reused via the inherited
-        pure ``_filter_phantoms`` / ``_invariant_verdict``)."""
+        pure ``_filter_phantoms`` / ``_invariant_verdict``).
+
+        ``place_price`` (THIS place's price) is threaded EXPLICITLY into ``_invariant_verdict`` so two
+        concurrently-dispatched places never read each other's price off the shared
+        ``_pending_place_price`` field across the open-orders GET await (review finding A1). Falls back to
+        the instance field only if a caller omits it."""
+        if place_price is None:
+            place_price = self._pending_place_price
         first = await self._venue_resting_ours_async(self._last_confirmed_gone_oid)
         if not first:
             return None
         first = self._filter_phantoms(first, now)
         if not first:
             return None
-        overflow, dup, strays = self._invariant_verdict(first)
+        overflow, dup, strays = self._invariant_verdict(first, place_price)
         if not (overflow or dup or strays):
             return None
         self.rest_invariant_rechecks += 1
@@ -310,7 +318,7 @@ class V33AsyncExecutor(V33LiveExecutor):
         reread = self._filter_phantoms(reread, now)
         if not reread:
             return None
-        overflow, dup, strays = self._invariant_verdict(reread)
+        overflow, dup, strays = self._invariant_verdict(reread, place_price)
         if not (overflow or dup or strays):
             return None
         if strays and not (overflow or dup):
@@ -323,7 +331,6 @@ class V33AsyncExecutor(V33LiveExecutor):
             self.journal.append("rest_stray_cancelled", info, self.clock())
             self._record_alarm("rest_stray_cancelled", info)
             return None
-        place_price = self._pending_place_price
         detail = {
             "count_resting": len(reread), "k": self.k_rungs, "coid_attempted": coid,
             "overflow": overflow, "dup_price": dup,
@@ -691,7 +698,7 @@ class V33AsyncExecutor(V33LiveExecutor):
                 events += self._reject_place(coid, ticker, now, {"reason": "no_exchange_index"})
                 continue
             self._pending_place_price = a.price
-            violation = await self._pre_place_invariant_async(coid, now)
+            violation = await self._pre_place_invariant_async(coid, now, place_price=a.price)
             if violation is not None:
                 events += violation
                 continue

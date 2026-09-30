@@ -750,5 +750,91 @@ def test_async_wing_retry_belt_allows_next_after_completion():
     assert len(wing_posts) == 2 and ex.wing_retries_dropped == 0
 
 
+# ===========================================================================
+# Review regressions (Opus 4.8 adversarial review, 2026-09-30)
+# ===========================================================================
+def test_async_concurrent_places_use_own_price_not_shared_field():
+    """FINDING A1: two PLACE_REST coroutines dispatched concurrently must each run the K-aware pre-place
+    dup check against THEIR OWN price, not whichever clobbered the shared ``_pending_place_price`` field
+    last across the open-orders GET await. A legit new rung (0.45) must NOT be killed because a concurrent
+    place at a genuinely-resting price (0.30) overwrote the field. Pre-fix this stood the whole hour down
+    and dropped the legit rung."""
+    from service.v32.executor import OPEN_ORDERS_PATH
+
+    fake = FakeProxyWriter(get_latency=0.03)  # slow GET widens the set->read interleave window
+
+    async def go():
+        ex, aw = _aexec(fake, k=11)
+        try:
+            # a REAL resting rung at 0.30 so a 2nd order at 0.30 is a genuine dup, but 0.45 is not.
+            await ex.on_action_async(_place("v33-dup", "0.30"), _state(), CTS - 600)
+            oid_dup = ex.rest_book["v33-dup"].order_id
+            fake.get_map[OPEN_ORDERS_PATH] = {"orders": [
+                {"order_id": oid_dup, "client_order_id": "v33-dup", "exchange_index": 2, "ticker": "X"}]}
+            a_ev, b_ev = await asyncio.gather(
+                ex.on_action_async(_place("v33-A", "0.45"), _state(), CTS - 590),
+                ex.on_action_async(_place("v33-B", "0.30"), _state(), CTS - 590))
+            return ex, a_ev, b_ev
+        finally:
+            aw.close()
+
+    ex, a_ev, b_ev = asyncio.run(go())
+    # the LEGIT rung at 0.45 is placed (an OrderAck, a live RestRecord) — never collateral of B's dup.
+    assert any(isinstance(e, OrderAck) for e in a_ev), f"legit 0.45 place was killed: {a_ev}"
+    assert "v33-A" in ex.rest_book and ex.rest_book["v33-A"].status == "live"
+    # B at the genuinely-resting 0.30 IS a real dup -> it (correctly) short-circuits with no OrderAck.
+    assert not any(isinstance(e, OrderAck) for e in b_ev)
+
+
+def test_pacer_priority_not_blocked_behind_nonpriority_sleep():
+    """FINDING A2: a PRIORITY acquire (wing take / cancel-all) must not wait behind a non-priority write's
+    pacing sleep. Pre-fix ``acquire_async`` held ``_alock`` across the ``asyncio.sleep``, so a priority
+    write blocked for the full non-priority wait (~0.4 s at the pinned reserve). The sleep now runs with
+    the lock released, so the priority write is served immediately."""
+    from service.v33.executor import WriteTokenBucket, COST_CREATE, COST_CANCEL
+
+    async def go():
+        clk = time.monotonic
+        b = WriteTokenBucket(rate=100.0, size=100.0, clock=clk, sleep=None, reserve=30.0)
+        b.tokens = 0.0  # drained -> a non-priority create must pace-sleep ~0.4 s
+        waited = {}
+
+        async def nonpri():
+            await b.acquire_async(COST_CREATE, "create")
+
+        async def wing():
+            await asyncio.sleep(0.01)             # ensure the create grabs the bucket first
+            s = clk()
+            await b.acquire_async(COST_CANCEL, "wing", priority=True)
+            waited["wing"] = clk() - s
+
+        await asyncio.gather(nonpri(), wing())
+        return waited["wing"]
+
+    wing_wait = asyncio.run(go())
+    assert wing_wait < 0.05, f"priority wing blocked {wing_wait:.3f}s behind a non-priority pacing sleep"
+
+
+def test_pacer_async_no_double_spend_under_concurrency():
+    """FINDING A2 (belt): releasing the lock across the sleep must NOT let concurrent writes double-spend.
+    Each write reserves its cost exactly once under the lock (deduct-then-sleep), so the bucket integral is
+    the serial one: starting tokens minus the sum of all costs (plus refill), never off by a dropped or
+    doubled deduction. Frozen clock isolates the deduction arithmetic from refill."""
+    from service.v33.executor import WriteTokenBucket
+
+    async def go():
+        b = WriteTokenBucket(rate=1000.0, size=50.0, clock=lambda: 0.0, sleep=None, reserve=10.0)
+
+        async def create():
+            await b.acquire_async(10, "create")
+
+        await asyncio.gather(*[create() for _ in range(20)])
+        return b.tokens
+
+    final = asyncio.run(go())
+    # frozen clock -> no refill: 20 writes x 10 tokens deducted from a size-50 bucket == 50 - 200 = -150.
+    assert final == -150.0, f"token conservation broken (double-spend or dropped deduct): {final}"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
