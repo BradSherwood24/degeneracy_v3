@@ -126,6 +126,25 @@ _LIMIT_CEILING = Decimal("0.99")
 # tiny epsilon for the print-through trigger boundary (a print exactly at the tick counts), matching
 # ``service.v33.shadow.ideal_rung_crosses``.
 _EPS = Decimal("0.000000001")
+# D4 (2026-09-30 incident): a missing wing leg is retried NO MORE OFTEN than this. The pre-fix retry
+# re-fired on EVERY book/trade/clock tick (967 IOC creates in ~96 s, blocking the loop ~60 s and burning
+# the daily create budget). The floor caps re-fires at 1/250 ms per missing leg while the lock-floor gate
+# and the T-``no_orders_after_s_to_settle`` cutoff still apply, and only one retry is ever in flight per
+# leg (a leg is skipped while ``status != "unfilled"``).
+WING_RETRY_MIN_INTERVAL_MS = 250
+# D3 count precision: Kalshi crypto fills are FRACTIONAL (``count_fp``); lots are carried as Decimal at
+# 2dp end-to-end (event -> book -> wing take -> ledger). A whole-lot count keeps 0 decimals so a dry
+# (1-lot) window is byte-identical; a fractional fill (e.g. 0.44) is preserved exactly.
+_COUNT_Q = Decimal("0.01")
+
+
+def _q_count(c: Decimal) -> Decimal:
+    """Normalise a lot count to 2dp Decimal, stripping a trailing-zero fraction so a whole count is the
+    bare integer Decimal (``Decimal('2')`` not ``Decimal('2.00')``) — this keeps whole-lot (dry) journals
+    byte-identical while a fractional count (``0.44``) survives quantisation."""
+    c = Decimal(c).quantize(_COUNT_Q)
+    return c.to_integral_value() if c == c.to_integral_value() else c
+
 
 BUY_YES = "yes"
 BUY_NO = "no"
@@ -143,7 +162,7 @@ class RestOrder:
     client_order_id: str
     order_id: str | None
     price: Decimal
-    count: int
+    count: Decimal        # lots resting (D3: Decimal — a partial fractional fill leaves a fractional rest)
     placed_ts: float
     live: bool
     pending: bool
@@ -167,7 +186,7 @@ class RungFill:
     rung: int
     E_rung: Decimal
     price: Decimal
-    count: int
+    count: Decimal        # lots filled in THIS event (D3: Decimal — Kalshi crypto fills are fractional)
     server_ts: float
     coid: str | None = None
     order_id: str | None = None
@@ -196,13 +215,16 @@ class WingLeg:
 
     ticker: str
     side: str
-    count: int
+    count: Decimal        # lots (D3: Decimal — sized to the batch's filled amount)
     limit: Decimal
     client_order_id: str
     status: str = "pending"
     fill_price: Decimal | None = None
     fill_fee: Decimal | None = None
     batch: int = 0
+    # D4 (2026-09-30): when this leg last had a RETRY_WING emitted for it. The retry is gated to no more
+    # often than ``WING_RETRY_MIN_INTERVAL_MS``; ``None`` = never retried (the initial take is unbounded).
+    last_retry_ts: float | None = None
 
 
 @dataclass(frozen=True)
@@ -227,15 +249,22 @@ class WingBatch:
     completed: bool = False
     one_legged: bool = False
     print_through: bool = False
-    taken_count: int = 0
+    taken_count: Decimal = _ZERO
     resolved: bool = False
+    # D2 (2026-09-30 incident): the spot bucket the batch's rungs FILLED on. Its wing strikes are solved
+    # from THIS bucket (never the current ``st.spot_Sd``, which may have moved on between fill and take).
+    # For a coalesced batch it is the fills' shared ``bucket_Sd``; for a print-through batch it is stamped
+    # at trigger time (the pre-hedged rungs' bucket). ``None`` only before any fill is attached.
+    bucket_Sd: int | None = None
+    # D4: RETRY_WING emissions issued for this batch (journalled per batch for the falsifier/report).
+    retries: int = 0
 
     @property
-    def total_count(self) -> int:
-        return sum(f.count for f in self.fills)
+    def total_count(self) -> Decimal:
+        return sum((f.count for f in self.fills), _ZERO)
 
     @property
-    def leg_count(self) -> int:
+    def leg_count(self) -> Decimal:
         """The count the wing legs were sized to: ``taken_count`` for a print-through batch (pre-hedged
         before fills exist), else ``total_count`` (the sum of the rung fills it coalesced)."""
         return self.taken_count if self.print_through else self.total_count
@@ -255,7 +284,7 @@ class PrintThroughTrigger:
     batch_index: int
     rung_coids: tuple[str, ...]
     rung_prices: tuple[Decimal, ...]
-    count: int
+    count: Decimal        # D3: Decimal lots (pre-hedged rung lots; fractional-safe)
     trigger_ts: float
     yes_print: Decimal
     W_at_trigger: Decimal | None
@@ -266,7 +295,7 @@ class PrintThroughTrigger:
     filled_coids: tuple[str, ...] = ()
     resolved: bool = False
     resolution: str | None = None            # filled | complete | unwind | partial
-    shortfall: int = 0                        # lots resolved by the stall policy (count - filled)
+    shortfall: Decimal = _ZERO                # lots resolved by the stall policy (count - filled)
     complete_price: Decimal | None = None     # bucket-NO ask paid on a `complete`
     lock_at_completion: Decimal | None = None
     roundtrip_cost: Decimal | None = None     # per-window unwind round-trip cost ($ total)
@@ -362,7 +391,15 @@ class V33State:
     rest_fills: tuple[RungFill, ...] = ()               # every rung fill booked this hour
     rungs_filled: int = 0                                # count of rungs filled (a set contributes 1)
     rest_booked_by_coid: Mapping[str, int] = field(default_factory=dict)
-    cancel_ctx: Mapping[str, tuple[str, Decimal, int, Decimal]] = field(default_factory=dict)
+    # D1 (2026-09-30 incident): the retained attribution record for an order removed from the ladder
+    # (eager-clear / cancel-all) whose cancel has not yet confirmed. Keyed by order_id ->
+    # (coid, price, rung, E_rung, bucket_Sd). ``bucket_Sd`` is the bucket the rung ACTUALLY rested on, so
+    # a late fill surfaced via the cancel-confirm path is attributed to the rung's OWN bucket, NEVER the
+    # current spot bucket (the incident mis-hedged because the fallback read ``spot_Sd`` after the bucket
+    # had moved on).
+    cancel_ctx: Mapping[str, tuple[str, Decimal, int, Decimal, int | None]] = field(default_factory=dict)
+    # D1: the hour is stood down fail-closed when a fill cannot be attributed to a named bucket.
+    bucket_unknown: bool = False
     amend_cross_pending: Mapping[str, int] = field(default_factory=dict)
     rest_allotment_done: bool = False                    # every rung filled (or max_sets) -> stop quoting
 
@@ -461,9 +498,11 @@ class V33State:
         max_w = max(params.rung_lots)
         for o in lad:
             # L5: an order carries the lots it was PLACED with (a slot's weight), less any partial fill,
-            # so it is a rung weight at most and >= 1 while resting (it drops at 0). It is NOT re-derived
-            # from the current slot (rolls keep count -> smearing; see the module "L5" note).
-            assert 1 <= o.count <= max_w, f"rung count {o.count} not in [1, max(rung_lots)={max_w}]"
+            # so it is a rung weight at most and > 0 while resting (it drops at 0). It is NOT re-derived
+            # from the current slot (rolls keep count -> smearing; see the module "L5" note). D3: a
+            # FRACTIONAL partial (count_fp) can leave a fractional remainder resting (e.g. 0.56 of a 1-lot
+            # rung), so the floor is ``> 0``, not ``>= 1``.
+            assert _ZERO < o.count <= max_w, f"rung count {o.count} not in (0, max(rung_lots)={max_w}]"
             assert isinstance(o.rung, int), f"bad rung index {o.rung!r}"
             assert o.price == o.price.quantize(_CENT), f"rung price {o.price} not a whole cent"
             assert o.price >= params.n_min, f"rung price {o.price} < n_min {params.n_min}"
@@ -586,14 +625,16 @@ def _allotment(params: V33Params) -> int:
     return sum(params.rung_lots)
 
 
-def _resting_contracts(st: V33State) -> int:
-    """Contracts currently live/pending on the resting rungs (sum of the ladder order counts)."""
-    return sum(int(o.count) for o in st.ladder)
+def _resting_contracts(st: V33State) -> Decimal:
+    """Contracts currently live/pending on the resting rungs (sum of the ladder order counts). D3: the
+    sum is Decimal (a fractional partial leaves a fractional resting remainder)."""
+    return sum((o.count for o in st.ladder), _ZERO)
 
 
-def _filled_contracts(st: V33State) -> int:
-    """Contracts filled this hour (sum of every booked rung-fill count, incl. taker completes)."""
-    return sum(int(f.count) for f in st.rest_fills)
+def _filled_contracts(st: V33State) -> Decimal:
+    """Contracts filled this hour (sum of every booked rung-fill count, incl. taker completes). D3:
+    Decimal (fractional fills)."""
+    return sum((f.count for f in st.rest_fills), _ZERO)
 
 
 def _sync_wing_mirrors(st: V33State) -> V33State:
@@ -861,19 +902,20 @@ def _apply_amended(
         roll_count=st.roll_count + 1, roll_single_order_count=st.roll_single_order_count + 1,
     )
 
-    delta = int(event.fill_count) if event.fill_count is not None else 0
+    delta = _q_count(event.fill_count) if event.fill_count is not None else _ZERO
     if delta > 0:
         moved = next((o for o in st.ladder if o.client_order_id == rp.new_coid), None)
         n = event.average_fill_price if event.average_fill_price is not None else new_price
         if moved is not None:
+            # the moved order is still in the ladder -> its own bucket_Sd attributes the cross fill.
             st, wa = _book_rung_fill(params, st, moved.client_order_id, n, delta, moved.rung,
-                                     moved.E_rung, now)
+                                     moved.E_rung, now, retained_Sd=moved.bucket_Sd)
             actions += wa
             if event.order_id is not None and any(
                 o.client_order_id == rp.new_coid for o in st.ladder
             ):
                 acp = dict(st.amend_cross_pending)
-                acp[event.order_id] = acp.get(event.order_id, 0) + delta
+                acp[event.order_id] = acp.get(event.order_id, _ZERO) + delta
                 st = replace(st, amend_cross_pending=acp)
 
     # re-converge: issue the next pair(s) now this one acked (continuation, no re-debounce).
@@ -889,28 +931,33 @@ def _apply_cancelled(
     quote-end cancel -> decrement the outstanding count; (3) any of the above with a partial fill before
     the cancel -> book the delta via the still-live order or ``cancel_ctx`` (cumulative -> delta)."""
     actions: list[V33Action] = []
-    filled = int(event.filled_count_before_cancel)
+    filled = _q_count(event.filled_count_before_cancel)
 
     # book a partial fill first (attribute by live order, else cancel_ctx), before we drop slots.
     coid: str | None = None
     price: Decimal | None = None
     rung: int | None = None
     E_rung: Decimal | None = None
+    retained_Sd: int | None = None
     live_order = next((o for o in st.ladder if o.order_id == event.order_id), None)
     if live_order is not None:
-        coid, price, rung, E_rung = (
-            live_order.client_order_id, live_order.price, live_order.rung, live_order.E_rung
+        coid, price, rung, E_rung, retained_Sd = (
+            live_order.client_order_id, live_order.price, live_order.rung, live_order.E_rung,
+            live_order.bucket_Sd,
         )
     else:
         ctx = st.cancel_ctx.get(event.order_id)
         if ctx is not None:
-            coid, price, rung, E_rung = ctx
+            # D1: the 5th element is the retained bucket_Sd (the rung's OWN bucket) — this is the incident
+            # path (fill surfaced by the cancel confirm after the ladder was torn down on a bucket change).
+            coid, price, rung, E_rung, retained_Sd = ctx
     if filled > 0 and coid is not None and price is not None:
-        already = st.rest_booked_by_coid.get(coid, 0)
+        already = _q_count(st.rest_booked_by_coid.get(coid, _ZERO))
         delta = filled - already
         if delta > 0:
             st, wa = _book_rung_fill(params, st, coid, price, delta, rung or 0,
-                                     E_rung if E_rung is not None else params.E_min, now)
+                                     E_rung if E_rung is not None else params.E_min, now,
+                                     retained_Sd=retained_Sd)
             actions += wa
 
     rp = next((r for r in st.rolls_in_flight
@@ -988,12 +1035,12 @@ def _apply_fill(
     order = next((o for o in st.ladder if o.client_order_id == event.client_order_id), None)
     if order is None:
         return st, actions
-    delta = int(event.count)
+    delta = _q_count(event.count)
     # N1: skip lots an amend CROSS already booked for this order_id (the venue echoes the crossed taker
     # fill on the WS ``fill`` channel with a fresh trade_id the driver's dedup cannot catch).
     oid = order.order_id if order.order_id is not None else event.order_id
-    if delta > 0 and oid is not None and st.amend_cross_pending.get(oid, 0) > 0:
-        pending = st.amend_cross_pending.get(oid, 0)
+    if delta > 0 and oid is not None and st.amend_cross_pending.get(oid, _ZERO) > 0:
+        pending = _q_count(st.amend_cross_pending.get(oid, _ZERO))
         skip = min(pending, delta)
         acp = dict(st.amend_cross_pending)
         if pending - skip > 0:
@@ -1004,10 +1051,13 @@ def _apply_fill(
         delta -= skip
     if delta > 0:
         # book at the order's RESTING price (pre-roll: if a roll is in flight the order is still resting
-        # at ``order.price`` on the venue until the amend acks) — golden (f).
+        # at ``order.price`` on the venue until the amend acks) — golden (f). The order is live in the
+        # ladder here, so its own ``bucket_Sd`` attributes the fill (D1).
         n = order.price
         st, wa = _book_rung_fill(params, st, order.client_order_id, n, delta, order.rung,
-                                 order.E_rung, now)
+                                 order.E_rung, now,
+                                 retained_Sd=order.bucket_Sd,
+                                 fill_ticker=getattr(event, "market_ticker", None))
         actions += wa
     return st, actions
 
@@ -1015,36 +1065,63 @@ def _apply_fill(
 # ---------------------------------------------------------------------------
 # Rung fill booking + coalesced wings
 # ---------------------------------------------------------------------------
+def _sd_for_bucket_ticker(st: V33State, ticker: str | None) -> int | None:
+    """D1 last-resort attribution: invert ``st.bucket_tickers`` (Sd -> ticker) to recover the bucket Sd
+    a fill's OWN market ticker names. ``None`` if the ticker is unknown/absent."""
+    if not ticker:
+        return None
+    for sd, tk in st.bucket_tickers.items():
+        if tk == ticker:
+            return sd
+    return None
+
+
 def _book_rung_fill(
-    params: V33Params, st: V33State, coid: str, price: Decimal, delta: int, rung: int,
-    E_rung: Decimal, now: float
+    params: V33Params, st: V33State, coid: str, price: Decimal, delta: Decimal, rung: int,
+    E_rung: Decimal, now: float, *, retained_Sd: int | None = None, fill_ticker: str | None = None,
 ) -> tuple[V33State, list[V33Action]]:
     """Book ``delta`` filled lots of rung ``coid`` at ``price``: record the RungFill, remove the rung
     from the ladder (Q3 no refill), and COALESCE the fill into the open wing group (Q2). The fill's margin
     is DERIVED from ``price`` vs the current n_top (Brad R4: the index is never a stored identity); the
-    2-slot is tied to this fill via ``filled_at``."""
+    2-slot is tied to this fill via ``filled_at``.
+
+    D1 (2026-09-30 incident) — FILL-TO-BUCKET ATTRIBUTION NEVER READS THE CURRENT SPOT BUCKET. The bucket
+    the fill hedges is resolved, in order: (1) the order's OWN ``bucket_Sd`` while it is still live in the
+    ladder; (2) ``retained_Sd`` — the bucket retained by the caller through cancel-all (the live order, or
+    ``cancel_ctx`` for a fill surfaced only by the cancel confirm); (3) the fill's OWN market ticker
+    inverted through ``st.bucket_tickers``. If NONE of those names a bucket, the fill is booked
+    ``bucket_unknown`` (no wings), the hour is stood down FAIL-CLOSED, and a ``fill_bucket_unknown``
+    stand-down is emitted — we never hedge a leg whose bucket we cannot name."""
+    delta = _q_count(delta)
     booked = dict(st.rest_booked_by_coid)
-    booked[coid] = booked.get(coid, 0) + int(delta)
+    booked[coid] = _q_count(booked.get(coid, _ZERO) + delta)
     # remove the (now filled) rung from the live ladder; a filled rung is not refilled inside the window.
     ladder = st.ladder
     order = next((o for o in ladder if o.client_order_id == coid), None)
     order_id = order.order_id if order is not None else None
-    # capture the bucket the rung ACTUALLY rested on, at FILL time (MUST-FIX-3): from the order's own
-    # bucket_Sd (the rung was placed on it), falling back to the ladder's / current spot bucket.
-    fill_Sd = order.bucket_Sd if order is not None and order.bucket_Sd is not None else (
-        st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd)
+    # D1 attribution: order's own bucket (live) -> retained bucket (cancel_ctx / caller) -> fill's own
+    # market ticker inverted -> None (fail-closed). The pre-fix ``rest_bucket_Sd or spot_Sd`` fallback is
+    # GONE: after a bucket change ``rest_bucket_Sd`` is None and ``spot_Sd`` is the NEW bucket, which is
+    # exactly the mis-attribution that hedged the wrong strikes in the incident.
+    fill_Sd = None
+    if order is not None and order.bucket_Sd is not None:
+        fill_Sd = order.bucket_Sd
+    elif retained_Sd is not None:
+        fill_Sd = retained_Sd
+    else:
+        fill_Sd = _sd_for_bucket_ticker(st, fill_ticker)
     fill_bucket_ticker = st.bucket_tickers.get(fill_Sd) if fill_Sd is not None else None
     fill_Su = (fill_Sd + params.bucket_width) if fill_Sd is not None else None
     if order is not None:
         # L5: subtract THIS event's ``delta`` from the order's CURRENT resting count (not the cumulative
         # ``booked``, which double-counts across successive partials — a latent bug harmless at weight 1
         # where a rung fills in exactly one event). A weight-w rung filling c < w keeps w-c resting; the
-        # exposure invariant (filled + resting contracts) is conserved through each partial.
-        remaining = int(order.count) - int(delta)
+        # exposure invariant (filled + resting contracts) is conserved through each partial. D3: Decimal.
+        remaining = _q_count(order.count - delta)
         if remaining <= 0:
             ladder = _drop_order(ladder, coid)
         else:
-            # a partial fill of a rung (only when the rung's weight > 1): keep the remainder resting.
+            # a partial fill of a rung: keep the (possibly fractional) remainder resting.
             ladder = _replace_order(ladder, coid, count=remaining)
     # DERIVE the fill's margin from the price vs the current n_top (the passed rung/E_rung are the caller's
     # fallback label when n_top is momentarily unknown). This is the literal "index derived from price".
@@ -1054,7 +1131,7 @@ def _book_rung_fill(
         E_rung = params.E_min + rung * _CENT
     else:
         m = _emin_cents(params) + rung
-    rf = RungFill(rung=rung, E_rung=E_rung, price=price, count=int(delta), server_ts=now,
+    rf = RungFill(rung=rung, E_rung=E_rung, price=price, count=_q_count(delta), server_ts=now,
                   coid=coid, order_id=order_id, W=st.W, n_top=st.n_top,
                   bucket_ticker=fill_bucket_ticker, bucket_Sd=fill_Sd, bucket_Su=fill_Su,
                   weight=(_weight_of_rung(params, rung) if 0 <= rung < len(params.rung_lots) else None))
@@ -1077,6 +1154,18 @@ def _book_rung_fill(
         rungs_filled=st.rungs_filled + 1, rest_booked_by_coid=booked,
         margin_state=margin_state, filled_at=filled_at,
     )
+    # D1 FAIL-CLOSED: the fill's bucket could not be named from any retained record or its own ticker. The
+    # RungFill is booked (so the held NO leg is accounted) but NO wings are taken and the hour stands down
+    # — a hedge on a guessed bucket is what the incident did. The ledger/report price the held leg on the
+    # fill's (now None) bucket and flag it.
+    if fill_Sd is None:
+        st = replace(st, bucket_unknown=True, stood_down=True, rest_allotment_done=True)
+        ca: list[V33Action] = []
+        if st.ladder:
+            st, ca = _cancel_all(st)
+        st, sa = _standdown(st, "fill_bucket_unknown")
+        st = _sync_wing_mirrors(st)
+        return st, ca + sa
     # PRINT-THROUGH: if this rung was pre-hedged by an active trigger, its wings are ALREADY in hand.
     # Attach the fill to that batch (no coalesce, no second take) and try to close the set.
     pt_idx = _pt_trigger_index_for_coid(st, coid)
@@ -1108,7 +1197,10 @@ def _coalesce_flush(params: V33Params, st: V33State, now: float) -> V33State:
     if g is None:
         return st
     if now - g.first_ts > params.wing_coalesce_ms / 1000.0:
-        batch = WingBatch(index=g.index, server_ts=g.first_ts, fills=g.fills)
+        # D2: stamp the batch's bucket from its fills (all coalesced rungs share one bucket). The wing
+        # strikes are solved from THIS bucket in ``_wing_step``, never the current spot.
+        bsd = next((f.bucket_Sd for f in g.fills if f.bucket_Sd is not None), None)
+        batch = WingBatch(index=g.index, server_ts=g.first_ts, fills=g.fills, bucket_Sd=bsd)
         return replace(st, wing_batches=st.wing_batches + (batch,), coalesce_open=None)
     return st
 
@@ -1138,8 +1230,36 @@ def _batch_legs(st: V33State, index: int) -> list[WingLeg]:
     return [l for l in st.wing_legs if l.batch == index]
 
 
+def _batch_bucket(params: V33Params, b: WingBatch) -> tuple[int | None, int | None]:
+    """D2: the (Sd, Su) the batch's rungs FILLED on — the fills' shared ``bucket_Sd`` (stamped at
+    coalesce), else the batch's own ``bucket_Sd`` (print-through, stamped at trigger). ``(None, None)`` if
+    no fill has named a bucket yet."""
+    sd = next((f.bucket_Sd for f in b.fills if f.bucket_Sd is not None), None)
+    if sd is None:
+        sd = b.bucket_Sd
+    if sd is None:
+        return None, None
+    return sd, sd + params.bucket_width
+
+
+def _wing_prices_for_bucket(
+    st: V33State, sd: int | None, su: int | None, now: float, params: V33Params
+) -> tuple[Decimal, Decimal] | None:
+    """The V3.2 ``_wing_prices`` gate (fresh, valid, non-suspect strike books) evaluated for a SPECIFIC
+    bucket rather than the current spot — by temporarily viewing ``st`` with ``spot_Sd/Su`` = the fill's
+    bucket. The pure V3.2 law is reused UNCHANGED (never reimplemented); only the bucket it reads moves."""
+    if sd is None or su is None:
+        return None
+    return _wing_prices(replace(st, spot_Sd=sd, spot_Su=su), now, params)
+
+
 def _wing_step(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V33Action]]:
-    """Close any expired coalescing group, then take (or retry) the wings for every CLOSED batch."""
+    """Close any expired coalescing group, then take (or retry) the wings for every CLOSED batch.
+
+    D2: each batch's wing strikes and asks are solved from the batch's OWN filled bucket (``_batch_bucket``
+    / ``_wing_prices_for_bucket``), never the current ``st.spot_Sd`` — a fill hedges the strikes of the
+    bucket it landed in, even if spot has moved on by take time. A batch whose bucket has no fresh strike
+    book is skipped (that batch waits) without blocking other batches."""
     st = _coalesce_flush(params, st, now)
     actions: list[V33Action] = []
     if not st.wing_batches:
@@ -1163,10 +1283,6 @@ def _wing_step(params: V33Params, st: V33State, now: float) -> tuple[V33State, l
                 st = replace(st, wing_batches=_replace_batch(st.wing_batches, b.index, one_legged=True))
         return _sync_wing_mirrors(st), actions
 
-    prices = _wing_prices(st, now, params)
-    if prices is None:
-        return _sync_wing_mirrors(st), actions
-    ya, na = prices
     for index in [b.index for b in st.wing_batches]:
         b = next((x for x in st.wing_batches if x.index == index), None)
         if b is None or b.completed:
@@ -1175,10 +1291,15 @@ def _wing_step(params: V33Params, st: V33State, now: float) -> tuple[V33State, l
         # to the fail-closed unwind path in _apply_fill); _wing_step leaves them alone.
         if b.print_through:
             continue
+        sd, su = _batch_bucket(params, b)
+        prices = _wing_prices_for_bucket(st, sd, su, now, params)
+        if prices is None:
+            continue                       # this batch's bucket has no fresh strike book yet — it waits.
+        ya, na = prices
         if not b.taken:
-            st, a = _take_batch(params, st, b, ya, na, now)
+            st, a = _take_batch(params, st, b, sd, su, ya, na, now)
         else:
-            st, a = _retry_batch(params, st, b, ya, na, now)
+            st, a = _retry_batch(params, st, b, sd, su, ya, na, now)
         actions += a
     return _sync_wing_mirrors(st), actions
 
@@ -1201,20 +1322,22 @@ def _batch_lock(b: WingBatch, w_paid: Decimal) -> Decimal:
 
 
 def _take_batch(
-    params: V33Params, st: V33State, b: WingBatch, ya: Decimal, na: Decimal, now: float
+    params: V33Params, st: V33State, b: WingBatch, sd: int | None, su: int | None,
+    ya: Decimal, na: Decimal, now: float
 ) -> tuple[V33State, list[V33Action]]:
     """UNCONDITIONAL initial take (ruling F-2) of ONE coalesced batch's two wings at ask + wing_margin,
-    sized to the batch's TOTAL filled count. ``lock`` (batch total) is computed for the journal/report."""
+    sized to the batch's TOTAL filled count. ``lock`` (batch total) is computed for the journal/report.
+    D2: the wing strikes are the FILL's bucket strikes (``sd``/``su``), never the current spot."""
     w_paid = ya + fee(ya) + na + fee(na)
     lock = _batch_lock(b, w_paid)
-    count = b.total_count
+    count = _q_count(b.total_count)
     coid_y, st = _mint_coid(st)
     coid_n, st = _mint_coid(st)
     yes_limit = min(ya + params.wing_margin, _LIMIT_CEILING)
     no_limit = min(na + params.wing_margin, _LIMIT_CEILING)
     legs = (
-        LegOrder(st.strike_tickers.get(st.spot_Sd, ""), BUY_YES, "buy", count, yes_limit),
-        LegOrder(st.strike_tickers.get(st.spot_Su, ""), BUY_NO, "buy", count, no_limit),
+        LegOrder(st.strike_tickers.get(sd, ""), BUY_YES, "buy", count, yes_limit),
+        LegOrder(st.strike_tickers.get(su, ""), BUY_NO, "buy", count, no_limit),
     )
     new_legs = (
         WingLeg(legs[0].ticker, BUY_YES, count, yes_limit, coid_y, batch=b.index),
@@ -1228,14 +1351,20 @@ def _take_batch(
 
 
 def _retry_batch(
-    params: V33Params, st: V33State, b: WingBatch, ya: Decimal, na: Decimal, now: float
+    params: V33Params, st: V33State, b: WingBatch, sd: int | None, su: int | None,
+    ya: Decimal, na: Decimal, now: float
 ) -> tuple[V33State, list[V33Action]]:
     """Retry any unfilled leg of ONE batch at the fresh ask, gated by the projected batch lock staying
     at/above lock_floor (ruling F-2). The already-held leg forms the floor, so a deferred retry is
-    bounded, not naked."""
+    bounded, not naked.
+
+    D4 (2026-09-30 incident): a leg is retried NO MORE OFTEN than ``WING_RETRY_MIN_INTERVAL_MS`` (a leg
+    whose last retry was < that ago is skipped this tick) and only ONE retry is ever in flight per leg
+    (a leg is eligible only while ``status == "unfilled"``). The pre-fix path re-fired on every book/trade
+    /clock tick (967 IOC creates in ~96 s). ``bucket`` strikes (``sd``/``su``) key the retry tickers."""
     actions: list[V33Action] = []
     legs = _batch_legs(st, b.index)
-    count = b.total_count
+    count = _q_count(b.total_count)
     n_cost = sum((f.price + fee(f.price)) * f.count for f in b.fills)  # per-lot rest cost, weighted
     projected_wing = _ZERO
     for leg in legs:
@@ -1250,18 +1379,27 @@ def _retry_batch(
 
     legs_out = list(st.wing_legs)
     changed = False
+    retries_added = 0
     for i, leg in enumerate(st.wing_legs):
         if leg.batch != b.index or leg.status != "unfilled":
+            continue
+        # D4 cadence floor: skip a leg retried within WING_RETRY_MIN_INTERVAL_MS (do NOT touch its state,
+        # so it stays "unfilled" and is reconsidered once the floor elapses).
+        if (leg.last_retry_ts is not None
+                and (now - leg.last_retry_ts) * 1000.0 < WING_RETRY_MIN_INTERVAL_MS):
             continue
         ask = ya if leg.side == BUY_YES else na
         limit = min(ask + params.wing_margin, _LIMIT_CEILING)
         coid_r, st = _mint_coid(st)
         retry = LegOrder(leg.ticker, leg.side, "buy", leg.count, limit)
-        legs_out[i] = replace(leg, status="pending", limit=limit, client_order_id=coid_r)
+        legs_out[i] = replace(leg, status="pending", limit=limit, client_order_id=coid_r,
+                              last_retry_ts=now)
         changed = True
+        retries_added += 1
         actions.append(_mk(ActionKind.RETRY_WING, st.shakedown, legs=(retry,), count=leg.count))
     if changed:
         st = replace(st, wing_legs=tuple(legs_out))
+        st = replace(st, wing_batches=_replace_batch(st.wing_batches, b.index, retries=b.retries + retries_added))
     return st, actions
 
 
@@ -1408,7 +1546,10 @@ def _print_through_step(
     # a pre-emptive take on an unfilled rung is not.)
     if not _in_window(params, st, now):
         return st, []
-    asks = _pt_wing_asks(st, now, params)
+    # D2: price the pre-emptive wings on the LADDER's bucket (rest_sd), the bucket the pre-hedged rungs
+    # rest on — not the current spot (identical in the gated path where spot == rest, correct if it drifts).
+    rest_su = rest_sd + params.bucket_width
+    asks = _wing_prices_for_bucket(st, rest_sd, rest_su, now, params)
     if asks is None:
         return st, []                     # cannot hedge without fresh wing books -> do not fire
     ya, na = asks
@@ -1435,22 +1576,24 @@ def _print_through_step(
     slack = params.print_through_slack_c * _CENT
     yes_limit = min(ya + slack, _LIMIT_CEILING)
     no_limit = min(na + slack, _LIMIT_CEILING)
-    count = sum(o.count for o in cands)
+    count = _q_count(sum((o.count for o in cands), _ZERO))
     w_paid = yes_limit + fee(yes_limit) + no_limit + fee(no_limit)
     lock_at_trigger = sum((o.count * lock_value(o.price, w_paid) for o in cands), _ZERO)
     idx = st.next_batch_index
     coid_y, st = _mint_coid(st)
     coid_n, st = _mint_coid(st)
+    # D2: the pre-emptive wing strikes are the LADDER bucket's strikes (rest_sd / rest_su), and the batch
+    # carries that bucket so a later re-price/retry keys off it.
     legs = (
-        LegOrder(st.strike_tickers.get(st.spot_Sd, ""), BUY_YES, "buy", count, yes_limit),
-        LegOrder(st.strike_tickers.get(st.spot_Su, ""), BUY_NO, "buy", count, no_limit),
+        LegOrder(st.strike_tickers.get(rest_sd, ""), BUY_YES, "buy", count, yes_limit),
+        LegOrder(st.strike_tickers.get(rest_su, ""), BUY_NO, "buy", count, no_limit),
     )
     new_legs = (
         WingLeg(legs[0].ticker, BUY_YES, count, yes_limit, coid_y, batch=idx),
         WingLeg(legs[1].ticker, BUY_NO, count, no_limit, coid_n, batch=idx),
     )
     batch = WingBatch(index=idx, server_ts=now, fills=(), taken=True, print_through=True,
-                      taken_count=count)
+                      taken_count=count, bucket_Sd=rest_sd)
     trig = PrintThroughTrigger(
         batch_index=idx, rung_coids=tuple(o.client_order_id for o in cands),
         rung_prices=tuple(o.price for o in cands), count=count, trigger_ts=now, yes_print=yes_print,
@@ -1475,20 +1618,23 @@ def _pt_latch_if_done(params: V33Params, st: V33State) -> V33State:
 
 
 def _pt_book_taker_complete(
-    params: V33Params, st: V33State, idx: int, price: Decimal, count: int, now: float
+    params: V33Params, st: V33State, idx: int, price: Decimal, count: Decimal, now: float
 ) -> V33State:
     """Book ``count`` bucket-NO lots bought as an IOC TAKER (the ``complete`` stall leg) into the trigger's
     batch at ``price`` -- a fee-bearing taker leg (RungFill.taker=True). Shared by the DRY optimistic book
-    and the ARMED book-from-IOC-response path (F3)."""
+    and the ARMED book-from-IOC-response path (F3). D2: the completing rung's bucket is the LADDER bucket
+    (rest_sd), captured on the RungFill; it is never the raw spot."""
+    count = _q_count(count)
     if count <= 0:
         return st
     trig = st.print_through[idx]
     batch = next(b for b in st.wing_batches if b.index == trig.batch_index)
-    rest_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
+    rest_sd = batch.bucket_Sd if batch.bucket_Sd is not None else (
+        st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd)
     bt = st.bucket_tickers.get(rest_sd) if rest_sd is not None else None
     rung_lbl = _rung_of(st.n_top, price) if st.n_top is not None else 0
     e_lbl = _e_rung(params, st.n_top, price) if st.n_top is not None else params.E_min
-    rf = RungFill(rung=rung_lbl, E_rung=e_lbl, price=price, count=int(count), server_ts=now,
+    rf = RungFill(rung=rung_lbl, E_rung=e_lbl, price=price, count=count, server_ts=now,
                   coid=None, order_id=None, W=st.W, n_top=st.n_top, bucket_ticker=bt,
                   bucket_Sd=rest_sd, bucket_Su=(rest_sd + params.bucket_width) if rest_sd is not None
                   else None, taker=True,
@@ -1595,39 +1741,41 @@ def _pt_finalize_stall(
         and (batch.total_count > 0 or lock_complete_per >= floor)
     )
     if do_complete:
-        st, a = _pt_complete(params, st, idx, int(shortfall), no_ask, lock_complete_per, now)
+        st, a = _pt_complete(params, st, idx, _q_count(shortfall), no_ask, lock_complete_per, now)
     else:
         st, a = _pt_unwind(params, st, idx, now, resolution="unwind")
     return _sync_wing_mirrors(st), actions + a
 
 
 def _pt_complete(
-    params: V33Params, st: V33State, idx: int, shortfall: int, no_ask: Decimal,
+    params: V33Params, st: V33State, idx: int, shortfall: Decimal, no_ask: Decimal,
     lock_complete_per: Decimal, now: float
 ) -> tuple[V33State, list[V33Action]]:
     """The ``complete`` branch: buy ``shortfall`` bucket-NO as an IOC taker. DRY books it optimistically
     (no venue). ARMED (F3) sends the IOC with ``complete_coid`` and books from its Fill in ``_apply_fill``;
-    a fill shortfall there unwinds the un-hedged wings + stands down."""
+    a fill shortfall there unwinds the un-hedged wings + stands down. D3: ``shortfall`` is Decimal lots."""
+    shortfall = _q_count(shortfall)
     trig = st.print_through[idx]
     batch = next(b for b in st.wing_batches if b.index == trig.batch_index)
-    rest_sd = st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd
+    rest_sd = batch.bucket_Sd if batch.bucket_Sd is not None else (
+        st.rest_bucket_Sd if st.rest_bucket_Sd is not None else st.spot_Sd)
     bt = st.bucket_tickers.get(rest_sd) if rest_sd is not None else None
     if st.shakedown:
-        st = _pt_book_taker_complete(params, st, idx, no_ask, int(shortfall), now)
+        st = _pt_book_taker_complete(params, st, idx, no_ask, shortfall, now)
         st = replace(st, print_through=_replace_pt(
-            st.print_through, idx, resolved=True, resolution="complete", shortfall=int(shortfall),
+            st.print_through, idx, resolved=True, resolution="complete", shortfall=shortfall,
             complete_price=no_ask, lock_at_completion=lock_complete_per, resolved_ts=now))
         st = _maybe_close_set(st, batch.index)
         st = _pt_latch_if_done(params, st)
     else:
         cc, st = _mint_coid(st)
         st = replace(st, print_through=_replace_pt(
-            st.print_through, idx, resolved=True, resolution="complete", shortfall=int(shortfall),
+            st.print_through, idx, resolved=True, resolution="complete", shortfall=shortfall,
             complete_price=no_ask, lock_at_completion=lock_complete_per, resolved_ts=now,
             complete_coid=cc))
-    legs = (LegOrder(bt or "", BUY_NO, "buy", int(shortfall), no_ask),)
+    legs = (LegOrder(bt or "", BUY_NO, "buy", shortfall, no_ask),)
     action = _mk(V33ActionKind.TAKE_BUCKET_NO, st.shakedown, legs=legs, ticker=bt or "", side=BUY_NO,
-                 action="buy", count=int(shortfall), price=no_ask,
+                 action="buy", count=shortfall, price=no_ask,
                  client_order_id=(None if st.shakedown else st.print_through[idx].complete_coid))
     return st, [action]
 
@@ -1665,10 +1813,10 @@ def _pt_unwind(
         paid = lg.fill_price if lg.fill_price is not None else lg.limit
         bid = _bid(lg.side)
         if bid is not None:
-            legs_sell.append(LegOrder(lg.ticker, lg.side, "sell", int(n), bid))
-            roundtrip += ((paid + fee(paid)) - (bid - fee(bid))) * Decimal(int(n))
+            legs_sell.append(LegOrder(lg.ticker, lg.side, "sell", _q_count(n), bid))
+            roundtrip += ((paid + fee(paid)) - (bid - fee(bid))) * _q_count(n)
         else:
-            roundtrip += (paid + fee(paid)) * Decimal(int(n))       # no bid -> conservative full loss
+            roundtrip += (paid + fee(paid)) * _q_count(n)           # no bid -> conservative full loss
 
     if keep_hedged:
         # keep the ``filled_lots`` sets: shrink both wing legs + taken_count to filled_lots, complete them.
@@ -1678,7 +1826,8 @@ def _pt_unwind(
         st = replace(st, wing_legs=new_legs,
                      wing_batches=_replace_batch(st.wing_batches, batch.index, taken_count=filled_lots),
                      print_through=_replace_pt(st.print_through, idx,
-                                               shortfall=int(sell_each or 0), roundtrip_cost=roundtrip,
+                                               shortfall=_q_count(sell_each or _ZERO),
+                                               roundtrip_cost=roundtrip,
                                                resolved=True, resolution=resolution, resolved_ts=now))
         st = _maybe_close_set(st, batch.index)
     else:
@@ -1687,7 +1836,8 @@ def _pt_unwind(
             st,
             wing_batches=tuple(b for b in st.wing_batches if b.index != batch.index),
             wing_legs=tuple(lg for lg in st.wing_legs if lg.batch != batch.index),
-            print_through=_replace_pt(st.print_through, idx, shortfall=int(trig.count - filled_lots),
+            print_through=_replace_pt(st.print_through, idx,
+                                      shortfall=_q_count(trig.count - filled_lots),
                                       roundtrip_cost=roundtrip, resolved=True, resolution=resolution,
                                       resolved_ts=now))
     if legs_sell:
@@ -1729,12 +1879,12 @@ def _pt_apply_complete_fill(
     for i, t in enumerate(st.print_through):
         if t.complete_coid is None or t.complete_coid != event.client_order_id:
             continue
-        got = int(event.count)
+        got = _q_count(event.count)
         price = event.price if event.price is not None else (t.complete_price or _ZERO)
         st = _pt_book_taker_complete(params, st, i, price, got, now)
         st = replace(st, print_through=_replace_pt(st.print_through, i, complete_coid=None))
         batch = next((b for b in st.wing_batches if b.index == t.batch_index), None)
-        short = int(t.shortfall) - got
+        short = _q_count(t.shortfall) - got
         actions: list[V33Action] = []
         if short > 0 and batch is not None:
             # the un-hedged wings for the missed lots: shrink the batch to what is hedged and sell them.
@@ -1748,10 +1898,10 @@ def _pt_apply_complete_fill(
                 bid = yes_bid if lg.side == BUY_YES else no_bid
                 paid = lg.fill_price if lg.fill_price is not None else lg.limit
                 if bid is not None:
-                    legs_sell.append(LegOrder(lg.ticker, lg.side, "sell", int(short), bid))
-                    roundtrip += ((paid + fee(paid)) - (bid - fee(bid))) * Decimal(int(short))
+                    legs_sell.append(LegOrder(lg.ticker, lg.side, "sell", _q_count(short), bid))
+                    roundtrip += ((paid + fee(paid)) - (bid - fee(bid))) * short
                 else:
-                    roundtrip += (paid + fee(paid)) * Decimal(int(short))
+                    roundtrip += (paid + fee(paid)) * short
             new_legs = tuple(replace(lg, count=hedged) if (lg.batch == batch.index
                                                            and lg.status == "filled") else lg
                              for lg in st.wing_legs)
@@ -1849,7 +1999,9 @@ def _remember_cancel_ctx(st: V33State, order: RestOrder) -> V33State:
     if order.order_id is None:
         return st
     ctx = dict(st.cancel_ctx)
-    ctx[order.order_id] = (order.client_order_id, order.price, order.rung, order.E_rung)
+    # D1: retain the order's OWN bucket_Sd so a late fill surfaced only by the cancel confirm is
+    # attributed to the bucket the rung rested on, not the (possibly moved-on) current spot bucket.
+    ctx[order.order_id] = (order.client_order_id, order.price, order.rung, order.E_rung, order.bucket_Sd)
     return replace(st, cancel_ctx=ctx)
 
 
@@ -1887,14 +2039,14 @@ def _place_action(st: V33State, params: V33Params, coid: str, n: Decimal, count:
 
 def _place_one(
     params: V33Params, st: V33State, price: Decimal, rung: int, E_rung: Decimal, now: float,
-    *, count: int | None = None,
+    *, count: Decimal | None = None,
 ) -> tuple[V33State, list[V33Action]]:
     """Emit ONE PLACE_REST rung at ``price`` and add it (pending) to the ladder. ``count`` is the lots to
     rest: L5 -> the rung's configured weight ``rung_lots[rung]`` for a FRESH slot placement (default), or
     an explicit remaining count for the roll's cancel->create fallback (which re-places what was still
     resting, matching the amend end-state). Used by the bucket / first placement (each rung), the
     vacant-create, and the roll fallback."""
-    c = int(count) if count is not None else _weight_of_rung(params, rung)
+    c = _q_count(count) if count is not None else _q_count(Decimal(_weight_of_rung(params, rung)))
     coid, st = _mint_coid(st)
     order = RestOrder(
         client_order_id=coid, order_id=None, price=price, count=c,
