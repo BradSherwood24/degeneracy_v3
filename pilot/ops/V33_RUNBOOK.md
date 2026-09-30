@@ -258,10 +258,11 @@ It prints, in order:
   %positive; the DRY (dry_sim) rows are in a SEPARATE section, NEVER pooled with realised; pooled
   per-contract stats; the **capture ratio @ 10c** (Registration-3 definition, V3.2-comparable);
 - **FALSIFIER GATE TABLE (§6)** computed from REALISED rows only -- each gate value/threshold/status
-  (PASS/FAIL/n-too-small), the n>=30 rung-fill counter, and the verdict (kill: mean < +2.0c at n >= 15,
-  or one-legged > 2);
-- **DEEP END (SO-3, observation only)** -- the deep 16..25c rungs the tape reached, mean ideal lock, and
-  absorption (lots printed at/through each deep rung);
+  (PASS/FAIL/n-too-small), the n>=15 rung-fill counter (L6 2026-09-30; was n>=30), and the verdict (kill:
+  mean < +2.0c at n >= 15, one-legged > 2, or an S4 day-loss latch on any armed day);
+- **DEEP END (SO-3, observation only)** -- the deep rungs the tape reached (the band is derived from the
+  live ladder; 19..28c after the 8..18c shift), mean ideal lock, and absorption (lots printed at/through
+  each deep rung);
 - **SIDE-BY-SIDE** -- per hour V3.2 vs V3.3, day + running totals, and the windows where V3.3 (dry_sim or
   realised) ENTERED and V3.2 did not, and vice versa.
 

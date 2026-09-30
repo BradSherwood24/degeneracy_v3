@@ -192,15 +192,18 @@ Total ~1,650 lines + tests, 4-5 PRs. Suite target: current 961 + ~120.
 ## 6. Falsifier draft (V3.3 roster `DegeneracyV3_3`; frozen only on Brad's verbatim go)
 
 Judged quantity: realised lock PER CONTRACT PER RUNG on live fills vs the in-process ideal ladder.
-Proposed gates at n >= 30 rung-fills (n counts contracts; a full sweep contributes K):
-- ladder mean true lock >= +6.0c (ideal 9.6c/contract; live V3.2 beat its shadow by 0.6c);
+Proposed gates at n >= 15 rung-fills (n counts contracts; a full sweep contributes K; L6 2026-09-30
+dropped the verdict n 30 -> 15):
+- ladder mean true lock >= +4.0c (L6 2026-09-30, was +6.0c; ideal 9.6c/contract; live V3.2 beat its
+  shadow by 0.6c);
 - per-rung shortfall (solved E - realised lock) <= 3.0c at every rung with >= 3 fills;
 - % positive >= 80%;
 - capture ratio at the 10c rung >= 0.50 (same definition as Registration 3, V3.2-comparable);
 - one-legged <= 2 contracts;
 - roll integrity: >= 90% of rolls move exactly one order (journal-counted).
-Kill: mean lock < +2.0c at n >= 15, or one-legged > 2. Promotion (2 lots per rung, or rungs to 20c):
-Brad's dated word after n >= 30, informed by SO-3's deep-end absorption.
+Kill: mean lock < +2.0c at n >= 15, or one-legged > 2, or an S4 day-loss ($3.00) latch on any armed day
+(L6 2026-09-30 campaign kill). Promotion (2 lots per rung, or rungs deeper than 18c): Brad's dated word
+after n >= 15 (L6), informed by SO-3's deep-end absorption.
 Per Brad's sizing philosophy (2026-09-18): n answers slippage and edge-case questions, not a coin flip.
 
 ## 7. Order of operations

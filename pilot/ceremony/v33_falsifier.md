@@ -89,6 +89,9 @@ History NOT mixed: the L1 5..15c dry sample (22 entry windows, 161 rung fills, 2
 the 8..18c sample for the `n >= 30` verdict / kill / promotion gate counting; the gate counters count only
 8..18c fills from here. The gates themselves (mean lock +6.0c, per-rung shortfall, % positive, capture
 ratio, one-legged, roll integrity, kill and promotion pins) are UNCHANGED. V3.3 stays DRY.
+_(Dated L4 record: the `n >= 30` verdict n and the +6.0c mean-lock bar named in this paragraph are
+SUPERSEDED by L6, 2026-09-30 -- the live gate is now `n >= 15` and +4.0c; see the L6 amendment section
+below.)_
 
 ## Proposed pre-registered thresholds (the verdict)
 

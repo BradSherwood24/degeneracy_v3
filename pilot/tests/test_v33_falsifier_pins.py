@@ -51,8 +51,8 @@ def test_draft_status_line_and_not_frozen():
 
 def test_verdict_pins_match_doc():
     doc = _doc()
-    assert f"n >= {V33_FALSIFIER_MIN_N}" in doc                       # n >= 30
-    assert f"+{V33_FALSIFIER_MIN_MEAN_LOCK_CENTS}c" in doc            # +6.0c
+    assert f"n >= {V33_FALSIFIER_MIN_N}" in doc                       # n >= 15 (L6; was n >= 30)
+    assert f"+{V33_FALSIFIER_MIN_MEAN_LOCK_CENTS}c" in doc            # +4.0c (L6; was +6.0c)
     assert f"<= {V33_FALSIFIER_MAX_RUNG_SHORTFALL_CENTS}c" in doc     # <= 3.0c
     assert f">= {V33_FALSIFIER_MIN_RUNG_FILLS_FOR_SHORTFALL} [pin] fills" in doc  # >= 3 [pin] fills
     assert f">= {V33_FALSIFIER_MIN_PCT_POSITIVE}%" in doc             # >= 80%
