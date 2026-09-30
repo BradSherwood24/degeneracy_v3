@@ -550,5 +550,136 @@ def test_async_startup_sweep_scoped_to_v33():
     assert not any(c.verb == "delete" and "oid-b" in c.path for c in fake.calls)
 
 
+# ===========================================================================
+# V33Driver async dispatch — end-to-end through the real core (armed)
+# ===========================================================================
+from dataclasses import replace as _dr  # noqa: E402
+
+import service.run_v33 as RUN  # noqa: E402
+from tests.test_v33_run import BK, B_SD, STK_SD, STK_SU, J as DryJ, _bring_up  # noqa: E402
+
+_EXCH2 = {B_SD: 2, STK_SD: 2, STK_SU: 2, "KXBTC-RANGE-B80500": 2}
+
+
+def _armed_params():
+    from service.v33 import load_v33_params
+    return _dr(load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
+              freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)
+
+
+def _armed_driver(fake, *, post_latency=0.008):
+    p = _armed_params()
+    cts = 1789876800
+    close = "2026-09-20T04:00:00Z"
+    st = V33State.new(close, cts, BK, p, shakedown=False)  # ARMED -> REAL place/amend/cancel
+    fake.post_latency = post_latency
+    aw = AsyncOrderWriter(fake, wing_workers=6, cancel_workers=12, normal_workers=12)
+    ex = V33AsyncExecutor(aw, fake, BK, _EXCH2, DryJ(), cts, 300, k_rungs=p.rungs,
+                          clock=lambda: 0.0, sleep=lambda _s: None, wing_cap=2)
+    drv = RUN.V33Driver(p, st, DryJ(), ex, dry_sim=False, clock=lambda: 0.0, async_writer=aw)
+    return drv, aw, cts
+
+
+async def _drain(pred, *, timeout=4.0):
+    t0 = time.monotonic()
+    while not pred():
+        await asyncio.sleep(0.001)
+        if time.monotonic() - t0 > timeout:
+            break
+
+
+def test_async_driver_places_full_ladder_end_to_end():
+    fake = FakeProxyWriter()
+
+    async def go():
+        drv, aw, cts = _armed_driver(fake, post_latency=0.006)
+        try:
+            _bring_up(drv, cts)   # schedules the initial ladder placement off the loop
+            await _drain(lambda: len(drv.state.ladder) == 11
+                         and all(o.live and o.order_id is not None for o in drv.state.ladder))
+            return drv
+        finally:
+            aw.close()
+
+    drv = asyncio.run(go())
+    assert len(drv.state.ladder) == 11
+    assert all(o.live and o.order_id is not None for o in drv.state.ladder)
+    # every rung's place went out on the REST lane as a real create.
+    rests = [c for c in fake.calls if c.verb == "post" and c.body.get("post_only")]
+    assert len(rests) == 11 and all(c.klass == CLASS_REST for c in rests)
+
+
+def test_async_driver_loop_not_blocked_and_placements_concurrent():
+    # 11 creates at 12 ms each: if they ran SERIALLY on the loop (the 2026-09-30 bug) the ladder would
+    # take >= ~132 ms and the loop would be frozen the whole time; off-loop + concurrent it completes in a
+    # small multiple of one latency AND the loop keeps iterating (loops counter high).
+    fake = FakeProxyWriter()
+
+    async def go():
+        drv, aw, cts = _armed_driver(fake, post_latency=0.012)
+        try:
+            _bring_up(drv, cts)
+            loops = 0
+            t0 = time.monotonic()
+            while not (len(drv.state.ladder) == 11 and all(o.live for o in drv.state.ladder)):
+                await asyncio.sleep(0.001)
+                loops += 1
+                if time.monotonic() - t0 > 4.0:
+                    break
+            return drv, loops, time.monotonic() - t0
+        finally:
+            aw.close()
+
+    drv, loops, elapsed = asyncio.run(go())
+    assert len(drv.state.ladder) == 11 and all(o.live for o in drv.state.ladder)
+    assert elapsed < 0.11, f"ladder took {elapsed:.3f}s -> writes were serialized, not concurrent off-loop"
+    assert loops > 3, "the loop did not iterate while writes were in flight (it was blocked)"
+    # the feed never froze while quoting: the max feed gap stayed tiny (the direct proof).
+    assert drv._feed_gap_max_s < 0.05
+    stats = RUN._v33_writer_stats(drv)
+    assert stats["async_writer"] is True
+    assert stats["writer"]["submitted"] >= 11 and stats["writer"]["by_class"][CLASS_REST] >= 11
+
+
+def test_async_driver_loop_free_while_creates_gated():
+    # gate every create: the ladder can't ack, but the loop MUST keep processing (a blocked loop would
+    # not advance the tick counter). Proves the dispatch does not block the loop even when the venue hangs.
+    fake = FakeProxyWriter()
+    fake.gate("post:rest")
+
+    async def go():
+        drv, aw, cts = _armed_driver(fake, post_latency=0.0)
+        try:
+            _bring_up(drv, cts)   # 11 creates dispatched, all parked on the gate
+            ticks = 0
+            for _ in range(60):
+                await asyncio.sleep(0)
+                ticks += 1
+            gated = (aw.inflight > 0) and not any(o.live for o in drv.state.ladder)
+            fake.gate("post:rest").set()
+            await _drain(lambda: len(drv.state.ladder) == 11 and all(o.live for o in drv.state.ladder))
+            return drv, ticks, gated
+        finally:
+            aw.close()
+
+    drv, ticks, gated = asyncio.run(go())
+    assert gated, "expected creates in flight (gated) with no rung live yet"
+    assert ticks == 60, "the loop was blocked while creates were in flight"
+    assert len(drv.state.ladder) == 11 and all(o.live for o in drv.state.ladder)
+
+
+def test_dry_driver_is_not_async_and_unchanged():
+    # DRY (async_writer=None) -> the synchronous path; _async is False; writer_stats carry no writer block.
+    from service.run_v32 import FrozenExecutor
+    p = _armed_params()
+    st = V33State.new("2026-09-20T04:00:00Z", 1789876800, BK, p, shakedown=True)
+    drv = RUN.V33Driver(p, st, DryJ(), FrozenExecutor(BK), dry_sim=True, clock=lambda: 0.0)
+    assert drv._async is False and drv._aw is None
+    _bring_up(drv, 1789876800)
+    assert len(drv.state.ladder) == 11              # dry FrozenExecutor acks synchronously (unchanged)
+    stats = RUN._v33_writer_stats(drv)
+    assert stats["async_writer"] is False and "writer" not in stats
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
