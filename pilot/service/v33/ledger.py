@@ -83,12 +83,25 @@ def load_v33_rows(path: str = DEFAULT_V33_LEDGER_PATH) -> list[dict[str, Any]]:
     return out
 
 
-def _fee_total(price: Any, count: int) -> Decimal:
+def _dc(count: Any) -> Decimal:
+    """A lot count as Decimal (D3: fractional-safe), accepting int, Decimal, or numeric string."""
+    return count if isinstance(count, Decimal) else Decimal(str(count))
+
+
+def _co(count: Any) -> Any:
+    """Serialise a lot count for the ledger row: integral -> int (dry rows byte-identical), fractional ->
+    the 2dp Decimal (str-encoded by ``_json_default``). Old integer rows already parse as ints."""
+    d = _dc(count).quantize(Decimal("0.01"))
+    return int(d) if d == d.to_integral_value() else d
+
+
+def _fee_total(price: Any, count: Any) -> Decimal:
     """Venue per-FILL taker fee: ``ceil(0.07*p*(1-p)*count, $0.0001)`` (kalshi-fee-exact), on the SAME
     frozen ``_FEE_RATE`` as ``_fee`` — equal to ``_fee(price)`` at count 1, and NEVER ``_fee(price)*N``
-    (the per-contract fee already rounded up once). Mirrors ``run_v32._fee_total``."""
+    (the per-contract fee already rounded up once). Mirrors ``run_v32._fee_total``. D3: ``count`` is
+    Decimal-safe."""
     p = price if isinstance(price, Decimal) else Decimal(str(price))
-    raw = _FEE_RATE * p * (_ONE - p) * Decimal(int(count)) * Decimal(10000)
+    raw = _FEE_RATE * p * (_ONE - p) * _dc(count) * Decimal(10000)
     return Decimal(math.ceil(raw)) / Decimal(10000)
 
 
@@ -177,22 +190,22 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
         bt = _bucket_ticker_for_fill(state, b.fills[0] if b.fills else None)
         if bt:
             held_this += 1
-            held.append({"ticker": bt, "side": "no", "count": int(b.total_count)})
+            held.append({"ticker": bt, "side": "no", "count": _co(b.total_count)})
         for lg in legs:
             if lg.status == "filled":
                 held_this += 1
-                held.append({"ticker": lg.ticker, "side": lg.side, "count": int(lg.count)})
+                held.append({"ticker": lg.ticker, "side": lg.side, "count": _co(lg.count)})
                 if lg.fill_price is not None:
                     w_paid += lg.fill_price + _fee(lg.fill_price)
         batch_wpaid[b.index] = w_paid
-        floor += v33_set_floor_dollars(held_this, int(b.total_count))
+        floor += v33_set_floor_dollars(held_this, _dc(b.total_count))
         # per-batch realized lock (Σ per rung fill count * lock_value(price, w_paid)) when completed.
         batch_lock = None
         if completed:
             batch_lock = sum((f.count * lock_value(f.price, w_paid) for f in b.fills), _ZERO)
         batch_records.append({
             "index": b.index,
-            "fill_count": int(b.total_count),
+            "fill_count": _co(b.total_count),
             "rungs": [int(f.rung) for f in b.fills],
             "prices": [str(f.price) for f in b.fills],
             "completed": bool(completed),
@@ -217,7 +230,7 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
             "rung": int(rf.rung),
             "E_rung": str(rf.E_rung),
             "price": str(rf.price),
-            "count": int(rf.count),
+            "count": _co(rf.count),
             # L5 (2026-09-29): the rung's configured lot WEIGHT (rung_lots[rung]) at fill; None pre-L5 or
             # for a stranded/out-of-range margin. ``count`` is lots filled this event (<= weight on a
             # partial). Backward compatible: absent on rows written before L5.
@@ -235,16 +248,16 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
     # cash paid = Σ rung rest cost (n x count, maker fee 0) + Σ wing cost (price x count + fee_total).
     cost = _ZERO
     for rf in rest_fills:
-        cost += rf.price * Decimal(int(rf.count))   # bucket-NO maker leg, fee 0 on crypto
+        cost += rf.price * _dc(rf.count)   # bucket-NO maker leg, fee 0 on crypto
         # PRINT-THROUGH (2026-09-26): the `complete` stall branch buys the bucket-NO as a TAKER, so that
         # leg carries the venue taker fee (a maker rung fill is fee 0 on crypto).
         if getattr(rf, "taker", False):
-            cost += _fee_total(rf.price, int(rf.count))
+            cost += _fee_total(rf.price, rf.count)
     for lg in wing_legs:
         if lg.status == "filled" and lg.fill_price is not None:
-            cost += lg.fill_price * Decimal(int(lg.count)) + _fee_total(lg.fill_price, int(lg.count))
+            cost += lg.fill_price * _dc(lg.count) + _fee_total(lg.fill_price, lg.count)
     realized_delta = floor - cost
-    lots_filled = sum(int(rf.count) for rf in rest_fills)
+    lots_filled = sum((_dc(rf.count) for rf in rest_fills), _ZERO)
     return {
         "dry_sim": bool(dry_sim),
         "rung_fills": rung_records,
@@ -255,7 +268,7 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
         "realized_lock": realized_lock_first,   # the shallowest completed rung's lock (info)
         "one_legged": bool(getattr(state, "one_legged", False)),
         "realized_unsettled": bool(held) and not bool(dry_sim),   # dry_sim never awaits settlement
-        "lots_filled": int(lots_filled),
+        "lots_filled": _co(lots_filled),
     }
 
 
@@ -269,12 +282,12 @@ def _ladder_summary(state, money: dict[str, Any], driver_counts: dict[str, int],
     for r in rungs:
         rl = r.get("realized_lock")
         if rl is not None:
-            ladder_lock += Decimal(str(rl)) * Decimal(int(r["count"]))
+            ladder_lock += Decimal(str(rl)) * _dc(r["count"])   # D3: fractional-safe
     roll_count = int(getattr(state, "roll_count", 0) or 0)
     single = int(getattr(state, "roll_single_order_count", 0) or 0)
     return {
         "rungs_filled": int(getattr(state, "rungs_filled", 0) or 0),
-        "contracts": int(money.get("lots_filled", 0) or 0),
+        "contracts": _co(money.get("lots_filled", 0) or 0),
         "shallowest_margin_c": (str(min(e_rungs) * 100) if e_rungs else None),
         "deepest_margin_c": (str(max(e_rungs) * 100) if e_rungs else None),
         "ladder_lock": str(ladder_lock),
@@ -418,17 +431,18 @@ def _v33_floor_booked_for_entry(entry: dict[str, Any], legs: list[Any]) -> Decim
     if isinstance(batches, list) and batches:
         total = _ZERO
         for b in batches:
+            # D3: fill_count may be a fractional Decimal string ("1.44") in an armed row — parse as Decimal.
             total += v33_set_floor_dollars(int(b.get("held_legs", 0) or 0),
-                                           int(b.get("fill_count", 1) or 1))
+                                           _dc(b.get("fill_count", 1) or 1))
         return total
     counts = []
     for lg in legs:
         c = lg["count"] if isinstance(lg, dict) else (lg[2] if len(lg) > 2 else 1)
         try:
-            counts.append(int(c))
-        except (TypeError, ValueError):
-            counts.append(1)
-    cnt = min(counts) if counts else 1
+            counts.append(_dc(c))
+        except (TypeError, ValueError, ArithmeticError):
+            counts.append(_ONE)
+    cnt = min(counts) if counts else _ONE
     return v33_set_floor_dollars(len(legs), cnt)
 
 
@@ -450,21 +464,21 @@ def v33_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> tuple[Decima
         if isinstance(batches, list) and batches:
             for b in batches:
                 held = int(b.get("held_legs", 0) or 0)
-                cnt = int(b.get("fill_count", 1) or 1)
+                cnt = _dc(b.get("fill_count", 1) or 1)   # D3: fractional-safe
                 pessimistic += v33_set_floor_dollars(held, cnt)
-                optimistic += Decimal(min(held, 2)) * Decimal(cnt)
+                optimistic += Decimal(min(held, 2)) * cnt
             continue
         legs = r.get("unsettled_legs") or r.get("held_legs") or []
         counts = []
         for lg in legs:
             c = lg["count"] if isinstance(lg, dict) else (lg[2] if len(lg) > 2 else 1)
             try:
-                counts.append(int(c))
-            except (TypeError, ValueError):
-                counts.append(1)
-        cnt = min(counts) if counts else 1
+                counts.append(_dc(c))
+            except (TypeError, ValueError, ArithmeticError):
+                counts.append(_ONE)
+        cnt = min(counts) if counts else _ONE
         pessimistic += v33_set_floor_dollars(len(legs), cnt)
-        optimistic += Decimal(min(len(legs), 2)) * Decimal(cnt)
+        optimistic += Decimal(min(len(legs), 2)) * cnt
     return pessimistic, optimistic
 
 

@@ -62,6 +62,20 @@ def _dec(v: Any) -> Decimal | None:
         return None
 
 
+def _cnt(v: Any, default: Decimal = _ONE) -> Decimal:
+    """D3: a ledger lot count as a positive Decimal (fractional-safe). Old rows store an int, armed
+    fractional rows a Decimal string ("1.44"); both parse. Non-positive/absent -> ``default`` (1)."""
+    d = _dec(v)
+    return d if (d is not None and d > 0) else default
+
+
+def _count_num(d: Decimal) -> Any:
+    """Render a Decimal contract tally as a bare int when integral (whole-lot reports byte-identical to
+    the pre-D3 ``int(...)`` output), else the 2dp Decimal (fractional armed windows)."""
+    q = d.quantize(Decimal("0.01"))
+    return int(q) if q == q.to_integral_value() else q
+
+
 def _recent_days(rows: list[dict[str, Any]], days: int | None) -> list[dict[str, Any]]:
     if days is None:
         return rows
@@ -120,7 +134,7 @@ def build_v33_report(rows: list[dict[str, Any]],
     None keeps the gate table file-free."""
     windows: list[dict[str, Any]] = []
     tot_rungs = 0
-    tot_contracts = 0
+    tot_contracts = _ZERO
     tot_ladder_lock = _ZERO
     tot_rolls = 0
     tot_single = 0
@@ -132,7 +146,7 @@ def build_v33_report(rows: list[dict[str, Any]],
         lad = r.get("ladder") or {}
         ll = _dec(lad.get("ladder_lock")) or _ZERO
         tot_rungs += int(lad.get("rungs_filled", 0) or 0)
-        tot_contracts += int(lad.get("contracts", 0) or 0)
+        tot_contracts += _cnt(lad.get("contracts"), _ZERO)   # D3: Decimal, fractional-safe
         tot_ladder_lock += ll
         tot_rolls += int(lad.get("roll_count", 0) or 0)
         tot_single += int(lad.get("roll_single_order_count", 0) or 0)
@@ -164,7 +178,7 @@ def build_v33_report(rows: list[dict[str, Any]],
         "totals": {
             "windows": sum(1 for r in rows if _is_window_row(r)),
             "rungs_filled": tot_rungs,
-            "contracts": tot_contracts,
+            "contracts": _count_num(tot_contracts),
             "ladder_lock": tot_ladder_lock,
             "roll_count": tot_rolls,
             "roll_single_order_count": tot_single,
@@ -182,30 +196,36 @@ def _margin_stats(rung_fills: list[dict[str, Any]]) -> dict[int, dict[str, Any]]
     """Per-margin (whole cents) aggregate over a flat list of rung fills: n contracts, mean solved E
     (lock_solved), mean realised lock, shortfall (solved - realised), %positive. Locks in CENTS,
     count-weighted (each contract one observation)."""
-    by: dict[int, dict[str, list[Decimal]]] = defaultdict(
-        lambda: {"solved": [], "realised": [], "n": [Decimal(0)]})
+    # D3: count-WEIGHTED aggregation (each contract one observation, weighted by the fill's Decimal count)
+    # instead of list-replication, so a fractional fill (0.44) weights correctly and never crashes.
+    by: dict[int, dict[str, Decimal]] = defaultdict(
+        lambda: {"n": _ZERO, "solved_w": _ZERO, "solved_n": _ZERO, "realised_w": _ZERO,
+                 "realised_n": _ZERO, "realised_pos": _ZERO})
     for rf in rung_fills:
         m = _margin_c(rf)
         if m is None:
             continue
-        cnt = int(rf.get("count", 1) or 1)
-        by[m]["n"][0] += Decimal(cnt)
+        cnt = _cnt(rf.get("count"))
+        by[m]["n"] += cnt
         ls = _dec(rf.get("lock_solved"))
         if ls is not None:
-            by[m]["solved"].extend([ls * 100] * cnt)
+            by[m]["solved_w"] += ls * 100 * cnt
+            by[m]["solved_n"] += cnt
         rl = _dec(rf.get("realized_lock"))
         if rl is not None:
-            by[m]["realised"].extend([rl * 100] * cnt)
+            by[m]["realised_w"] += rl * 100 * cnt
+            by[m]["realised_n"] += cnt
+            if rl > 0:
+                by[m]["realised_pos"] += cnt
     out: dict[int, dict[str, Any]] = {}
     for m in sorted(by):
-        solved = by[m]["solved"]
-        realised = by[m]["realised"]
-        ms = (sum(solved, _ZERO) / Decimal(len(solved))) if solved else None
-        mr = (sum(realised, _ZERO) / Decimal(len(realised))) if realised else None
+        sn = by[m]["solved_n"]
+        rn = by[m]["realised_n"]
+        ms = (by[m]["solved_w"] / sn) if sn > 0 else None
+        mr = (by[m]["realised_w"] / rn) if rn > 0 else None
         sf = (ms - mr) if (ms is not None and mr is not None) else None
-        pos = sum(1 for x in realised if x > 0)
-        pctp = (Decimal(pos) * 100 / Decimal(len(realised))) if realised else None
-        out[m] = {"margin_c": m, "n_contracts": int(by[m]["n"][0]), "n_completed": len(realised),
+        pctp = (by[m]["realised_pos"] * 100 / rn) if rn > 0 else None
+        out[m] = {"margin_c": m, "n_contracts": _count_num(by[m]["n"]), "n_completed": _count_num(rn),
                   "mean_solved_c": ms, "mean_realised_c": mr, "shortfall_c": sf, "pct_positive": pctp}
     return out
 
@@ -238,13 +258,15 @@ def _pooled_ladder(rows_subset: list[dict[str, Any]]) -> dict[str, Any]:
     mean realised lock, %positive, rolls + single-order-roll ratio, mean venue activity per window."""
     all_rf = [rf for r in rows_subset for rf in _row_rung_fills(r)]
     realised_locks: list[Decimal] = []
-    contracts = 0
+    contracts = _ZERO
     for rf in all_rf:
-        cnt = int(rf.get("count", 1) or 1)
+        cnt = _cnt(rf.get("count"))          # D3: Decimal, fractional-safe
         contracts += cnt
         rl = _dec(rf.get("realized_lock"))
         if rl is not None:
-            realised_locks.extend([rl * 100] * cnt)
+            # count-weighted mean/percentile via whole-lot replication (a rare fractional partial
+            # contributes its integer part to the coarse summary; the per-margin table is exactly weighted).
+            realised_locks.extend([rl * 100] * int(cnt))
     ladder_lock = _ZERO
     for r in rows_subset:
         ladder_lock += _dec((r.get("ladder") or {}).get("ladder_lock")) or _ZERO
@@ -260,7 +282,7 @@ def _pooled_ladder(rows_subset: list[dict[str, Any]]) -> dict[str, Any]:
     amends = sum(int((r.get("ladder") or {}).get("amends_attempted", 0) or 0) for r in rows_subset)
     cancels = sum(int((r.get("ladder") or {}).get("cancels", 0) or 0) for r in rows_subset)
     return {
-        "windows": nwin, "contracts": contracts, "ladder_lock_c": ladder_lock * 100,
+        "windows": nwin, "contracts": _count_num(contracts), "ladder_lock_c": ladder_lock * 100,
         "n_completed": len(realised_locks), "mean_realised_lock_c": mean_lock, "pct_positive": pctp,
         "roll_count": tot_rolls, "roll_single_order_count": tot_single,
         "roll_single_order_ratio": roll_ratio,
@@ -310,12 +332,12 @@ def _allocation_levels(rung_fills: list[dict[str, Any]]) -> list[dict[str, Any]]
     mean lock/contract (cents, count-weighted), %pos (% contracts with solved lock > 0), total lock
     (cents, Σ count*lock_solved)."""
     by: dict[int, dict[str, Any]] = defaultdict(
-        lambda: {"fills": 0, "contracts": 0, "solved_c": [], "weight": None})
+        lambda: {"fills": 0, "contracts": _ZERO, "solved_c": [], "weight": None})
     for rf in rung_fills:
         m = _margin_c(rf)
         if m is None:
             continue
-        cnt = int(rf.get("count", 1) or 1)
+        cnt = _cnt(rf.get("count"))          # D3: Decimal, fractional-safe
         by[m]["fills"] += 1
         by[m]["contracts"] += cnt
         w = rf.get("weight")
@@ -323,7 +345,7 @@ def _allocation_levels(rung_fills: list[dict[str, Any]]) -> list[dict[str, Any]]
             by[m]["weight"] = int(w)
         ls = _dec(rf.get("lock_solved"))
         if ls is not None:
-            by[m]["solved_c"].extend([ls * 100] * cnt)
+            by[m]["solved_c"].extend([ls * 100] * int(cnt))
     out: list[dict[str, Any]] = []
     for m in sorted(by):
         solved = by[m]["solved_c"]
@@ -332,7 +354,7 @@ def _allocation_levels(rung_fills: list[dict[str, Any]]) -> list[dict[str, Any]]
         pos = sum(1 for x in solved if x > 0)
         pctp = (Decimal(pos) * 100 / Decimal(len(solved))) if solved else None
         out.append({
-            "level_c": m, "fills": by[m]["fills"], "contracts": by[m]["contracts"],
+            "level_c": m, "fills": by[m]["fills"], "contracts": _count_num(by[m]["contracts"]),
             "weight": by[m]["weight"], "mean_lock_c": mean, "pct_positive": pctp,
             "total_lock_c": total,
         })
@@ -440,12 +462,12 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]],
     default, and the pure unit-test path) the S4 scan is skipped -- no file is read."""
     realised = [r for r in rows if _is_realised(r)]
     all_rf = [rf for r in realised for rf in _row_rung_fills(r)]
-    n = sum(int(rf.get("count", 1) or 1) for rf in all_rf)                 # rung-fill contracts
+    n = sum((_cnt(rf.get("count")) for rf in all_rf), _ZERO)               # rung-fill contracts (D3: Decimal)
     realised_locks: list[Decimal] = []
     for rf in all_rf:
         rl = _dec(rf.get("realized_lock"))
         if rl is not None:
-            realised_locks.extend([rl * 100] * int(rf.get("count", 1) or 1))
+            realised_locks.extend([rl * 100] * int(_cnt(rf.get("count"))))
     mean_lock = (sum(realised_locks, _ZERO) / Decimal(len(realised_locks))) if realised_locks else None
     pos = sum(1 for x in realised_locks if x > 0)
     pct_pos = (Decimal(pos) * 100 / Decimal(len(realised_locks))) if realised_locks else None
@@ -465,11 +487,11 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]],
     n_min = load_v33_params().n_min
     cap_num, cap_den, cap_ratio = _capture_at_margin(rows, V33_FALSIFIER_CAPTURE_MARGIN_C, n_min)
 
-    one_legged = 0
+    one_legged = _ZERO
     for r in realised:
         for b in (r.get("wing_batch_sets") or []):
             if b.get("one_legged"):
-                one_legged += int(b.get("fill_count", 1) or 1)
+                one_legged += _cnt(b.get("fill_count"))   # D3: Decimal, fractional-safe
 
     tot_rolls = sum(int((r.get("ladder") or {}).get("roll_count", 0) or 0) for r in realised)
     tot_single = sum(int((r.get("ladder") or {}).get("roll_single_order_count", 0) or 0)
@@ -502,7 +524,7 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]],
         cap_status = "PASS" if cap_ratio >= V33_CAPTURE_RATIO_MIN else "FAIL"
     gates.append({"gate": f"capture ratio @ {V33_FALSIFIER_CAPTURE_MARGIN_C}c", "value": cap_ratio,
                   "threshold": f">= {V33_CAPTURE_RATIO_MIN}", "status": cap_status})
-    add("one-legged contracts", Decimal(one_legged), f"<= {V33_FALSIFIER_MAX_ONE_LEGGED}",
+    add("one-legged contracts", one_legged, f"<= {V33_FALSIFIER_MAX_ONE_LEGGED}",
         (one_legged <= V33_FALSIFIER_MAX_ONE_LEGGED), True)
     add("single-order-roll ratio", roll_ratio, f">= {V33_FALSIFIER_MIN_SINGLE_ORDER_ROLL_RATIO}",
         (roll_ratio is not None and roll_ratio >= V33_FALSIFIER_MIN_SINGLE_ORDER_ROLL_RATIO),
@@ -534,11 +556,11 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]],
                     f"(S4 state UNKNOWN; verify)")
 
     return {
-        "n_rung_fills": n, "min_n": V33_FALSIFIER_MIN_N, "mean_lock_c": mean_lock,
+        "n_rung_fills": _count_num(n), "min_n": V33_FALSIFIER_MIN_N, "mean_lock_c": mean_lock,
         "pct_positive": pct_pos, "worst_shortfall_c": worst_shortfall,
         "worst_shortfall_margin_c": worst_margin,
         "capture_live": cap_num, "capture_shadow": cap_den, "capture_ratio": cap_ratio,
-        "one_legged": one_legged, "roll_count": tot_rolls, "roll_single_order_ratio": roll_ratio,
+        "one_legged": _count_num(one_legged), "roll_count": tot_rolls, "roll_single_order_ratio": roll_ratio,
         "s4_kill_days": s4_days, "s4_corrupt_days": s4_corrupt_days,
         "gates": gates, "verdict": verdict,
     }
@@ -593,7 +615,7 @@ def build_print_through(rows: list[dict[str, Any]]) -> dict[str, Any]:
     trigger recorded vs the realised batch lock the ladder scoreboard already carries for filled rungs."""
     windows = 0
     triggers = 0
-    contracts = 0
+    contracts = _ZERO
     res: dict[str, int] = {"filled": 0, "complete": 0, "unwind": 0, "partial": 0, "open": 0}
     trigger_locks_c: list[Decimal] = []       # lock at the early ask, per FILLED trigger (cents/contract)
     completion_locks_c: list[Decimal] = []    # lock at completion for the `complete` branch
@@ -614,13 +636,13 @@ def build_print_through(rows: list[dict[str, Any]]) -> dict[str, Any]:
         windows += 1
         for t in pts:
             triggers += 1
-            cnt = int(t.get("count", 0) or 0)
+            cnt = _cnt(t.get("count"), _ZERO)   # D3: Decimal, fractional-safe
             contracts += cnt
             resolution = t.get("resolution") if t.get("resolved") else "open"
             res[resolution] = res.get(resolution, 0) + 1
             lat = _dec(t.get("lock_at_trigger"))
-            if resolution == "filled" and lat is not None and cnt:
-                trigger_locks_c.append((lat / Decimal(cnt)) * 100)
+            if resolution == "filled" and lat is not None and cnt > 0:
+                trigger_locks_c.append((lat / cnt) * 100)
             if resolution == "complete":
                 lc = _dec(t.get("lock_at_completion"))
                 if lc is not None:
@@ -635,7 +657,7 @@ def build_print_through(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "windows_with_triggers": windows,
         "triggers": triggers,
-        "contracts_prehedged": contracts,
+        "contracts_prehedged": _count_num(contracts),
         "resolutions": res,
         "mean_trigger_lock_c": mean_trigger_lock,
         "mean_completion_lock_c": mean_completion_lock,
@@ -657,18 +679,18 @@ def _v32_set_lock(r: dict[str, Any]) -> Decimal | None:
         for b in batches:
             lk = _dec(b.get("realized_lock"))
             if lk is not None:
-                total += lk * Decimal(int(b.get("fill_count", 1) or 1))
+                total += lk * _cnt(b.get("fill_count"))   # D3: Decimal, fractional-safe
                 any_lock = True
         return total if any_lock else None
     return _dec(r.get("realized_lock"))
 
 
 def _v32_entered(r: dict[str, Any]) -> bool:
-    return (_v32_set_lock(r) is not None) or int(r.get("lots_filled", 0) or 0) > 0
+    return (_v32_set_lock(r) is not None) or _cnt(r.get("lots_filled"), _ZERO) > 0
 
 
 def _v33_entered(r: dict[str, Any]) -> bool:
-    return int((r.get("ladder") or {}).get("contracts", 0) or 0) > 0
+    return _cnt((r.get("ladder") or {}).get("contracts"), _ZERO) > 0
 
 
 def build_side_by_side(v33_rows: list[dict[str, Any]], v32_rows: list[dict[str, Any]]
@@ -711,8 +733,8 @@ def build_side_by_side(v33_rows: list[dict[str, Any]], v32_rows: list[dict[str, 
             "v32_mode": v32.get("effective_mode") or v32.get("mode"),
             "v33_mode": r.get("effective_mode") or r.get("mode"),
             "v33_dry_sim": bool(r.get("dry_sim")),
-            "v32_contracts": int(v32.get("lots_filled", 0) or 0),
-            "v33_contracts": int(lad.get("contracts", 0) or 0),
+            "v32_contracts": _count_num(_cnt(v32.get("lots_filled"), _ZERO)),
+            "v33_contracts": _count_num(_cnt(lad.get("contracts"), _ZERO)),
             "v33_rungs": int(lad.get("rungs_filled", 0) or 0),
             "v32_lock": v32_lock,
             "v33_lock": v33_lock,
