@@ -610,13 +610,14 @@ def test_async_driver_places_full_ladder_end_to_end():
 
 
 def test_async_driver_loop_not_blocked_and_placements_concurrent():
-    # 11 creates at 12 ms each: if they ran SERIALLY on the loop (the 2026-09-30 bug) the ladder would
-    # take >= ~132 ms and the loop would be frozen the whole time; off-loop + concurrent it completes in a
-    # small multiple of one latency AND the loop keeps iterating (loops counter high).
+    # 11 creates (20 ms each): if they ran SERIALLY on the loop (the 2026-09-30 bug) the writer would only
+    # ever have ONE round trip in flight and the loop would be frozen; off-loop + concurrent, MANY are in
+    # flight at once (max_inflight high -- a DETERMINISTIC concurrency witness, not a wall-clock race) AND
+    # the loop keeps iterating while they run.
     fake = FakeProxyWriter()
 
     async def go():
-        drv, aw, cts = _armed_driver(fake, post_latency=0.012)
+        drv, aw, cts = _armed_driver(fake, post_latency=0.02)
         try:
             _bring_up(drv, cts)
             loops = 0
@@ -624,15 +625,17 @@ def test_async_driver_loop_not_blocked_and_placements_concurrent():
             while not (len(drv.state.ladder) == 11 and all(o.live for o in drv.state.ladder)):
                 await asyncio.sleep(0.001)
                 loops += 1
-                if time.monotonic() - t0 > 4.0:
+                if time.monotonic() - t0 > 5.0:
                     break
-            return drv, loops, time.monotonic() - t0
+            return drv, loops, aw.stats.max_inflight
         finally:
             aw.close()
 
-    drv, loops, elapsed = asyncio.run(go())
+    drv, loops, max_inflight = asyncio.run(go())
     assert len(drv.state.ladder) == 11 and all(o.live for o in drv.state.ladder)
-    assert elapsed < 0.11, f"ladder took {elapsed:.3f}s -> writes were serialized, not concurrent off-loop"
+    # concurrency proof (deterministic): the writer had many round trips in flight AT ONCE. Serialized
+    # (the bug) would peak at 1; off-loop concurrent peaks near the ladder width.
+    assert max_inflight >= 5, f"max_inflight={max_inflight} -> writes were serialized, not concurrent"
     assert loops > 3, "the loop did not iterate while writes were in flight (it was blocked)"
     # the feed never froze while quoting: the max feed gap stayed tiny (the direct proof).
     assert drv._feed_gap_max_s < 0.05
