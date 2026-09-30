@@ -768,6 +768,8 @@ def _v33_writer_stats(driver: V33Driver) -> dict[str, Any]:
     if driver._async and driver._aw is not None:
         out["writer"] = driver._aw.stats.summary()
         out["async_rate_limited"] = int(getattr(driver.executor, "async_rate_limited", 0))
+        # duplicate wing retries dropped by the transport belt (one in-flight IOC per missing leg).
+        out["wing_retries_dropped"] = int(getattr(driver.executor, "wing_retries_dropped", 0))
     return out
 
 

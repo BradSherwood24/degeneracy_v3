@@ -118,6 +118,13 @@ class V33AsyncExecutor(V33LiveExecutor):
         self._aw = async_writer
         self.writer = _SyncGuardWriter()   # trap synchronous HTTP (would block the loop)
         self.async_rate_limited = 0        # 429s observed across retries (surfaced on the exec counters)
+        # WING RETRY-STORM BELT (2026-09-30 22:00Z finding): ONE in-flight IOC per missing leg. The (batch,
+        # side) keys of legs with a wing take currently in flight; a RETRY_WING for a leg already in flight
+        # is DROPPED (counted, never a journal record each) so a per-tick retry storm cannot starve the
+        # cancel/roll lanes or the reader. The CORE-side re-emission floor (fix/v33-fill-attribution branch,
+        # core.py) is the source fix; this is the transport belt on the priority lane.
+        self._wing_inflight_legs: set[tuple[int, str]] = set()
+        self.wing_retries_dropped = 0
 
     # =====================================================================
     # off-loop verb helpers (429 belt on the SAME lane; build brief §5)
@@ -557,9 +564,33 @@ class V33AsyncExecutor(V33LiveExecutor):
     # TAKE_WINGS / RETRY_WING — async twin of V33LiveExecutor._take_wings (chunked; WING lane)
     # =====================================================================
     async def _take_wings_async(self, state, now: float) -> list[Any]:
-        pending = [lg for lg in state.wing_legs if lg.status == "pending"]
+        pending_all = [lg for lg in state.wing_legs if lg.status == "pending"]
+        if not pending_all:
+            return []
+        # WING RETRY-STORM BELT: claim one in-flight IOC per missing leg; DROP a retry for a leg that
+        # already has an IOC in flight (count it, no journal record each). The claim is check-and-add on the
+        # single loop thread (no await between), so it is atomic. Cleared in the finally below when the take
+        # returns — the core's next RETRY_WING (subject to its own re-emission floor) then re-claims.
+        pending: list[Any] = []
+        claimed: list[tuple[int, str]] = []
+        for lg in pending_all:
+            key = (lg.batch, lg.side)
+            if key in self._wing_inflight_legs:
+                self.wing_retries_dropped += 1
+                self._bump("wing_retry_dropped")
+                continue
+            self._wing_inflight_legs.add(key)
+            claimed.append(key)
+            pending.append(lg)
         if not pending:
             return []
+        try:
+            return await self._take_wings_send(pending, now)
+        finally:
+            for key in claimed:
+                self._wing_inflight_legs.discard(key)
+
+    async def _take_wings_send(self, pending: list[Any], now: float) -> list[Any]:
         events: list[Any] = []
         entries: list[dict[str, Any]] = []
         chunk_owner: dict[str, tuple[int, str]] = {}

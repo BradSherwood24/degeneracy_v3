@@ -681,5 +681,71 @@ def test_dry_driver_is_not_async_and_unchanged():
     assert stats["async_writer"] is False and "writer" not in stats
 
 
+def test_async_wing_retry_storm_belt_one_inflight_per_leg():
+    # 2026-09-30 22:00Z finding: a missing wing leg was retried EVERY TICK (967 IOCs in ~96 s). The
+    # transport belt allows only ONE in-flight IOC per missing leg: a duplicate retry for a leg already in
+    # flight is DROPPED (counted, no journal record each) and never sent.
+    from dataclasses import replace as dc_replace
+
+    fake = FakeProxyWriter()
+    fake.gate("post:wing")   # hold the first wing take in flight
+
+    async def go():
+        st = _state()
+        leg = WingLeg(ticker=B, side="yes", count=1, limit=Decimal("0.03"),
+                      client_order_id="v33-w0", batch=0)
+        st = dc_replace(st, wing_legs=(leg,))
+        ex, aw = _aexec(fake, wing_cap=2)
+        try:
+            take = V32Action(kind=ActionKind.TAKE_WINGS, legs=[], count=1)
+            retry = V32Action(kind=ActionKind.RETRY_WING, legs=[], count=1)
+            t1 = asyncio.ensure_future(ex.on_action_async(take, st, CTS - 500))
+            await asyncio.sleep(0.02)   # let t1 CLAIM the leg and park on the wing gate
+            # three duplicate retries for the SAME leg while the first is in flight -> all DROPPED.
+            for _ in range(3):
+                r = await ex.on_action_async(retry, st, CTS - 499)
+                assert r == []
+            fake.gate("post:wing").set()
+            await t1
+            return ex
+        finally:
+            aw.close()
+
+    ex = asyncio.run(go())
+    wing_posts = [c for c in fake.calls if c.verb == "post" and c.klass == CLASS_WING]
+    assert len(wing_posts) == 1                 # ONE IOC sent despite four take/retry actions
+    assert ex.wing_retries_dropped == 3         # the three duplicates were counted, not sent
+    # the belt counted (never a journal record each): no per-drop journal record kind.
+    kinds = [k for k, _ in ex.journal.records]
+    assert kinds.count("take_wings") == 1
+
+
+def test_async_wing_retry_belt_allows_next_after_completion():
+    # once the in-flight take COMPLETES, the belt releases the leg so the core's NEXT retry can send again.
+    from dataclasses import replace as dc_replace
+
+    fake = FakeProxyWriter()
+    fake.post_queue.append(WriteResponse(200, {"order": {"order_id": "wo-1", "client_order_id": "v33-wc-1",
+                                                        "fill_count": "0.00", "remaining_count": "1.00"}}, True))
+
+    async def go():
+        st = _state()
+        leg = WingLeg(ticker=B, side="yes", count=1, limit=Decimal("0.03"),
+                      client_order_id="v33-w0", batch=0)
+        st = dc_replace(st, wing_legs=(leg,))
+        ex, aw = _aexec(fake, wing_cap=2)
+        try:
+            take = V32Action(kind=ActionKind.TAKE_WINGS, legs=[], count=1)
+            await ex.on_action_async(take, st, CTS - 500)      # completes (IOC unfilled)
+            await ex.on_action_async(take, st, CTS - 490)      # leg released -> sends again
+            return ex
+        finally:
+            aw.close()
+
+    ex = asyncio.run(go())
+    wing_posts = [c for c in fake.calls if c.verb == "post" and c.klass == CLASS_WING]
+    assert len(wing_posts) == 2 and ex.wing_retries_dropped == 0
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
