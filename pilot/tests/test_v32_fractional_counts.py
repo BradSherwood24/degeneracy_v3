@@ -424,3 +424,35 @@ def test_money_math_whole_count_bare_ints():
     assert all(isinstance(h["count"], int) for h in held)
     assert money["rest_fills"][-1]["count"] == 1 and isinstance(money["rest_fills"][-1]["count"], int)
     assert isinstance(money["lots_unfilled_at_quote_end"], int)
+
+
+# ===========================================================================
+# REPORT reconciliation: the ``size`` field is a bare int for a WHOLE set (so the
+# ``--json`` report stays byte-identical to the pre-fractional build) and a Decimal
+# for a fractional set. (Review nit N1, 2026-10-01.)
+# ===========================================================================
+def test_report_recon_size_whole_is_bare_int_fractional_is_decimal():
+    import json as _json
+    from service.v32.report import build_ledger_reconciliation
+
+    def _row(close, fill_count, held=3):
+        return {
+            "mode": "armed", "close_time": close, "Sd": 79600, "Su": 79700,
+            "wing_batch_sets": [{"index": 0, "fill_count": fill_count,
+                                 "held_legs": held, "completed": True}],
+            "realized_lock": "0.10", "one_legged": False,
+            "floor_booked": "0.88", "realized_delta": "0.80",
+            "held_legs": [{"ticker": "KXBTC-RANGE-B79600", "side": "no", "count": fill_count}],
+        }
+
+    # whole set (int row 2, and Decimal-string row "2") -> size a BARE int
+    for fc in (2, "2", "2.00"):
+        rc = build_ledger_reconciliation([_row("2026-10-01T00:00:00Z", fc)])
+        assert rc[0]["size"] == 2 and isinstance(rc[0]["size"], int), (fc, rc[0]["size"])
+        # and it serialises as a JSON NUMBER (not a quoted string) under the report's dump
+        dumped = _json.dumps(rc[0], default=lambda o: str(o))
+        assert '"size": 2' in dumped and '"size": "2"' not in dumped
+
+    # fractional set -> size the exact Decimal (str-encoded by the json dump like the other fields)
+    rc = build_ledger_reconciliation([_row("2026-10-01T01:00:00Z", "0.44")])
+    assert rc[0]["size"] == Decimal("0.44") and isinstance(rc[0]["size"], Decimal)

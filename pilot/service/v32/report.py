@@ -55,6 +55,15 @@ def _cnt(v: Any, default: Decimal = Decimal(1)) -> Decimal:
     return d if (d is not None and d > 0) else default
 
 
+def _co(c: Decimal) -> Any:
+    """Serialise a reconciliation lot count for the report dict: an INTEGRAL count as a bare int (so the
+    ``--json`` report's ``size`` stays a JSON NUMBER -- byte-identical to the pre-fractional build and to
+    every whole-lot ``_count_out``/``_co`` elsewhere), a fractional count (e.g. 1.44) as the Decimal
+    (the ``--json`` dump's ``default=str`` encodes it, exactly as it does the other Decimal recon
+    fields). Mirrors ``service.v32.ledger._co`` (2026-10-01 fractional MECHANICS review nit N1)."""
+    return int(c) if c == c.to_integral_value() else c
+
+
 def _shadow_below_min(sub: dict[str, Any], n_min: Decimal) -> bool:
     """True when a shadow fill record's derived n (1 - offer) is below ``n_min`` -- the live path
     stands down (``n_below_min``) at such an n and would never have rested there, so the shadow fill is
@@ -567,7 +576,9 @@ def build_ledger_reconciliation(rows: list[dict[str, Any]]) -> list[dict[str, An
         stored_total = stored_window + (stored_backfill if stored_backfill is not None else Decimal(0))
         out.append({
             "close_time": ct,
-            "size": total_count,
+            # whole -> bare int (``--json`` ``size`` stays a JSON number, byte-identical to main);
+            # fractional -> Decimal (str-encoded by the json dump, like the other recon fields).
+            "size": _co(total_count),
             "complete": complete,
             "backfilled": bf is not None,
             "stored_window": stored_window,
