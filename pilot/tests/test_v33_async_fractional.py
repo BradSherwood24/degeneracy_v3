@@ -20,7 +20,8 @@ from decimal import Decimal
 from service.proxy_writer import WriteResponse
 from service.v32.actions import ActionKind, V32Action
 from service.v32.events import Fill, OrderCancelled
-from service.v32.executor import OPEN_ORDERS_PATH, ORDER_STATUS_PATH_TMPL, RestRecord
+from service.v32.executor import (OPEN_ORDERS_PATH, ORDER_STATUS_PATH_TMPL, OrderStatus,
+                                  RestRecord)
 from service.v33 import V33State, WingLeg, load_v33_params
 from service.v33.actions import LegOrder, V33Action, V33ActionKind
 from service.v33.async_writer import AsyncOrderWriter
@@ -212,6 +213,61 @@ def test_async_poll_returns_decimal_fractional_fill():
 # ---------------------------------------------------------------------------
 # F1 — async print-through taker/unwind chunking is fractional (dormant path, pinned for parity)
 # ---------------------------------------------------------------------------
+def _cancel_rec(coid, oid):
+    return RestRecord(client_order_id=coid, order_id=oid, price=Decimal("0.46"), count=1,
+                      ticker=B, bucket_Sd=80400, placed_ts=0.0, status="live", exchange_index=2)
+
+
+def test_async_concurrent_cancels_do_not_cross_contaminate_status_fp():
+    """REVIEW (fractional integration): a cancel-all dispatches N cancel coroutines CONCURRENTLY, whose
+    ``_confirm_cancel_filled_async`` loops interleave across the off-loop status-GET await. The fractional
+    cancel resolution must read ITS OWN confirm's status fp, never a sibling's off the shared
+    ``_last_confirm_status_fp`` field.
+
+    Deterministic interleave: order A (TRUE fill 0, reduced_by = full count, status poll UNREADABLE) and
+    order B (0.44 fill, reduced_by 0.56) resolve concurrently; B writes the shared field 0.44 while A's own
+    poll is unreadable. A must still report filled_before_cancel = 0 (its truth), not B's 0.44 (which would
+    book a PHANTOM fractional fill on A and hedge a position it never held). PRE-FIX A reads the clobbered
+    0.44; POST-FIX A reads its own confirm return (0)."""
+    fake = FracAsyncProxy(cap=2)
+    ex, aw = _aexec(fake)
+    recA, recB = _cancel_rec("v33-A", "oidA"), _cancel_rec("v33-B", "oidB")
+
+    async def go():
+        a_entered = asyncio.Event()
+        b_wrote = asyncio.Event()
+
+        async def status(oid):
+            if oid == "oidA":
+                a_entered.set()
+                await b_wrote.wait()               # A's poll stays unreadable until B wrote the field
+                return OrderStatus("oidA", None, 0, None, available=False)
+            await a_entered.wait()                  # ensure A entered confirm (reset field) before B writes
+            return OrderStatus("oidB", "canceled", 0, 0, True, filled_count_fp=Decimal("0.44"))
+        ex.order_status_async = status
+
+        orig_finish = ex._finish_cancel
+        def finish(rec, oid, filled, ds, rb, now, **kw):
+            r = orig_finish(rec, oid, filled, ds, rb, now, **kw)
+            if oid == "oidB":
+                b_wrote.set()                       # B has computed filled_fp (field written) -> release A
+            return r
+        ex._finish_cancel = finish
+
+        wrA = WriteResponse(200, {"reduced_by": "1.00"}, True)   # A: 0 filled
+        wrB = WriteResponse(200, {"reduced_by": "0.56"}, True)   # B: 0.44 filled
+        try:
+            return await asyncio.gather(
+                ex._resolve_cancel_success_async(wrA, recA, "oidA", 0.0),
+                ex._resolve_cancel_success_async(wrB, recB, "oidB", 0.0))
+        finally:
+            aw.close()
+
+    resA, resB = asyncio.run(go())
+    assert resA[0].filled_count_before_cancel == Decimal(0), resA[0].filled_count_before_cancel
+    assert resB[0].filled_count_before_cancel == Decimal("0.44"), resB[0].filled_count_before_cancel
+
+
 def test_async_take_bucket_no_fractional_chunking():
     """``_take_bucket_no_async`` chunks a 3.44 want to [2.00, 1.44] and books the fractional got."""
     fake = FracAsyncProxy(cap=2)

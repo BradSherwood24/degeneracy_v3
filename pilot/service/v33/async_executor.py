@@ -408,17 +408,21 @@ class V33AsyncExecutor(V33LiveExecutor):
         rb = _dec_or_none(wr.body.get("reduced_by")) if isinstance(wr.body, dict) else None
         if rb is not None and rec is not None:
             filled_delete = max(0, int(rec.count) - int(rb))
-        filled_status = await self._confirm_cancel_filled_async(oid, now)
+        filled_status, status_fp = await self._confirm_cancel_filled_async(oid, now)
         filled = max(filled_delete or 0, filled_status)
         self.cancels_confirmed += 1
         self._last_confirmed_gone_oid = oid
         # V3.3 D3 (F2 port): the EXACT fractional fill = max(placed - reduced_by, status fp) so a 0.44
         # leg surfaced by the cancel confirm is not truncated to 0 (mirrors LiveExecutor._resolve_cancel_success).
+        # REVIEW (fractional integration): ``status_fp`` is THIS cancel's own confirm return, NOT the shared
+        # ``self._last_confirm_status_fp`` field -- a cancel-all dispatches N confirm coroutines concurrently,
+        # which interleave across the off-loop status-GET await and would clobber a shared field (a sibling's
+        # fp read as our own = a phantom fractional fill when our own status poll was unreadable).
         filled_fp = None
         if self._fractional_counts:
             fp_delete = (max(Decimal(0), Decimal(rec.count) - rb)
                          if (rb is not None and rec is not None) else Decimal(0))
-            filled_fp = max(fp_delete, self._last_confirm_status_fp)
+            filled_fp = max(fp_delete, status_fp)
         return self._finish_cancel(rec, oid, filled, wr.status_code, rb, now, filled_fp=filled_fp)
 
     async def _cancel_nonok_async(self, wr, rec, oid: str, exch: int | None, coid, now: float) -> list[Any]:
@@ -456,22 +460,33 @@ class V33AsyncExecutor(V33LiveExecutor):
                                              "delete_status": last_status})
         return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0))]
 
-    async def _confirm_cancel_filled_async(self, order_id: str, now: float) -> int:
+    async def _confirm_cancel_filled_async(self, order_id: str, now: float) -> tuple[int, Decimal]:
         """Async twin of LiveExecutor._confirm_cancel_filled (the confirm polls run OFF the loop).
-        V3.3 D3 (F2 port): also stashes the EXACT fractional fill in ``self._last_confirm_status_fp`` for
-        the fractional cancel resolution (V3.2 ignores it)."""
+        V3.3 D3 (F2 port): also returns the EXACT fractional fill for the fractional cancel resolution.
+
+        REVIEW (fractional integration): the sync twin stashes the fp in ``self._last_confirm_status_fp``
+        and the sync resolver reads that instance field -- safe because the sync path cancels ONE order at a
+        time. On the ASYNC path a cancel-all dispatches N confirm coroutines CONCURRENTLY
+        (``_dispatch_async`` ``as_completed``): two confirm loops interleave across the off-loop status-GET
+        await and both write that one field, so a resolver could read a SIBLING cancel's fp (a phantom
+        fractional fill on an order whose own status poll was unreadable). The fp is therefore RETURNED here
+        (a per-call local) and read from the return in ``_resolve_cancel_success_async`` -- never cross-read
+        off the shared field. (The field is still written for sync-twin parity; it is not read on the async
+        path.)"""
         filled = 0
+        status_fp = Decimal(0)
         self._last_confirm_status_fp = Decimal(0)
         for i in range(CANCEL_CONFIRM_POLLS):
             st = await self.order_status_async(order_id)
             if st.available:
                 filled = st.filled_count
+                status_fp = st.filled_count_fp
                 self._last_confirm_status_fp = st.filled_count_fp
                 if st.status not in ("resting", None) or st.remaining_count == 0:
-                    return filled
+                    return filled, status_fp
             if i < CANCEL_CONFIRM_POLLS - 1:
                 await asyncio.sleep(CANCEL_CONFIRM_INTERVAL_S)
-        return filled
+        return filled, status_fp
 
     async def order_status_async(self, order_id: str) -> OrderStatus:
         """Async twin of LiveExecutor.order_status (fail-closed to unavailable on any error)."""
