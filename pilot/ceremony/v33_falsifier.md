@@ -294,6 +294,22 @@ stays DRY -- this is a falsifier amendment, not a mode flip.
   coid -313 @0.46 filled count_fp **0.44** -- i.e. -312=1.00, -313=0.44. The entry's "(count_fp 0.44 and 1.00)"
   has the two the wrong way round; the total (1.44 NO) and every other fact in the entry are unchanged.
 
+- 2026-10-01 17:16:07Z -- RE-ARM (Brad's hand) after the 09-30 incident fixes. Brad ran, as a typed command,
+  `Set-Content ops/v33_mode.txt armed` (read back armed; V3.2 stays dry beside it; inside the 17:02-17:33 window).
+  Code at re-arm: main 77a75e4 (1453 passed / 1 skipped) = #105 off-loop async order writer, #106 fill attribution
+  by the rung's own bucket + fractional counts + 250 ms wing retry floor + netted wings, #107 V3.2 fractional counts.
+  Levers pulled on Brad's verbatim "Go for both" (17:14Z): the proxy AMEND CAP (ops/proxy_amend_cap.md) applied to
+  degeneracy-proxy/proxy.py (amends capped like a single create + counted against the budget; proxy suite 112
+  passed; backups kept) and the proxy restarted (budget 8000, cap 2, prefixes incl. KXBTC); the V3.3 supervisor
+  restarted with DV3_V33_ASYNC_WRITER=1 so the first armed windows ARE the async writer's shakedown (dry cannot
+  exercise it) at 1 lot per rung, read window by window. Feed on both processes healthy at 16:00Z/17:00Z
+  (lag ~0.8 s mean, p99 < 2.2 s, zero alarms) after a 14:00Z-15:00Z backlog caused by local build/test load, now a
+  standing rule: no heavy local work in the :40-:00 band while armed. Crypto-side balance $44.60. MUST CONFIRM for
+  the first windows: 11 rests 201'd; amend_confirmed 2xx (not amend_failed fallback); one-order rolls; wings sized
+  to the filled count on the FILL's bucket; feed_gap_max_s small with writer_stats.async_writer true; no 429s.
+  The incident's two contracts (09-30 22:00Z row) remain in the ledger pending Brad's ruling (exclude vs restate)
+  before n approaches 15.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
