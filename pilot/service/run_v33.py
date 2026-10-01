@@ -72,6 +72,8 @@ from service.v33 import (
 from service.v33.actions import ActionKind, V33ActionKind
 from service.v33.core import print_through_summary
 from service.v33.executor import V33LiveExecutor, cancel_stale_open_orders
+from service.v33.async_writer import AsyncOrderWriter
+from service.v33.async_executor import V33AsyncExecutor
 from service.v33.shadow import DeepObservationLadder, ideal_rung_crosses
 from service.v33.ledger import (
     append_v33_ledger_row,
@@ -119,6 +121,26 @@ _HEARTBEAT_S = 10.0
 _PUMP_GUARD = 100000
 
 DEFAULT_FALSIFIER_PATH_V33 = falsifier_path_v33()
+
+# The action kinds that carry an order to the venue (everything else — STAND_DOWN, the shadow-fill
+# telemetry kinds — produces no HTTP; the async executor returns [] for them). The async dispatch path
+# routes ONLY these to the off-loop writer; the sync path routes every kind through on_action (which
+# returns [] for the rest), so the two are behaviourally equivalent.
+_ORDER_ACTION_KINDS = frozenset({
+    ActionKind.PLACE_REST, ActionKind.CANCEL_REST, ActionKind.AMEND_REST,
+    ActionKind.TAKE_WINGS, ActionKind.RETRY_WING,
+    V33ActionKind.TAKE_BUCKET_NO, V33ActionKind.UNWIND_WINGS,
+})
+
+
+def async_writer_enabled(cli_flag: bool) -> bool:
+    """Whether the OFF-LOOP async order writer is selected. CLI --async-writer wins; else the
+    DV3_V33_ASYNC_WRITER env var (1/true/yes/on). DEFAULT OFF — the synchronous V33LiveExecutor stays the
+    live path until Brad shakes down the async path and flips it (mirrors the --batch-create / amend-first
+    dormant-flag discipline; NOT a params field, so the pinned v33_params sha is untouched)."""
+    if cli_flag:
+        return True
+    return os.environ.get("DV3_V33_ASYNC_WRITER", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ===========================================================================
@@ -168,6 +190,7 @@ def build_executor_v33(
     effective_mode: str, *, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
     params: V33Params, writer: ProxyWriter | None, clock: Callable[[], float] = time.time,
     batch_create: bool = False, wing_cap: int | None = None,
+    async_writer: AsyncOrderWriter | None = None,
 ) -> Any:
     """``armed`` -> the real ``V33LiveExecutor`` (requires a ProxyWriter); everything else -> the reused
     dry ``FrozenExecutor`` (refuses a real action kind). ``wing_cap`` = the chunk cap for coalesced wing
@@ -185,6 +208,18 @@ def build_executor_v33(
         if wing_cap is None:
             raise ValueError("armed executor requires a known proxy contract cap (wing_cap); the "
                              "/health cap was unreadable -- refusing to size wings against a guess")
+        if async_writer is not None:
+            # OFF-LOOP armed executor (2026-09-30): the SAME pacer/counter/invariant setup as the sync one,
+            # but every round trip runs off the loop via ``async_writer``. Selected only when Brad's
+            # --async-writer flag / DV3_V33_ASYNC_WRITER is set (default OFF — shakedown before arm).
+            return V33AsyncExecutor(
+                async_writer, writer, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
+                params.quote_end_s, k_rungs=params.rungs, clock=clock, batch_create=batch_create,
+                wing_cap=wing_cap, write_tokens_per_s=params.write_tokens_per_s,
+                write_bucket_size=params.write_bucket_size,
+                write_reserve_tokens=params.write_reserve_tokens,
+                enable_print_through=params.print_through,
+            )
         return V33LiveExecutor(
             writer, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
             params.quote_end_s, k_rungs=params.rungs, clock=clock, batch_create=batch_create,
@@ -207,7 +242,8 @@ class V33Driver:
 
     def __init__(self, params: V33Params, state: V33State, journal: StreamJournal, executor: Any,
                  *, dry_sim: bool, batch_create: bool = False,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 async_writer: AsyncOrderWriter | None = None) -> None:
         self.params = params
         self.state = state
         self.journal = journal
@@ -215,6 +251,16 @@ class V33Driver:
         self.dry_sim = bool(dry_sim)
         self.batch_create = bool(batch_create)
         self.clock = clock
+        # OFF-LOOP async writer (2026-09-30): when set, order-bearing actions are dispatched to the writer
+        # as loop tasks (the loop never blocks on a round trip); when None, the byte-identical synchronous
+        # path runs. The executor is a V33AsyncExecutor iff async_writer is set (wired in build_executor_v33).
+        self._async = async_writer is not None
+        self._aw = async_writer
+        self._async_errors = 0
+        # feed_gap_max_s (build brief §6): the largest WALL gap between consecutive WS feed frames while the
+        # ladder is quoting (live/pending rungs) — the DIRECT proof the loop is not freezing the feed.
+        self._last_feed_wall: float | None = None
+        self._feed_gap_max_s: float = 0.0
         self.counts: dict[str, int] = defaultdict(int)
         self._last_server_ts: float | None = None
         self._last_wall: float | None = None
@@ -245,7 +291,21 @@ class V33Driver:
         return self._last_server_ts + (self.clock() - self._last_wall)
 
     # --- event entry points (same signatures the reused V32Recorder drives) ---
+    def _track_feed_gap(self) -> None:
+        """Record the max wall gap between consecutive feed frames WHILE QUOTING (the ladder holds live or
+        pending rungs). A frozen loop shows up here directly; a healthy off-loop writer keeps it near the
+        WS cadence even through an 11-order cancel-all + re-place."""
+        wall = self.clock()
+        prev = self._last_feed_wall
+        self._last_feed_wall = wall
+        quoting = bool(self.state.ladder) or bool(self.state.rolls_in_flight)
+        if prev is not None and quoting:
+            gap = wall - prev
+            if gap > self._feed_gap_max_s:
+                self._feed_gap_max_s = gap
+
     def on_book_update(self, market: str, top: TopOfBook, server_ts: float) -> None:
+        self._track_feed_gap()
         self._stamp(server_ts)
         eval_ts = self._last_server_ts
         self._pump([BookUpdate(market_ticker=market, top=top, server_ts=eval_ts, book_ts=server_ts)])
@@ -255,6 +315,7 @@ class V33Driver:
         if ev is None:
             self.journal.append("v33_trade_unparsed", {"market": market}, self.clock())
             return
+        self._track_feed_gap()
         self._stamp(server_ts)
         ev = replace(ev, server_ts=self._last_server_ts)
         self._pump([ev])
@@ -376,6 +437,8 @@ class V33Driver:
 
     # --- decide + route loop ---
     def _pump(self, events: list[Any]) -> None:
+        if self._async:
+            return self._pump_async(events)
         q: deque = deque(events)
         guard = 0
         while q:
@@ -404,6 +467,68 @@ class V33Driver:
                     q.extend(self.executor.on_action(a, self.state, ts))
             self._apply_executor_standdown(ts)
             self._maybe_eval(getattr(ev, "server_ts", None))
+
+    # --- async (off-loop) decide + dispatch ---
+    def _pump_async(self, events: list[Any]) -> None:
+        """The async twin of ``_pump``: decide SYNCHRONOUSLY (decide_v33 never awaits, so state stays
+        serialized on the loop), journal every action, then DISPATCH the order-bearing actions to the
+        off-loop writer as a loop task and RETURN — the loop is never blocked on a round trip. The
+        executor's result events (OrderAck / OrderCancelled / OrderAmended / Fill) re-enter decide later via
+        ``_ingest_async`` (build brief §1). Non-order kinds are no-ops for the executor exactly as in the
+        sync path (``on_action`` returns [] for them)."""
+        q: deque = deque(events)
+        guard = 0
+        while q:
+            guard += 1
+            if guard > _PUMP_GUARD:
+                self.journal.append("alarm", {"alarm": "pump_runaway", "guard": guard}, self.clock())
+                break
+            ev = q.popleft()
+            self.state, actions = decide_v33(self.params, self.state, ev)
+            ts = getattr(ev, "server_ts", self.clock())
+            order_actions = [a for a in actions if a.kind in _ORDER_ACTION_KINDS]
+            for a in actions:
+                self._journal_action(a, ts)
+            self._apply_executor_standdown(ts)
+            self._maybe_eval(getattr(ev, "server_ts", None))
+            if order_actions:
+                snapshot = self.state
+                asyncio.get_running_loop().create_task(
+                    self._dispatch_async(order_actions, ts, snapshot))
+
+    async def _dispatch_async(self, order_actions: list[Any], ts: float, snapshot: V33State) -> None:
+        """Run the order-bearing actions of ONE decide tick CONCURRENTLY off the loop ("reprices of
+        multiple levels can be sent without delay" — Brad), and feed each result back into decide as it
+        completes. A failure in one action never wedges the driver (journaled, counted, skipped)."""
+        try:
+            places = [a for a in order_actions if a.kind == ActionKind.PLACE_REST]
+            coros: list[Any] = []
+            if self.batch_create and len(places) > 1 and hasattr(self.executor, "place_batch_async"):
+                others = [a for a in order_actions if a.kind != ActionKind.PLACE_REST]
+                coros.append(self.executor.place_batch_async(places, ts))
+                coros += [self.executor.on_action_async(a, snapshot, ts) for a in others]
+            else:
+                coros = [self.executor.on_action_async(a, snapshot, ts) for a in order_actions]
+            for fut in asyncio.as_completed(coros):
+                try:
+                    result = await fut
+                except Exception as e:  # noqa: BLE001 — one action's failure must not wedge the loop
+                    self._async_errors += 1
+                    self.journal.append("alarm", {"alarm": "async_dispatch_error", "error": str(e)},
+                                        self.clock())
+                    continue
+                self._apply_executor_standdown(ts)
+                if result:
+                    self._ingest_async(result)
+        except Exception as e:  # noqa: BLE001
+            self._async_errors += 1
+            self.journal.append("alarm", {"alarm": "async_dispatch_fatal", "error": str(e)},
+                                self.clock())
+
+    def _ingest_async(self, events: list[Any]) -> None:
+        """Re-enter the async pump on the loop with the executor's result events. Synchronous (decide never
+        awaits), so it serializes with every other decide on the single loop thread — no state race."""
+        self._pump_async(list(events))
 
     def _apply_executor_standdown(self, server_ts: float) -> None:
         reason = getattr(self.executor, "stand_down_reason", None)
@@ -531,6 +656,10 @@ async def _order_status_poll_v33(
     it does ONE ``GET /portfolio/orders?ticker=<bucket>`` per tick instead of K per-rung GETs; else it
     polls each live rung. Never raises."""
     batched = getattr(driver.params, "order_poll_batched", True)
+    is_async = getattr(driver, "_async", False)
+    if is_async:
+        batched = True   # the off-loop executor implements only the batched ASYNC poll (order_poll_batched
+        # is True by default anyway); the per-rung sync poll would hit the sync-HTTP guard.
     while clock() < deadline:
         await sleep(interval)
         if clock() >= deadline:
@@ -555,7 +684,10 @@ async def _order_status_poll_v33(
             filled_by_oid: dict[str, int] = {}
             for tk in tickers:
                 try:
-                    filled_by_oid.update(executor.poll_orders_for_bucket(tk))
+                    if is_async:
+                        filled_by_oid.update(await executor.poll_orders_for_bucket_async(tk))
+                    else:
+                        filled_by_oid.update(executor.poll_orders_for_bucket(tk))
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[V33] batched order-status poll error for %s: %s", tk, e)
                     continue
@@ -625,6 +757,22 @@ def _compute_v33_money(driver: V33Driver) -> dict[str, Any]:
     return {**money, **counters}
 
 
+def _v33_writer_stats(driver: V33Driver) -> dict[str, Any]:
+    """The off-loop-writer telemetry for the ledger row (build brief §6): the DIRECT feed-gap proof plus
+    the writer's queue-depth / latency / class mix (present only when the async writer ran this window)."""
+    out: dict[str, Any] = {
+        "async_writer": bool(driver._async),
+        "feed_gap_max_s": round(driver._feed_gap_max_s, 4),
+        "async_errors": int(driver._async_errors),
+    }
+    if driver._async and driver._aw is not None:
+        out["writer"] = driver._aw.stats.summary()
+        out["async_rate_limited"] = int(getattr(driver.executor, "async_rate_limited", 0))
+        # duplicate wing retries dropped by the transport belt (one in-flight IOC per missing leg).
+        out["wing_retries_dropped"] = int(getattr(driver.executor, "wing_retries_dropped", 0))
+    return out
+
+
 def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: str, resolved_mode: str,
               effective_mode: str, degrade: str | None, params: V33Params, strike_disc, bucket_map,
               journal_path: str, summary_path: str, ledger_path: str, strike_lag, bucket_lag,
@@ -652,6 +800,7 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         lots_filled=m.get("lots_filled", 0), m15_tickers=list(m15_tickers or []),
         m15_frames=shared.m15_frames, deep_obs=driver.deep_obs.summary(),
         print_through=print_through_summary(driver.state),
+        writer_stats=_v33_writer_stats(driver),
     )
     append_v33_ledger_row(row, ledger_path)
     summary = {
@@ -708,6 +857,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--flush-every", type=int, default=200)
     parser.add_argument("--batch-create", action="store_true",
                         help="Group multi-place ticks into batch creates (armed only; default OFF).")
+    parser.add_argument("--async-writer", action="store_true",
+                        help="Send orders OFF the event loop via the async writer (armed only; default "
+                             "OFF, also settable via DV3_V33_ASYNC_WRITER). Shake down in dry-adjacent "
+                             "before arming with it.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -855,11 +1008,20 @@ def main(argv: list[str] | None = None) -> int:
     proxy_cap = _proxy_max_contracts(health)
     wing_cap = (min(params.max_contracts_per_order_hint, proxy_cap)
                 if proxy_cap is not None else None)
+    # OFF-LOOP writer (2026-09-30): armed + --async-writer/DV3_V33_ASYNC_WRITER -> route every order round
+    # trip off the loop. The thread pools are created now (no loop needed); the first run_in_executor binds
+    # the loop inside run_v33_window. DEFAULT OFF -> the synchronous path is unchanged.
+    use_async = armed and writer is not None and async_writer_enabled(args.async_writer)
+    async_writer = AsyncOrderWriter(writer) if use_async else None
+    if use_async:
+        journal.append("async_writer_enabled", {"from_mode": resolved_mode}, clock())
+        logger.info("[V33] OFF-LOOP async order writer ENABLED for this armed window.")
     executor = build_executor_v33(effective_mode, bucket_map=bucket_map, exchange_index_by_ticker=exch_map,
                                   journal=journal, close_epoch_val=cts, params=params, writer=writer,
-                                  clock=clock, batch_create=args.batch_create, wing_cap=wing_cap)
+                                  clock=clock, batch_create=args.batch_create, wing_cap=wing_cap,
+                                  async_writer=async_writer)
     driver = V33Driver(params, state, journal, executor, dry_sim=dry_sim,
-                       batch_create=args.batch_create, clock=clock)
+                       batch_create=args.batch_create, clock=clock, async_writer=async_writer)
     shared = R.V32Recorder(journal, driver, clock=clock, m15_tickers=frozenset(m15_disc.tickers))
 
     if armed and writer is not None:
@@ -911,6 +1073,8 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("[V33] window done: %s", summary)
     finally:
         hard_stop.cancel()  # normal exit / _finalize error: disarm the belt-and-braces hard stop
+        if async_writer is not None:
+            async_writer.close()  # shut the off-loop pools at window end (idempotent; never raises)
     return 0
 
 
