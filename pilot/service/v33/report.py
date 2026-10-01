@@ -192,6 +192,7 @@ def build_v33_report(rows: list[dict[str, Any]],
             "bucket_mismatch": _row_bucket_mismatch(r),   # F3: fill bucket != held NO-leg bucket
             "netted_sets": len(netted),                   # D5: venue-netted wing pairs this window
             "netted_realised": row_netted_realised,
+            "writer": r.get("writer_stats") or {},
         })
     roll_ratio = (Decimal(tot_single) / Decimal(tot_rolls)) if tot_rolls else None
     return {
@@ -938,6 +939,47 @@ def _render_print_through(pt: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_writer(windows: list[dict[str, Any]]) -> list[str]:
+    """OFF-LOOP WRITER section (2026-09-30): per-window ``feed_gap_max_s`` — the DIRECT proof the loop is
+    not freezing the feed — plus the writer's queue depth / latency when the async writer ran. A large
+    feed_gap_max_s on a SYNC-writer window is the 2026-09-30 symptom (a write blocked the loop); a small one
+    on an ASYNC-writer window is the fix confirmed. Silent when no window carries writer telemetry."""
+    rows = [w for w in windows if isinstance(w.get("writer"), dict) and w["writer"]]
+    if not rows:
+        return []
+    out: list[str] = ["", "OFF-LOOP WRITER (feed_gap_max_s = largest WS gap while quoting; the direct proof)"]
+    out.append("-" * 92)
+    out.append("  " + "close_time".ljust(22) + "writer".rjust(8) + "feed_gap_s".rjust(12)
+               + "writes".rjust(8) + "lat_p50".rjust(9) + "lat_p99".rjust(9) + "lat_max".rjust(9)
+               + "errs".rjust(6))
+    worst_sync = None
+    worst_async = None
+    for w in rows:
+        ws = w["writer"]
+        is_async = bool(ws.get("async_writer"))
+        gap = ws.get("feed_gap_max_s")
+        wr = ws.get("writer") or {}
+        out.append(
+            "  " + str(w["close_time"]).ljust(22)
+            + ("async" if is_async else "sync").rjust(8)
+            + (f"{gap:.3f}" if isinstance(gap, (int, float)) else "-").rjust(12)
+            + (str(wr.get("submitted")) if wr.get("submitted") is not None else "-").rjust(8)
+            + (str(wr.get("latency_ms_p50")) if wr.get("latency_ms_p50") is not None else "-").rjust(9)
+            + (str(wr.get("latency_ms_p99")) if wr.get("latency_ms_p99") is not None else "-").rjust(9)
+            + (str(wr.get("latency_ms_max")) if wr.get("latency_ms_max") is not None else "-").rjust(9)
+            + str(ws.get("async_errors", 0)).rjust(6))
+        if isinstance(gap, (int, float)):
+            if is_async:
+                worst_async = gap if worst_async is None else max(worst_async, gap)
+            else:
+                worst_sync = gap if worst_sync is None else max(worst_sync, gap)
+    out.append("-" * 92)
+    out.append(f"  worst feed_gap  sync={'-' if worst_sync is None else f'{worst_sync:.3f}s'}   "
+               f"async={'-' if worst_async is None else f'{worst_async:.3f}s'}   "
+               f"(the async column near the WS cadence = loop-blocking gone)")
+    return out
+
+
 def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
     lines: list[str] = []
     header = ["close_time".ljust(22), "mode".ljust(10), "bucket".ljust(26), "rungs".rjust(6),
@@ -976,6 +1018,7 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
             f"  netted wing pairs (D5, adjacent-bucket overlap, $1/contract realised now) = "
             f"{t['netted_sets']}  realised={_c(t.get('netted_realised'))}")
 
+    lines.extend(_render_writer(report["windows"]))
     lines.extend(_render_scoreboard(report["scoreboard"]))
     lines.extend(_render_allocation(report["allocation"]))
     lines.extend(_render_gate_table(report["gate_table"]))

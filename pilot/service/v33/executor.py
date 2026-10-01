@@ -199,6 +199,47 @@ class WriteTokenBucket:
         self.tokens -= cost
         return wait
 
+    async def acquire_async(self, cost: int, kind: str, *, priority: bool = False) -> float:
+        """The ASYNC twin of ``acquire`` for the off-loop writer (2026-09-30): identical token accounting,
+        but the pacing wait is ``await asyncio.sleep`` (which YIELDS the loop) instead of a blocking
+        ``time.sleep`` that would freeze the feed.
+
+        The critical section (``_alock``) is held ONLY for the token arithmetic + the deduction; the
+        ``asyncio.sleep`` runs with the lock RELEASED (review finding A2). Each write RESERVES its ``cost``
+        atomically under the lock (computing its pacing wait from the pre-deduct level exactly as the sync
+        ``acquire`` does), then sleeps outside the lock. This keeps every token accounted exactly once (no
+        double-spend under concurrency — the integral matches the serial sync path and progress is
+        guaranteed: one bounded sleep, never a re-check spin that a frozen/slow clock could livelock),
+        while a PRIORITY write (a wing IOC take / a T-5 cancel-all — the safety-critical hedge/flatten) is
+        served IMMEDIATELY and is never blocked behind a non-priority write's pacing sleep the way a lock
+        held across that sleep would block it. A priority write ignores the reserve and does not pace,
+        exactly as the sync ``acquire`` does."""
+        import asyncio
+        lock = getattr(self, "_alock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._alock = lock
+        async with lock:
+            self._refill()
+            wait = 0.0
+            floor = 0.0 if priority else self.reserve
+            if not priority and self.tokens < cost + floor:
+                wait = (cost + floor - self.tokens) / self.rate if self.rate > 0 else 0.0
+            self.tokens -= cost  # reserve the cost atomically (under the lock) — no double-spend
+        if wait > 0:
+            self.total_wait_s += wait
+            self.paced_waits += 1
+            if self._journal is not None:
+                try:
+                    self._journal.append("write_paced",
+                                         {"kind": kind, "cost": cost, "reserve": self.reserve,
+                                          "wait_s": round(wait, 4), "async": True},
+                                         self._clock())
+                except Exception:  # noqa: BLE001 — pacing telemetry must never break the send
+                    pass
+            await asyncio.sleep(wait)  # OUTSIDE the lock — a priority acquire is never blocked behind it
+        return wait
+
 
 class V33LiveExecutor(LiveExecutor):
     """The armed maker executor for the K-rung ladder. Subclasses ``LiveExecutor`` and overrides only
@@ -683,12 +724,19 @@ class V33LiveExecutor(LiveExecutor):
         rec = self.attribute(order_id=r.get("order_id"), coid=r.get("client_order_id"))
         return rec.price if rec is not None else None
 
-    def _invariant_verdict(self, resting: list[dict[str, Any]]) -> tuple[bool, bool, list[dict[str, Any]]]:
+    def _invariant_verdict(self, resting: list[dict[str, Any]],
+                           place_price: Decimal | None = None) -> tuple[bool, bool, list[dict[str, Any]]]:
         """(overflow, dup_price, strays) for a resting-list snapshot, attributing each order's price via
         the RestBook. overflow = venue already holds >= K of ours; dup = one of ours already at the price
         we are about to place; a stray = an order we cannot attribute. A healthy partial ladder returns
-        (False, False, [])."""
-        place_price = self._pending_place_price
+        (False, False, []).
+
+        ``place_price`` is the price of THIS place (the dup check compares against it). It is passed
+        EXPLICITLY on the async path so two concurrently-dispatched places never read each other's price
+        off the shared ``_pending_place_price`` field across a GET await (review finding A1); the sync
+        path omits it and falls back to the instance field (one place at a time, no interleave)."""
+        if place_price is None:
+            place_price = self._pending_place_price
         resting_prices: list[Decimal] = []
         strays: list[dict[str, Any]] = []
         for r in resting:

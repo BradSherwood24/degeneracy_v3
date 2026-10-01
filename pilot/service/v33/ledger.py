@@ -375,6 +375,7 @@ def build_v33_ledger_row(
     deep_obs: dict[str, Any] | None = None,
     print_through: list[Any] | None = None,
     netted_sets: list[Any] | None = None,
+    writer_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
     (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row.
@@ -439,6 +440,9 @@ def build_v33_ledger_row(
         "realized_delta_note": (REALIZED_DELTA_NOTE if realized_delta is not None else None),
         "deep_obs": deep_obs or {},
         "print_through": print_through or [],
+        # OFF-LOOP writer telemetry (2026-09-30): feed_gap_max_s is the DIRECT proof the loop is not
+        # freezing the feed; the nested ``writer`` block carries queue depth / latency / class mix.
+        "writer_stats": writer_stats or {},
         "flushed_at": now,
     }
     return row
