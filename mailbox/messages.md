@@ -1352,3 +1352,32 @@ the core so capital can be tilted by level. V3.2's 10c stays untouched. Your lev
 NTP sync, power cord, amend cap.
 
 -- Claude
+
+## 2026-10-01 ~17:20Z -- Claude -> house: the day the ladder went live, broke, and came back
+
+Pre-compact note. Since the 09-29 compact: the two allocation builds landed (#98 ladder 8..18c, #99 `rung_lots`
+mechanism, #100 test collision), Brad amended the V3.3 falsifier (#101: +4.0c bar, S4 day loss = campaign kill,
+every decision at n=15) and FROZE it on his verbatim go (#102, 09-30 05:05Z). Proxy budget 8000, crypto-side
+funds $42.60. V3.3 ARMED 09-30 12:30Z by Brad's hand. Eight armed windows, no fills; the ladder was torn down
+15-35 times a window by the stale-wing rule -- self-inflicted: synchronous proxy writes inside the event loop
+starved the websocket reader (75 of 77 feed gaps had our own writes inside them). First live fill 21:50Z was an
+incident: fractional rung fills (0.44 + 1.00) into a stale-wing re-place, bucket-change cancel-all, the fill
+attributed to the CURRENT spot bucket, wings on the wrong strikes, 967 per-tick IOC retries. Settled +$2.05
+by luck (the inside-bucket outcome was -$1.39). V3.3 dry 22:02Z on Brad's order.
+
+Fixes, each with Opus 4.8 build + adversarial review (nine review rounds across four PRs, every one found
+something real): #105 off-loop async order writer (wing/cancel priority lanes, per-slot FIFO, batch create,
+feed-gap proof on the ledger row; two coroutine-interleaving races caught in review); #106 fill attribution by
+the rung's own bucket, fractional counts end-to-end, 250 ms retry floor, netted wings (the backfill was
+cancelling the netted $1 -- caught); #107 V3.2 fractional counts (whole lots byte-identical). Proxy amend cap
+applied to proxy.py and restarted 10-01 17:15Z on Brad's "Go for both"; V3.3 supervisor restarted with the
+async flag; V3.3 RE-ARMED 17:16:07Z (#108). First armed window on the new path = 18:00Z close.
+
+Lessons the house should keep: (1) Kalshi crypto contracts are fractional (count_fp, 0.01) -- every count
+is a Decimal now; (2) "loop-confined" does not mean "race-free" -- shared instance fields read across an
+await bit three times; (3) a laptop running builds and reviews cannot also be the feed reader (14:00Z-15:00Z
+backlog of 10-25 s was local CPU load, not Kalshi) -- no heavy work in :40-:00 while armed, and Render is the
+answer; (4) Kalshi's Collateral Return would return ~$1/set on the wing pair (a directional hedge inside the
+strike event) -- a real capital lever, unstudied, off; (5) refill-in-window: 5 of 37 entry windows had a 2nd
+burst and its locks were coin flips (+2.1c mean, 52% pos) -- rides with the weights promotion at n>=15.
+Open ruling for Brad: the incident's two contracts in the verdict sample (exclude vs restate).
