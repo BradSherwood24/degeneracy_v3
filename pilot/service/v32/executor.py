@@ -62,6 +62,16 @@ logger = logging.getLogger(__name__)
 
 _ONE = Decimal(1)
 _PRICE_Q = Decimal("0.0001")
+_COUNT_Q = Decimal("0.01")   # fractional-count granularity (Kalshi crypto count_fp)
+
+
+def _count_out(c: Any) -> Any:
+    """Serialise a lot count for the executor journal / money-math capture: an INTEGRAL count as a bare
+    int (so a whole-lot V3.2 journal/ledger stays byte-identical to the pre-fractional build), a
+    fractional count (e.g. 0.44) as the 2dp Decimal (str-encoded by the journal's ``_json_default``).
+    Mirrors ``run_v32._count_out`` / ``run_v33._count_out`` (2026-10-01 fractional MECHANICS)."""
+    d = (c if isinstance(c, Decimal) else Decimal(str(c))).quantize(_COUNT_Q)
+    return int(d) if d == d.to_integral_value() else d
 
 # --- create paths, RELATIVE to REST_PREFIX (2026-09-14 doubled-prefix fix) ---
 # ``ProxyWriter.rest_post`` composes {base}/trade-api/v2{path}; the envelope's
@@ -304,10 +314,32 @@ def parse_order_status(body: dict[str, Any], order_id: str) -> OrderStatus:
 class LiveExecutor:
     """The armed maker executor. See module docstring for the law."""
 
-    # V3.3 D3 (2026-09-30): a roster opt-in to fractional-count cancel resolution. FALSE here so V3.2's
-    # cancel-confirm path is byte-identical (int filled, int journal). ``V33LiveExecutor`` sets it True to
-    # thread the EXACT ``fill_count_fp`` (0.44) into the OrderCancelled + journal — the incident's own path.
-    _fractional_counts: bool = False
+    # FRACTIONAL contract counts (2026-10-01 MECHANICS CLARIFICATION): Kalshi crypto fills are fractional
+    # (``count_fp``, 0.01 granularity; the 2026-09-30 incident filled 0.44 of a lot). This gate threads the
+    # EXACT ``fill_count_fp`` into the cancel-confirm OrderCancelled + journal + money-math (a 0.44 cancel
+    # fill is booked 0.44, not int-truncated to 0 and LOST). It is now True by default so BOTH rosters are
+    # fractional: V3.2 (this base, re-arms after this lands) and V3.3 (``V33LiveExecutor``, which still sets
+    # it True explicitly). The INT ``OrderStatus.filled_count`` field is retained (unchanged, byte-identical)
+    # for the cancel-race arithmetic and any reader that wants the whole-lot count; nothing now needs the
+    # gate False, but it is kept so a future int-only consumer / test can opt out. Whole counts serialise as
+    # bare ints (``_count_out``), so a whole-lot V3.2 journal/ledger is byte-identical to the pre-fractional
+    # build (``test_v32_cancel_confirm_whole_count_byte_identical``).
+    _fractional_counts: bool = True
+
+    @staticmethod
+    def _dc(count: Any) -> Decimal:
+        """A lot count as Decimal (fractional-safe), accepting int, Decimal, or numeric string. Shared with
+        ``V33LiveExecutor`` (#106); reused here for the fractional-safe wing wire body."""
+        return count if isinstance(count, Decimal) else Decimal(str(count))
+
+    @classmethod
+    def _count_body_str(cls, count: Any) -> str:
+        """The 2dp decimal string the venue accepts for the wire ``count`` (e.g. '1.44'); a whole lot stays
+        byte-identical ('2.00'). OVERRIDES ``to_v2_order``'s ``f"{int(count):.2f}"`` (which truncated
+        0.44 -> '0.00' and 1.44 -> '1.00'), exactly as the wing body already overrides ``price``. The
+        proxy's ``max_contracts_per_order`` cap compares numerically, so a sub-cap fractional count passes.
+        Shared machinery (#106); ``V33LiveExecutor`` carries an identical override."""
+        return str(cls._dc(count).quantize(_COUNT_Q))
 
     def __init__(
         self,
@@ -675,22 +707,26 @@ class LiveExecutor:
                                     {"order_id": oid, "status": wr.status_code}, self.clock())
                 continue
             filled = int(st.filled_count) if st.available else 0
-            if filled > 0:
+            # FRACTIONAL (2026-10-01): a 0.44 stray fill has ``filled_count`` int-truncated to 0, so gate on
+            # the EXACT ``fill_count_fp`` when the roster is fractional — else a sub-lot stray fill would be
+            # mis-classified as a phantom and dropped naked. ``filled_fp`` is threaded into _finish_cancel.
+            filled_fp = (st.filled_count_fp if (self._fractional_counts and st.available) else None)
+            has_fill = (filled_fp > 0) if filled_fp is not None else (filled > 0)
+            if has_fill:
                 # The stray left the book by FILLING — never silently drop it (reviewer §1a).
                 rec = self.attribute(order_id=oid)
                 if rec is not None:
                     self._last_confirmed_gone_oid = oid
-                    filled_fp = (st.filled_count_fp if (self._fractional_counts and st.available)
-                                 else None)
                     fill_events += self._finish_cancel(rec, oid, filled, wr.status_code, None, now,
                                                        via="invariant_fill", filled_fp=filled_fp)
                 else:
                     unbooked_fill = True
+                    filled_out = _count_out(filled_fp if filled_fp is not None else filled)
                     self._record_alarm("rest_invariant_unbooked_fill",
-                                       {"order_id": oid, "coid": r["client_order_id"], "filled": filled})
+                                       {"order_id": oid, "coid": r["client_order_id"], "filled": filled_out})
                     self.journal.append("rest_invariant_unbooked_fill",
                                         {"order_id": oid, "coid": r["client_order_id"],
-                                         "filled": filled, "delete_status": wr.status_code}, self.clock())
+                                         "filled": filled_out, "delete_status": wr.status_code}, self.clock())
                 continue
             # off the book with no fill -> a genuine read-path phantom.
             self.rest_invariant_phantoms += 1
@@ -859,12 +895,13 @@ class LiveExecutor:
         race fill into money-math if one slipped in (maker fee 0, de-duped by order_id), journal
         ``cancel_confirmed``, and hand the core an OrderCancelled carrying the filled count.
 
-        V3.3 D3: ``filled_fp`` (Decimal) is the EXACT fractional fill. When None (V3.2) the int ``filled``
-        is used exactly as before (byte-identical). When provided (V3.3, ``_fractional_counts``) the
-        OrderCancelled, the ``cancel_confirmed`` journal and the race-fill count carry the decimal so a
-        0.44 leg is not truncated — this is the incident's own surfacing path."""
-        val = filled_fp if filled_fp is not None else filled          # journal + race-fill count value
+        ``filled_fp`` (Decimal) is the EXACT fractional fill. When None (gate off) the int ``filled`` is
+        used exactly as before (byte-identical). When provided (``_fractional_counts``, now the default) the
+        OrderCancelled, the ``cancel_confirmed`` journal and the race-fill count carry the fraction so a
+        0.44 leg is not truncated — the incident's own surfacing path. A WHOLE count still serialises as a
+        bare int via ``_count_out`` (journal/ledger byte-identity)."""
         event_filled = filled_fp if filled_fp is not None else Decimal(filled)
+        out_val = _count_out(event_filled)   # bare int when whole, 2dp Decimal when fractional
         if rec is not None:
             rec.status = "filled" if event_filled > 0 else "cancelled"
             rec.cancel_confirmed_ts = now  # engine-truth confirm time; a later resting-LIST read still
@@ -873,13 +910,13 @@ class LiveExecutor:
                 self.booked_rest_oids.add(rec.order_id)
                 self.fills.append({"leg": "rest", "side": "no", "ticker": rec.ticker,
                                    "price": rec.price, "exec_price": None, "fee": Decimal(0),
-                                   "count": (val if filled_fp is not None else int(filled)),
+                                   "count": out_val,
                                    "bucket_Sd": rec.bucket_Sd,
                                    "path": "cancel_race", "client_order_id": rec.client_order_id})
         self.journal.append("cancel_confirmed",
                             {"order_id": oid, "delete_status": delete_status,
                              "reduced_by": (str(rb) if rb is not None else None),
-                             "filled_before_cancel": val, "via": via}, self.clock())
+                             "filled_before_cancel": out_val, "via": via}, self.clock())
         return [OrderCancelled(order_id=oid, server_ts=now,
                                filled_count_before_cancel=event_filled)]
 
@@ -976,7 +1013,9 @@ class LiveExecutor:
             rec.status = "amended"   # retained for late-fill attribution
         self.rest_book[coid_new] = new_rec
         self._by_order_id[oid] = coid_new
-        fill_count = int(parsed.fill_count) if parsed.fill_count is not None else 0
+        # FRACTIONAL (2026-10-01): an amend CROSS can fill a fractional taker amount; parse it as Decimal
+        # so a 0.44 amend-cross is not int-truncated to 0 (and the wings are sized to the fraction).
+        fill_count = self._dc(parsed.fill_count) if parsed.fill_count is not None else Decimal(0)
         avg_price = parsed.average_fill_price       # NO-space (normalized); can only be <= new_price
         avg_fee = parsed.average_fee_paid
         if fill_count > 0:
@@ -993,20 +1032,20 @@ class LiveExecutor:
                 self.fills.append({"leg": "rest", "side": "no", "ticker": ticker,
                                    "price": booked_price, "exec_price": avg_price,
                                    "fee": avg_fee if avg_fee is not None else Decimal(0),
-                                   "count": int(fill_count), "bucket_Sd": self._bucket_sd(ticker),
+                                   "count": _count_out(fill_count), "bucket_Sd": self._bucket_sd(ticker),
                                    "path": "amend", "client_order_id": coid_new})
             self.journal.append("amend_fill",
                                 {"order_id": oid, "client_order_id": coid_new,
                                  "avg_fill_price": avg_price, "avg_fee": avg_fee,
-                                 "fill_count": fill_count,
+                                 "fill_count": _count_out(fill_count),
                                  "remaining": str(parsed.remaining_count)}, self.clock())
         self.journal.append("amend_confirmed",
                             {"order_id": oid, "client_order_id": coid_new, "price": body.get("price"),
                              "n": new_price, "remaining_count": str(parsed.remaining_count),
-                             "fill_count": fill_count, "average_fill_price": avg_price,
+                             "fill_count": _count_out(fill_count), "average_fill_price": avg_price,
                              "average_fee_paid": avg_fee}, self.clock())
         return [OrderAmended(order_id=oid, client_order_id=coid_new, price=new_price, server_ts=now,
-                             remaining_count=parsed.remaining_count, fill_count=Decimal(fill_count),
+                             remaining_count=parsed.remaining_count, fill_count=fill_count,
                              average_fill_price=(avg_price if fill_count > 0 else None))]
 
     def _amend_body(self, action, oid: str, exch: int | None, coid_old, coid_new) -> dict[str, Any]:
@@ -1096,7 +1135,7 @@ class LiveExecutor:
             "ticker": leg.ticker,
             "side": leg.side,             # "yes" (low @ Sd) or "no" (high @ Su)
             "action": "buy",
-            "count": int(leg.count),
+            "count": leg.count,
             "time_in_force": WING_TIF,    # IOC taker
             "self_trade_prevention_type": DEFAULT_STP,
             "client_order_id": leg.client_order_id,
@@ -1107,6 +1146,11 @@ class LiveExecutor:
         else:
             legacy["no_price"] = _cents(leg.limit)
         body = to_v2_order(legacy)
+        # FRACTIONAL (2026-10-01): write the wire ``count`` fractional-safe (``_count_body_str``) — a 1.44
+        # wing goes out for 1.44, not ``to_v2_order``'s int-truncated '1.00'. A whole lot stays '2.00'
+        # (byte-identical). V3.2 never chunks: the wing count is <= params.contracts (2) <= the proxy
+        # ``max_contracts_per_order`` cap, so one IOC order per leg always carries the full hedge.
+        body["count"] = self._count_body_str(leg.count)
         # full-precision 4-dp price in YES-space (yes -> limit; no -> 1 - limit)
         p = Decimal(leg.limit) if leg.side == "yes" else (_ONE - Decimal(leg.limit))
         body["price"] = str(p.quantize(_PRICE_Q))
@@ -1138,7 +1182,7 @@ class LiveExecutor:
             price = r.average_fill_price if r.average_fill_price is not None else lg.limit
             self.fills.append({"leg": "wing", "side": lg.side, "ticker": lg.ticker,
                                "price": price, "fee": r.average_fee_paid,
-                               "count": int(r.fill_count), "ts": now, "path": "batch",
+                               "count": _count_out(r.fill_count), "ts": now, "path": "batch",
                                "client_order_id": coid})
             self._bump("wing_fill")
             events.append(Fill(order_id=r.order_id, client_order_id=coid, count=r.fill_count,

@@ -222,6 +222,22 @@ The falsifier's "FIRST ARMED WINDOW MUST CONFIRM" list, and where each item appe
     size-1 sets AND the new size-2 sets in ONE `n` toward the `n >= 30` verdict (the scoreboard does not
     filter by `params_sha`); each SET is one rest-fill event with both wings filled, lock reported per
     contract.
+11. **fractional contract counts (MECHANICS CLARIFICATION, 2026-10-01; `v32_falsifier.md` Registration).**
+    Kalshi crypto fills are FRACTIONAL (`count_fp`, 0.01). V3.2 now books and hedges a sub-lot fill at its
+    EXACT size; confirm on the first fractional fill:
+    (a) **wings sized to the fraction.** A 0.44 fill of a 2-lot rest -> a `wing_batch`/`take_wings` with
+    `count` 0.44 (the wing create wire body carries `count` "0.44", NOT a truncated "1.00"), and the
+    `rest_fill` record shows `count` "0.44"; the remainder (1.56) keeps resting. A WHOLE fill still shows a
+    bare-int `count` (byte-identical) -- a `count` serialised as "1.00"/"2.00" in a rest_fill/held leg is a
+    regression, STOP.
+    (b) **cancel-confirm / poll never lose a sub-lot.** A `cancel_confirmed` / poll `rest_fill` for a 0.44
+    fill books 0.44 (`filled_before_cancel` "0.44"), never 0 (a 0-booked but venue-filled rung = naked);
+    `placed - reduced_by` equals the fractional WS fill.
+    (c) **rests stay WHOLE on the wire (fail-closed).** `place_rest`/`amend_rest` `count` is always a whole
+    integer; a sub-lot remainder is NEVER re-placed (no count-0 order) -- it keeps resting on the original
+    order or is dropped off the book (under-exposed, never naked), per the Registration entry.
+    (d) **economics count-weighted.** `floor_booked`, the S4 band, settlement backfill and fees scale by the
+    fractional count; a complete fractional pin's floor = (held-1) x count.
 
 Also watch: no `A_REPLACE` (replaces/min under 60 -- an amend counts as a replace), no `A_STALE` bursts
 (strike/bucket data-age under 1.0 s), and the ledger row's `realized_lock` positive and near the shadow

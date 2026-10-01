@@ -31,6 +31,21 @@ def _json_default(obj: object) -> str:
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+# FRACTIONAL contract counts (2026-10-01 MECHANICS CLARIFICATION): Kalshi crypto fills are fractional
+# (``count_fp``). These keep the ledger count-weighted and Decimal-safe while a WHOLE count still
+# serialises as a bare int (every pre-fractional row byte-identical; old integer rows still parse).
+def _dc(count: Any) -> Decimal:
+    """A lot count as Decimal (fractional-safe), accepting int, Decimal, or numeric string."""
+    return count if isinstance(count, Decimal) else Decimal(str(count))
+
+
+def _co(count: Any) -> Any:
+    """Serialise a lot count for the row: integral -> bare int (byte-identical), fractional -> the 2dp
+    Decimal (str-encoded by ``_json_default``). Old integer rows already parse as ints."""
+    d = _dc(count).quantize(Decimal("0.01"))
+    return int(d) if d == d.to_integral_value() else d
+
+
 # Human-readable gloss stamped on every armed money-math row so a reader never mis-reads ``realized_delta``.
 REALIZED_DELTA_NOTE = (
     "floor - total cost incl. all fees x count (venue per-fill fee ceil(0.07*p*(1-p)*count)); "
@@ -264,8 +279,9 @@ def build_v32_ledger_row(
         # PARTIAL-FILL WINGS additive slots (per-set money math)
         "rest_fills": rest_fills or [],
         "wing_batch_sets": wing_batch_sets or [],
-        "lots_filled": int(lots_filled),
-        "lots_unfilled_at_quote_end": int(lots_unfilled_at_quote_end),
+        # FRACTIONAL (2026-10-01): lots are count-weighted; whole -> bare int (byte-identical).
+        "lots_filled": _co(lots_filled),
+        "lots_unfilled_at_quote_end": _co(lots_unfilled_at_quote_end),
         "partial_fills": int(partial_fills),
         "cancels_attempted": int(cancels_attempted),
         "cancels_confirmed": int(cancels_confirmed),
@@ -280,7 +296,7 @@ def build_v32_ledger_row(
         "amends_confirmed": int(amends_confirmed),
         "amends_failed": int(amends_failed),
         "amend_fallbacks": int(amend_fallbacks),
-        "fills_on_amend": int(fills_on_amend),
+        "fills_on_amend": _co(fills_on_amend),   # fractional-safe (a fractional amend-cross); whole -> int
         # settlement backfill slots (the sweep appends its own backfill row)
         "realized_unsettled": bool(realized_unsettled),
         "unsettled_legs": (held_legs or []) if realized_unsettled else [],
@@ -325,20 +341,20 @@ def _v32_floor_booked_for_entry(
         total = Decimal(0)
         for b in batches:
             held = int(b.get("held_legs", 0) or 0)
-            cnt = int(b.get("fill_count", 1) or 1)
+            cnt = _dc(b.get("fill_count", 1) or 1)   # fractional-safe (count-weighted floor)
             total += v32_set_floor_dollars(held, cnt)
         return total
     counts = []
     for lg in legs:
         c = lg["count"] if isinstance(lg, dict) else (lg[2] if len(lg) > 2 else 1)
         try:
-            counts.append(int(c))
-        except (TypeError, ValueError):
-            counts.append(1)
+            counts.append(_dc(c))
+        except (TypeError, ValueError, ArithmeticError):
+            counts.append(Decimal(1))
     # Fail closed on a malformed mixed-count legs list: take the SMALLER count (never the optimistic
     # larger one) so a reconstructed floor can only UNDER-credit, never over-credit. A well-formed set
     # has one count across its legs, so this is exact for every real row.
-    cnt = min(counts) if counts else 1
+    cnt = min(counts) if counts else Decimal(1)
     return v32_set_floor_dollars(len(legs), cnt)
 
 
@@ -381,9 +397,9 @@ def v32_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> tuple[Decima
         if isinstance(batches, list) and batches:
             for b in batches:
                 held = int(b.get("held_legs", 0) or 0)
-                cnt = int(b.get("fill_count", 1) or 1)
+                cnt = _dc(b.get("fill_count", 1) or 1)   # fractional-safe (count-weighted band)
                 pessimistic += v32_set_floor_dollars(held, cnt)   # floor: 3->2, 2->1, 1->0 (x count)
-                optimistic += Decimal(min(held, 2)) * Decimal(cnt)  # best: 3->2, 2->2, 1->1 (x count)
+                optimistic += Decimal(min(held, 2)) * cnt         # best: 3->2, 2->2, 1->1 (x count)
             continue
         legs = r.get("unsettled_legs") or r.get("held_legs") or []
         n_legs = len(legs)
@@ -391,15 +407,15 @@ def v32_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> tuple[Decima
         for lg in legs:
             c = lg["count"] if isinstance(lg, dict) else (lg[2] if len(lg) > 2 else 1)
             try:
-                counts.append(int(c))
-            except (TypeError, ValueError):
-                counts.append(1)
+                counts.append(_dc(c))
+            except (TypeError, ValueError, ArithmeticError):
+                counts.append(Decimal(1))
         # Fail closed on a malformed mixed-count legs list: the SMALLER count. For the pessimistic
         # (guaranteed floor) bound an under-stated floor only makes the day loss look larger (fail-safe
         # for S4); a well-formed set has one count across its legs, so this is exact for every real row.
-        cnt = min(counts) if counts else 1
+        cnt = min(counts) if counts else Decimal(1)
         pessimistic += v32_set_floor_dollars(n_legs, cnt)   # guaranteed floor (count-aware)
-        optimistic += Decimal(min(n_legs, 2)) * Decimal(cnt)  # best-case payoff (count-aware)
+        optimistic += Decimal(min(n_legs, 2)) * cnt         # best-case payoff (count-aware)
     return pessimistic, optimistic
 
 

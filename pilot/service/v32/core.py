@@ -86,6 +86,17 @@ _ONE = Decimal(1)
 _TWO = Decimal(2)
 _CENT = Decimal("0.01")
 _LIMIT_CEILING = Decimal("0.99")
+_COUNT_Q = Decimal("0.01")   # fractional-count granularity (Kalshi crypto count_fp, 0.01)
+
+
+def _q_count(c: Decimal) -> Decimal:
+    """Normalise a lot count to 2dp Decimal (Kalshi crypto fills are FRACTIONAL — ``count_fp``, 0.01
+    granularity; 2026-09-30 incident), stripping a trailing-zero fraction so a WHOLE count is the bare
+    integer Decimal (``Decimal('2')`` not ``Decimal('2.00')``). That keeps whole-lot journals/ledger
+    rows byte-identical (the driver/ledger serialise an integral count as a bare int) while a fractional
+    count (``0.44``) survives quantisation. Mirrors ``service.v33.core._q_count``."""
+    c = Decimal(c).quantize(_COUNT_Q)
+    return c.to_integral_value() if c == c.to_integral_value() else c
 
 # leg sides (Kalshi YES-perspective outcome we BUY on that leg)
 BUY_YES = "yes"
@@ -146,7 +157,7 @@ class RestOrder:
     client_order_id: str
     order_id: str | None
     price: Decimal
-    count: int
+    count: Decimal   # lots (fractional-safe; whole counts are the bare integer Decimal via _q_count)
     placed_ts: float
     live: bool
     pending: bool
@@ -158,7 +169,7 @@ class RestFill:
     """A fill of our resting bucket-NO order (n dollars, count contracts)."""
 
     price: Decimal
-    count: int
+    count: Decimal   # lots filled (fractional-safe; Kalshi crypto count_fp)
     server_ts: float
 
 
@@ -175,7 +186,7 @@ class WingLeg:
 
     ticker: str
     side: str
-    count: int
+    count: Decimal   # lots to take for this wing leg (fractional-safe; sized to the fill)
     limit: Decimal
     client_order_id: str
     status: str = "pending"
@@ -197,7 +208,7 @@ class WingBatch:
 
     index: int
     fill_price: Decimal
-    fill_count: int
+    fill_count: Decimal   # lots this batch hedges (fractional-safe; the size the rest filled at)
     server_ts: float
     taken: bool = False
     completed: bool = False
@@ -285,9 +296,9 @@ class V32State:
     # PARTIAL-FILL WINGS (Brad 2026-09-18): per-fill wing batches + the resting remainder.
     wing_batches: tuple[WingBatch, ...] = ()    # one per rest fill event, tracked independently
     rest_fills: tuple[RestFill, ...] = ()       # every rest fill booked this hour (each spawns a batch)
-    rest_remaining: int | None = None           # lots of the allotment still resting (None == full)
+    rest_remaining: Decimal | None = None        # lots of the allotment still resting (None == full; fractional-safe)
     rest_allotment_done: bool = False           # the whole allotment (params.contracts lots) has filled
-    rest_booked_by_coid: Mapping[str, int] = field(default_factory=dict)  # cumulative lots booked / order
+    rest_booked_by_coid: Mapping[str, Decimal] = field(default_factory=dict)  # cumulative lots booked / order (Decimal)
     next_batch_index: int = 0
     partial_fills: int = 0                       # rest fills that left a resting remainder
     # B1 fix: order_id -> (client_order_id, resting price) for a POPULATED rest_live that was EAGERLY
@@ -303,7 +314,7 @@ class V32State:
     # Only a PARTIAL cross sets it (a full cross nulls rest_live -> the echo can't match); at contracts=1 a
     # cross always fully fills, so this stays empty and behaviour is byte-identical. If it ever over-skips
     # (an echo that never arrives), the cumulative cancel/poll paths still reconcile to venue truth.
-    amend_cross_pending: Mapping[str, int] = field(default_factory=dict)
+    amend_cross_pending: Mapping[str, Decimal] = field(default_factory=dict)
 
     # shadow (keyed by str(E))
     shadows: Mapping[str, ShadowSub] = field(default_factory=dict)
@@ -436,10 +447,26 @@ def _mint_coid(st: V32State) -> tuple[str, V32State]:
 # ===========================================================================
 # PARTIAL-FILL WINGS helpers (Brad 2026-09-18)
 # ===========================================================================
-def _rest_size(params: V32Params, st: V32State) -> int:
-    """The number of lots to REST right now: the full allotment (``params.contracts``) until a fill
-    reduces it, then the still-resting remainder. ``rest_remaining`` is None until the first fill."""
-    return params.contracts if st.rest_remaining is None else int(st.rest_remaining)
+def _rest_size(params: V32Params, st: V32State) -> Decimal:
+    """The EXACT lots still resting right now (fractional-safe): the full allotment
+    (``params.contracts``) until a fill reduces it, then the still-resting remainder. ``rest_remaining``
+    is None until the first fill. This is the exposure/arithmetic truth (``_book_rest_delta`` subtracts
+    the next fill from it, and a partial fill mirrors it onto the live order's ``count``); the count
+    actually SENT to the venue on a (re)place/amend is ``_rest_place_count`` (whole lots only)."""
+    return _q_count(Decimal(params.contracts) if st.rest_remaining is None else st.rest_remaining)
+
+
+def _rest_place_count(params: V32Params, st: V32State) -> int:
+    """The WHOLE lot count to PLACE/AMEND on the venue right now (fail-closed, 2026-10-01 fractional
+    MECHANICS CLARIFICATION). The executor's place/amend bodies are integer-only (``_rest_body`` /
+    ``_amend_body`` do ``int(action.count)``), so a fractional rest cannot be sent end-to-end (same law
+    as #106 N1 for V3.3). We therefore FLOOR the exact remaining allotment to whole lots: a sub-lot
+    fractional remainder (e.g. 0.56 of a lot) is NOT re-placed on a requote — it either keeps resting on
+    the original venue order (the common partial-fill case does not requote; the venue holds the exact
+    fraction) or, if a requote tears that order down, the fraction is dropped off the book (fail-closed:
+    under-exposed, never a naked or over-sized rest). ``_requote`` skips placing/amending when this is 0
+    (no whole lot to rest), so a count-0 order is never sent."""
+    return int(_rest_size(params, st))
 
 
 def _replace_batch(batches: tuple[WingBatch, ...], index: int, **fields) -> tuple[WingBatch, ...]:
@@ -467,7 +494,7 @@ def _sync_wing_mirrors(st: V32State) -> V32State:
 
 
 def _book_rest_delta(
-    params: V32Params, st: V32State, coid: str, price: Decimal, delta: int, now: float
+    params: V32Params, st: V32State, coid: str, price: Decimal, delta: Decimal, now: float
 ) -> tuple[V32State, list[V32Action]]:
     """Book ``delta`` newly-filled lots of OUR resting bucket-NO (order ``coid``) at ``price``.
 
@@ -475,15 +502,21 @@ def _book_rest_delta(
     our maker order filled, for the size it filled at ... leave the [remainder] unfilled. Hopefully
     another taker comes and fills the remainder." So each fill event spawns ITS OWN wing batch sized to
     the fill; the remainder stays resting and keeps being requoted; the allotment is done only when the
-    last lot fills. ``delta`` must be > 0 (the caller does the cumulative->delta arithmetic and dedup)."""
+    last lot fills. ``delta`` must be > 0 (the caller does the cumulative->delta arithmetic and dedup).
+
+    FRACTIONAL (2026-10-01): Kalshi crypto fills are fractional (``count_fp``), so ``delta`` is a Decimal
+    and the wings are sized to the EXACT fraction (a 0.44 fill of a 2-lot rest -> a 0.44 wing batch and
+    1.56 keeps resting). Whole-lot windows (contracts=1, or integral fills) carry integral Decimals via
+    ``_q_count``, so every count serialises as a bare int and the behaviour is byte-identical."""
+    delta = _q_count(delta)
     size_before = _rest_size(params, st)
-    new_remaining = max(0, size_before - int(delta))
-    rf = RestFill(price=price, count=int(delta), server_ts=now)
+    new_remaining = max(_ZERO, _q_count(size_before - delta))
+    rf = RestFill(price=price, count=delta, server_ts=now)
     idx = st.next_batch_index
-    batch = WingBatch(index=idx, fill_price=price, fill_count=int(delta), server_ts=now)
+    batch = WingBatch(index=idx, fill_price=price, fill_count=delta, server_ts=now)
     booked = dict(st.rest_booked_by_coid)
-    booked[coid] = booked.get(coid, 0) + int(delta)
-    partial_fills = st.partial_fills + (1 if new_remaining > 0 else 0)
+    booked[coid] = _q_count(booked.get(coid, _ZERO) + delta)
+    partial_fills = st.partial_fills + (1 if new_remaining > _ZERO else 0)
     common = dict(
         rest_fills=st.rest_fills + (rf,),
         wing_batches=st.wing_batches + (batch,),
@@ -492,7 +525,7 @@ def _book_rest_delta(
         rest_remaining=new_remaining,
         partial_fills=partial_fills,
     )
-    if new_remaining == 0:
+    if new_remaining <= _ZERO:
         # the whole allotment has filled -> stop resting/quoting (one allotment per hour). Also clear
         # ``amend_in_flight`` (amend-first replace): a fill that completes the allotment DURING an amend
         # nulls the rest, so the in-flight amend hold must release too (moved here from _apply_fill's
@@ -675,8 +708,8 @@ def _apply_cancelled(
     # releases the held requotes and lets the next tick place the fresh (create) rest.
     if matched or st.cancel_in_flight or st.amend_in_flight:
         st = replace(st, cancel_in_flight=False, amend_in_flight=False)
-    filled = int(event.filled_count_before_cancel)
-    if filled > 0:
+    filled = _q_count(event.filled_count_before_cancel)   # fractional-safe (count_fp); whole -> int Decimal
+    if filled > _ZERO:
         # ``filled_count_before_cancel`` is CUMULATIVE for this order (venue truth). Book only the DELTA
         # over the lots already booked for it (a fill can arrive on the ws channel AND then be re-reported
         # by the cancel's status poll — see PARTIAL-FILL WINGS): one lot booked via a ws Fill, then a
@@ -697,9 +730,9 @@ def _apply_cancelled(
             if ctx is not None:
                 coid, price = ctx
         if coid is not None and price is not None:
-            already = st.rest_booked_by_coid.get(coid, 0)
-            delta = filled - already
-            if delta > 0:
+            already = _q_count(st.rest_booked_by_coid.get(coid, _ZERO))
+            delta = _q_count(filled - already)
+            if delta > _ZERO:
                 st, wa = _book_rest_delta(params, st, coid, price, delta, now)
                 actions += wa
         elif not st.rest_fills:
@@ -741,24 +774,24 @@ def _apply_fill(
     elif st.rest_pending is not None and st.rest_pending.client_order_id == event.client_order_id:
         matched = st.rest_pending
     if matched is not None:
-        delta = int(event.count)
+        delta = _q_count(event.count)   # fractional-safe (per-fill count_fp)
         # N1: skip lots this order's amend CROSS already booked (``_apply_amended``) — the venue echoes
         # that crossed taker fill on the WS ``fill`` channel with a fresh trade_id, which the driver's
         # trade-id dedup cannot catch (the Amend V2 response has no trade_id). Consume the echo guard for
         # the order before booking, so a partial amend cross is not double-booked. If the guard over-skips
         # (an echo that never arrives), the cumulative cancel/poll paths still book the true lot.
         oid = matched.order_id if matched.order_id is not None else event.order_id
-        if delta > 0 and oid is not None and st.amend_cross_pending.get(oid, 0) > 0:
-            pending = st.amend_cross_pending.get(oid, 0)
+        if delta > _ZERO and oid is not None and _q_count(st.amend_cross_pending.get(oid, _ZERO)) > _ZERO:
+            pending = _q_count(st.amend_cross_pending.get(oid, _ZERO))
             skip = min(pending, delta)
             acp = dict(st.amend_cross_pending)
-            if pending - skip > 0:
-                acp[oid] = pending - skip
+            if _q_count(pending - skip) > _ZERO:
+                acp[oid] = _q_count(pending - skip)
             else:
                 acp.pop(oid, None)
             st = replace(st, amend_cross_pending=acp)
-            delta -= skip
-        if delta > 0:
+            delta = _q_count(delta - skip)
+        if delta > _ZERO:
             n = event.price if event.price is not None else matched.price
             st, wa = _book_rest_delta(params, st, matched.client_order_id, n, delta, now)
             actions += wa
@@ -801,7 +834,7 @@ def _apply_amended(
     # Carry the cumulative booked count forward to the new coid (order_id persists across the amend).
     booked = dict(st.rest_booked_by_coid)
     if new_coid != old_coid and old_coid in booked:
-        booked[new_coid] = booked.get(new_coid, 0) + booked.pop(old_coid)
+        booked[new_coid] = _q_count(booked.get(new_coid, _ZERO) + booked.pop(old_coid))
     # Count the confirmed replace (an amend IS a replace: replace_count, the A_REPLACE alarm's
     # replace_times, and the ledger `replaces` counter). Same convention as _emit_place.
     times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
@@ -818,8 +851,8 @@ def _apply_amended(
     # at the venue's average fill price (NO-space; a TAKER fill, its fee booked by the executor). The
     # count is per-amend (the delta), so book it directly; _book_rest_delta spawns the wings, reduces the
     # remainder, and latches the allotment when the remainder reaches 0.
-    delta = int(event.fill_count) if event.fill_count is not None else 0
-    if delta > 0:
+    delta = _q_count(event.fill_count) if event.fill_count is not None else _ZERO
+    if delta > _ZERO:
         n = event.average_fill_price if event.average_fill_price is not None else updated.price
         st, wa = _book_rest_delta(params, st, new_coid, n, delta, now)
         actions += wa
@@ -830,7 +863,7 @@ def _apply_amended(
         # contracts=1 always fully fills, so this stays empty there).
         if st.rest_live is not None and event.order_id is not None:
             acp = dict(st.amend_cross_pending)
-            acp[event.order_id] = acp.get(event.order_id, 0) + delta
+            acp[event.order_id] = _q_count(acp.get(event.order_id, _ZERO) + delta)
             st = replace(st, amend_cross_pending=acp)
     return st, actions
 
@@ -1005,7 +1038,10 @@ def _place_action(st: V32State, params: V32Params, coid: str, n: Decimal) -> V32
     return _mk(
         ActionKind.PLACE_REST, st.shakedown,
         ticker=st.bucket_tickers.get(st.spot_Sd, ""), side=BUY_NO, action="buy",
-        count=_rest_size(params, st), price=n, expiration_epoch=exp, client_order_id=coid,
+        # WHOLE lots only on the wire (``_rest_place_count``, fail-closed on a sub-lot remainder); the
+        # executor's place body is integer-only. ``_q_count`` keeps it the bare-int Decimal (byte-identical).
+        count=_q_count(Decimal(_rest_place_count(params, st))), price=n,
+        expiration_epoch=exp, client_order_id=coid,
     )
 
 
@@ -1018,7 +1054,8 @@ def _emit_place(st: V32State, params: V32Params, now: float) -> tuple[V32State, 
     n = st.desired_n
     assert n is not None
     order = RestOrder(
-        client_order_id=coid, order_id=None, price=n, count=_rest_size(params, st),
+        client_order_id=coid, order_id=None, price=n,
+        count=_q_count(Decimal(_rest_place_count(params, st))),   # whole lots actually placed
         placed_ts=now, live=False, pending=True, bucket_Sd=st.spot_Sd,  # type: ignore[arg-type]
     )
     times = tuple(t for t in st.replace_times if now - t <= 60.0) + (now,)
@@ -1037,9 +1074,10 @@ def _amend_action(
         ActionKind.AMEND_REST, st.shakedown,
         order_id=order_id, ticker=st.bucket_tickers.get(st.spot_Sd, ""), side=BUY_NO, action="buy",
         # AMEND the still-resting REMAINDER, never the full allotment (PARTIAL-FILL WINGS): at
-        # ``contracts`` > 1 a partial fill leaves ``_rest_size`` lots resting, and the amend must carry
-        # that reduced count, not ``params.contracts``. At ``contracts`` = 1 this is params.contracts.
-        count=_rest_size(params, st), price=n, expiration_epoch=exp,
+        # ``contracts`` > 1 a partial fill leaves lots resting, and the amend must carry that reduced
+        # count, not ``params.contracts``. WHOLE lots only on the wire (``_rest_place_count``,
+        # fail-closed on a sub-lot remainder). At ``contracts`` = 1 this is params.contracts.
+        count=_q_count(Decimal(_rest_place_count(params, st))), price=n, expiration_epoch=exp,
         client_order_id=old_coid, updated_client_order_id=new_coid,
     )
 
@@ -1180,6 +1218,13 @@ def _requote(params: V32Params, st: V32State, now: float) -> tuple[V32State, lis
         # re-amend until OrderAmended (success) or the executor's fallback OrderCancelled resolves it.
         return st, actions
 
+    # FRACTIONAL fail-closed (2026-10-01): only a sub-lot remains to rest (``_rest_place_count`` floors
+    # the exact remainder to whole lots; the executor's place/amend bodies are integer-only). Do NOT send
+    # a count-0 (re)place/amend — leave whatever rests on the venue and keep hedging what filled. A fresh
+    # window (no fill yet) has ``_rest_place_count`` == params.contracts, so this never fires there.
+    if _rest_place_count(params, st) < 1:
+        return st, actions
+
     # place / replace
     if st.rest_live is None:
         # first place, or place after a bucket-change cancel confirmed.
@@ -1293,7 +1338,7 @@ def book_late_rest_fill(
     st: V32State,
     *,
     price: Decimal,
-    count: int,
+    count: Decimal,
     server_ts: float,
     bucket_Sd: int | None = None,
 ) -> tuple[V32State, list[V32Action]]:
@@ -1329,8 +1374,8 @@ def book_late_rest_fill(
     # as before (PARTIAL-FILL WINGS keeps the F-1 hook single-batch — a partial on a replaced order is
     # a rare tail; the batch machinery still books whatever ``count`` is reported).
     idx = st.next_batch_index
-    rf = RestFill(price=price, count=int(count), server_ts=server_ts)
-    batch = WingBatch(index=idx, fill_price=price, fill_count=int(count), server_ts=server_ts)
+    rf = RestFill(price=price, count=_q_count(count), server_ts=server_ts)
+    batch = WingBatch(index=idx, fill_price=price, fill_count=_q_count(count), server_ts=server_ts)
     st = replace(
         st,
         rest_fills=st.rest_fills + (rf,),

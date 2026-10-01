@@ -47,6 +47,23 @@ def _dec(v: Any) -> Decimal | None:
         return None
 
 
+def _cnt(v: Any, default: Decimal = Decimal(1)) -> Decimal:
+    """A ledger lot count as a positive Decimal (2026-10-01 fractional MECHANICS; count_fp). Old rows
+    store an int, armed fractional rows a Decimal string ("1.44"); both parse. Non-positive/absent ->
+    ``default``. Mirrors ``service.v33.report._cnt``."""
+    d = _dec(v)
+    return d if (d is not None and d > 0) else default
+
+
+def _co(c: Decimal) -> Any:
+    """Serialise a reconciliation lot count for the report dict: an INTEGRAL count as a bare int (so the
+    ``--json`` report's ``size`` stays a JSON NUMBER -- byte-identical to the pre-fractional build and to
+    every whole-lot ``_count_out``/``_co`` elsewhere), a fractional count (e.g. 1.44) as the Decimal
+    (the ``--json`` dump's ``default=str`` encodes it, exactly as it does the other Decimal recon
+    fields). Mirrors ``service.v32.ledger._co`` (2026-10-01 fractional MECHANICS review nit N1)."""
+    return int(c) if c == c.to_integral_value() else c
+
+
 def _shadow_below_min(sub: dict[str, Any], n_min: Decimal) -> bool:
     """True when a shadow fill record's derived n (1 - offer) is below ``n_min`` -- the live path
     stands down (``n_below_min``) at such an n and would never have rested there, so the shadow fill is
@@ -489,11 +506,11 @@ def _recon_fill_fee(f: dict[str, Any]) -> Decimal:
     per_d = _dec(per) or Decimal(0)
     if per_d == 0:
         return Decimal(0)
-    count = int(f.get("count", 0) or 0)
-    if count <= 1:
+    count = _cnt(f.get("count", 0), Decimal(0))   # fractional-safe (count_fp)
+    if count == 1:
         return per_d
     p = _dec(f.get("price", 0)) or Decimal(0)
-    raw = _FEE_RATE * p * (Decimal(1) - p) * Decimal(count) * Decimal(10000)
+    raw = _FEE_RATE * p * (Decimal(1) - p) * count * Decimal(10000)
     return Decimal(math.ceil(raw)) / Decimal(10000)
 
 
@@ -503,7 +520,7 @@ def _recon_row_cost(row: dict[str, Any]) -> Decimal:
     cost = Decimal(0)
     for f in list(row.get("fills") or []) + list(row.get("wing_fills") or []):
         p = _dec(f.get("price", 0)) or Decimal(0)
-        c = Decimal(int(f.get("count", 0) or 0))
+        c = _cnt(f.get("count", 0), Decimal(0))   # fractional-safe
         cost += p * c + _recon_fill_fee(f)
     return cost
 
@@ -535,19 +552,19 @@ def build_ledger_reconciliation(rows: list[dict[str, Any]]) -> list[dict[str, An
         corr_window = floor - cost
         batches = r.get("wing_batch_sets")
         if isinstance(batches, list) and batches:
-            total_count = sum(int(b.get("fill_count", 0) or 0) for b in batches)
+            total_count = sum((_cnt(b.get("fill_count", 0), Decimal(0)) for b in batches), Decimal(0))
             complete = all(b.get("completed") for b in batches)
         else:
             # No per-batch sets (an old ledger row): the set size is ``lots_filled`` when the row
             # carries it, else the SMALLEST held-leg count (all legs of one set share a count; the
             # min fails closed -- a smaller size can only UNDER-state the corrected payoff, never
             # over-credit). Never the old integer-divide, which silently truncated a mixed-count row.
-            leg_counts = [int(lg["count"]) if isinstance(lg, dict) else int(lg[2]) for lg in legs]
-            total_count = int(r.get("lots_filled") or 0) or (min(leg_counts) if leg_counts else 0)
+            leg_counts = [_cnt(lg["count"] if isinstance(lg, dict) else lg[2], Decimal(0)) for lg in legs]
+            total_count = _cnt(r.get("lots_filled"), Decimal(0)) or (min(leg_counts) if leg_counts else Decimal(0))
             complete = (_dec(r.get("realized_lock")) is not None) and not bool(r.get("one_legged"))
         bf = bfmap.get(ct)
         if complete and total_count:
-            corr_payoff = Decimal(2) * Decimal(total_count)
+            corr_payoff = Decimal(2) * total_count
             corr_backfill: Decimal | None = corr_payoff - floor
         elif bf is not None:
             corr_backfill = (_dec(bf.get("settlement_payoff")) or Decimal(0)) - floor
@@ -559,7 +576,9 @@ def build_ledger_reconciliation(rows: list[dict[str, Any]]) -> list[dict[str, An
         stored_total = stored_window + (stored_backfill if stored_backfill is not None else Decimal(0))
         out.append({
             "close_time": ct,
-            "size": total_count,
+            # whole -> bare int (``--json`` ``size`` stays a JSON number, byte-identical to main);
+            # fractional -> Decimal (str-encoded by the json dump, like the other recon fields).
+            "size": _co(total_count),
             "complete": complete,
             "backfilled": bf is not None,
             "stored_window": stored_window,

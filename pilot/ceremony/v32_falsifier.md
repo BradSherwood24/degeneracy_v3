@@ -280,6 +280,54 @@ showing >= 10 lots [pin] available at every completion (`V32_PROMOTION_MIN_DEPTH
     `tests/test_v32_executor.py`) keep testing size 1 byte-identically via explicit `contracts=1` overrides;
     the golden reference (+10.36c at 1 contract) still reproduces exactly at contracts=1.
 
+- 2026-10-01 -- MECHANICS CLARIFICATION (fractional contract counts). Brad, verbatim (2026-09-30/10-01):
+  "Then start the build on the fractional." Context: Kalshi crypto contracts are FRACTIONAL (the venue
+  reports `count_fp` at 0.01 granularity, and a resting maker order partially fills in sub-lot amounts).
+  On 2026-09-30 22:00Z a V3.3 rung filled 0.44 of a lot; the V3.2 pump-fader (`service/v32/`,
+  `service/run_v32.py`, live at `contracts` = 2) still INT-TRUNCATED on every fill path -- the WS fill
+  handler parsed `int(pf.get("count") or 0) or rec.count`, so a 0.44 fill truncated to 0 and then fell
+  back to the FULL placed lot (an OVER-hedge), while the status-poll and cancel-confirm paths parsed the
+  venue `fill_count_fp` with `int(...)`, so a 0.44 cancel-confirm fill became 0 and the fill was LOST (a
+  naked, unhedged bucket-NO rung). This entry registers the mechanics so a sub-lot fill is booked and
+  hedged at its EXACT size. It is a MECHANICS CLARIFICATION, NOT a threshold / param / sha change: NO
+  `[pin]`, no threshold, the `n >= 30` count, the params sha
+  `a2a58787bb88a6ded644c2ff6a22c5e75fbb1b41882ca7f76e40d9405a139a9c`, and the STATUS line are all
+  untouched. Registered at n=23 live completed sets (the current live-ledger set count read read-only from
+  a scratchpad copy of `pilot/ledger/v32_ledger.jsonl`; well before the n >= 30 verdict), so the
+  registered-specs rule -- no re-spec on the same evaluation window -- is honoured.
+  - WHAT CHANGES: every V3.2 fill path now carries the EXACT Decimal `count_fp` (quantised to 0.01), not
+    an int truncation: the WS fill handler, the 1 s status poll (`fill_count_fp`), the cancel-confirm
+    (`_finish_cancel` / `OrderCancelled.filled_count_before_cancel`), the rest-invariant stray-fill branch,
+    the amend-cross fill, and the partial-fill wing batches (`cancel_ctx` + cumulative->delta booking per
+    the 2026-09-18 entry). The wings go out for the size that filled -- a 0.44 fill of a 2-lot rest takes a
+    0.44 wing batch and leaves 1.56 RESTING (the executor's wing SEND now writes a fractional wire `count`,
+    "1.44" not an int-truncated "1.00"; it never chunks because a V3.2 wing count is <= `contracts` = 2 <=
+    the proxy `max_contracts_per_order` cap). The core carries Decimal counts in its fill/set/exposure
+    state (`RestOrder`/`RestFill`/`WingLeg`/`WingBatch`, `rest_remaining`, `rest_booked_by_coid`); "never
+    two live rests" and the size-N partial-fill invariants hold with fractional booked amounts.
+  - WHAT DOES NOT CHANGE: RESTS stay WHOLE lots on the wire (fail-closed, the SAME law as #106 N1 for
+    V3.3): the executor's place/amend bodies are integer-only, so a fractional REMAINDER is never re-placed
+    -- `_rest_place_count` floors the exact remainder to whole lots for the wire, and `_requote` never
+    sends a count-0 (re)place/amend (a sub-lot remainder keeps resting on the ORIGINAL venue order in the
+    common case, and is dropped off the book -- under-exposed, never naked or over-sized -- if a requote
+    tears that order down). A WHOLE count serialises EXACTLY as before (a bare int) in every journal /
+    ledger / report / golden row, so the whole-lot history and the parity/golden tests stay byte-identical
+    and old integer ledger rows still parse. The economics (floor, cost, fees, settlement backfill, the S4
+    band) are count-WEIGHTED and so are exact at any fractional size; the five verdict gates, the lock
+    convention (per contract), and the completed-SET definition (one rest-fill event with both wings
+    filled) are untouched.
+  - Mirrored in code: `service.v32.executor` (`_fractional_counts` True by default -- both rosters; the
+    cancel/poll/stray/amend fill paths carry `fill_count_fp`; the wing wire body via the shared
+    `_count_body_str`; `_finish_cancel` normalises a whole count to a bare int via `_count_out`),
+    `service.v32.core` (`_q_count` + Decimal count state + `_rest_place_count` fail-closed floor + the
+    `_requote` sub-lot guard), `service.run_v32` (`_count_out`/`_count_dec`; `on_fill`/`on_poll_fill`/
+    `_record_fill`/`_journal_action` and `_compute_money_math` Decimal + count-weighted; the status poll
+    feeds `fill_count_fp`), `service.v32.ledger` (`_dc`/`_co`; count-weighted floor/band/backfill; bare-int
+    whole counts), `service.v32.report` (`_cnt`; count-weighted reconciliation). Asserted in
+    `tests/test_v32_fractional_counts.py` (new) and the updated byte-identity assertions in
+    `tests/test_v33_fill_discovery_fractional.py` / `tests/test_v33_fill_attribution.py`. Build report:
+    `pilot/build/v32_fractional_build_report.md`.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), registered with this draft
