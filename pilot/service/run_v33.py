@@ -70,7 +70,8 @@ from service.v33 import (
     load_v33_params,
 )
 from service.v33.actions import ActionKind, V33ActionKind
-from service.v33.core import print_through_summary
+from service.v33.core import _q_count, print_through_summary
+from service.v33.events import V33Fill
 from service.v33.executor import V33LiveExecutor, cancel_stale_open_orders
 from service.v33.async_writer import AsyncOrderWriter
 from service.v33.async_executor import V33AsyncExecutor
@@ -109,6 +110,24 @@ from service.stops import ensure_balance_start, parse_balance, read_day_guard
 import service.run_v32 as R
 
 logger = logging.getLogger(__name__)
+
+
+def _count_out(c: Any) -> Any:
+    """D3: serialise a lot count for the journal/ledger — an INTEGRAL count as a bare int (so a dry
+    1-lot window stays byte-identical), a fractional count (e.g. 0.44) as the 2dp Decimal (str-encoded by
+    the journal's ``_json_default``). Old integer rows already parse as ints; new fractional rows parse
+    as Decimal strings."""
+    d = _q_count(Decimal(str(c)))
+    return int(d) if d == d.to_integral_value() else d
+
+
+def _count_dec(raw: Any) -> Decimal:
+    """Parse a raw count/count_fp value to a 2dp Decimal (0 on any parse failure)."""
+    try:
+        return _q_count(Decimal(str(raw)))
+    except (TypeError, ValueError, ArithmeticError):
+        return Decimal(0)
+
 
 VALID_MODES_V33 = ("shakedown", "dry", "armed")
 STRIKE_SERIES = R.STRIKE_SERIES
@@ -355,36 +374,51 @@ class V33Driver:
         self._stamp(server_ts)
         if trade_id is not None:
             self._seen_trade_ids.add(trade_id)
-        count = int(pf.get("count") or 0) or rec.count
+        # D3 (2026-09-30 incident): Kalshi crypto fills are FRACTIONAL — parse ``count_fp`` as Decimal.
+        # The pre-fix ``int(pf.get("count") or 0) or rec.count`` truncated 0.44 -> 0 and then fell back to
+        # the rung's FULL placed lot (a 0.44 fill became a whole lot; the wings were oversized). Prefer the
+        # raw ``count_fp``; only if it is absent/zero fall back to the placed count.
+        count = _count_dec(payload.get("count_fp"))
+        if count <= 0:
+            count = _count_dec(pf.get("count"))
+        if count <= 0:
+            count = _count_dec(rec.count)
         self.executor.mark_filled(rec.client_order_id)
         self.counts["rest_fill"] += 1
         self.journal.append("rest_fill",
                             {"market": market, "client_order_id": rec.client_order_id,
                              "order_id": rec.order_id, "rest_price": rec.price,
-                             "exec_price": pf.get("price"), "count": count, "path": "ws"}, self.clock())
-        self._pump([Fill(order_id=rec.order_id, client_order_id=rec.client_order_id,
-                         count=Decimal(count), price=rec.price, side="no", server_ts=server_ts)])
+                             "exec_price": pf.get("price"), "count": _count_out(count), "path": "ws"},
+                            self.clock())
+        # D1: V33Fill carries the fill's OWN market ticker as the last-resort bucket attribution channel.
+        self._pump([V33Fill(order_id=rec.order_id, client_order_id=rec.client_order_id,
+                            count=count, price=rec.price, side="no", server_ts=server_ts,
+                            market_ticker=market)])
 
-    def on_poll_fill(self, order_id: str, filled_count: int, server_ts: float) -> None:
+    def on_poll_fill(self, order_id: str, filled_count: Any, server_ts: float) -> None:
         """Book a rung fill discovered by the order-status poll (ARMED belt-and-braces). Feeds the DELTA
-        over what the core has booked for this order (``rest_booked_by_coid``)."""
-        if filled_count <= 0:
+        over what the core has booked for this order (``rest_booked_by_coid``). D3: ``filled_count`` is the
+        venue cumulative fill (fractional-safe), and the delta over what is booked is fed as Decimal."""
+        filled = _count_dec(filled_count)
+        if filled <= 0:
             return
         rec = self.executor.attribute(order_id=order_id)
         if rec is None:
             return
-        already = int(self.state.rest_booked_by_coid.get(rec.client_order_id, 0))
-        delta = int(filled_count) - already
+        already = _count_dec(self.state.rest_booked_by_coid.get(rec.client_order_id, 0))
+        delta = filled - already
         if delta <= 0:
             return
         self._stamp(server_ts)
         self.executor.mark_filled(rec.client_order_id)
         self.counts["rest_fill_poll"] += 1
         self.journal.append("rest_fill", {"client_order_id": rec.client_order_id, "order_id": order_id,
-                                          "rest_price": rec.price, "count": int(delta), "path": "poll"},
-                            self.clock())
-        self._pump([Fill(order_id=order_id, client_order_id=rec.client_order_id,
-                         count=Decimal(int(delta)), price=rec.price, side="no", server_ts=server_ts)])
+                                          "rest_price": rec.price, "count": _count_out(delta),
+                                          "path": "poll", "market": rec.ticker}, self.clock())
+        # D1: the poll knows the order's market via the retained RestRecord (``rec.ticker``).
+        self._pump([V33Fill(order_id=order_id, client_order_id=rec.client_order_id,
+                            count=delta, price=rec.price, side="no", server_ts=server_ts,
+                            market_ticker=rec.ticker)])
 
     # --- DRY ladder-fill simulation (the ideal rule; never in armed) ---
     def _simulate_ladder_fills(self, market: str, trade: Trade, now: float) -> None:
@@ -410,9 +444,12 @@ class V33Driver:
             self.journal.append("dry_sim_fill",
                                 {"client_order_id": o.client_order_id, "order_id": o.order_id,
                                  "n": o.price, "rung": o.rung, "yes_print": trade.yes_price,
-                                 "count": o.count}, self.clock())
-            self._pump([Fill(order_id=o.order_id, client_order_id=o.client_order_id,
-                             count=Decimal(int(o.count)), price=o.price, side="no", server_ts=now)])
+                                 "count": _count_out(o.count)}, self.clock())
+            # DRY simulates whole-lot rungs; ``_count_out`` keeps the count an int so the dry journal is
+            # byte-identical to the pre-D3 build. V33Fill's ticker is the rung's own bucket (the rest bucket).
+            self._pump([V33Fill(order_id=o.order_id, client_order_id=o.client_order_id,
+                                count=_q_count(o.count), price=o.price, side="no", server_ts=now,
+                                market_ticker=bucket_ticker)])
 
     # --- SO-3 deep-end observation (19..28c; observation only, all modes) ---
     def _observe_deep(self, market: str, trade: Trade, now: float) -> None:
@@ -460,11 +497,13 @@ class V33Driver:
                 q.extend(self.executor.place_batch(places, ts))
                 for a in others:
                     self._journal_action(a, ts)
-                    q.extend(self.executor.on_action(a, self.state, ts))
+                    if a.kind != V33ActionKind.WING_NETTED:   # D5: informational, no venue order
+                        q.extend(self.executor.on_action(a, self.state, ts))
             else:
                 for a in actions:
                     self._journal_action(a, ts)
-                    q.extend(self.executor.on_action(a, self.state, ts))
+                    if a.kind != V33ActionKind.WING_NETTED:   # D5: informational, no venue order
+                        q.extend(self.executor.on_action(a, self.state, ts))
             self._apply_executor_standdown(ts)
             self._maybe_eval(getattr(ev, "server_ts", None))
 
@@ -543,7 +582,7 @@ class V33Driver:
         k = a.kind
         if k in (ActionKind.WOULD_PLACE_REST, ActionKind.PLACE_REST):
             rk = "would_place_rest" if k == ActionKind.WOULD_PLACE_REST else "place_rest"
-            payload = {"ticker": a.ticker, "side": a.side, "count": a.count, "price": a.price,
+            payload = {"ticker": a.ticker, "side": a.side, "count": _count_out(a.count), "price": a.price,
                        "expiration_epoch": a.expiration_epoch, "client_order_id": a.client_order_id}
             self._capture_quote(a)
         elif k in (ActionKind.WOULD_CANCEL_REST, ActionKind.CANCEL_REST):
@@ -551,19 +590,19 @@ class V33Driver:
             payload = {"order_id": a.order_id, "client_order_id": a.client_order_id}
         elif k in (ActionKind.WOULD_AMEND_REST, ActionKind.AMEND_REST):
             rk = "would_amend_rest" if k == ActionKind.WOULD_AMEND_REST else "amend_rest"
-            payload = {"order_id": a.order_id, "ticker": a.ticker, "count": a.count, "price": a.price,
-                       "client_order_id": a.client_order_id,
+            payload = {"order_id": a.order_id, "ticker": a.ticker, "count": _count_out(a.count),
+                       "price": a.price, "client_order_id": a.client_order_id,
                        "updated_client_order_id": a.updated_client_order_id}
             self._capture_quote(a)
         elif k in (ActionKind.WOULD_TAKE_WINGS, ActionKind.TAKE_WINGS, ActionKind.RETRY_WING):
-            legs = [{"ticker": lg.ticker, "side": lg.side, "action": lg.action, "count": lg.count,
-                     "limit": lg.limit} for lg in a.legs]
+            legs = [{"ticker": lg.ticker, "side": lg.side, "action": lg.action,
+                     "count": _count_out(lg.count), "limit": lg.limit} for lg in a.legs]
             is_retry = k == ActionKind.RETRY_WING or len(legs) == 1
             if k == ActionKind.WOULD_TAKE_WINGS or (k == ActionKind.RETRY_WING and self.state.shakedown):
                 rk = "would_retry_wing" if is_retry else "would_take_wings"
             else:
                 rk = "retry_wing" if is_retry else "take_wings"
-            payload = {"legs": legs, "count": a.count, "lock": a.lock}
+            payload = {"legs": legs, "count": _count_out(a.count), "lock": a.lock}
         elif k == ActionKind.STAND_DOWN:
             # BUCKET-FLAP FIX (2026-09-23): the stale/missing-wing HOLD lifecycle journals under distinct
             # kinds and does NOT count as a real stand-down; only the terminal cancel (and other reasons) do.
@@ -591,14 +630,20 @@ class V33Driver:
             # PRINT-THROUGH complete branch: buy the bucket-NO ourselves (IOC taker) to finish the set.
             rk = ("would_print_through_complete" if k == V33ActionKind.WOULD_TAKE_BUCKET_NO
                   else "print_through_complete")
-            payload = {"ticker": a.ticker, "side": a.side, "count": a.count, "price": a.price}
+            payload = {"ticker": a.ticker, "side": a.side, "count": _count_out(a.count), "price": a.price}
         elif k in (V33ActionKind.UNWIND_WINGS, V33ActionKind.WOULD_UNWIND_WINGS):
             # PRINT-THROUGH unwind / fail-closed: sell the pre-taken wings back (IOC).
             rk = ("would_print_through_unwind" if k == V33ActionKind.WOULD_UNWIND_WINGS
                   else "print_through_unwind")
-            legs = [{"ticker": lg.ticker, "side": lg.side, "action": lg.action, "count": lg.count,
-                     "limit": lg.limit} for lg in a.legs]
-            payload = {"legs": legs, "count": a.count}
+            legs = [{"ticker": lg.ticker, "side": lg.side, "action": lg.action,
+                     "count": _count_out(lg.count), "limit": lg.limit} for lg in a.legs]
+            payload = {"legs": legs, "count": _count_out(a.count)}
+        elif k == V33ActionKind.WING_NETTED:
+            # D5: the venue netted a YES/NO wing pair on one market to flat (+$1/contract). Informational.
+            rk = "wing_netted"
+            legs = [{"ticker": lg.ticker, "side": lg.side, "count": _count_out(lg.count),
+                     "fill_price": lg.price} for lg in a.legs]
+            payload = {"legs": legs, "count": _count_out(a.count), "realised": a.lock}
         elif k == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW:
             rk = "shadow_fill_outside_window"
             payload = {"E": a.shadow_E, "offer": a.offer, "print": a.print_price, "count": a.count,
@@ -681,7 +726,7 @@ async def _order_status_poll_v33(
                         tickers.add(tk)
             if not tickers:
                 continue
-            filled_by_oid: dict[str, int] = {}
+            filled_by_oid: dict[str, Decimal] = {}
             for tk in tickers:
                 try:
                     if is_async:
@@ -695,8 +740,9 @@ async def _order_status_poll_v33(
                 if not o.live or o.order_id is None:
                     continue
                 fc = filled_by_oid.get(str(o.order_id))
+                # D3: fc is the cumulative Decimal fill; on_poll_fill parses it Decimal and feeds the delta.
                 if fc and fc > 0:
-                    driver.on_poll_fill(o.order_id, int(fc), driver.server_now() or clock())
+                    driver.on_poll_fill(o.order_id, fc, driver.server_now() or clock())
             continue
         for o in list(st.ladder):
             if not o.live or o.order_id is None:
@@ -706,8 +752,9 @@ async def _order_status_poll_v33(
             except Exception as e:  # noqa: BLE001
                 logger.warning("[V33] order-status poll error: %s", e)
                 continue
-            if stt.available and stt.filled_count > 0:
-                driver.on_poll_fill(o.order_id, int(stt.filled_count), driver.server_now() or clock())
+            # D3: the EXACT fractional fill (fill_count_fp), not the int-truncated filled_count.
+            if stt.available and stt.filled_count_fp > 0:
+                driver.on_poll_fill(o.order_id, stt.filled_count_fp, driver.server_now() or clock())
 
 
 async def run_v33_window(
@@ -800,6 +847,7 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         lots_filled=m.get("lots_filled", 0), m15_tickers=list(m15_tickers or []),
         m15_frames=shared.m15_frames, deep_obs=driver.deep_obs.summary(),
         print_through=print_through_summary(driver.state),
+        netted_sets=m.get("netted_sets"),   # D5: venue-netted wing pairs
         writer_stats=_v33_writer_stats(driver),
     )
     append_v33_ledger_row(row, ledger_path)

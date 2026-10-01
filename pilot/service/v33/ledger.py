@@ -83,12 +83,25 @@ def load_v33_rows(path: str = DEFAULT_V33_LEDGER_PATH) -> list[dict[str, Any]]:
     return out
 
 
-def _fee_total(price: Any, count: int) -> Decimal:
+def _dc(count: Any) -> Decimal:
+    """A lot count as Decimal (D3: fractional-safe), accepting int, Decimal, or numeric string."""
+    return count if isinstance(count, Decimal) else Decimal(str(count))
+
+
+def _co(count: Any) -> Any:
+    """Serialise a lot count for the ledger row: integral -> int (dry rows byte-identical), fractional ->
+    the 2dp Decimal (str-encoded by ``_json_default``). Old integer rows already parse as ints."""
+    d = _dc(count).quantize(Decimal("0.01"))
+    return int(d) if d == d.to_integral_value() else d
+
+
+def _fee_total(price: Any, count: Any) -> Decimal:
     """Venue per-FILL taker fee: ``ceil(0.07*p*(1-p)*count, $0.0001)`` (kalshi-fee-exact), on the SAME
     frozen ``_FEE_RATE`` as ``_fee`` — equal to ``_fee(price)`` at count 1, and NEVER ``_fee(price)*N``
-    (the per-contract fee already rounded up once). Mirrors ``run_v32._fee_total``."""
+    (the per-contract fee already rounded up once). Mirrors ``run_v32._fee_total``. D3: ``count`` is
+    Decimal-safe."""
     p = price if isinstance(price, Decimal) else Decimal(str(price))
-    raw = _FEE_RATE * p * (_ONE - p) * Decimal(int(count)) * Decimal(10000)
+    raw = _FEE_RATE * p * (_ONE - p) * _dc(count) * Decimal(10000)
     return Decimal(math.ceil(raw)) / Decimal(10000)
 
 
@@ -144,11 +157,12 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
     rest_fills = list(getattr(state, "rest_fills", ()) or ())
     wing_legs = list(getattr(state, "wing_legs", ()) or ())
     wing_batches = list(getattr(state, "wing_batches", ()) or ())
+    netted_pairs = list(getattr(state, "netted_pairs", ()) or ())     # D5: venue-netted wing pairs
     if not rest_fills:
         return {"dry_sim": bool(dry_sim), "rung_fills": [], "wing_batch_sets": [],
                 "held_legs": [], "floor_booked": None, "realized_delta": None, "realized_lock": None,
                 "one_legged": bool(getattr(state, "one_legged", False)), "realized_unsettled": False,
-                "lots_filled": 0}
+                "lots_filled": 0, "netted_sets": []}
 
     # index the batch a rung fill belongs to (by identity of the RungFill in the batch's .fills).
     batch_of_fill: dict[int, int] = {}
@@ -177,22 +191,29 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
         bt = _bucket_ticker_for_fill(state, b.fills[0] if b.fills else None)
         if bt:
             held_this += 1
-            held.append({"ticker": bt, "side": "no", "count": int(b.total_count)})
+            held.append({"ticker": bt, "side": "no", "count": _co(b.total_count)})
         for lg in legs:
             if lg.status == "filled":
-                held_this += 1
-                held.append({"ticker": lg.ticker, "side": lg.side, "count": int(lg.count)})
+                # w_paid is the per-contract wing cost that priced the PIN — the netting changes the EXIT,
+                # not what we paid, so every filled leg contributes (D5).
                 if lg.fill_price is not None:
                     w_paid += lg.fill_price + _fee(lg.fill_price)
+                # D5: a wing leg NETTED against an opposite leg on the same market is CLOSED (realised $1
+                # now) -> only the UN-netted portion is HELD to settlement / listed in unsettled_legs.
+                held_ct = _dc(getattr(lg, "count", 0)) - _dc(getattr(lg, "netted", 0))
+                if held_ct <= 0:
+                    continue
+                held_this += 1
+                held.append({"ticker": lg.ticker, "side": lg.side, "count": _co(held_ct)})
         batch_wpaid[b.index] = w_paid
-        floor += v33_set_floor_dollars(held_this, int(b.total_count))
+        floor += v33_set_floor_dollars(held_this, _dc(b.total_count))
         # per-batch realized lock (Σ per rung fill count * lock_value(price, w_paid)) when completed.
         batch_lock = None
         if completed:
             batch_lock = sum((f.count * lock_value(f.price, w_paid) for f in b.fills), _ZERO)
         batch_records.append({
             "index": b.index,
-            "fill_count": int(b.total_count),
+            "fill_count": _co(b.total_count),
             "rungs": [int(f.rung) for f in b.fills],
             "prices": [str(f.price) for f in b.fills],
             "completed": bool(completed),
@@ -217,7 +238,7 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
             "rung": int(rf.rung),
             "E_rung": str(rf.E_rung),
             "price": str(rf.price),
-            "count": int(rf.count),
+            "count": _co(rf.count),
             # L5 (2026-09-29): the rung's configured lot WEIGHT (rung_lots[rung]) at fill; None pre-L5 or
             # for a stranded/out-of-range margin. ``count`` is lots filled this event (<= weight on a
             # partial). Backward compatible: absent on rows written before L5.
@@ -235,16 +256,32 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
     # cash paid = Σ rung rest cost (n x count, maker fee 0) + Σ wing cost (price x count + fee_total).
     cost = _ZERO
     for rf in rest_fills:
-        cost += rf.price * Decimal(int(rf.count))   # bucket-NO maker leg, fee 0 on crypto
+        cost += rf.price * _dc(rf.count)   # bucket-NO maker leg, fee 0 on crypto
         # PRINT-THROUGH (2026-09-26): the `complete` stall branch buys the bucket-NO as a TAKER, so that
         # leg carries the venue taker fee (a maker rung fill is fee 0 on crypto).
         if getattr(rf, "taker", False):
-            cost += _fee_total(rf.price, int(rf.count))
+            cost += _fee_total(rf.price, rf.count)
     for lg in wing_legs:
         if lg.status == "filled" and lg.fill_price is not None:
-            cost += lg.fill_price * Decimal(int(lg.count)) + _fee_total(lg.fill_price, int(lg.count))
+            # the FULL filled cost (incl. the netted portion) — we paid for it; the netting credits $1 back.
+            cost += lg.fill_price * _dc(lg.count) + _fee_total(lg.fill_price, lg.count)
+    # D5: each netted YES/NO pair on one market pays exactly $1/contract, credited NOW (position flat).
+    # The pair's legs' costs are already in ``cost``; add the $1 revenue to the floor and record the set so
+    # the report shows it and the settlement backfill NEVER looks the netted (position-0) market up.
+    netted_sets: list[dict[str, Any]] = []
+    netted_credit = _ZERO
+    for np in netted_pairs:
+        c = _dc(getattr(np, "count", 0))
+        netted_credit += c                      # $1 per contract guaranteed
+        netted_sets.append({
+            "ticker": np.ticker, "count": _co(c),
+            "yes_cost": str(getattr(np, "yes_cost", _ZERO)),
+            "no_cost": str(getattr(np, "no_cost", _ZERO)),
+            "realised": str(getattr(np, "realised", _ZERO)),
+        })
+    floor += netted_credit
     realized_delta = floor - cost
-    lots_filled = sum(int(rf.count) for rf in rest_fills)
+    lots_filled = sum((_dc(rf.count) for rf in rest_fills), _ZERO)
     return {
         "dry_sim": bool(dry_sim),
         "rung_fills": rung_records,
@@ -255,7 +292,8 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
         "realized_lock": realized_lock_first,   # the shallowest completed rung's lock (info)
         "one_legged": bool(getattr(state, "one_legged", False)),
         "realized_unsettled": bool(held) and not bool(dry_sim),   # dry_sim never awaits settlement
-        "lots_filled": int(lots_filled),
+        "lots_filled": _co(lots_filled),
+        "netted_sets": netted_sets,             # D5: venue-netted wing pairs (realised $1/contract now)
     }
 
 
@@ -269,12 +307,12 @@ def _ladder_summary(state, money: dict[str, Any], driver_counts: dict[str, int],
     for r in rungs:
         rl = r.get("realized_lock")
         if rl is not None:
-            ladder_lock += Decimal(str(rl)) * Decimal(int(r["count"]))
+            ladder_lock += Decimal(str(rl)) * _dc(r["count"])   # D3: fractional-safe
     roll_count = int(getattr(state, "roll_count", 0) or 0)
     single = int(getattr(state, "roll_single_order_count", 0) or 0)
     return {
         "rungs_filled": int(getattr(state, "rungs_filled", 0) or 0),
-        "contracts": int(money.get("lots_filled", 0) or 0),
+        "contracts": _co(money.get("lots_filled", 0) or 0),
         "shallowest_margin_c": (str(min(e_rungs) * 100) if e_rungs else None),
         "deepest_margin_c": (str(max(e_rungs) * 100) if e_rungs else None),
         "ladder_lock": str(ladder_lock),
@@ -336,6 +374,7 @@ def build_v33_ledger_row(
     m15_frames: int = 0,
     deep_obs: dict[str, Any] | None = None,
     print_through: list[Any] | None = None,
+    netted_sets: list[Any] | None = None,
     writer_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
@@ -344,7 +383,7 @@ def build_v33_ledger_row(
     money = {
         "rung_fills": rung_fills or [],
         "wing_batch_sets": wing_batch_sets or [],
-        "lots_filled": int(lots_filled),
+        "lots_filled": _co(lots_filled),   # D3: fractional-safe (was int())
     }
     ladder = _ladder_summary(state, money, driver_counts, executor_counts) if state is not None else {}
     row: dict[str, Any] = {
@@ -393,9 +432,10 @@ def build_v33_ledger_row(
         "realized_delta": (str(realized_delta) if realized_delta is not None else None),
         "realized_lock": (str(realized_lock) if realized_lock is not None else None),
         "one_legged": one_legged,
-        "lots_filled": int(lots_filled),
+        "lots_filled": _co(lots_filled),   # D3: fractional-safe (was int())
         "realized_unsettled": bool(realized_unsettled),
         "unsettled_legs": (held_legs or []) if realized_unsettled else [],
+        "netted_sets": netted_sets or [],   # D5: venue-netted wing pairs (realised $1/contract, closed)
         "settlement": settlement,
         "realized_delta_note": (REALIZED_DELTA_NOTE if realized_delta is not None else None),
         "deep_obs": deep_obs or {},
@@ -422,17 +462,18 @@ def _v33_floor_booked_for_entry(entry: dict[str, Any], legs: list[Any]) -> Decim
     if isinstance(batches, list) and batches:
         total = _ZERO
         for b in batches:
+            # D3: fill_count may be a fractional Decimal string ("1.44") in an armed row — parse as Decimal.
             total += v33_set_floor_dollars(int(b.get("held_legs", 0) or 0),
-                                           int(b.get("fill_count", 1) or 1))
+                                           _dc(b.get("fill_count", 1) or 1))
         return total
     counts = []
     for lg in legs:
         c = lg["count"] if isinstance(lg, dict) else (lg[2] if len(lg) > 2 else 1)
         try:
-            counts.append(int(c))
-        except (TypeError, ValueError):
-            counts.append(1)
-    cnt = min(counts) if counts else 1
+            counts.append(_dc(c))
+        except (TypeError, ValueError, ArithmeticError):
+            counts.append(_ONE)
+    cnt = min(counts) if counts else _ONE
     return v33_set_floor_dollars(len(legs), cnt)
 
 
@@ -454,21 +495,21 @@ def v33_pending_credit(rows: list[dict[str, Any]], utc_day: str) -> tuple[Decima
         if isinstance(batches, list) and batches:
             for b in batches:
                 held = int(b.get("held_legs", 0) or 0)
-                cnt = int(b.get("fill_count", 1) or 1)
+                cnt = _dc(b.get("fill_count", 1) or 1)   # D3: fractional-safe
                 pessimistic += v33_set_floor_dollars(held, cnt)
-                optimistic += Decimal(min(held, 2)) * Decimal(cnt)
+                optimistic += Decimal(min(held, 2)) * cnt
             continue
         legs = r.get("unsettled_legs") or r.get("held_legs") or []
         counts = []
         for lg in legs:
             c = lg["count"] if isinstance(lg, dict) else (lg[2] if len(lg) > 2 else 1)
             try:
-                counts.append(int(c))
-            except (TypeError, ValueError):
-                counts.append(1)
-        cnt = min(counts) if counts else 1
+                counts.append(_dc(c))
+            except (TypeError, ValueError, ArithmeticError):
+                counts.append(_ONE)
+        cnt = min(counts) if counts else _ONE
         pessimistic += v33_set_floor_dollars(len(legs), cnt)
-        optimistic += Decimal(min(len(legs), 2)) * Decimal(cnt)
+        optimistic += Decimal(min(len(legs), 2)) * cnt
     return pessimistic, optimistic
 
 
@@ -527,11 +568,22 @@ def v33_settlement_backfill_sweep(rows: list[dict[str, Any]], fetch_result, now:
         if incomplete:
             continue
         payoff = settlement_payoff(legs, results)
+        # D5 (review r2): a venue-netted YES/NO pair paid $1/contract at close and its market was EXCLUDED
+        # from ``legs`` (position 0, never looked up). The close ``floor_booked`` INCLUDES that $1, so the
+        # settlement payoff of the HELD legs must add it back or the correction ``payoff - floor_booked``
+        # silently removes the netted dollar (verified: a 1-lot adjacent-bucket net lost exactly $1). The
+        # netted markets never settle for us, so this credit is fixed, not a settlement lookup.
+        netted_credit = _ZERO
+        for ns in (entry.get("netted_sets") or []):
+            netted_credit += _dc(ns.get("count", 0) if isinstance(ns, dict) else 0)
+        payoff = Decimal(str(payoff)) + netted_credit
         floor = _v33_floor_booked_for_entry(entry, legs)
         note = ("floor_booked (explicit)" if entry.get("floor_booked") is not None
                 else ("reconstructed from wing_batch_sets"
                       if isinstance(entry.get("wing_batch_sets"), list) and entry.get("wing_batch_sets")
                       else "reconstructed from legs (fail-closed)"))
+        if netted_credit > 0:
+            note = f"{note}; +{netted_credit} netted credit"
         out.append(build_v33_backfill_row(entry, results, payoff, floor, now,
                                           legs_priced=len(legs), backfill_note=note))
     return out

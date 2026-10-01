@@ -408,11 +408,22 @@ class V33AsyncExecutor(V33LiveExecutor):
         rb = _dec_or_none(wr.body.get("reduced_by")) if isinstance(wr.body, dict) else None
         if rb is not None and rec is not None:
             filled_delete = max(0, int(rec.count) - int(rb))
-        filled_status = await self._confirm_cancel_filled_async(oid, now)
+        filled_status, status_fp = await self._confirm_cancel_filled_async(oid, now)
         filled = max(filled_delete or 0, filled_status)
         self.cancels_confirmed += 1
         self._last_confirmed_gone_oid = oid
-        return self._finish_cancel(rec, oid, filled, wr.status_code, rb, now)
+        # V3.3 D3 (F2 port): the EXACT fractional fill = max(placed - reduced_by, status fp) so a 0.44
+        # leg surfaced by the cancel confirm is not truncated to 0 (mirrors LiveExecutor._resolve_cancel_success).
+        # REVIEW (fractional integration): ``status_fp`` is THIS cancel's own confirm return, NOT the shared
+        # ``self._last_confirm_status_fp`` field -- a cancel-all dispatches N confirm coroutines concurrently,
+        # which interleave across the off-loop status-GET await and would clobber a shared field (a sibling's
+        # fp read as our own = a phantom fractional fill when our own status poll was unreadable).
+        filled_fp = None
+        if self._fractional_counts:
+            fp_delete = (max(Decimal(0), Decimal(rec.count) - rb)
+                         if (rb is not None and rec is not None) else Decimal(0))
+            filled_fp = max(fp_delete, status_fp)
+        return self._finish_cancel(rec, oid, filled, wr.status_code, rb, now, filled_fp=filled_fp)
 
     async def _cancel_nonok_async(self, wr, rec, oid: str, exch: int | None, coid, now: float) -> list[Any]:
         """Async twin of LiveExecutor._cancel_nonok (status-truth, shard-aware backoff retries)."""
@@ -449,18 +460,33 @@ class V33AsyncExecutor(V33LiveExecutor):
                                              "delete_status": last_status})
         return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0))]
 
-    async def _confirm_cancel_filled_async(self, order_id: str, now: float) -> int:
-        """Async twin of LiveExecutor._confirm_cancel_filled (the confirm polls run OFF the loop)."""
+    async def _confirm_cancel_filled_async(self, order_id: str, now: float) -> tuple[int, Decimal]:
+        """Async twin of LiveExecutor._confirm_cancel_filled (the confirm polls run OFF the loop).
+        V3.3 D3 (F2 port): also returns the EXACT fractional fill for the fractional cancel resolution.
+
+        REVIEW (fractional integration): the sync twin stashes the fp in ``self._last_confirm_status_fp``
+        and the sync resolver reads that instance field -- safe because the sync path cancels ONE order at a
+        time. On the ASYNC path a cancel-all dispatches N confirm coroutines CONCURRENTLY
+        (``_dispatch_async`` ``as_completed``): two confirm loops interleave across the off-loop status-GET
+        await and both write that one field, so a resolver could read a SIBLING cancel's fp (a phantom
+        fractional fill on an order whose own status poll was unreadable). The fp is therefore RETURNED here
+        (a per-call local) and read from the return in ``_resolve_cancel_success_async`` -- never cross-read
+        off the shared field. (The field is still written for sync-twin parity; it is not read on the async
+        path.)"""
         filled = 0
+        status_fp = Decimal(0)
+        self._last_confirm_status_fp = Decimal(0)
         for i in range(CANCEL_CONFIRM_POLLS):
             st = await self.order_status_async(order_id)
             if st.available:
                 filled = st.filled_count
+                status_fp = st.filled_count_fp
+                self._last_confirm_status_fp = st.filled_count_fp
                 if st.status not in ("resting", None) or st.remaining_count == 0:
-                    return filled
+                    return filled, status_fp
             if i < CANCEL_CONFIRM_POLLS - 1:
                 await asyncio.sleep(CANCEL_CONFIRM_INTERVAL_S)
-        return filled
+        return filled, status_fp
 
     async def order_status_async(self, order_id: str) -> OrderStatus:
         """Async twin of LiveExecutor.order_status (fail-closed to unavailable on any error)."""
@@ -615,16 +641,21 @@ class V33AsyncExecutor(V33LiveExecutor):
             if exch is None:
                 self._record_alarm("wing_no_exchange_index", {"ticker": lg.ticker, "side": lg.side})
                 continue
-            remaining = int(lg.count) - self._wing_filled.get(key, 0)
+            # D3 (review, F1 port): remaining is Decimal (a 1.44 fill hedges 1.44 lots, not int(1.44)=1).
+            # Chunk as ceil(remaining/cap) with the LAST chunk carrying the fractional remainder (Σ == remaining).
+            remaining = self._dc(lg.count) - self._wing_filled.get(key, Decimal(0))
             if remaining <= 0:
                 continue
             n_chunks = ceil(remaining / self.wing_cap)
+            _sum_chunks = Decimal(0)
             for c in range(n_chunks):
-                cnt = min(self.wing_cap, remaining - c * self.wing_cap)
+                cnt = min(Decimal(self.wing_cap), remaining - c * self.wing_cap)
+                _sum_chunks += cnt
                 chunk_coid = self._mint_wing_coid()
                 entries.append(self._wing_chunk_entry(lg, exch, cnt, chunk_coid))
                 chunk_owner[chunk_coid] = key
                 self.wing_coids.add(chunk_coid)
+            assert _sum_chunks == remaining, f"wing chunk sum {_sum_chunks} != remaining {remaining}"
         for lg in pending:
             if (lg.batch, lg.side) not in {v for v in chunk_owner.values()} and self._exch(lg.ticker) is None:
                 events.append(Fill(order_id=None, client_order_id=lg.client_order_id, count=Decimal(0),
@@ -645,7 +676,7 @@ class V33AsyncExecutor(V33LiveExecutor):
             resp = await self._apost(REL_BATCH_CREATE, build_batch(entries), CLASS_WING)
             parsed = parse_batch_response(resp.body) if resp.ok else []
         from collections import defaultdict as _dd
-        agg_count: dict[tuple[int, str], int] = _dd(int)
+        agg_count: dict[tuple[int, str], Decimal] = _dd(lambda: Decimal(0))
         agg_notional: dict[tuple[int, str], Decimal] = _dd(lambda: Decimal(0))
         by_coid = {r.client_order_id: r for r in parsed if r.client_order_id in chunk_owner}
         for chunk_coid, key in chunk_owner.items():
@@ -655,7 +686,7 @@ class V33AsyncExecutor(V33LiveExecutor):
             side = key[1]
             nr = normalize_fill_to_side(r, side)
             price = nr.average_fill_price if nr.average_fill_price is not None else leg_by_key[key].limit
-            fc = int(nr.fill_count)
+            fc = self._dc(nr.fill_count)          # D3 (review, F1 port): fractional-safe chunk fill
             agg_count[key] += fc
             agg_notional[key] += Decimal(price) * fc
             self.fills.append({"leg": "wing", "side": side, "ticker": leg_by_key[key].ticker,
@@ -664,13 +695,13 @@ class V33AsyncExecutor(V33LiveExecutor):
             self._bump("wing_fill")
         for lg in pending:
             key = (lg.batch, lg.side)
-            got = agg_count.get(key, 0)
+            got = agg_count.get(key, Decimal(0))
             self._wing_filled[key] += got
             self._wing_notional[key] += agg_notional.get(key, Decimal(0))
             total = self._wing_filled[key]
-            if total >= int(lg.count) and got > 0:
+            if total >= self._dc(lg.count) and got > 0:
                 avg = (self._wing_notional[key] / total) if total else lg.limit
-                events.append(Fill(order_id=None, client_order_id=lg.client_order_id, count=Decimal(total),
+                events.append(Fill(order_id=None, client_order_id=lg.client_order_id, count=total,
                                    price=avg, side=lg.side, server_ts=now))
             elif key in leg_by_key:
                 events.append(Fill(order_id=None, client_order_id=lg.client_order_id, count=Decimal(0),
@@ -752,7 +783,9 @@ class V33AsyncExecutor(V33LiveExecutor):
     # =====================================================================
     # batched order-status poll — async twin of V33LiveExecutor.poll_orders_for_bucket
     # =====================================================================
-    async def poll_orders_for_bucket_async(self, ticker: str) -> dict[str, int]:
+    async def poll_orders_for_bucket_async(self, ticker: str) -> dict[str, Decimal]:
+        """D3 (F2 port): the cumulative fill is a DECIMAL (``fill_count_fp``), not int-truncated -- a 0.44
+        poll-discovered fill must not vanish (mirrors LiveExecutor.poll_orders_for_bucket)."""
         try:
             body = await self._aget(OPEN_ORDERS_PATH, {"ticker": ticker})
         except Exception as e:  # noqa: BLE001
@@ -761,7 +794,7 @@ class V33AsyncExecutor(V33LiveExecutor):
         orders = (body or {}).get("orders") if isinstance(body, dict) else None
         if not isinstance(orders, list):
             return {}
-        out: dict[str, int] = {}
+        out: dict[str, Decimal] = {}
         for o in orders:
             if not isinstance(o, dict):
                 continue
@@ -773,9 +806,9 @@ class V33AsyncExecutor(V33LiveExecutor):
             if fc is None:
                 fc = o.get("fill_count")
             try:
-                out[str(oid)] = int(Decimal(str(fc))) if fc is not None else 0
+                out[str(oid)] = Decimal(str(fc)) if fc is not None else Decimal(0)
             except Exception:  # noqa: BLE001
-                out[str(oid)] = 0
+                out[str(oid)] = Decimal(0)
         return out
 
     # =====================================================================
@@ -785,25 +818,30 @@ class V33AsyncExecutor(V33LiveExecutor):
         coid = action.client_order_id
         ticker = (action.legs[0].ticker if action.legs else action.ticker) or ""
         limit = action.legs[0].limit if action.legs else action.price
-        want = int(action.count or (action.legs[0].count if action.legs else 0))
+        # D3 (F2/F1 port): ``want`` is Decimal (fractional-safe); chunk as ceil(want/cap) with the LAST
+        # chunk carrying the fractional remainder (sum of chunk counts == want). Mirrors _take_bucket_no.
+        want = self._dc(action.count or (action.legs[0].count if action.legs else 0))
         exch = self._exch(ticker)
         if exch is None or limit is None or want <= 0:
-            self._record_alarm("print_through_complete_unrouted", {"ticker": ticker, "count": want})
+            self._record_alarm("print_through_complete_unrouted", {"ticker": ticker, "count": str(want)})
             return [Fill(order_id=None, client_order_id=coid, count=Decimal(0),
                          price=(limit or Decimal(0)), side=BUY_NO, server_ts=now)] if coid else []
-        got = 0
+        got = Decimal(0)
         notional = Decimal(0)
         n_chunks = ceil(want / self.wing_cap)
         entries: list[dict[str, Any]] = []
+        _sum_chunks = Decimal(0)
         for c in range(n_chunks):
-            cnt = min(self.wing_cap, want - c * self.wing_cap)
+            cnt = min(Decimal(self.wing_cap), want - c * self.wing_cap)
+            _sum_chunks += cnt
             entries.append(self._pt_taker_entry(ticker, BUY_NO, "buy", cnt, limit, exch,
                                                 self._mint_wing_coid()))
+        assert _sum_chunks == want, f"pt-complete chunk sum {_sum_chunks} != want {want}"
         await self._pacer.acquire_async(COST_CREATE * len(entries), "print_through_complete", priority=True)
         self.pt_bucket_no_takes += 1
         self._bump("pt_bucket_no_take")
         self.journal.append("print_through_complete",
-                            {"ticker": ticker, "limit": str(limit), "count": want,
+                            {"ticker": ticker, "limit": str(limit), "count": str(want),
                              "chunks": len(entries)}, self.clock())
         if len(entries) == 1:
             resp = await self._apost(REL_SINGLE_CREATE, entries[0], CLASS_WING)
@@ -815,7 +853,7 @@ class V33AsyncExecutor(V33LiveExecutor):
             if r is None or r.error or not r.fill_count or r.fill_count <= 0:
                 continue
             nr = normalize_fill_to_side(r, BUY_NO)
-            fc = int(nr.fill_count)
+            fc = self._dc(nr.fill_count)
             price = nr.average_fill_price if nr.average_fill_price is not None else limit
             got += fc
             notional += Decimal(price) * fc
@@ -825,27 +863,31 @@ class V33AsyncExecutor(V33LiveExecutor):
         if got < want:
             self._bump("pt_bucket_no_short")
             self._record_alarm("print_through_complete_short",
-                               {"ticker": ticker, "wanted": want, "filled": got})
+                               {"ticker": ticker, "wanted": str(want), "filled": str(got)})
             self.journal.append("print_through_complete_short",
-                                {"ticker": ticker, "wanted": want, "filled": got}, self.clock())
-        return [Fill(order_id=None, client_order_id=coid, count=Decimal(got), price=avg, side=BUY_NO,
+                                {"ticker": ticker, "wanted": str(want), "filled": str(got)}, self.clock())
+        return [Fill(order_id=None, client_order_id=coid, count=got, price=avg, side=BUY_NO,
                      server_ts=now)] if coid else []
 
     async def _unwind_wings_async(self, action, now: float) -> list[Any]:
         entries: list[dict[str, Any]] = []
-        want = 0
+        want = Decimal(0)
         for lg in action.legs:
             exch = self._exch(lg.ticker)
-            if exch is None or lg.count <= 0:
+            lg_count = self._dc(lg.count)                      # D3 (F1 port): fractional-safe
+            if exch is None or lg_count <= 0:
                 self._record_alarm("print_through_unwind_unrouted",
-                                   {"ticker": lg.ticker, "side": lg.side, "count": lg.count})
+                                   {"ticker": lg.ticker, "side": lg.side, "count": str(lg_count)})
                 continue
-            want += int(lg.count)
-            n_chunks = ceil(int(lg.count) / self.wing_cap)
+            want += lg_count
+            n_chunks = ceil(lg_count / self.wing_cap)
+            _sum_chunks = Decimal(0)
             for c in range(n_chunks):
-                cnt = min(self.wing_cap, int(lg.count) - c * self.wing_cap)
+                cnt = min(Decimal(self.wing_cap), lg_count - c * self.wing_cap)
+                _sum_chunks += cnt
                 entries.append(self._pt_taker_entry(lg.ticker, lg.side, "sell", cnt, lg.limit, exch,
                                                     self._mint_wing_coid()))
+            assert _sum_chunks == lg_count, f"unwind chunk sum {_sum_chunks} != leg {lg_count}"
         if not entries:
             return []
         await self._pacer.acquire_async(COST_CREATE * len(entries), "print_through_unwind", priority=True)
@@ -860,15 +902,16 @@ class V33AsyncExecutor(V33LiveExecutor):
         else:
             resp = await self._apost(REL_BATCH_CREATE, build_batch(entries), CLASS_WING)
             parsed = parse_batch_response(resp.body) if resp.ok else []
-        sold = 0
+        sold = Decimal(0)
         for r in parsed:
             if r is not None and not r.error and r.fill_count and r.fill_count > 0:
-                sold += int(r.fill_count)
+                sold += self._dc(r.fill_count)
         if sold < want:
             self.pt_unwind_shortfalls += 1
             self._bump("pt_unwind_short")
-            self._record_alarm("print_through_unwind_short", {"wanted": want, "sold": sold})
-            self.journal.append("print_through_unwind_short", {"wanted": want, "sold": sold}, self.clock())
+            self._record_alarm("print_through_unwind_short", {"wanted": str(want), "sold": str(sold)})
+            self.journal.append("print_through_unwind_short",
+                                {"wanted": str(want), "sold": str(sold)}, self.clock())
             if self.stand_down_reason is None:
                 self.stand_down_reason = "print_through_unwind_short"
         return []
