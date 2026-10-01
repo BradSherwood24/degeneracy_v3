@@ -177,9 +177,13 @@ def _v32_exec(w):
 
 
 def test_v32_cancel_confirm_stays_int_byte_identical():
+    # 2026-10-01 MECHANICS CLARIFICATION: V3.2 is now fractional too (``_fractional_counts`` True), but a
+    # WHOLE cancel-confirm fill must still journal a BARE int (not a "1.00" Decimal string) so the ledger /
+    # report / golden rows stay byte-identical. (A fractional V3.2 cancel is proven by
+    # ``test_v32_fractional_counts.py``.)
     w = FakeWriter()
     ex = _v32_exec(w)
-    assert ex._fractional_counts is False
+    assert ex._fractional_counts is True
     ex.on_action(V32Action(kind=V32ActionKind.PLACE_REST, ticker="KXBTC-26SEP1316-B68200", side="no",
                            action="buy", count=1, price=Decimal("0.45"),
                            expiration_epoch=CTS - 300, client_order_id="c1"),

@@ -155,13 +155,16 @@ def test_count_fp_parsed_fractional_not_truncated_to_a_full_lot():
     assert _count_dec(f313["count_fp"]) == Decimal("0.44")
     assert _count_dec(frames["v33-2026-09-30T22:00:00Z-312"]["count_fp"]) == Decimal("1.00")
 
-    # the BUG it replaces: _fill_event ints count_fp to 0 for a sub-1 fill, and the old
-    # ``int(pf['count'] or 0) or rec.count`` would then fall back to the placed lot (1).
+    # The BUG it replaced: the shared ``_fill_event`` (``run_v32.parse_fill``) used to int-truncate
+    # ``count_fp`` to 0 for a sub-1 fill, and the old ``int(pf['count'] or 0) or rec.count`` then fell
+    # back to the placed lot (1). The 2026-10-01 V3.2 fractional MECHANICS fixed the SHARED parser too, so
+    # ``_fill_event`` now returns the EXACT fraction; run_v33's ``on_fill`` reads ``payload['count_fp']``
+    # directly, so its behaviour is unchanged, but the shared parser no longer manufactures the mirage.
     pf = _fill_event(f313)
-    assert pf["count"] == 0
-    placed_lot = 1
-    old_buggy = int(pf.get("count") or 0) or placed_lot
-    assert old_buggy == 1 and old_buggy != Decimal("0.44")      # the mirage the fix removes
+    assert pf["count"] == Decimal("0.44")
+    # the old int-truncation + placed-lot fallback is gone at the source:
+    old_buggy = int(pf.get("count") or 0) or 1
+    assert old_buggy == 1 and pf["count"] != old_buggy          # exact fraction, not the mirage
 
 
 # ===========================================================================

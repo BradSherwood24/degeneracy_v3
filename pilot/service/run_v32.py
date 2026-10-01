@@ -107,7 +107,7 @@ from service.v32.executor import (
     LiveExecutor,
     cancel_stale_open_orders,
 )
-from service.v32.core import lock_value
+from service.v32.core import _q_count, lock_value
 from service.v32.ledger import (
     append_v32_ledger_row,
     build_v32_ledger_row,
@@ -153,6 +153,25 @@ from service.wake import (
 from service.ws_client import KalshiWebSocketClient, WsCallbacks, _parse_server_ts
 
 logger = logging.getLogger(__name__)
+
+
+def _count_out(c: Any) -> Any:
+    """Serialise a lot count for the journal/ledger (2026-10-01 fractional MECHANICS): an INTEGRAL count
+    as a bare int (a whole-lot window's journal/ledger stays byte-identical to the pre-fractional build),
+    a fractional count (e.g. 0.44) as the 2dp Decimal (str-encoded by the journal's ``_json_default``).
+    Old integer rows already parse as ints. Mirrors ``run_v33._count_out``."""
+    d = _q_count(Decimal(str(c)))
+    return int(d) if d == d.to_integral_value() else d
+
+
+def _count_dec(raw: Any) -> Decimal:
+    """Parse a raw count / ``count_fp`` value to a 2dp Decimal (0 on any parse failure). Mirrors
+    ``run_v33._count_dec`` — Kalshi crypto fills are fractional (``count_fp``)."""
+    try:
+        return _q_count(Decimal(str(raw)))
+    except (TypeError, ValueError, ArithmeticError):
+        return Decimal(0)
+
 
 VALID_MODES_V32 = ("shakedown", "dry", "armed")
 STRIKE_SERIES = STRIKE_SERIES_PREFIX  # "KXBTCD"
@@ -718,10 +737,9 @@ def _fill_event(payload: dict) -> dict | None:
     except (TypeError, ValueError, ArithmeticError):
         yes_price = None
         price = None
-    try:
-        count = int(Decimal(str(payload.get("count_fp", payload.get("count", 0)))))
-    except (TypeError, ValueError, ArithmeticError):
-        count = 0
+    # FRACTIONAL (2026-10-01): Kalshi crypto fills are fractional (``count_fp``) — keep the Decimal, never
+    # int-truncate (a 0.44 fill must survive to size the wings).
+    count = _count_dec(payload.get("count_fp", payload.get("count", 0)))
     fee: Decimal | None = None
     try:
         if payload.get("fee_cost") is not None:
@@ -872,7 +890,14 @@ class V32Driver:
         self._stamp(server_ts)
         if trade_id is not None:
             self._seen_trade_ids.add(trade_id)
-        count = int(pf.get("count") or 0) or rec.count  # count_fp; fall back to the placed count
+        # FRACTIONAL (2026-10-01): parse ``count_fp`` as Decimal (a 0.44 fill must not int-truncate to 0 and
+        # then fall back to the FULL placed lot — that over-hedged). Prefer the raw ``count_fp``; only if it
+        # is absent/zero fall back to the parsed frame count, then the placed count.
+        count = _count_dec(payload.get("count_fp"))
+        if count <= 0:
+            count = _count_dec(pf.get("count"))
+        if count <= 0:
+            count = _count_dec(rec.count)
         exec_price = pf.get("price")  # NO-space executed price (parsed from the frame; 1 - yes on NO)
         exec_fee = pf.get("fee_cost")
         live = self.state.rest_live
@@ -890,7 +915,7 @@ class V32Driver:
                 "rest_fill",
                 {"market": market, "client_order_id": rec.client_order_id, "order_id": rec.order_id,
                  "rest_price": rec.price, "exec_price": exec_price, "exec_fee": exec_fee,
-                 "count": count, "path": "ws"},
+                 "count": _count_out(count), "path": "ws"},
                 self.clock(),
             )
             self._record_fill(rec, exec_price, exec_fee, count, path="ws")
@@ -898,7 +923,7 @@ class V32Driver:
             # ``rec.price`` (the Phase-1 convention). ``exec_price``/``exec_fee`` are journaled above
             # for Phase-3 reconciliation against the frame.
             self._pump([Fill(order_id=rec.order_id, client_order_id=rec.client_order_id,
-                             count=Decimal(count), price=rec.price, side="no", server_ts=server_ts)])
+                             count=count, price=rec.price, side="no", server_ts=server_ts)])
             return
         # F-1 late fill on a no-longer-tracked (replaced / eagerly-cancelled) own order
         if rec.order_id is not None:
@@ -914,7 +939,7 @@ class V32Driver:
                 "price": rec.price,
                 "exec_price": exec_price,
                 "exec_fee": exec_fee,
-                "count": count,
+                "count": _count_out(count),
                 "bucket_Sd": rec.bucket_Sd,
                 "status_before": rec.status,
                 "path": "ws",
@@ -952,10 +977,11 @@ class V32Driver:
         except (ArithmeticError, ValueError, TypeError):
             pass
 
-    def _record_fill(self, rec, exec_price, exec_fee, count: int, *, path: str) -> None:
+    def _record_fill(self, rec, exec_price, exec_fee, count: Decimal, *, path: str) -> None:
         """Append the REST fill to the executor's money-math capture (the ledger reads it at finalize).
         Booked at the resting price ``rec.price`` (post_only maker); the frame's executed price/fee are
-        kept for reconciliation."""
+        kept for reconciliation. FRACTIONAL (2026-10-01): ``count`` is a Decimal; a whole count serialises
+        as a bare int via ``_count_out`` (byte-identical)."""
         fills = getattr(self.executor, "fills", None)
         if fills is None:
             return
@@ -967,11 +993,11 @@ class V32Driver:
                 return
             booked.add(rec.order_id)
         fills.append({"leg": "rest", "side": "no", "ticker": rec.ticker, "price": rec.price,
-                      "exec_price": exec_price, "fee": exec_fee, "count": int(count),
+                      "exec_price": exec_price, "fee": exec_fee, "count": _count_out(count),
                       "bucket_Sd": rec.bucket_Sd, "path": path,
                       "client_order_id": rec.client_order_id})
 
-    def on_poll_fill(self, order_id: str, filled_count: int, server_ts: float) -> None:
+    def on_poll_fill(self, order_id: str, filled_count: Any, server_ts: float) -> None:
         """Book a REST fill discovered by the 1 s order-status poll (belt and braces).
 
         ``filled_count`` is the venue-CUMULATIVE fill for this order. The core treats ``Fill.count`` as a
@@ -983,13 +1009,16 @@ class V32Driver:
         ``contracts`` = 1 the order is fully booked after one fill, so a poll reporting the same total
         yields delta 0 and does nothing — byte-identical to the pre-partial single-shot poll (and the
         WS-then-poll dedup: the WS lot already advanced ``rest_booked_by_coid``)."""
-        if filled_count <= 0:
+        # FRACTIONAL (2026-10-01): ``filled_count`` is the venue cumulative fill (fractional-safe); feed the
+        # Decimal DELTA over what the core has booked. A whole count stays int-equivalent (byte-identical).
+        filled = _count_dec(filled_count)
+        if filled <= 0:
             return
         rec = self.executor.attribute(order_id=order_id)
         if rec is None:
             return
-        already = int(self.state.rest_booked_by_coid.get(rec.client_order_id, 0))
-        delta = int(filled_count) - already
+        already = _count_dec(self.state.rest_booked_by_coid.get(rec.client_order_id, 0))
+        delta = _q_count(filled - already)
         if delta <= 0:
             return
         self._rest_fill_booked_oids.add(order_id)
@@ -998,15 +1027,15 @@ class V32Driver:
         self.counts["rest_fill_poll"] += 1
         self.journal.append(
             "rest_fill", {"client_order_id": rec.client_order_id, "order_id": order_id,
-                          "rest_price": rec.price, "count": int(delta), "path": "poll"},
+                          "rest_price": rec.price, "count": _count_out(delta), "path": "poll"},
             self.clock(),
         )
-        self._record_fill(rec, None, None, int(delta), path="poll")
+        self._record_fill(rec, None, None, delta, path="poll")
         # feed the core the DELTA (per-fill) so it books the newly-filled lot(s) and completes their wings.
         self.state, actions = decide_v32(
             self.params, self.state,
             Fill(order_id=order_id, client_order_id=rec.client_order_id,
-                 count=Decimal(int(delta)), price=rec.price, side="no", server_ts=server_ts),
+                 count=delta, price=rec.price, side="no", server_ts=server_ts),
         )
         synth: list[Any] = []
         for a in actions:
@@ -1050,7 +1079,7 @@ class V32Driver:
         if k in (ActionKind.WOULD_PLACE_REST, ActionKind.PLACE_REST):
             rk = "would_place_rest" if k == ActionKind.WOULD_PLACE_REST else "place_rest"
             payload = {
-                "ticker": a.ticker, "side": a.side, "action": a.action, "count": a.count,
+                "ticker": a.ticker, "side": a.side, "action": a.action, "count": _count_out(a.count),
                 "price": a.price, "expiration_epoch": a.expiration_epoch,
                 "client_order_id": a.client_order_id,
             }
@@ -1062,13 +1091,13 @@ class V32Driver:
             rk = "would_amend_rest" if k == ActionKind.WOULD_AMEND_REST else "amend_rest"
             payload = {
                 "order_id": a.order_id, "ticker": a.ticker, "side": a.side, "action": a.action,
-                "count": a.count, "price": a.price, "client_order_id": a.client_order_id,
+                "count": _count_out(a.count), "price": a.price, "client_order_id": a.client_order_id,
                 "updated_client_order_id": a.updated_client_order_id,
             }
             self._capture_quote(a)
         elif k in (ActionKind.WOULD_TAKE_WINGS, ActionKind.TAKE_WINGS, ActionKind.RETRY_WING):
             legs = [
-                {"ticker": lg.ticker, "side": lg.side, "action": lg.action, "count": lg.count,
+                {"ticker": lg.ticker, "side": lg.side, "action": lg.action, "count": _count_out(lg.count),
                  "limit": lg.limit}
                 for lg in a.legs
             ]
@@ -1079,7 +1108,7 @@ class V32Driver:
                 rk = "would_retry_wing" if is_retry else "would_take_wings"
             else:
                 rk = "retry_wing" if is_retry else "take_wings"
-            payload = {"legs": legs, "count": a.count, "lock": a.lock}
+            payload = {"legs": legs, "count": _count_out(a.count), "lock": a.lock}
         elif k == ActionKind.STAND_DOWN:
             rk = "stand_down"
             payload = {"reason": a.reason}
@@ -1378,8 +1407,10 @@ async def _order_status_poll(
         except Exception as e:  # noqa: BLE001
             logger.warning("[V32] order-status poll error: %s", e)
             continue
-        if st.available and st.filled_count > 0:
-            driver.on_poll_fill(rest.order_id, int(st.filled_count),
+        # FRACTIONAL (2026-10-01): feed the EXACT ``fill_count_fp`` (not the int-truncated ``filled_count``)
+        # so a 0.44 poll-discovered fill is booked 0.44, not 0.
+        if st.available and st.filled_count_fp > 0:
+            driver.on_poll_fill(rest.order_id, st.filled_count_fp,
                                 driver.server_now() or clock())
 
 
@@ -1448,7 +1479,7 @@ def _batch_set_records(state: V32State) -> list[dict[str, Any]]:
         out.append({
             "index": b.index,
             "fill_price": str(b.fill_price),
-            "fill_count": int(b.fill_count),
+            "fill_count": _count_out(b.fill_count),   # fractional-safe (whole -> bare int)
             "completed": bool(completed),
             "one_legged": bool(b.one_legged),
             "realized_lock": (str(lock) if lock is not None else None),
@@ -1457,15 +1488,17 @@ def _batch_set_records(state: V32State) -> list[dict[str, Any]]:
     return out
 
 
-def _fee_total(price: Any, count: int) -> Decimal:
+def _fee_total(price: Any, count: Any) -> Decimal:
     """Venue per-FILL taker fee in dollars: ``ceil(0.07*p*(1-p)*count, $0.0001)`` -- the $0.0001
     ceiling applied ONCE to the whole fill, which is how Kalshi charges (MEMORY kalshi-fee-exact;
     169 live fills). This EQUALS the frozen per-contract law ``_fee(price)`` at ``count`` == 1, so a
     1-lot fill is unchanged; a size-N taker fill's true fee is THIS, never ``_fee(price) * N`` (the
     per-contract fee already rounded up once, so multiplying by N over-counts the rounding). Built on
-    the SAME frozen ``_FEE_RATE`` as ``_fee`` -- no reimplementation of the coefficient."""
+    the SAME frozen ``_FEE_RATE`` as ``_fee`` -- no reimplementation of the coefficient. FRACTIONAL
+    (2026-10-01): ``count`` is Decimal-safe (a 0.44 fill's fee is ``ceil(0.07*p*(1-p)*0.44)``)."""
     p = price if isinstance(price, Decimal) else Decimal(str(price))
-    raw = _FEE_RATE * p * (Decimal(1) - p) * Decimal(int(count)) * Decimal(10000)
+    cnt = count if isinstance(count, Decimal) else Decimal(str(count))
+    raw = _FEE_RATE * p * (Decimal(1) - p) * cnt * Decimal(10000)
     return Decimal(math.ceil(raw)) / Decimal(10000)
 
 
@@ -1475,16 +1508,18 @@ def _fill_total_fee(f: Mapping[str, Any]) -> tuple[Decimal, str]:
     A fill record's ``fee`` key is PER CONTRACT (Kalshi's ``average_fee_paid``); the maker rest leg is
     fee-free on crypto (``fee`` 0). The TOTAL charged is:
       * ``fee`` 0            -> 0                      (maker leg; source "maker_zero")
-      * taker, count 1       -> the per-contract ``fee`` itself IS the venue total (source
+      * taker, count == 1   -> the per-contract ``fee`` itself IS the venue total (source
         "per_contract") -- keeps every pre-existing size-1 row byte-for-byte identical
-      * taker, count >= 2    -> ``_fee_total(price, count)`` = the venue per-fill charge (source
-        "law_total"); NOT ``fee * count`` (which under/over-counts the once-applied ceiling)."""
+      * taker, else (count >= 2 OR fractional) -> ``_fee_total(price, count)`` = the venue per-fill
+        charge (source "law_total"); NOT ``fee * count`` (which under/over-counts the once-applied
+        ceiling). FRACTIONAL (2026-10-01): a sub-lot fill (0.44) uses the law total, not the whole-
+        contract ``fee`` (which would over-charge)."""
     per = f.get("fee")
     per_d = Decimal(str(per)) if per is not None else Decimal(0)
     if per_d == 0:
         return Decimal(0), "maker_zero"
-    count = int(f.get("count", 0) or 0)
-    if count <= 1:
+    count = _count_dec(f.get("count", 0))
+    if count == 1:
         return per_d, "per_contract"
     return _fee_total(f.get("price", 0), count), "law_total"
 
@@ -1547,7 +1582,8 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
         "amends_confirmed": int(getattr(executor, "amends_confirmed", 0)),
         "amends_failed": int(getattr(executor, "amends_failed", 0)),
         "amend_fallbacks": int(getattr(executor, "amend_fallbacks", 0)),
-        "fills_on_amend": int(getattr(executor, "fills_on_amend", 0)),
+        # FRACTIONAL (2026-10-01): a fractional amend-cross makes this a Decimal; serialise bare-int when whole.
+        "fills_on_amend": _count_out(getattr(executor, "fills_on_amend", 0) or 0),
     }
     fills = list(getattr(executor, "fills", []) or [])
     if not fills or state.rest_fill is None:
@@ -1583,18 +1619,18 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
     # Single-bucket windows and contracts=1 are byte-identical (every record carries the one ticker).
     batch_bt: dict[int, str | None] = {}
     _ri = 0
-    _rem = int(rest_records[0].get("count", 0) or 0) if rest_records else 0
+    _rem = _count_dec(rest_records[0].get("count", 0)) if rest_records else Decimal(0)   # fractional-safe
     for b in getattr(state, "wing_batches", ()):  # type: ignore[attr-defined]
         while _ri < len(rest_records) and _rem <= 0:
             _ri += 1
-            _rem = int(rest_records[_ri].get("count", 0) or 0) if _ri < len(rest_records) else 0
+            _rem = _count_dec(rest_records[_ri].get("count", 0)) if _ri < len(rest_records) else Decimal(0)
         if _ri < len(rest_records):
             rec = rest_records[_ri]
             tk = rec.get("ticker")
             if not tk and rec.get("bucket_Sd") is not None:
                 tk = state.bucket_tickers.get(rec["bucket_Sd"])
             batch_bt[b.index] = tk or fallback_bt
-            _rem -= int(b.fill_count)
+            _rem -= _count_dec(b.fill_count)
         else:
             batch_bt[b.index] = fallback_bt
 
@@ -1613,23 +1649,24 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
         held_this = 0
         if bt:
             held_this += 1
-            held.append({"ticker": bt, "side": "no", "count": int(b.fill_count)})
+            held.append({"ticker": bt, "side": "no", "count": _count_out(b.fill_count)})
         w_paid = Decimal(0)
         completed = bool(legs) and all(lg.status == "filled" for lg in legs)
         for lg in legs:
             if lg.status == "filled":
                 held_this += 1
-                held.append({"ticker": lg.ticker, "side": lg.side, "count": int(lg.count)})
+                held.append({"ticker": lg.ticker, "side": lg.side, "count": _count_out(lg.count)})
                 if lg.fill_price is not None:
                     w_paid += lg.fill_price + _fee(lg.fill_price)
-        floor += v32_set_floor_dollars(held_this, int(b.fill_count))
+        # v32_set_floor_dollars multiplies by Decimal(str(count)) -> fractional-safe (count-weighted).
+        floor += v32_set_floor_dollars(held_this, b.fill_count)
         if completed and realized_lock is None:
             realized_lock = lock_value(b.fill_price, w_paid)
     # conservative realized at close = floor guaranteed by the held legs − cash actually paid.
     cost = Decimal(0)
     for f in fills:
         try:
-            cost += Decimal(str(f.get("price", 0))) * Decimal(int(f.get("count", 0)))
+            cost += Decimal(str(f.get("price", 0))) * _count_dec(f.get("count", 0))
             # TOTAL fee for ALL lots of this fill. The venue charges ceil(0.07*p*(1-p)*count)
             # ONCE per fill, so the per-contract ``fee`` must be scaled by count (not added
             # once). Adding it once dropped every lot past the first -- the 2026-09-20 04:00Z
@@ -1639,11 +1676,11 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
             continue
     realized_delta = floor - cost
     rest_fills_events = [
-        {"price": str(rf.price), "count": int(rf.count), "server_ts": rf.server_ts}
+        {"price": str(rf.price), "count": _count_out(rf.count), "server_ts": rf.server_ts}
         for rf in getattr(state, "rest_fills", ())
     ]
-    lots_filled = sum(int(rf.count) for rf in getattr(state, "rest_fills", ()))
-    lots_unfilled = max(0, int(contracts) - lots_filled)
+    lots_filled = sum((_count_dec(rf.count) for rf in getattr(state, "rest_fills", ())), Decimal(0))
+    lots_unfilled = max(Decimal(0), _q_count(Decimal(contracts) - lots_filled))
     return {
         "fills": rest_fills_mm,
         "wing_fills": wing_fills,
@@ -1658,8 +1695,8 @@ def _compute_money_math(state: V32State, executor: Any, contracts: int = 1) -> d
         # PARTIAL-FILL WINGS additive slots
         "rest_fills": rest_fills_events,
         "wing_batch_sets": _batch_set_records(state),
-        "lots_filled": int(lots_filled),
-        "lots_unfilled_at_quote_end": int(lots_unfilled),
+        "lots_filled": _count_out(lots_filled),
+        "lots_unfilled_at_quote_end": _count_out(lots_unfilled),
         "partial_fills": int(getattr(state, "partial_fills", 0)),
         **counters,
     }
