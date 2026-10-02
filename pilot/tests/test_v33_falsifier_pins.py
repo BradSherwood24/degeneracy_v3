@@ -58,7 +58,7 @@ def test_falsifier_is_frozen_with_registration():
 
 def test_verdict_pins_match_doc():
     doc = _doc()
-    assert f"n >= {V33_FALSIFIER_MIN_N}" in doc                       # n >= 15 (L6; was n >= 30)
+    assert f"n >= {V33_FALSIFIER_MIN_N}" in doc                       # n >= 45 (L7; L6 was 15, L4 30)
     assert f"+{V33_FALSIFIER_MIN_MEAN_LOCK_CENTS}c" in doc            # +4.0c (L6; was +6.0c)
     assert f"<= {V33_FALSIFIER_MAX_RUNG_SHORTFALL_CENTS}c" in doc     # <= 3.0c
     assert f">= {V33_FALSIFIER_MIN_RUNG_FILLS_FOR_SHORTFALL} [pin] fills" in doc  # >= 3 [pin] fills
@@ -73,30 +73,35 @@ def test_verdict_pins_match_doc():
 def test_kill_pins_match_doc():
     doc = _doc()
     assert f"+{V33_KILL_MEAN_LOCK_CENTS}c [pin]" in doc               # +2.0c [pin]
-    assert f"`n >= {V33_KILL_MIN_N}` [pin]" in doc                    # `n >= 15` [pin]
+    assert f"`n >= {V33_KILL_MIN_N}` [pin]" in doc                    # `n >= 15` [pin] (early kill; L7 kept)
+    assert V33_KILL_MIN_N == 15                                      # L7: the early-kill n did NOT move
     assert f"> {V33_FALSIFIER_MAX_ONE_LEGGED} [pin] contracts" in doc  # > 2 [pin] contracts
 
 
 def test_promotion_pin_matches_doc():
     doc = _doc()
-    assert f"`n >= {V33_PROMOTION_MIN_N}` [pin]" in doc               # `n >= 15` [pin]
-    assert V33_PROMOTION_MIN_N == 15
+    assert f"`n >= {V33_PROMOTION_MIN_N}` [pin]" in doc               # `n >= 45` [pin] (L7)
+    assert V33_PROMOTION_MIN_N == 45
 
 
-def test_verdict_min_n_is_15_and_in_doc():
-    """L6 (Brad 2026-09-30): the verdict/promotion n dropped 30 -> 15; no '30' verdict n survives."""
+def test_verdict_min_n_is_45_and_in_doc():
+    """L7 (Brad 2026-10-02, Test Fire #2): the verdict/promotion n is 45 (L6 had 15, L4 30); no stale
+    verdict n survives in the live thresholds / promotion text. The KILL section keeps `n >= 15` (early kill)."""
     doc = _doc()
-    assert V33_FALSIFIER_MIN_N == 15
+    assert V33_FALSIFIER_MIN_N == 45
     assert f"`n >= {V33_FALSIFIER_MIN_N}` [pin]" in doc               # `n >= 15` [pin]
     assert f"`n<{V33_FALSIFIER_MIN_N} pending`" in doc                # the report string
-    # no stale "n >= 30" / "n<30 pending" verdict wording in the live thresholds/kill/promotion text
-    # (the L4/L5 historical amendments keep their own dated prose).
-    for section in ("## Proposed pre-registered thresholds", "## Kill (early / immediate)",
-                    "## Promotion"):
+    # no stale "n >= 30" / "n >= 15" verdict wording in the live thresholds / promotion text (the L4/L5/L6/L7
+    # amendment sections keep their own dated prose). The KILL section legitimately keeps `n >= 15`.
+    for section in ("## Proposed pre-registered thresholds", "## Promotion"):
         start = doc.index(section)
         end = doc.index("\n## ", start + 1)
         body = doc[start:end]
-        assert "n >= 30" not in body and "n<30" not in body and "n=30" not in body, section
+        for stale in ("n >= 30", "n<30", "n=30", "n >= 15", "n<15", "n=15"):
+            assert stale not in body, (section, stale)
+    kill = doc[doc.index("## Kill (early / immediate)"):]
+    kill = kill[:kill.index("\n## ", 1)]
+    assert "`n >= 15` [pin]" in kill and "n >= 45" not in kill
 
 
 def test_s4_day_loss_kill_pin_matches_doc():

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from service.v33.falsifier_pins import V33_FALSIFIER_MIN_N
 from service.v33.report import (
     build_deep_end,
     build_falsifier_gate_table,
@@ -76,17 +77,17 @@ def test_capture_ratio_at_10c():
 # gate table
 # ---------------------------------------------------------------------------
 def test_gate_table_n_too_small_pending():
-    gt = build_falsifier_gate_table([_sweep_row("2026-09-24T04:00:00Z")])   # n=11 < 15
+    gt = build_falsifier_gate_table([_sweep_row("2026-09-24T04:00:00Z")])   # n=11 < MIN_N (45 under L7)
     assert gt["n_rung_fills"] == 11
-    assert gt["verdict"].startswith("n<15 pending")
+    assert gt["verdict"].startswith(f"n<{V33_FALSIFIER_MIN_N} pending")
     mean_gate = next(g for g in gt["gates"] if g["gate"] == "mean true lock")
     assert mean_gate["status"] == "n-too-small"
 
 
-def test_gate_table_alive_at_n_over_30():
-    rows = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=8, solved_c=10) for h in range(3)]  # 33
+def test_gate_table_alive_at_n_over_45():
+    rows = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=8, solved_c=10) for h in range(5)]  # 55 (L7: verdict n 45)
     gt = build_falsifier_gate_table(rows)
-    assert gt["n_rung_fills"] == 33
+    assert gt["n_rung_fills"] == 55
     assert gt["mean_lock_c"] == Decimal(8)
     # every gate PASS: mean 8>=6, shortfall 2<=3, %pos 100>=80, capture 1.0>=0.5, one-legged 0<=2, roll 1.0
     assert all(g["status"] == "PASS" for g in gt["gates"]), gt["gates"]
@@ -108,10 +109,10 @@ def test_gate_table_kill_on_one_legged():
     assert gt["verdict"].startswith("KILL") and "one-legged" in gt["verdict"]
 
 
-def test_gate_table_fail_on_wide_shortfall_at_n_over_30():
-    rows = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=3, solved_c=10) for h in range(3)]  # 33
+def test_gate_table_fail_on_wide_shortfall_at_n_over_45():
+    rows = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=3, solved_c=10) for h in range(5)]  # 55 (L7: verdict n 45)
     gt = build_falsifier_gate_table(rows)                       # shortfall 7c > 3c AND mean 3c < 6c
-    assert gt["n_rung_fills"] == 33
+    assert gt["n_rung_fills"] == 55
     assert gt["verdict"].startswith("KILL")
     sf = next(g for g in gt["gates"] if g["gate"].startswith("per-rung shortfall"))
     assert sf["status"] == "FAIL" and sf["value"] == Decimal(7)
@@ -179,11 +180,11 @@ def test_capture_excludes_below_n_min_shadow_fill():
     assert sb["capture_10c"]["shadow"] == 0 and sb["capture_10c"]["ratio"] is None
 
 
-def test_gate_capture_none_fails_closed_at_n_over_30():
-    """F1 (fail-closed): at n >= 15 an UNMEASURABLE capture (no valid shadow availability, ratio None) is
-    a FAIL, not a pass -- and the verdict is NOT ALIVE. Below n >= 15 it stays n-too-small."""
-    rows = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=8, shadow_10=None) for h in range(3)]
-    gt = build_falsifier_gate_table(rows)                       # n=33, no shadow
+def test_gate_capture_none_fails_closed_at_n_over_45():
+    """F1 (fail-closed): at n >= 45 (L7) an UNMEASURABLE capture (no valid shadow availability, ratio None) is
+    a FAIL, not a pass -- and the verdict is NOT ALIVE. Below n >= 45 it stays n-too-small."""
+    rows = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=8, shadow_10=None) for h in range(5)]  # 55 >= 45 (L7)
+    gt = build_falsifier_gate_table(rows)                       # n=55, no shadow
     cap_gate = next(g for g in gt["gates"] if g["gate"].startswith("capture ratio"))
     assert cap_gate["status"] == "FAIL" and cap_gate["value"] is None
     assert gt["verdict"] != "ALIVE-so-far" and gt["verdict"].startswith("KILL")
@@ -192,7 +193,7 @@ def test_gate_capture_none_fails_closed_at_n_over_30():
 def test_gate_capture_none_is_n_too_small_below_min_n():
     gt = build_falsifier_gate_table([_sweep_row("2026-09-24T04:00:00Z", realised_c=8, shadow_10=None)])
     cap_gate = next(g for g in gt["gates"] if g["gate"].startswith("capture ratio"))
-    assert gt["n_rung_fills"] == 11                              # < 15
+    assert gt["n_rung_fills"] == 11                              # < 45 (L7)
     assert cap_gate["status"] == "n-too-small"                  # below MIN_N: unmeasured, not yet a FAIL
 
 
@@ -236,7 +237,7 @@ def test_full_report_has_all_blocks(capsys, tmp_path):
 def test_build_v33_report_includes_new_sections():
     rep = build_v33_report([_sweep_row("2026-09-24T04:00:00Z")])
     assert "scoreboard" in rep and "gate_table" in rep and "deep_end" in rep
-    assert rep["gate_table"]["verdict"].startswith("n<15 pending")
+    assert rep["gate_table"]["verdict"].startswith(f"n<{V33_FALSIFIER_MIN_N} pending")
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +245,13 @@ def test_build_v33_report_includes_new_sections():
 # ---------------------------------------------------------------------------
 def test_gate_mean_lock_boundary_pass_and_fail():
     # L6 (Brad 2026-09-30): the mean-lock bar dropped +6.0c -> +4.0c.
-    # mean exactly +4.0c at n>=15 -> PASS; +3c -> FAIL (mean-lock gate is >= not >; +3c is above the
+    # mean exactly +4.0c at n>=45 (L7) -> PASS; +3c -> FAIL (mean-lock gate is >= not >; +3c is above the
     # +2.0c early kill, so it fails on the verdict mean-lock gate, not the early kill).
-    at4 = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=4, solved_c=6) for h in range(3)]
+    at4 = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=4, solved_c=6) for h in range(5)]  # n=55 >= 45 (L7)
     gt4 = build_falsifier_gate_table(at4)
     mg = next(g for g in gt4["gates"] if g["gate"] == "mean true lock")
     assert mg["status"] == "PASS" and gt4["verdict"] == "ALIVE-so-far"
-    at3 = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=3, solved_c=6) for h in range(3)]
+    at3 = [_sweep_row(f"2026-09-24T{h:02d}:00:00Z", realised_c=3, solved_c=6) for h in range(5)]
     gt3 = build_falsifier_gate_table(at3)
     mg3 = next(g for g in gt3["gates"] if g["gate"] == "mean true lock")
     assert mg3["status"] == "FAIL" and gt3["verdict"].startswith("KILL")

@@ -90,14 +90,14 @@ the 8..18c sample for the `n >= 30` verdict / kill / promotion gate counting; th
 8..18c fills from here. The gates themselves (mean lock +6.0c, per-rung shortfall, % positive, capture
 ratio, one-legged, roll integrity, kill and promotion pins) are UNCHANGED. V3.3 stays DRY.
 _(Dated L4 record: the `n >= 30` verdict n and the +6.0c mean-lock bar named in this paragraph are
-SUPERSEDED by L6, 2026-09-30 -- the live gate is now `n >= 15` and +4.0c; see the L6 amendment section
-below.)_
+SUPERSEDED by L6, 2026-09-30 -- `n >= 15` and +4.0c -- and the verdict n again by L7, 2026-10-02 --
+`n >= 45`; see the L6 and L7 amendment sections below.)_
 
 ## Proposed pre-registered thresholds (the verdict)
 
-Judged on LIVE fills. The verdict is decided only once there are `n >= 15` [pin] realised rung-fills (n
-counts contracts; a full sweep contributes K); before that the scoreboard prints `n<15 pending`. At
-`n >= 15`:
+Judged on LIVE fills. The verdict is decided only once there are `n >= 45` [pin] realised rung-fills (n
+counts contracts; a full sweep contributes K); before that the scoreboard prints `n<45 pending`. At
+`n >= 45`:
 
 - ALIVE iff ALL of:
   - ladder mean true lock (realised, per contract) >= +4.0c [pin], AND
@@ -105,15 +105,15 @@ counts contracts; a full sweep contributes K); before that the scoreboard prints
   - % positive >= 80% [pin], AND
   - capture ratio at the 10c margin >= 0.50 [pin] (= 50%; same definition as V3.2 Registration 3 --
     live completed 10c-rung sets / ideal-shadow E=0.10 fills inside the quoting window, over armed+bucket
-    windows). FAIL-CLOSED: at `n >= 15` an UNMEASURABLE capture (no valid ideal-shadow E=0.10 availability
+    windows). FAIL-CLOSED: at `n >= 45` an UNMEASURABLE capture (no valid ideal-shadow E=0.10 availability
     to measure execution against, ratio None) is a MISS, not a pass -- exactly as V3.2's verdict logic
-    treats a None ratio. (Below `n >= 15` the gate reads `n-too-small`.) AND
+    treats a None ratio. (Below `n >= 45` the gate reads `n-too-small`.) AND
   - one-legged <= 2 [pin] contracts, AND
   - roll integrity: >= 90% [pin] of rolls move exactly one order (journal-counted).
-- KILL iff ANY of those thresholds is missed at `n >= 15`. No re-spec on the same evaluation window
+- KILL iff ANY of those thresholds is missed at `n >= 45`. No re-spec on the same evaluation window
   (the registered-specs rule): a miss is a kill, not a re-parameterisation.
 
-The report computes this verdict (`ALIVE-so-far` / `KILL` / `n<15 pending`) directly from the `[pin]`
+The report computes this verdict (`ALIVE-so-far` / `KILL` / `n<45 pending`) directly from the `[pin]`
 constants in `service.v33.falsifier_pins` -- see the FALSIFIER GATE TABLE + LADDER SCOREBOARD blocks in
 `python -m service.v33.report`.
 
@@ -171,7 +171,7 @@ settlement and flag `one_legged`.
 ## Promotion
 
 Nothing here promotes automatically. What would JUSTIFY 2 lots per rung, OR rungs deeper than 18c live
-(Brad's dated word, informed by SO-3's measured deep-end absorption): ALIVE at `n >= 15` [pin]
+(Brad's dated word, informed by SO-3's measured deep-end absorption): ALIVE at `n >= 45` [pin]
 (`V33_PROMOTION_MIN_N`) completed rung-fills. The SO-3 deep observation ladder (19..28c, observation only)
 measures the deep end's absorption before anyone sizes into it (sec 8, PLAN_V33). The proxy cap
 `MAX_CONTRACTS_PER_ORDER` (2 or 11) stands regardless.
@@ -231,6 +231,28 @@ The per-rung shortfall's "`>= 3` fills per rung" pin, the % positive (80%), the 
 10c margin), the one-legged tolerance (<= 2), the roll-integrity (>= 90%) and the S4 cap dollars ($3.00),
 budget and S1_LEGGED pins are all UNCHANGED. The 5..15c and 8..18c history stays as recorded (L4/L5). V3.3
 stays DRY -- this is a falsifier amendment, not a mode flip.
+
+## L7 amendment (2026-10-02, between Test Fire #1 and Test Fire #2) -- Brad's verbatim words
+
+Brad's verbatim words 2026-10-02 (morning after Test Fire #1's frozen KILL): "Id like the same falsifier as
+test fire 1, I think. Maybe we should up n from 15 to 30 now. Thoughts?" -> (Claude: agree; the n-gated
+mean-lock verdict is the only rule n touches; the one-legged and S4 kills fire at any n) -> "I agree with
+30,000 budget and raising above n=30." -> "Lets go with n=45 for test fire 2."
+
+One change (old -> new):
+
+1. Verdict / promotion n: `V33_FALSIFIER_MIN_N` and `V33_PROMOTION_MIN_N` 15 -> 45. The report prints
+   `n<45 pending` below it. Rationale (Brad's): at 1 lot per rung and ~2 entries a day, 45 contracts is
+   about two armed days; 15 is one active hour (Test Fire #1 reached n=26 in three windows only because spot
+   was moving), too small to call a mean on.
+
+UNCHANGED, explicitly: the early kill `mean < +2.0c at n >= 15` (`V33_KILL_MIN_N` stays 15 -- a broken
+premise still kills after one active hour; Claude's reading of "the same falsifier", flagged to Brad), the
+mean true-lock bar +4.0c, one-legged <= 2 contracts (the rule that returned Test Fire #1's KILL), the S4
+$3.00 day-loss campaign kill, the S1_LEGGED day latch at 2 occurrences, and every other [pin]. Params sha
+unchanged (`295590ce...`). This is a falsifier amendment on Brad's word before the Test Fire #2 arm, not a
+re-spec of a running evaluation: Test Fire #1 was closed under the L6 rules (KILL, one-legged 14 > 2) and
+its record stands; Test Fire #2 opens a NEW evaluation window under L7.
 
 ## Registration (append-only; the freeze line, Brad's verbatim go, and every verdict go here)
 
@@ -345,6 +367,24 @@ stays DRY -- this is a falsifier amendment, not a mode flip.
   leg) and/or Kalshi Advanced tier (POST /trade-api/v2/account/api_usage_level/upgrade; scope to the crypto
   instance unverified); and the re-registration terms for Test Fire #2 (same frozen thresholds unless amended
   on his word). V3.3 stays DRY until then.
+- 2026-10-02 ~13:40Z -- TEST FIRE #2 REGISTERED (pre-arm; the arm itself is Brad's mode-file flip, recorded when it
+  happens). Brad, verbatim: "Think we're ready to flip V3.3 back on?"; "Lets go ahead and raise the proxy budget, I can
+  do that in the env if you dont mind restarting it after."; "Id like the same falsifier as test fire 1, I think. Maybe
+  we should up n from 15 to 30 now."; "I agree with 30,000 budget and raising above n=30."; "Lets go with n=45 for test
+  fire 2." Terms: the L6-frozen rules AS AMENDED BY L7 -- verdict / promotion at `n >= 45`, early kill mean < +2.0c at
+  `n >= 15`, mean true lock >= +4.0c, one-legged <= 2 contracts, S4 $3.00 campaign kill, S1_LEGGED day latch at 2 --
+  on the PR #110 engine (wing venue-confirm, sub-batched wings paced to the bucket, 429 definitive + backoff, amend-404
+  status resolve, netting-journal fix). Evaluation window = the armed windows from the Test Fire #2 flip forward; Test
+  Fire #1's windows (10-01 23:00Z .. 10-02 02:00Z) are CLOSED under L6 and are not pooled. Preconditions met at
+  registration: Kalshi account tier ADVANCED (write 300/s, bucket 900, read 13:11Z 10-02); proxy restarted 13:15Z
+  (pid 22952) with DAILY_ORDER_BUDGET 30000 (Brad's .env edit; 7253 used today -> 22747 remaining; the counter persists
+  across restarts), MAX_CONTRACTS_PER_ORDER 2, orders_enabled true, same key fingerprint; venue clean (0 positions, 0
+  resting, balance $66.15 total / $53.04 crypto instance); 10 overnight dry windows (03Z..12Z) clean (0 alarms, 5
+  dry-sim entries, lock 3.5-5.3c/lot). Pending Brad's levers before the flip: (a) remove the FALSE S1_LEGGED occurrence
+  (window 2026-10-02T00:00:00Z, the netting-bug false positive) from `ops/v33_stops_2026-10-02.json` -- with two
+  occurrences the day is latched and every 10-02 window would degrade to dry; (b) merge of this amendment PR + live-tree
+  pull in a :02-:33 band; (c) `ops/v33_mode.txt` -> armed. Pacer params stay 100/100 (sha-pinned; conservative under
+  the 900 bucket). The 09-30 incident pair ruling remains open and does not gate the arm.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
