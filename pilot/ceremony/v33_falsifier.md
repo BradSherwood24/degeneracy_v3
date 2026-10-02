@@ -310,6 +310,42 @@ stays DRY -- this is a falsifier amendment, not a mode flip.
   The incident's two contracts (09-30 22:00Z row) remain in the ledger pending Brad's ruling (exclude vs restate)
   before n approaches 15.
 
+- 2026-10-02 03:1xZ -- TEST FIRE #1 (Brad's name for the armed campaign 2026-10-01 17:16:07Z .. 2026-10-02
+  02:04:59Z) -- VERDICT BY THE FROZEN RULES: **KILL** (one-legged contracts 14 > 2 [pin]). Recorded as the
+  machinery states it (`python -m service.v33.report`, 02:3xZ): realised rung-fills n = 26; mean true lock
+  +8.32c (>= +4.0c PASS); single-order-roll ratio 1.00 PASS; one-legged contracts 14.00 (<= 2) FAIL;
+  `VERDICT: KILL: one-legged 14 > 2`. Realized money over the campaign +$8.43 (crypto balance 44.60 -> 53.04);
+  as-designed (locked) money about +$2.70. The mechanism failed; the account was lucky. Facts, window by window:
+  * 09-30 22:00Z (pre-campaign incident, 2 contracts, +$2.05): unchanged, still pending Brad's exclude/restate ruling.
+  * 10-01 23:00Z: 2 rungs (B84650 @0.35/0.34), wings 2+2 filled within 300 ms, both sets locked, +$0.11 (3.4c/4.4c).
+  * 10-02 00:00Z: 8 rungs (B84750 @0.26..0.33) swept in one tick, wings 8+8 filled, lock +64c. Then 3 rungs on the
+    NEXT bucket (B84850 @0.34..0.36); its YES@T84799.99 wing (3 @0.46) NETTED against the first batch's NO on the
+    same strike (the first live D5 netting, $3 credited) and its NO@T84899.99 wing (3 @0.96) FILLED at the venue
+    (fills endpoint, 23:54:06.199Z). BUG: `run_v33._journal_action` read `.price` on a `LegOrder` while journaling
+    the netted pair -> the exception unwound the pump with the NO-wing Fill still queued -> the ledger booked the
+    batch ONE-LEGGED (false), S1_LEGGED occurrence #1 on ops/v33_stops_2026-10-02.json, settlement backfill $19
+    vs real $22. CORRECTION (ledger row left intact; this appends only): batch 1 was COMPLETE and locked, about
+    +20c/contract; the window's realised money +$1.27; the row's `one_legged: true` and 3 of the report's 14
+    one-legged contracts are FALSE. Fixed in PR #110 (merged 03:07Z, 58e2a16).
+  * 10-02 02:00Z: 11 rungs (B84550 @0.26..0.37, $4.07) filled 01:46:00Z; the wing take (11 lots/leg at the proxy's
+    2-contract cap = 12 orders in one batch = 120 Kalshi write tokens) was 429'd 292/292 times -- Kalshi Basic =
+    100-token bucket, 10 per order, a batch must FIT WHOLE (docs.kalshi.com/getting_started/rate_limits). The 11 NO
+    sat NAKED to settlement (bucket settled NO, +$6.93 by luck). These 11 one-legged contracts are REAL and alone
+    exceed the pin: the kill stands after the correction (11 > 2). S1_LEGGED occurrence #2 latched the day.
+  Brad's words: "After this run, now we should switch on back to dry lol / Were running her a little too hot. Lets
+  shut it down and assess damage"; "Shut it down for the 11 o'clock one if you haven't already" -> ops/v33_mode.txt
+  = dry at 02:04:59Z (Claude's hand on Brad's word); "Lets start calling these test fires. We got the rocket to
+  light, we got an engine to work. This was Test Fire #1, number 2 is next."
+  Fixes merged in PR #110: netted-leg journal attribute + per-action/per-result guards; wing venue-confirm via
+  /portfolio/fills before any leg is reported unfilled (additive, order_ids recorded -- review finding); amend
+  404 -> status resolve; wing takes as sub-batches of <= min(8, bucket//10) orders paced to FIT the bucket (sync
+  and async); wing 429 = definitive, backoff 0.5 s doubling to 4 s; Decimal-safe summary. Suite 1468 passed.
+  OPEN (Brad's levers, before TEST FIRE #2 is registered): remove the false S1 occurrence from the 10-02 guard
+  file; rule on the 09-30 pair (exclude/restate); proxy max_contracts_per_order 2 -> 11 (one order per wing
+  leg) and/or Kalshi Advanced tier (POST /trade-api/v2/account/api_usage_level/upgrade; scope to the crypto
+  instance unverified); and the re-registration terms for Test Fire #2 (same frozen thresholds unless amended
+  on his word). V3.3 stays DRY until then.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
