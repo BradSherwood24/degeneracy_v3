@@ -268,6 +268,9 @@ class V33AsyncExecutor(V33LiveExecutor):
         self._inflight_creates.add(coid)
         try:
             resp = await self._apost(REL_SINGLE_CREATE, body, CLASS_REST, slot=coid)
+        except BaseException:
+            self._cancel_pending.discard(coid)   # review N3: no deferred cancel may outlive a create that raised
+            raise
         finally:
             self._inflight_creates.discard(coid)
         self.rests_placed += 1
