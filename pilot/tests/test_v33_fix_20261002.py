@@ -424,3 +424,110 @@ def test_wing_429_is_definitive_backs_off_and_does_not_query_the_venue():
             aw.close()
 
     asyncio.run(go())
+
+
+# ---------------------------------------------------------------------------
+# 8 (review 2026-10-02): venue-confirm on a leg with BOTH a READABLE and a LOST sub-batch, and the
+# cross-take re-count guard. The venue GET excludes this take's readable chunks (their order_ids are in
+# _wing_order_ids), so its count must be booked ADDITIVELY on top of the readable chunks (capped by the
+# leg's room) -- NOT subtracted against the readable total, which dropped the real lost-chunk fills, let
+# the leg report unfilled and the core RE-BUY the chunk that had executed.
+# ---------------------------------------------------------------------------
+class _SecondBatchLostProxy(FracAsyncProxy):
+    """Sub-batch 1 (the 8-order POST) is SERVED (readable fills with order_ids); sub-batch 2 (the 4-order
+    POST) is LOST after the venue executed it. The fills GET then shows the 3 remaining lots per leg."""
+
+    def __init__(self, venue_fills):
+        super().__init__(cap=2)
+        self.venue_fills = venue_fills
+        self.gets: list = []
+        self._batch_posts = 0
+
+    def rest_post(self, path, body, headers=None):
+        # NB: super().rest_post appends to self.posts, so DON'T pre-append here (would double-count sends).
+        if "orders" in body:
+            self._batch_posts += 1
+            if self._batch_posts == 2:          # the fit-paced second sub-batch: response lost
+                self.posts.append((path, body))
+                return WriteResponse(None, {}, False, "post_exception:ReadTimeout")
+        return super().rest_post(path, body, headers)
+
+    def rest_get(self, path, params=None):
+        self.gets.append((path, params))
+        if path == FILLS_PATH:
+            return {"fills": self.venue_fills}
+        return super().rest_get(path, params)
+
+
+def test_mixed_readable_and_lost_subbatch_books_additively_no_rebuy():
+    """11 lots/leg -> sub-batches [8,4]. Sub-batch 1 fills 8 lots/leg (readable); sub-batch 2 (3 lots/leg)
+    is LOST but executed at the venue. The leg must complete at 11 (8 readable + 3 venue-confirmed) and
+    NOT be re-bought. The pre-fix ``confirmed - agg_count`` compare dropped the 3 (8 >= 3) -> leg unfilled
+    -> core re-buys the 3 that already executed -> over-hedge."""
+    venue = [
+        {"ticker": S_SD, "side": "yes", "order_id": "v-y1", "count_fp": "2.00",
+         "created_time": "2026-09-20T03:53:21.000Z"},
+        {"ticker": S_SD, "side": "yes", "order_id": "v-y2", "count_fp": "1.00",
+         "created_time": "2026-09-20T03:53:21.100Z"},
+        {"ticker": S_SU, "side": "no", "order_id": "v-n1", "count_fp": "2.00",
+         "created_time": "2026-09-20T03:53:21.000Z"},
+        {"ticker": S_SU, "side": "no", "order_id": "v-n2", "count_fp": "1.00",
+         "created_time": "2026-09-20T03:53:21.100Z"},
+    ]
+    fake = _SecondBatchLostProxy(venue)
+    ex, aw = _aexec(fake)
+    try:
+        events = _take(ex, aw, _wing_state(Decimal("11")))
+    finally:
+        aw.close()
+    fills = {e.client_order_id: e for e in events if isinstance(e, Fill)}
+    assert fills["v33-wy"].count == Decimal("11") and fills["v33-wn"].count == Decimal("11")
+    assert ex._wing_filled[(0, "yes")] == Decimal("11") and ex._wing_filled[(0, "no")] == Decimal("11")
+    assert ex.wing_venue_confirmed_count == Decimal("6")       # 3 per leg, booked ADDITIVELY
+    # exactly the two original sub-batch sends; the lost one is not re-sent in this take
+    assert len([b for _, b in fake.posts if "orders" in b]) == 2
+    # a follow-up take for the same legs now sends NOTHING (remaining 0 — no over-buy)
+    fake._batch_posts = 0
+    try:
+        _take(ex, AsyncOrderWriter(fake), _wing_state(Decimal("11")))
+    finally:
+        pass
+    assert len([b for _, b in fake.posts if "orders" in b]) == 2
+
+
+class _FillsOnlyProxy(FracAsyncProxy):
+    def __init__(self, fills):
+        super().__init__(cap=2)
+        self._fills = fills
+
+    def rest_get(self, path, params=None):
+        if path == FILLS_PATH:
+            return {"fills": self._fills}
+        return super().rest_get(path, params)
+
+
+def test_venue_fills_excludes_known_ids_and_records_counted_ones():
+    """A fill already attributed to a chunk we read (order_id in _wing_order_ids) is excluded; every fill
+    the confirm COUNTS has its order_id recorded, so a later confirm inside the 5 s skew window can never
+    re-count the same venue fill (the cross-take over-count guard)."""
+    fills = [
+        {"ticker": S_SD, "side": "yes", "order_id": "known", "count_fp": "2.00",
+         "created_time": "2026-09-20T03:53:21.000Z"},
+        {"ticker": S_SD, "side": "yes", "order_id": "fresh", "count_fp": "1.00",
+         "created_time": "2026-09-20T03:53:21.100Z"},
+    ]
+    fake = _FillsOnlyProxy(fills)
+    ex, aw = _aexec(fake)
+    ex._wing_order_ids.add("known")
+    try:
+        total = asyncio.run(ex._venue_wing_fills_async(S_SD, "yes", 1000.0))
+    finally:
+        aw.close()
+    assert total == Decimal("1")                       # 'known' excluded; only 'fresh' counted
+    assert "fresh" in ex._wing_order_ids               # recorded -> a later confirm never re-counts it
+    # a second confirm over the SAME venue snapshot now returns 0 (both ids are known)
+    try:
+        again = asyncio.run(ex._venue_wing_fills_async(S_SD, "yes", 1000.0))
+    finally:
+        pass
+    assert again == Decimal("0")

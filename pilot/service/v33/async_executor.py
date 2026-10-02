@@ -787,22 +787,32 @@ class V33AsyncExecutor(V33LiveExecutor):
         # leg unfilled. A lost response on an executed IOC must not become a second, duplicate wing buy.
         for key in sorted(unknown_keys):
             lg = leg_by_key[key]
-            remaining = self._dc(lg.count) - self._wing_filled.get(key, Decimal(0))
+            readable = agg_count.get(key, Decimal(0))
+            # ROOM for THIS take = leg count - prior takes' booked (``_wing_filled``) - this take's READABLE
+            # chunk fills. The venue GET already EXCLUDES this take's readable chunks (their order_ids are in
+            # ``_wing_order_ids``), so ``venue`` is the UNATTRIBUTED fill count -- book it ADDITIVELY on top
+            # of the readable chunks, capped by ``room``. The old code compared venue (readable-excluded)
+            # against agg_count (readable-included) and booked the difference: on a leg with BOTH readable
+            # and unknown chunks (a lost sub-batch beside a served one) the condition failed, the real
+            # unknown fills were dropped, the leg reported unfilled, and the core RE-BOUGHT the chunk that
+            # had in fact executed -> over-hedge.
+            room = self._dc(lg.count) - self._wing_filled.get(key, Decimal(0)) - readable
+            if room <= 0:
+                continue
             venue = await self._venue_wing_fills_async(lg.ticker, key[1], send_ts)
-            confirmed = min(venue, remaining)
+            extra = min(venue, room)
             self.wing_venue_confirms += 1
             self._bump("wing_venue_confirm")
             fs = sorted({str(failed[c]) for c, k in chunk_owner.items() if k == key and c in failed})
             self.journal.append("wing_venue_confirm",
                                 {"ticker": lg.ticker, "side": key[1], "batch": key[0],
                                  "failed_responses": fs,
-                                 "parsed_count": str(agg_count.get(key, Decimal(0))),
-                                 "venue_count": str(venue), "confirmed": str(confirmed)}, self.clock())
-            if confirmed > agg_count.get(key, Decimal(0)):
-                extra = confirmed - agg_count.get(key, Decimal(0))
+                                 "parsed_count": str(readable),
+                                 "venue_count": str(venue), "confirmed": str(extra)}, self.clock())
+            if extra > 0:
                 self.wing_venue_confirmed_count += extra
                 # price unknown for the lost chunk -> book at the leg's limit (the most we could have paid).
-                agg_count[key] = confirmed
+                agg_count[key] = readable + extra
                 agg_notional[key] += Decimal(lg.limit) * extra
                 self.fills.append({"leg": "wing", "side": key[1], "ticker": lg.ticker,
                                    "price": Decimal(lg.limit), "fee": None, "count": extra, "ts": now,
@@ -838,7 +848,12 @@ class V33AsyncExecutor(V33LiveExecutor):
         """2026-10-02 (Brad): venue truth for a wing chunk whose POST response was LOST or non-2xx. Sums
         OUR fills on ``ticker``/``side`` created at/after ``since_ts`` (5 s skew allowance; the laptop clock
         runs ~0.3 s fast) whose order_id is NOT one of the chunks we already read (``_wing_order_ids``).
-        Fail-closed to 0 on any error -- the existing 'unfilled -> retry' path then applies."""
+        Fail-closed to 0 on any error -- the existing 'unfilled -> retry' path then applies.
+
+        Every COUNTED fill's order_id is recorded into ``_wing_order_ids`` so a LATER confirm (a subsequent
+        take whose own response is also lost) inside the 5 s skew window can never re-count the SAME venue
+        fill -- without this, a lost-response retry would see a prior take's already-booked fill again and
+        either over-book the leg or phantom-hedge a chunk that never executed."""
         try:
             body = await self._aget(FILLS_PATH, {"ticker": ticker, "limit": 100,
                                                   "min_ts": int(since_ts - WING_CONFIRM_SKEW_S)})
@@ -863,6 +878,9 @@ class V33AsyncExecutor(V33LiveExecutor):
                 c = _dec_or_none(f.get("count"))
             if c is not None and c > 0:
                 total += c
+                oid = f.get("order_id")
+                if oid:
+                    self._wing_order_ids.add(oid)
         return total
 
     # =====================================================================
