@@ -385,6 +385,18 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   occurrences the day is latched and every 10-02 window would degrade to dry; (b) merge of this amendment PR + live-tree
   pull in a :02-:33 band; (c) `ops/v33_mode.txt` -> armed. Pacer params stay 100/100 (sha-pinned; conservative under
   the 900 bucket). The 09-30 incident pair ruling remains open and does not gate the arm.
+- 2026-10-02 13:54Z -- TEST FIRE #2 ARMED on Brad's order. Brad, verbatim (13:5xZ, after PR #113 merged f6940b5 by his
+  own hand `! gh pr merge 113 --merge` and the live tree pulled to f6940b5 at 13:33Z, 1468 passed / 1 skipped, pins
+  45 / 15 / 45 loaded): "Good to go on both. Lets run it!" -- "both" = (a) the FALSE S1_LEGGED occurrence (window
+  2026-10-02T00:00:00Z, the netting-bug false positive) removed from `ops/v33_stops_2026-10-02.json` by Claude's hand
+  at 13:54:41Z (the real 02:00Z occurrence and balance_start 57.8264 kept; count 1 < latch threshold 2; the pre-edit
+  file is preserved in the session scratchpad), and (b) `ops/v33_mode.txt` dry -> armed, Claude's hand on Brad's word,
+  13:54:41Z. `ops/v32_mode.txt` stays dry (never two armed). The 14:00Z close (spawned 13:40Z) runs DRY on the
+  already-read mode; the FIRST ARMED WINDOW of Test Fire #2 is the 15:00Z close (spawn 14:40Z), subject to the arming
+  gates at spawn (S5 incl. orders_remaining_today 22747 >= 500, reconcile, day latch count 1, S4 vs start 57.8264
+  with balance $66.15). Engine: live tree f6940b5 (PR #110 fixes + L7), async writer ON (supervisor env), proxy pid
+  22952 budget 30000 / cap 2, Kalshi Advanced tier. Rules in force: L6 as amended by L7 (verdict / promotion n >= 45,
+  early kill mean < +2.0c at n >= 15, lock >= +4.0c, one-legged <= 2, S4 $3.00 campaign kill, S1_LEGGED day latch at 2).
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
