@@ -1,7 +1,9 @@
 """L6 (Brad 2026-09-30, pre-freeze) report tests: the S4 day-loss CAMPAIGN kill (any armed day at the
 $3.00 cap -> verdict KILL regardless of n, read from the ops/v33_stops_YYYY-MM-DD.json guard files), the
-verdict n dropped 30 -> 15 (n=14 pending / n=15 decided), the promotion pin at 15, and the mean-lock bar
-at +4.0c (+4.5c ALIVE / +3.5c KILL). Pure over synthetic rows + a tmp ops dir for the guard file."""
+verdict n dropped 30 -> 15 (n=14 pending / n=MIN_N decided), the promotion pin at 15, and the mean-lock bar
+at +4.0c (+4.5c ALIVE / +3.5c KILL). Pure over synthetic rows + a tmp ops dir for the guard file.
+L7 (Brad 2026-10-02, Test Fire #2) moved the verdict / promotion n to 45: every boundary below is written
+against the pin (MIN_N / MIN_N - 1) so the tests follow the pin; the early kill keeps n >= 15."""
 
 from __future__ import annotations
 
@@ -10,7 +12,11 @@ from decimal import Decimal
 import os
 
 from service.stops import record_latched_stop
-from service.v33.falsifier_pins import V33_KILL_ON_S4_DAY_LOSS, V33_PROMOTION_MIN_N
+from service.v33.falsifier_pins import (
+    V33_FALSIFIER_MIN_N as MIN_N,
+    V33_KILL_ON_S4_DAY_LOSS,
+    V33_PROMOTION_MIN_N,
+)
 from service.v33 import report as report_mod
 from service.v33.report import (
     _render_gate_table,
@@ -57,15 +63,15 @@ def _empty_armed_row(ct):
 
 
 def _all_green_15(ct="2026-09-24T04:00:00Z"):
-    """A single armed window with n=15 where EVERY falsifier gate passes (mean 5c, shortfall 1c)."""
-    return _row(ct, n=15, realised_c=5, solved_c=6)
+    """A single armed window with n=MIN_N where EVERY falsifier gate passes (mean 5c, shortfall 1c)."""
+    return _row(ct, n=MIN_N, realised_c=5, solved_c=6)
 
 
 # ---------------------------------------------------------------------------
 # (a) S4 day-loss campaign kill
 # ---------------------------------------------------------------------------
 def test_s4_latch_forces_kill_even_when_all_gates_green(tmp_path):
-    """An S4 latch on the report's day forces KILL even at n=15 with every other gate PASS."""
+    """An S4 latch on the report's day forces KILL even at n=MIN_N with every other gate PASS."""
     ops = str(tmp_path)
     row = _all_green_15("2026-09-24T04:00:00Z")
     # Sanity: without the guard file (ops_dir=None) the same row is ALIVE.
@@ -97,8 +103,8 @@ def test_s4_latch_kills_at_n_zero(tmp_path):
 def test_s4_scans_all_report_days(tmp_path):
     """The day range scanned is EVERY UTC day the report covers; a latch on any one is a kill."""
     ops = str(tmp_path)
-    rows = [_row("2026-09-24T04:00:00Z", n=8, realised_c=5, solved_c=6),
-            _row("2026-09-26T04:00:00Z", n=7, realised_c=5, solved_c=6)]   # n=15 pooled, ALIVE clean
+    rows = [_row("2026-09-24T04:00:00Z", n=MIN_N - 22, realised_c=5, solved_c=6),
+            _row("2026-09-26T04:00:00Z", n=22, realised_c=5, solved_c=6)]   # n=MIN_N pooled, ALIVE clean
     assert build_falsifier_gate_table(rows, ops)["verdict"] == "ALIVE-so-far"
     # latch S4 only on the SECOND day -> still a kill, naming 09-26.
     record_latched_stop(v33_day_guard_path(ops, "2026-09-26"), "2026-09-26", S4_DAY_LOSS,
@@ -125,33 +131,33 @@ def test_s4_kill_pin_is_true():
 # ---------------------------------------------------------------------------
 # (b) verdict n dropped 30 -> 15
 # ---------------------------------------------------------------------------
-def test_verdict_pending_at_n_14_decided_at_n_15():
-    gt14 = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=14, realised_c=5, solved_c=6)])
-    assert gt14["n_rung_fills"] == 14
-    assert gt14["verdict"].startswith("n<15 pending")
-    gt15 = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=15, realised_c=5, solved_c=6)])
-    assert gt15["n_rung_fills"] == 15
+def test_verdict_pending_at_n_minus_1_decided_at_min_n():
+    gt14 = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=MIN_N - 1, realised_c=5, solved_c=6)])
+    assert gt14["n_rung_fills"] == MIN_N - 1
+    assert gt14["verdict"].startswith(f"n<{MIN_N} pending")
+    gt15 = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=MIN_N, realised_c=5, solved_c=6)])
+    assert gt15["n_rung_fills"] == MIN_N
     assert gt15["verdict"] == "ALIVE-so-far"
 
 
 # ---------------------------------------------------------------------------
 # (c) promotion condition reads n >= 15
 # ---------------------------------------------------------------------------
-def test_promotion_min_n_is_15():
-    assert V33_PROMOTION_MIN_N == 15
+def test_promotion_min_n_is_45():
+    assert V33_PROMOTION_MIN_N == 45 == MIN_N   # L7 (was 15 under L6)
 
 
 # ---------------------------------------------------------------------------
 # (d) mean-lock bar at +4.0c
 # ---------------------------------------------------------------------------
 def test_mean_lock_bar_4c_alive_and_kill():
-    # +4.5c at n=15 with everything else green -> ALIVE-so-far.
-    gt_alive = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=15, realised_c="4.5",
+    # +4.5c at n=MIN_N with everything else green -> ALIVE-so-far.
+    gt_alive = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=MIN_N, realised_c="4.5",
                                                  solved_c=6)])
     mg = next(g for g in gt_alive["gates"] if g["gate"] == "mean true lock")
     assert mg["status"] == "PASS" and gt_alive["verdict"] == "ALIVE-so-far"
     # +3.5c (above the +2.0c early kill, below the +4.0c bar) -> the verdict mean-lock gate FAILS -> KILL.
-    gt_kill = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=15, realised_c="3.5",
+    gt_kill = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=MIN_N, realised_c="3.5",
                                                 solved_c=6)])
     mg2 = next(g for g in gt_kill["gates"] if g["gate"] == "mean true lock")
     assert mg2["status"] == "FAIL" and gt_kill["verdict"].startswith("KILL")
@@ -159,15 +165,15 @@ def test_mean_lock_bar_4c_alive_and_kill():
 
 
 # ---------------------------------------------------------------------------
-# (e) L6 REVIEW: the verdict-boundary matrix at n=15 -- ONE coherent verdict
+# (e) L6 REVIEW: the verdict-boundary matrix at n=MIN_N -- ONE coherent verdict
 #     +1.5c early-kill (single line, no doubled gate list), +3.0c gate-kill (a
 #     miss is a kill), +4.0c EXACTLY ALIVE (>= not >), +4.5c ALIVE.
 # ---------------------------------------------------------------------------
 def test_verdict_matrix_1p5c_early_kill_single_line():
-    """mean +1.5c at n=15: the EARLY kill (mean < +2.0c) fires and produces ONE coherent verdict line --
+    """mean +1.5c at n=MIN_N: the EARLY kill (mean < +2.0c) fires and produces ONE coherent verdict line --
     it must NOT also append the 'mean true lock' gate-fail (that lives in the else branch, unreached)."""
-    gt = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=15, realised_c="1.5", solved_c=6)])
-    assert gt["n_rung_fills"] == 15
+    gt = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=MIN_N, realised_c="1.5", solved_c=6)])
+    assert gt["n_rung_fills"] == MIN_N
     v = gt["verdict"]
     assert v.startswith("KILL")
     assert "< +2.0c" in v                       # the early-kill reason
@@ -176,9 +182,9 @@ def test_verdict_matrix_1p5c_early_kill_single_line():
 
 
 def test_verdict_matrix_3c_is_gate_kill():
-    """mean +3.0c at n=15 (between the +2.0c early kill and the +4.0c bar): a MISS is a KILL, via the
+    """mean +3.0c at n=MIN_N (between the +2.0c early kill and the +4.0c bar): a MISS is a KILL, via the
     verdict mean-lock gate (not the early kill, not S4)."""
-    gt = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=15, realised_c=3, solved_c=6)])
+    gt = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=MIN_N, realised_c=3, solved_c=6)])
     mg = next(g for g in gt["gates"] if g["gate"] == "mean true lock")
     assert mg["status"] == "FAIL"
     v = gt["verdict"]
@@ -187,14 +193,14 @@ def test_verdict_matrix_3c_is_gate_kill():
 
 
 def test_verdict_matrix_4c_exactly_alive():
-    """mean EXACTLY +4.0c at n=15: PASS (the bar is >=, not >) -> ALIVE-so-far."""
-    gt = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=15, realised_c=4, solved_c=6)])
+    """mean EXACTLY +4.0c at n=MIN_N: PASS (the bar is >=, not >) -> ALIVE-so-far."""
+    gt = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=MIN_N, realised_c=4, solved_c=6)])
     mg = next(g for g in gt["gates"] if g["gate"] == "mean true lock")
     assert mg["status"] == "PASS" and gt["verdict"] == "ALIVE-so-far"
 
 
 def test_verdict_matrix_4p5c_alive():
-    gt = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=15, realised_c="4.5", solved_c=6)])
+    gt = build_falsifier_gate_table([_row("2026-09-24T04:00:00Z", n=MIN_N, realised_c="4.5", solved_c=6)])
     assert gt["verdict"] == "ALIVE-so-far"
 
 
@@ -206,8 +212,8 @@ def test_verdict_matrix_4p5c_alive():
 # ---------------------------------------------------------------------------
 def test_s4_latch_on_rowless_day_in_range_is_seen(tmp_path):
     ops = str(tmp_path)
-    rows = [_row("2026-09-24T04:00:00Z", n=8, realised_c=5, solved_c=6),
-            _row("2026-09-26T04:00:00Z", n=7, realised_c=5, solved_c=6)]   # n=15 pooled, clean ALIVE
+    rows = [_row("2026-09-24T04:00:00Z", n=MIN_N - 22, realised_c=5, solved_c=6),
+            _row("2026-09-26T04:00:00Z", n=22, realised_c=5, solved_c=6)]   # n=MIN_N pooled, clean ALIVE
     assert build_falsifier_gate_table(rows, ops)["verdict"] == "ALIVE-so-far"
     # latch S4 on 2026-09-25 -- a day WITHIN the range that has NO ledger row.
     record_latched_stop(v33_day_guard_path(ops, "2026-09-25"), "2026-09-25", S4_DAY_LOSS,
@@ -221,7 +227,7 @@ def test_s4_latch_outside_row_range_is_ignored(tmp_path):
     """A guard file OUTSIDE the report's [min,max] row-day range is not scanned (it is a different
     reporting window)."""
     ops = str(tmp_path)
-    rows = [_row("2026-09-26T04:00:00Z", n=15, realised_c=5, solved_c=6)]   # range is a single day
+    rows = [_row("2026-09-26T04:00:00Z", n=MIN_N, realised_c=5, solved_c=6)]   # range is a single day
     record_latched_stop(v33_day_guard_path(ops, "2026-09-24"), "2026-09-24", S4_DAY_LOSS,
                         "cap", None, 1_700_000_000.0)
     gt = build_falsifier_gate_table(rows, ops)
@@ -252,8 +258,8 @@ def test_corrupt_guard_warning_rides_alongside_s4_kill(tmp_path):
     """A real S4 latch on one day AND a corrupt guard on another in range: KILL verdict carries the
     corrupt WARNING too (neither masks the other)."""
     ops = str(tmp_path)
-    rows = [_row("2026-09-24T04:00:00Z", n=8, realised_c=5, solved_c=6),
-            _row("2026-09-25T04:00:00Z", n=7, realised_c=5, solved_c=6)]
+    rows = [_row("2026-09-24T04:00:00Z", n=MIN_N - 22, realised_c=5, solved_c=6),
+            _row("2026-09-25T04:00:00Z", n=22, realised_c=5, solved_c=6)]
     record_latched_stop(v33_day_guard_path(ops, "2026-09-24"), "2026-09-24", S4_DAY_LOSS,
                         "cap", None, 1_700_000_000.0)
     with open(v33_day_guard_path(ops, "2026-09-25"), "w", encoding="utf-8") as f:
@@ -295,8 +301,8 @@ def test_resolve_guard_path_checkout_fallback_does_not_raise(tmp_path, monkeypat
 # ---------------------------------------------------------------------------
 def test_render_gate_table_shows_s4_and_corrupt_lines(tmp_path):
     ops = str(tmp_path)
-    rows = [_row("2026-09-24T04:00:00Z", n=8, realised_c=5, solved_c=6),
-            _row("2026-09-25T04:00:00Z", n=7, realised_c=5, solved_c=6)]
+    rows = [_row("2026-09-24T04:00:00Z", n=MIN_N - 22, realised_c=5, solved_c=6),
+            _row("2026-09-25T04:00:00Z", n=22, realised_c=5, solved_c=6)]
     record_latched_stop(v33_day_guard_path(ops, "2026-09-24"), "2026-09-24", S4_DAY_LOSS,
                         "cap", None, 1_700_000_000.0)
     with open(v33_day_guard_path(ops, "2026-09-25"), "w", encoding="utf-8") as f:

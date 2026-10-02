@@ -26,7 +26,9 @@ from decimal import Decimal
 from service.v33.params import FROZEN_V33_PARAMS_SHA256  # noqa: F401  (re-exported for the pins test)
 
 # --- Verdict at n >= MIN_N rung-fills (contracts) -------------------------------------------------
-V33_FALSIFIER_MIN_N = 15                                # [pin] realised rung-fills (contracts) before a verdict
+V33_FALSIFIER_MIN_N = 45                                # [pin] realised rung-fills (contracts) before a verdict
+#   L7 (Brad 2026-10-02, Test Fire #2): 15 -> 45 ("Lets go with n=45 for test fire 2."). V33_KILL_MIN_N below
+#   stays 15 -- the early kill (mean < +2.0c) keeps its L6 n; only the VERDICT / PROMOTION n moved.
 V33_FALSIFIER_MIN_MEAN_LOCK_CENTS = Decimal("4.0")     # [pin] mean realised true lock >= +4.0c
 V33_FALSIFIER_MAX_RUNG_SHORTFALL_CENTS = Decimal("3.0")  # [pin] (solved E - realised lock) per rung
 V33_FALSIFIER_MIN_RUNG_FILLS_FOR_SHORTFALL = 3         # [pin] a rung is judged for shortfall at >= 3 fills
@@ -51,7 +53,7 @@ V33_KILL_MIN_N = 15                                    # [pin] ... already at n 
 V33_KILL_ON_S4_DAY_LOSS = True                         # [pin] any-day S4 day-loss latch -> KILL
 
 # --- Promotion (Brad's dated word required; these are the necessary conditions) -------------------
-V33_PROMOTION_MIN_N = 15                                # [pin] alive at n >= 15 rung-fills, AND
+V33_PROMOTION_MIN_N = 45                                # [pin] alive at n >= 45 rung-fills (L7; was 15), AND
 # a promotion is 2 lots per rung, OR rungs deeper than 18c live, informed by SO-3's measured deep-end
 # absorption (PLAN_V33 sec 6 / sec 8). No automatic promotion; Brad's dated go, like V3.2's.
 
