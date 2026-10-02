@@ -150,6 +150,12 @@ class V33AsyncExecutor(V33LiveExecutor):
         # every wing chunk whose response we DID read, so a venue fills lookup after a LOST response can
         # exclude already-attributed fills and count only the unknown chunk's.
         self._wing_order_ids: set[str] = set()
+        # 2026-10-02 (Test Fire #2, 15:00Z window): creates whose POST is IN FLIGHT (no venue id yet) and the
+        # coids the core asked to cancel while that was so. A cancel for an un-acked order used to be a
+        # no-op that REPORTED cancelled -> the core re-placed the slot -> 17 orphan rests sat unmanaged
+        # until expiry. Now the cancel is DEFERRED and executed the instant the ack lands.
+        self._inflight_creates: set[str] = set()
+        self._cancel_pending: set[str] = set()
         self.wing_venue_confirms = 0
         self.wing_venue_confirmed_count = Decimal(0)
         # 2026-10-02 (02:00Z 429 storm): a wing 429 is a DEFINITIVE non-execution; the retry cadence backs
@@ -259,16 +265,22 @@ class V33AsyncExecutor(V33LiveExecutor):
                                               if k != "self_trade_prevention_type"},
                                           "n": action.price, "bucket_Sd": self._bucket_sd(ticker)},
                             self.clock())
-        resp = await self._apost(REL_SINGLE_CREATE, body, CLASS_REST, slot=coid)
+        self._inflight_creates.add(coid)
+        try:
+            resp = await self._apost(REL_SINGLE_CREATE, body, CLASS_REST, slot=coid)
+        finally:
+            self._inflight_creates.discard(coid)
         self.rests_placed += 1
         self._bump("rest_post")
         if not resp.ok:
+            self._cancel_pending.discard(coid)   # nothing rests at the venue; nothing to cancel
             unknown = resp.status_code is None or resp.status_code >= 500
             return self._reject_place(coid, ticker, now, {"status": resp.status_code,
                                                           "body": resp.body, "error": resp.error},
                                       unknown=unknown, n=action.price)
         parsed = parse_single_response(resp.body, side=BUY_NO)
         if parsed.error or parsed.order_id is None:
+            self._cancel_pending.discard(coid)
             return self._reject_place(coid, ticker, now,
                                       {"status": resp.status_code, "parsed_error": parsed.error,
                                        "order_id": parsed.order_id})
@@ -288,6 +300,25 @@ class V33AsyncExecutor(V33LiveExecutor):
             events.append(Fill(order_id=oid, client_order_id=coid, count=parsed.fill_count,
                                price=action.price if action.price is not None else Decimal(0),
                                side="no", server_ts=now))
+        if coid in self._cancel_pending:
+            # The core cancelled this slot while the create was in flight (stand-down / bucket change /
+            # quote end). Execute that cancel NOW that the venue id is known, so the order never rests
+            # unowned. The cancel-confirm path books any fill that landed in between.
+            self._cancel_pending.discard(coid)
+            self._bump("cancel_after_ack")
+            self.cancels_attempted += 1
+            rec = self.rest_book.get(coid)
+            self.journal.append("cancel_rest",
+                                {"order_id": oid, "client_order_id": coid, "exchange_index": exch,
+                                 "via": "cancel_after_ack"}, self.clock())
+            wr = await self._adelete(cancel_path(oid, exch), CLASS_CANCEL, slot=self._slot(oid))
+            self._bump("cancel_delete")
+            if wr.status_code == 404:
+                self.cancel_404s += 1
+            if wr.ok:
+                events += await self._resolve_cancel_success_async(wr, rec, oid, now)
+            else:
+                events += await self._cancel_nonok_async(wr, rec, oid, exch, coid, now)
         return events
 
     # =====================================================================
@@ -416,6 +447,13 @@ class V33AsyncExecutor(V33LiveExecutor):
         rec = self.rest_book.get(coid) if coid is not None else None
         if oid is None and rec is not None:
             oid = rec.order_id
+        if oid is None and coid is not None and coid in self._inflight_creates:
+            # 2026-10-02: the create for this coid is IN FLIGHT (no venue id yet). Reporting "cancelled"
+            # here is a lie the core acts on (re-places the slot). Defer: the ack path cancels it.
+            self._cancel_pending.add(coid)
+            self._bump("cancel_deferred_unacked")
+            self.journal.append("cancel_deferred_unacked", {"client_order_id": coid}, self.clock())
+            return []
         if oid is None:
             self._bump("cancel_noop")
             return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
