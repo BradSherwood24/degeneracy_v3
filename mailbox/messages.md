@@ -1381,3 +1381,56 @@ answer; (4) Kalshi's Collateral Return would return ~$1/set on the wing pair (a 
 strike event) -- a real capital lever, unstudied, off; (5) refill-in-window: 5 of 37 entry windows had a 2nd
 burst and its locks were coin flips (+2.1c mean, 52% pos) -- rides with the weights promotion at n>=15.
 Open ruling for Brad: the incident's two contracts in the verdict sample (exclude vs restate).
+
+## 2026-10-02 ~03:30Z -- Claude -> house: Test Fire #1
+
+Pre-compact note. Brad named it tonight: an armed V3.3 campaign is a test fire. Test Fire #1 ran from the
+re-arm at 10-01 17:16:07Z to Brad's shutdown at 10-02 02:04:59Z, on the async writer with the amend cap live.
+Nine armed windows. The first three were clean and empty: amends 2xx every time, one-order rolls, feed gap
+under 0.2 s, write latency 63 ms median, budget burn 200-270 a window against 500 on the old path. Then the
+tape arrived. 23:00Z: two rungs, wings in 300 ms, two sets locked, +$0.11. 00:00Z: a pump swept eight rungs in
+one tick, sixteen wing contracts filled in 230 ms, +64c locked; then spot crossed the strike and three rungs
+filled on the next bucket with the strike sitting at the money, wings for $1.42 against a $2 payout, about
++20c a contract, the best sets the ladder has caught. 02:00Z: eleven rungs filled at 01:46Z and the wings never
+came. 292 batched wing POSTs, 292 Kalshi 429s. The eleven NO contracts sat naked for fourteen minutes and
+settled in our favour. Night: +$8.43 in the account, about +$2.70 of it the engine, the rest luck.
+
+Two bugs, both real, both now merged in PR #110. First: the 00:00Z batch shared a strike with the batch before
+it, Kalshi netted three contracts and credited $3, the first live D5 netting -- and the line that journals a
+netted pair read an attribute the leg object does not have. The exception unwound the pump with the second
+wing leg's fill event still in the queue. The venue had both legs; the ledger booked one-legged, the day guard
+counted an occurrence, the settlement backfill was $3 short. Second: a wing take for eleven lots at the proxy's
+two-contract cap is twelve orders in one batch, 120 write tokens, and Kalshi's Basic bucket is 100 with the rule
+that a batch must fit whole. That batch could never pass. Wing takes are priority writes and skip our own pacer,
+so nothing on our side refused it either. The retry loop was tight and, per Kalshi, penalty-free; it just had
+no chance.
+
+The frozen falsifier returned KILL: one-legged contracts 14 against a pin of 2. Three of the fourteen are the
+false ones from the first bug; the eleven are real and alone exceed the pin. Mean true lock +8.32c on 26 fills,
+well over the +4.0c bar. The edge is fine. The structure that is supposed to be impossible to lose was naked,
+and the pin exists for exactly that. Recorded append-only in the Registration (PR #111) with the correction.
+
+What changed in the code (PR #110, Opus 4.8 review found two defects in my own venue-confirm and fixed them):
+the netted-leg attribute plus guards so one bad record can never drop a sibling event; a venue fills lookup
+before any wing leg is declared unfilled after a lost response (Brad's rule: confirm the last attempt did not
+fill before sending again), booked additively with order ids recorded; amend 404 resolved by order status with
+no cancel round trip; wing takes split into sub-batches that fit the bucket, legs interleaved, paced to the
+refill; a wing 429 treated as definitive with a backoff window; the Decimal crash in the window summary.
+Audit result for Brad's recursion question: rests and wings both confirm at the venue before any re-send now;
+the one hole was the lost wing response, and it is closed.
+
+Levers pulled on Brad's word: V3.3 dry at 02:04:59Z; the Kalshi Advanced tier upgrade hit at 03:10Z, 201,
+propagated in thirty seconds -- 300 write tokens a second, a 900-token bucket. Both rosters dry now.
+
+Lessons the house keeps: (1) a venue's batch endpoint is billed per order and fits whole or not at all --
+size every batch to the bucket, not to the cap; (2) a priority lane that skips the pacer must still respect
+the bucket; (3) an exception anywhere on the loop-side ingest path is a dropped event somewhere else --
+guard every record, every result; (4) "did the last order fill" is a question for the venue, never an
+assumption; (5) the day guard and the falsifier both did their jobs tonight, which is the point of having them.
+
+Open for Brad before Test Fire #2: remove the false S1 occurrence (window 00:00Z) from the 10-02 guard file;
+rule on the 09-30 pair (exclude vs restate); proxy cap 2 -> 11 (optional now); re-registration terms. Also
+measured tonight and parked: Brad's $3-payout dual-bucket idea -- no simultaneous sub-$1 neighbour pairs in 39
+windows, the sequential ones are the spot move not a dislocation, two adjacent singles already net into it.
+
+-- Claude
