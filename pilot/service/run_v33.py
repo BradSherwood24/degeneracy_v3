@@ -527,7 +527,15 @@ class V33Driver:
             ts = getattr(ev, "server_ts", self.clock())
             order_actions = [a for a in actions if a.kind in _ORDER_ACTION_KINDS]
             for a in actions:
-                self._journal_action(a, ts)
+                # 2026-10-02 fix: telemetry must never abort the pump. A journaling error on ONE action is
+                # alarmed and skipped; the decided state is already applied and the remaining queued events
+                # (e.g. the sibling wing-leg Fill of a netted pair) still get processed.
+                try:
+                    self._journal_action(a, ts)
+                except Exception as e:  # noqa: BLE001
+                    self._async_errors += 1
+                    self.journal.append("alarm", {"alarm": "journal_action_error", "kind": str(a.kind),
+                                                  "error": str(e)}, self.clock())
             self._apply_executor_standdown(ts)
             self._maybe_eval(getattr(ev, "server_ts", None))
             if order_actions:
@@ -558,7 +566,14 @@ class V33Driver:
                     continue
                 self._apply_executor_standdown(ts)
                 if result:
-                    self._ingest_async(result)
+                    # 2026-10-02 fix: ingest each result under its own guard so a failure while re-entering
+                    # decide for ONE result never abandons the still-pending futures of this dispatch.
+                    try:
+                        self._ingest_async(result)
+                    except Exception as e:  # noqa: BLE001
+                        self._async_errors += 1
+                        self.journal.append("alarm", {"alarm": "async_ingest_error", "error": str(e)},
+                                            self.clock())
         except Exception as e:  # noqa: BLE001
             self._async_errors += 1
             self.journal.append("alarm", {"alarm": "async_dispatch_fatal", "error": str(e)},
@@ -641,8 +656,10 @@ class V33Driver:
         elif k == V33ActionKind.WING_NETTED:
             # D5: the venue netted a YES/NO wing pair on one market to flat (+$1/contract). Informational.
             rk = "wing_netted"
+            # 2026-10-02 fix: the netted legs are LegOrder (field ``limit`` carries the fill price); reading
+            # ``.price`` raised inside the loop-side ingest and dropped the sibling wing-fill event (00:00Z).
             legs = [{"ticker": lg.ticker, "side": lg.side, "count": _count_out(lg.count),
-                     "fill_price": lg.price} for lg in a.legs]
+                     "fill_price": lg.limit} for lg in a.legs]
             payload = {"legs": legs, "count": _count_out(a.count), "realised": a.lock}
         elif k == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW:
             rk = "shadow_fill_outside_window"
@@ -817,6 +834,11 @@ def _v33_writer_stats(driver: V33Driver) -> dict[str, Any]:
         out["async_rate_limited"] = int(getattr(driver.executor, "async_rate_limited", 0))
         # duplicate wing retries dropped by the transport belt (one in-flight IOC per missing leg).
         out["wing_retries_dropped"] = int(getattr(driver.executor, "wing_retries_dropped", 0))
+        # 2026-10-02: venue-confirms after a lost wing response; 429 sub-batches and the retries the backoff
+        # window swallowed (no send).
+        out["wing_venue_confirms"] = int(getattr(driver.executor, "wing_venue_confirms", 0))
+        out["wing_rate_limited_batches"] = int(getattr(driver.executor, "wing_rate_limited_batches", 0))
+        out["wing_backoff_skips"] = int(getattr(driver.executor, "wing_backoff_skips", 0))
     return out
 
 

@@ -265,7 +265,9 @@ class WindowRecorder:
 def _append_summary(summary_path: str, summary: dict) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(summary_path)), exist_ok=True)
     with open(summary_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(summary, sort_keys=True))
+        # 2026-10-02 fix: a fill window carries Decimal money fields (realized_delta); the summary line must
+        # never crash the window process at the finish line (the ledger row is already written by then).
+        f.write(json.dumps(summary, sort_keys=True, default=str))
         f.write("\n")
 
 

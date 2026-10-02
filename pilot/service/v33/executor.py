@@ -71,6 +71,40 @@ DEFAULT_BATCH_CREATE_MAX = 8     # Kalshi batch chunk size (Basic-tier token buc
 COST_CREATE = 10
 COST_AMEND = 10
 COST_CANCEL = 2
+# 2026-10-02 (02:00Z window, 292 wing batches all 429): Kalshi bills EVERY order in a batch (10 tokens each)
+# and rejects the batch WHOLE when its cost exceeds the write bucket (Basic: 100 tokens). A 12-order wing
+# batch (11 lots/leg at the proxy's 2-contract cap) costs 120 and can NEVER pass. Wing takes are therefore
+# sent as sub-batches of at most WING_BATCH_MAX_ORDERS orders (and never more than bucket_size/COST_CREATE),
+# the first served now (priority) and the rest paced to FIT the bucket. A 429 is a DEFINITIVE non-execution
+# (the venue created nothing) and backs the retry cadence off: base * 2**(streak-1), capped.
+WING_BATCH_MAX_ORDERS = 8
+WING_429_BACKOFF_BASE_S = 0.5
+WING_429_BACKOFF_MAX_S = 4.0
+
+
+def wing_batch_max_orders(bucket_size: float) -> int:
+    """Orders per wing sub-batch: fits the bucket with headroom (min(WING_BATCH_MAX_ORDERS, size // 10), >= 1)."""
+    return int(max(1, min(WING_BATCH_MAX_ORDERS, int(float(bucket_size) // COST_CREATE))))
+
+
+def split_wing_batches(entries: list, chunk_owner: dict, max_orders: int) -> list[list]:
+    """Round-robin the chunk entries across their legs ((batch, side) keys) so every sub-batch carries
+    BOTH legs when possible (neither leg starves if a later sub-batch fails), then cut into sub-batches of
+    at most ``max_orders``."""
+    by_key: dict = {}
+    order: list = []
+    for e in entries:
+        k = chunk_owner.get(e.get("client_order_id"))
+        if k not in by_key:
+            by_key[k] = []
+            order.append(k)
+        by_key[k].append(e)
+    interleaved: list = []
+    while any(by_key[k] for k in order):
+        for k in order:
+            if by_key[k]:
+                interleaved.append(by_key[k].pop(0))
+    return [interleaved[i:i + max_orders] for i in range(0, len(interleaved), max_orders)] or []
 
 # L3 (L2 review R2-N1): the backoff floor for a 429 with no Retry-After hint (a POST is never retried on
 # an UNKNOWN outcome -- timeout/5xx -- but a 429 is a DEFINITIVE non-execution: the venue throttled the
@@ -174,14 +208,18 @@ class WriteTokenBucket:
         self.tokens = min(self.size, self.tokens + (now - self._last) * self.rate)
         self._last = now
 
-    def acquire(self, cost: int, kind: str, *, priority: bool = False) -> float:
+    def acquire(self, cost: int, kind: str, *, priority: bool = False, fit: bool = False) -> float:
         """Reserve ``cost`` tokens; return the seconds waited (0 for a priority write or an unconstrained
         one). A non-priority write sleeps until the bucket holds ``cost + reserve`` (so the reserve is
-        always left for a priority burst); a priority write proceeds now (ignoring the reserve)."""
+        always left for a priority burst); a priority write proceeds now (ignoring the reserve).
+
+        ``fit`` (2026-10-02, the 02:00Z 429 storm): a priority write that must nevertheless FIT the venue's
+        bucket -- it waits (ignoring the reserve) until the bucket holds ``cost``. Kalshi rejects a batch
+        WHOLE when its token cost exceeds the balance, so the 2nd..Nth wing sub-batches pace this way."""
         self._refill()
         wait = 0.0
         floor = 0.0 if priority else self.reserve
-        if not priority and self.tokens < cost + floor:
+        if (not priority or fit) and self.tokens < cost + floor:
             wait = (cost + floor - self.tokens) / self.rate if self.rate > 0 else 0.0
             if wait > 0:
                 self._sleep(wait)
@@ -199,7 +237,8 @@ class WriteTokenBucket:
         self.tokens -= cost
         return wait
 
-    async def acquire_async(self, cost: int, kind: str, *, priority: bool = False) -> float:
+    async def acquire_async(self, cost: int, kind: str, *, priority: bool = False,
+                            fit: bool = False) -> float:
         """The ASYNC twin of ``acquire`` for the off-loop writer (2026-09-30): identical token accounting,
         but the pacing wait is ``await asyncio.sleep`` (which YIELDS the loop) instead of a blocking
         ``time.sleep`` that would freeze the feed.
@@ -223,7 +262,8 @@ class WriteTokenBucket:
             self._refill()
             wait = 0.0
             floor = 0.0 if priority else self.reserve
-            if not priority and self.tokens < cost + floor:
+            # ``fit`` (2026-10-02): a priority write that must FIT the venue bucket waits for ``cost``.
+            if (not priority or fit) and self.tokens < cost + floor:
                 wait = (cost + floor - self.tokens) / self.rate if self.rate > 0 else 0.0
             self.tokens -= cost  # reserve the cost atomically (under the lock) — no double-spend
         if wait > 0:
@@ -574,20 +614,30 @@ class V33LiveExecutor(LiveExecutor):
                                    price=lg.limit, side=lg.side, server_ts=now))
         if not entries:
             return events
-        # issue ALL chunks of both wings in one burst (priority-paced: the hedge is safety-critical).
-        self._pacer.acquire(COST_CREATE * len(entries), "wing_take", priority=True)
-        self.wing_batches += 1
-        self.wing_chunks += len(entries)
-        self._bump("wing_batch")
-        if len(entries) == 1:
-            self.journal.append("take_wings", {"legs": entries, "chunked": True}, self.clock())
-            resp = self.writer.rest_post(REL_SINGLE_CREATE, entries[0])
-            parsed = [parse_single_response(resp.body, side=chunk_owner[entries[0]["client_order_id"]][1])] \
-                if resp.ok else []
-        else:
-            self.journal.append("take_wings", {"legs": entries, "chunked": True}, self.clock())
-            resp = self.writer.rest_post(REL_BATCH_CREATE, build_batch(entries))
-            parsed = parse_batch_response(resp.body) if resp.ok else []
+        # 2026-10-02: issue the chunks of both wings as SUB-BATCHES that each fit the venue's write bucket
+        # (the first served now, the rest paced to fit) -- never one burst the venue must reject whole.
+        max_orders = wing_batch_max_orders(self._pacer.size)
+        sub_batches = split_wing_batches(entries, chunk_owner, max_orders)
+        parsed = []
+        failed: set = set()                      # chunk coids of a sub-batch that did not return ok
+        for i, sub in enumerate(sub_batches):
+            self._pacer.acquire(COST_CREATE * len(sub), "wing_take", priority=True, fit=i > 0)
+            self.wing_batches += 1
+            self.wing_chunks += len(sub)
+            self._bump("wing_batch")
+            self.journal.append("take_wings", {"legs": sub, "chunked": True, "sub_batch": i + 1,
+                                               "sub_batches": len(sub_batches)}, self.clock())
+            if len(sub) == 1:
+                resp = self.writer.rest_post(REL_SINGLE_CREATE, sub[0])
+                p_ = [parse_single_response(resp.body, side=chunk_owner[sub[0]["client_order_id"]][1])] \
+                    if resp.ok else []
+            else:
+                resp = self.writer.rest_post(REL_BATCH_CREATE, build_batch(sub))
+                p_ = parse_batch_response(resp.body) if resp.ok else []
+            if resp.ok:
+                parsed += p_
+            else:
+                failed.update(e["client_order_id"] for e in sub)
         # aggregate chunk fills per original leg (weighted-average NO/side price for the leg's fill_price).
         agg_count: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal(0))
         agg_notional: dict[tuple[int, str], Decimal] = defaultdict(lambda: Decimal(0))
@@ -595,7 +645,7 @@ class V33LiveExecutor(LiveExecutor):
         by_coid = {r.client_order_id: r for r in parsed if r.client_order_id in chunk_owner}
         for chunk_coid, key in chunk_owner.items():
             r = by_coid.get(chunk_coid)
-            if r is None or not resp.ok or r.error or r.fill_count <= 0:
+            if r is None or chunk_coid in failed or r.error or r.fill_count <= 0:
                 continue
             side = key[1]
             nr = normalize_fill_to_side(r, side)

@@ -71,6 +71,8 @@ from service.v32.executor import (
     cancel_path,
     parse_order_status,
 )
+from datetime import datetime, timezone
+
 from service.v33.actions import V33ActionKind
 from service.v33.async_writer import (
     CLASS_CANCEL,
@@ -81,6 +83,10 @@ from service.v33.async_writer import (
     AsyncOrderWriter,
 )
 from service.v33.executor import (
+    WING_429_BACKOFF_BASE_S,
+    WING_429_BACKOFF_MAX_S,
+    split_wing_batches,
+    wing_batch_max_orders,
     COST_AMEND,
     COST_CANCEL,
     COST_CREATE,
@@ -107,6 +113,21 @@ class _SyncGuardWriter:
         raise AssertionError("V33AsyncExecutor.writer.rest_get called synchronously — un-async-ified path")
 
 
+# 2026-10-02 wing venue-confirm (Brad: "confirm the order attempted last time actually didn't fill").
+FILLS_PATH = "/portfolio/fills"
+WING_CONFIRM_SKEW_S = 5.0
+
+
+def _iso_to_epoch(value):
+    """'2026-10-01T23:54:06.199Z' -> epoch seconds; None when absent/unparseable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
 class V33AsyncExecutor(V33LiveExecutor):
     """The off-loop armed executor. Constructed with an ``AsyncOrderWriter`` (the HTTP edge) AND the
     underlying ``ProxyWriter`` (so the inherited ``__init__`` sets up the pacer/counters/RestBook exactly as
@@ -125,6 +146,19 @@ class V33AsyncExecutor(V33LiveExecutor):
         # core.py) is the source fix; this is the transport belt on the priority lane.
         self._wing_inflight_legs: set[tuple[int, str]] = set()
         self.wing_retries_dropped = 0
+        # 2026-10-02 (Brad: "confirm the order attempted last time actually didn't fill"): venue order ids of
+        # every wing chunk whose response we DID read, so a venue fills lookup after a LOST response can
+        # exclude already-attributed fills and count only the unknown chunk's.
+        self._wing_order_ids: set[str] = set()
+        self.wing_venue_confirms = 0
+        self.wing_venue_confirmed_count = Decimal(0)
+        # 2026-10-02 (02:00Z 429 storm): a wing 429 is a DEFINITIVE non-execution; the retry cadence backs
+        # off (base * 2**(streak-1), capped) -- a retry inside the backoff window sends NOTHING and reports
+        # the leg unfilled so the core re-emits after the window (no network, no venue hammering).
+        self._wing_429_streak = 0
+        self._wing_backoff_until = 0.0
+        self.wing_backoff_skips = 0
+        self.wing_rate_limited_batches = 0
 
     # =====================================================================
     # off-loop verb helpers (429 belt on the SAME lane; build brief §5)
@@ -530,6 +564,23 @@ class V33AsyncExecutor(V33LiveExecutor):
         self._bump("amend_post")
         if not resp.ok:
             self.amends_failed += 1
+            if resp.status_code == 404:
+                # 2026-10-02 (00:00Z window): an amend racing a fill comes back 404 -- the order is GONE
+                # (filled/cancelled/expired), so resolve it by STATUS TRUTH straight away instead of a DELETE
+                # that can only 404 again. The status GET surfaces any fill before the core may re-place.
+                self.journal.append("amend_failed",
+                                    {"order_id": oid, "client_order_id": coid_old,
+                                     "status": resp.status_code, "body": resp.body, "error": resp.error,
+                                     "fallback": "status_resolve"}, self.clock())
+                exp = rec.expiration_epoch if rec is not None else None
+                st = await self.order_status_async(oid)
+                resolved = self._resolve_cancel_from_status(st, rec, oid, resp.status_code, now,
+                                                            exp is not None and now >= exp)
+                if resolved is not None:
+                    self._bump("amend_404_status_resolved")
+                    return resolved
+                # status unavailable / still live (should not happen on a 404): proven DELETE fallback.
+                return await self._amend_fallback_async(rec, oid, exch, coid_old, now)
             self.journal.append("amend_failed",
                                 {"order_id": oid, "client_order_id": coid_old,
                                  "status": resp.status_code, "body": resp.body, "error": resp.error,
@@ -606,6 +657,13 @@ class V33AsyncExecutor(V33LiveExecutor):
         pending_all = [lg for lg in state.wing_legs if lg.status == "pending"]
         if not pending_all:
             return []
+        if self.clock() < self._wing_backoff_until:
+            # 429 BACKOFF (2026-10-02): inside the window -> no send; report unfilled so the core's next
+            # RETRY_WING (>= its own floor) re-asks once the window has passed.
+            self.wing_backoff_skips += 1
+            self._bump("wing_backoff_skip")
+            return [Fill(order_id=None, client_order_id=lg.client_order_id, count=Decimal(0),
+                         price=lg.limit, side=lg.side, server_ts=now) for lg in pending_all]
         # WING RETRY-STORM BELT: claim one in-flight IOC per missing leg; DROP a retry for a leg that
         # already has an IOC in flight (count it, no journal record each). The claim is check-and-add on the
         # single loop thread (no await between), so it is atomic. Cleared in the finally below when the take
@@ -662,26 +720,57 @@ class V33AsyncExecutor(V33LiveExecutor):
                                    price=lg.limit, side=lg.side, server_ts=now))
         if not entries:
             return events
-        await self._pacer.acquire_async(COST_CREATE * len(entries), "wing_take", priority=True)
-        self.wing_batches += 1
-        self.wing_chunks += len(entries)
-        self._bump("wing_batch")
-        if len(entries) == 1:
-            self.journal.append("take_wings", {"legs": entries, "chunked": True}, self.clock())
-            resp = await self._apost(REL_SINGLE_CREATE, entries[0], CLASS_WING)
-            parsed = [parse_single_response(resp.body, side=chunk_owner[entries[0]["client_order_id"]][1])] \
-                if resp.ok else []
-        else:
-            self.journal.append("take_wings", {"legs": entries, "chunked": True}, self.clock())
-            resp = await self._apost(REL_BATCH_CREATE, build_batch(entries), CLASS_WING)
-            parsed = parse_batch_response(resp.body) if resp.ok else []
+        # 2026-10-02 (02:00Z 429 storm): SUB-BATCHES that each fit the venue's write bucket. The first is
+        # served now (priority); the rest wait only until the bucket can FIT their cost. Kalshi rejects a
+        # batch WHOLE when its cost exceeds the balance, so one 12-order burst could never pass on Basic.
+        send_ts = self.clock()
+        max_orders = wing_batch_max_orders(self._pacer.size)
+        sub_batches = split_wing_batches(entries, chunk_owner, max_orders)
+        parsed = []
+        failed: dict[str, tuple[Any, Any]] = {}          # chunk coid -> (status, error) of a non-ok sub-batch
+        rate_limited: set[str] = set()                   # chunk coids the venue answered 429 (created nothing)
+        for i, sub in enumerate(sub_batches):
+            await self._pacer.acquire_async(COST_CREATE * len(sub), "wing_take", priority=True, fit=i > 0)
+            self.wing_batches += 1
+            self.wing_chunks += len(sub)
+            self._bump("wing_batch")
+            self.journal.append("take_wings", {"legs": sub, "chunked": True, "sub_batch": i + 1,
+                                               "sub_batches": len(sub_batches)}, self.clock())
+            if len(sub) == 1:
+                resp = await self._apost(REL_SINGLE_CREATE, sub[0], CLASS_WING)
+                p_ = [parse_single_response(resp.body, side=chunk_owner[sub[0]["client_order_id"]][1])] \
+                    if resp.ok else []
+            else:
+                resp = await self._apost(REL_BATCH_CREATE, build_batch(sub), CLASS_WING)
+                p_ = parse_batch_response(resp.body) if resp.ok else []
+            if resp.ok:
+                parsed += p_
+                self._wing_429_streak = 0
+                continue
+            for e in sub:
+                failed[e["client_order_id"]] = (resp.status_code, resp.error)
+            if resp.status_code == _HTTP_TOO_MANY_REQUESTS:
+                rate_limited.update(e["client_order_id"] for e in sub)
+                self._note_wing_rate_limited()
         from collections import defaultdict as _dd
         agg_count: dict[tuple[int, str], Decimal] = _dd(lambda: Decimal(0))
         agg_notional: dict[tuple[int, str], Decimal] = _dd(lambda: Decimal(0))
         by_coid = {r.client_order_id: r for r in parsed if r.client_order_id in chunk_owner}
+        # Chunks whose OUTCOME IS UNKNOWN: a sub-batch with no readable response (transport / 5xx), or a
+        # chunk absent from / errored in the body. A chunk the venue answered with fill_count 0 is a
+        # DEFINITIVE no-fill (IOC) and a 429 is a DEFINITIVE non-execution -- neither is unknown.
+        unknown_keys: set[tuple[int, str]] = set()
         for chunk_coid, key in chunk_owner.items():
             r = by_coid.get(chunk_coid)
-            if r is None or not resp.ok or r.error or r.fill_count <= 0:
+            if chunk_coid in rate_limited:
+                continue
+            if chunk_coid in failed or r is None or r.error:
+                unknown_keys.add(key)
+            elif getattr(r, "order_id", None):
+                self._wing_order_ids.add(r.order_id)
+        for chunk_coid, key in chunk_owner.items():
+            r = by_coid.get(chunk_coid)
+            if r is None or chunk_coid in failed or r.error or r.fill_count <= 0:
                 continue
             side = key[1]
             nr = normalize_fill_to_side(r, side)
@@ -693,6 +782,32 @@ class V33AsyncExecutor(V33LiveExecutor):
                                "price": price, "fee": nr.average_fee_paid, "count": fc, "ts": now,
                                "path": "wing_chunk", "client_order_id": chunk_coid})
             self._bump("wing_fill")
+        # VENUE CONFIRM (2026-10-02): for a leg with an unknown-outcome chunk, ask the venue what it filled
+        # for us on that ticker/side since the send (excluding chunks we already read) BEFORE reporting the
+        # leg unfilled. A lost response on an executed IOC must not become a second, duplicate wing buy.
+        for key in sorted(unknown_keys):
+            lg = leg_by_key[key]
+            remaining = self._dc(lg.count) - self._wing_filled.get(key, Decimal(0))
+            venue = await self._venue_wing_fills_async(lg.ticker, key[1], send_ts)
+            confirmed = min(venue, remaining)
+            self.wing_venue_confirms += 1
+            self._bump("wing_venue_confirm")
+            fs = sorted({str(failed[c]) for c, k in chunk_owner.items() if k == key and c in failed})
+            self.journal.append("wing_venue_confirm",
+                                {"ticker": lg.ticker, "side": key[1], "batch": key[0],
+                                 "failed_responses": fs,
+                                 "parsed_count": str(agg_count.get(key, Decimal(0))),
+                                 "venue_count": str(venue), "confirmed": str(confirmed)}, self.clock())
+            if confirmed > agg_count.get(key, Decimal(0)):
+                extra = confirmed - agg_count.get(key, Decimal(0))
+                self.wing_venue_confirmed_count += extra
+                # price unknown for the lost chunk -> book at the leg's limit (the most we could have paid).
+                agg_count[key] = confirmed
+                agg_notional[key] += Decimal(lg.limit) * extra
+                self.fills.append({"leg": "wing", "side": key[1], "ticker": lg.ticker,
+                                   "price": Decimal(lg.limit), "fee": None, "count": extra, "ts": now,
+                                   "path": "wing_venue_confirm", "client_order_id": None})
+                self._bump("wing_fill")
         for lg in pending:
             key = (lg.batch, lg.side)
             got = agg_count.get(key, Decimal(0))
@@ -707,6 +822,48 @@ class V33AsyncExecutor(V33LiveExecutor):
                 events.append(Fill(order_id=None, client_order_id=lg.client_order_id, count=Decimal(0),
                                    price=lg.limit, side=lg.side, server_ts=now))
         return events
+
+    def _note_wing_rate_limited(self) -> None:
+        """A wing sub-batch came back 429 (after the one-shot same-lane retry): a DEFINITIVE non-execution.
+        Grow the backoff window base * 2**(streak-1), capped; journal it once per occurrence."""
+        self.wing_rate_limited_batches += 1
+        self._wing_429_streak += 1
+        delay = min(WING_429_BACKOFF_MAX_S, WING_429_BACKOFF_BASE_S * (2 ** (self._wing_429_streak - 1)))
+        self._wing_backoff_until = self.clock() + delay
+        self._bump("wing_backoff")
+        self.journal.append("wing_backoff", {"streak": self._wing_429_streak, "delay_s": delay},
+                            self.clock())
+
+    async def _venue_wing_fills_async(self, ticker: str, side: str, since_ts: float) -> Decimal:
+        """2026-10-02 (Brad): venue truth for a wing chunk whose POST response was LOST or non-2xx. Sums
+        OUR fills on ``ticker``/``side`` created at/after ``since_ts`` (5 s skew allowance; the laptop clock
+        runs ~0.3 s fast) whose order_id is NOT one of the chunks we already read (``_wing_order_ids``).
+        Fail-closed to 0 on any error -- the existing 'unfilled -> retry' path then applies."""
+        try:
+            body = await self._aget(FILLS_PATH, {"ticker": ticker, "limit": 100,
+                                                  "min_ts": int(since_ts - WING_CONFIRM_SKEW_S)})
+        except Exception as e:  # noqa: BLE001
+            self._record_alarm("wing_confirm_get_failed",
+                               {"ticker": ticker, "side": side, "error": str(e)})
+            return Decimal(0)
+        fills = body.get("fills") if isinstance(body, dict) else None
+        if not isinstance(fills, list):
+            return Decimal(0)
+        total = Decimal(0)
+        for f in fills:
+            if not isinstance(f, dict) or f.get("ticker") != ticker or f.get("side") != side:
+                continue
+            if f.get("order_id") in self._wing_order_ids:
+                continue
+            ts = _iso_to_epoch(f.get("created_time"))
+            if ts is not None and ts < since_ts - WING_CONFIRM_SKEW_S:
+                continue
+            c = _dec_or_none(f.get("count_fp"))
+            if c is None and f.get("count") is not None:
+                c = _dec_or_none(f.get("count"))
+            if c is not None and c > 0:
+                total += c
+        return total
 
     # =====================================================================
     # OPTIONAL batch create — async twin of V33LiveExecutor.place_batch / _place_one_chunk
