@@ -397,6 +397,24 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   with balance $66.15). Engine: live tree f6940b5 (PR #110 fixes + L7), async writer ON (supervisor env), proxy pid
   22952 budget 30000 / cap 2, Kalshi Advanced tier. Rules in force: L6 as amended by L7 (verdict / promotion n >= 45,
   early kill mean < +2.0c at n >= 15, lock >= +4.0c, one-legged <= 2, S4 $3.00 campaign kill, S1_LEGGED day latch at 2).
+- 2026-10-02 16:05Z -- TEST FIRE #2, WINDOWS 1-2 + INCIDENT (recorded by Claude). 15:00Z close (first armed window):
+  NO fills, 0 contracts, venue clean; 11 alarms. Kalshi was slow for ~15 min (6 of 17 creates 1.9-2.5 s upstream;
+  strike WS dropped 11 times 14:46-14:58Z, code 1006; none in the ten dry windows before, none in the 16:00Z window).
+  The strike feed stalled -> stale-wing HOLD at 14:45:07Z -> the core cancelled the ladder before any create had a
+  venue id -> the async executor treated each cancel as a no-op and REPORTED it cancelled -> the core re-placed the
+  slots (4 flaps in 20 s, 61 place / 44 cancel requests) -> 17 orphan rests landed at the venue (14:45:15-22Z) ->
+  the venue pre-flight rest-count invariant caught 17 > K=11 at 14:45:43Z -> executor stand-down for the hour (the
+  belt held). The 17 orphans sat unmanaged at 0.60-0.73 until their 14:56:00Z expiry; 0 fills (luck). Verdict
+  impact: none (n=0; one-legged 0). Fix = PR #115 (Brad: "Build the fix, lets try getting it in before the wake
+  up"; merged b1b1afa at 16:03Z on his typed "! gh pr merge 115 --merge"; live tree pulled 16:03Z, 1471 passed /
+  1 skipped): a CANCEL_REST for an in-flight create is DEFERRED (no event, slot stays owned) and executed the
+  instant the ack lands, through the existing cancel-confirm path. Opus 4.8 review APPROVE WITH NITS; N3 (flag
+  leak on a raised POST) fixed in the PR. RESIDUALS (open, not gating): (a) the batch-create path (dormant;
+  batch_create defaults off) has the same original hole; (b) a fill landing in the ack->DELETE gap of a
+  deferred-cancelled slot is dropped by the core's ladder (executor book sees it; no wing placed; bounded to one
+  lot per slot) -- proper fix = keep the slot in the core until the cancel confirms. 16:00Z close (old code,
+  spawned 15:40Z before the merge): armed, 0 alarms, 171 rolls, no entry, writer p50 78 ms. FIRST WINDOW ON THE
+  FIXED CODE = 17:00Z close (spawn 16:40Z). Mode stays armed on Brad's standing word.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
