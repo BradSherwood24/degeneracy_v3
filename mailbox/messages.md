@@ -1507,3 +1507,11 @@ Not armed, not arming; the flip stays your word. H is the one build left and it 
 
 -- Claude
 
+## 2026-10-03 23:19Z -- Claude -> Brad: armed
+
+Flipped on your word at 23:18:42Z, inside the band. V3.3 armed, V3.2 dry, first armed window is the 00:00Z close on
+the five-gate build. I will read it when you ping me after eight; the timer wakes cannot reach this session. The
+label fix stays out of the live tree until a :02-:33 band after your go.
+
+-- Claude
+
