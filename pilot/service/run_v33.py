@@ -304,6 +304,11 @@ class V33Driver:
         self._spot_buckets_quoted: list[int] = []
         self._last_stand_down_reason: str | None = None
         self._real_stand_downs: int = 0
+        # STALE-WING SUB-CAUSE (2026-10-03 labeling fix): per-label tally of stale/missing-wing stand-down
+        # EPISODES this window (a hold-start, or a plain stale stand_down when the hold is disabled / there
+        # is nothing to protect). Resume/cancel are continuations of an already-counted episode, so they
+        # are NOT tallied -- the total equals the stale stand-down count. Additive diagnostics only.
+        self._stand_down_sub_causes: dict[str, int] = defaultdict(int)
         self._quote_end_cancel: bool = False
         self._dry_sim_fills: int = 0        # count of simulated rung fills (dry only)
         # GATE E (2026-10-03 02:00Z): EXECUTOR-TRUTH rest fills, captured as the driver journals each
@@ -673,15 +678,19 @@ class V33Driver:
         elif k == ActionKind.STAND_DOWN:
             # BUCKET-FLAP FIX (2026-09-23): the stale/missing-wing HOLD lifecycle journals under distinct
             # kinds and does NOT count as a real stand-down; only the terminal cancel (and other reasons) do.
+            # LABELING (2026-10-03): the hold lifecycle carries the diagnostic ``sub_cause`` -- the hold /
+            # cancel / resume all report the label captured when the hold began (``hold_sub_cause``); the
+            # plain stale stand_down reports the live ``wing_sub_cause``. The REASON strings are unchanged.
             if a.reason == "stale_or_missing_wing_hold":
                 rk = "stand_down_hold"
-                payload = {"reason": "stale_or_missing_wing"}
+                payload = {"reason": "stale_or_missing_wing", "sub_cause": self.state.hold_sub_cause}
+                self._stand_down_sub_causes[self.state.hold_sub_cause or "unknown"] += 1
             elif a.reason == "stale_or_missing_wing_resume":
                 rk = "stand_down_resume"
-                payload = {"reason": "stale_or_missing_wing"}
+                payload = {"reason": "stale_or_missing_wing", "sub_cause": self.state.hold_sub_cause}
             elif a.reason == "stale_or_missing_wing_cancel":
                 rk = "stand_down_cancel"
-                payload = {"reason": "stale_or_missing_wing"}
+                payload = {"reason": "stale_or_missing_wing", "sub_cause": self.state.hold_sub_cause}
                 self._last_stand_down_reason = "stale_or_missing_wing"
                 self._real_stand_downs += 1
             elif a.reason == "past_quote_end":
@@ -691,6 +700,11 @@ class V33Driver:
             else:
                 rk = "stand_down"
                 payload = {"reason": a.reason}
+                # the PLAIN stale path (hold disabled / nothing to protect) carries the sub_cause + counts
+                # as an episode, mirroring the hold-start; other reasons (n_below_min, ...) have no wing.
+                if a.reason == "stale_or_missing_wing":
+                    payload["sub_cause"] = self.state.wing_sub_cause
+                    self._stand_down_sub_causes[self.state.wing_sub_cause or "unknown"] += 1
                 self._last_stand_down_reason = a.reason
                 self._real_stand_downs += 1
         elif k in (V33ActionKind.TAKE_BUCKET_NO, V33ActionKind.WOULD_TAKE_BUCKET_NO):
@@ -756,13 +770,17 @@ class V33Driver:
             return
         self._last_eval_key = key
         self._last_eval_ts = server_ts
-        self.journal.append("v33_eval",
-                            {"t_minus_s": st.close_epoch - server_ts, "shakedown": st.shakedown,
-                             "spot_Sd": st.spot_Sd, "spot_Su": st.spot_Su, "W": st.W, "cap": st.cap,
-                             "n_top": st.n_top, "ladder_live": len(st.ladder),
-                             "rungs_filled": st.rungs_filled, "replace_count": st.replace_count,
-                             "roll_count": st.roll_count, "sets_done": st.sets_done,
-                             "stand_down_reason": st.stand_down_reason}, self.clock())
+        eval_rec = {"t_minus_s": st.close_epoch - server_ts, "shakedown": st.shakedown,
+                    "spot_Sd": st.spot_Sd, "spot_Su": st.spot_Su, "W": st.W, "cap": st.cap,
+                    "n_top": st.n_top, "ladder_live": len(st.ladder),
+                    "rungs_filled": st.rungs_filled, "replace_count": st.replace_count,
+                    "roll_count": st.roll_count, "sets_done": st.sets_done,
+                    "stand_down_reason": st.stand_down_reason}
+        # LABELING (2026-10-03): when W is None, attach the diagnostic sub-cause (``stand_down_reason`` is
+        # left exactly as is). Additive field, present only when W is unavailable.
+        if st.W is None:
+            eval_rec["wing_sub_cause"] = st.wing_sub_cause
+        self.journal.append("v33_eval", eval_rec, self.clock())
 
 
 # ===========================================================================
@@ -983,6 +1001,7 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         netted_sets=m.get("netted_sets"),   # D5: venue-netted wing pairs
         writer_stats=_v33_writer_stats(driver),
         alarms_breakdown=alarms, reconcile=recon_fields,
+        stand_down_sub_causes=dict(driver._stand_down_sub_causes),
     )
     append_v33_ledger_row(row, ledger_path)
     summary = {
@@ -997,6 +1016,7 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         "ladder_lock": row["ladder"].get("ladder_lock"), "realized_delta": row.get("realized_delta"),
         "spot_bucket_ticker": driver._last_quoted_bucket_ticker, "Sd": driver._last_quoted_Sd,
         "Su": driver._last_quoted_Su, "stand_downs": driver._real_stand_downs,
+        "stand_down_sub_causes": dict(driver._stand_down_sub_causes),
         "stand_down_reason": driver._last_stand_down_reason, "m15_frames": shared.m15_frames,
         "gzipped": bool(gz.get("gzipped")), "strike_lag_seconds": strike_lag,
         "bucket_lag_seconds": bucket_lag, "lag_stats": lag_stats or {}, "flushed_at": clock(),

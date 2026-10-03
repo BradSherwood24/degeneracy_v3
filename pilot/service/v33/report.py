@@ -200,6 +200,7 @@ def build_v33_report(rows: list[dict[str, Any]],
             "roll_count": lad.get("roll_count", 0),
             "roll_single_order_ratio": lad.get("roll_single_order_ratio"),
             "stand_down_reason": r.get("stand_down_reason"),
+            "stand_down_sub_causes": r.get("stand_down_sub_causes") or {},   # stale-wing label tally
             "bucket_mismatch": _row_bucket_mismatch(r),   # F3: fill bucket != held NO-leg bucket
             "netted_sets": len(netted),                   # D5: venue-netted wing pairs this window
             "netted_realised": row_netted_realised,
@@ -1028,6 +1029,9 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
         line = "  ".join(row)
         if w.get("stand_down_reason"):
             line += f"   [stand down: {w['stand_down_reason']}]"
+        subc = w.get("stand_down_sub_causes") or {}
+        if subc:
+            line += "   [stale-wing: " + ", ".join(f"{lbl}={n}" for lbl, n in sorted(subc.items())) + "]"
         if w.get("bucket_mismatch"):
             line += "   [BUCKET MISMATCH]"
         if w.get("netted_sets"):

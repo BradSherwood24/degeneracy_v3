@@ -131,6 +131,11 @@ def measure(path: str, *, feed_dead_s: float, hold_ms: float, old_age_s: float,
     close = _close_epoch(name)
     width = 100
     kinds = {"stand_down_hold": 0, "stand_down_resume": 0, "stand_down_cancel": 0}
+    # LABELING (2026-10-03): per-sub_cause tally of holds / cancels. ``sub_cause_present`` stays False for
+    # a pre-labeling journal (the field is absent) -> the report prints n/a for that window.
+    sub_cause_holds: dict[str, int] = {}
+    sub_cause_cancels: dict[str, int] = {}
+    sub_cause_present = False
     watchdog_strikes = 0
     watchdog_buckets = 0
     strike_snap_local: list[float] = []
@@ -209,6 +214,13 @@ def measure(path: str, *, feed_dead_s: float, hold_ms: float, old_age_s: float,
                 continue
             if k in kinds:
                 kinds[k] += 1
+                if "sub_cause" in obj:
+                    sub_cause_present = True
+                    sc = obj.get("sub_cause") or "unknown"
+                    if k == "stand_down_hold":
+                        sub_cause_holds[sc] = sub_cause_holds.get(sc, 0) + 1
+                    elif k == "stand_down_cancel":
+                        sub_cause_cancels[sc] = sub_cause_cancels.get(sc, 0) + 1
                 continue
             if (k == "stand_down" and obj.get("reason") != "past_quote_end") or (
                     k == "alarm" and obj.get("alarm") == "executor_standdown"):
@@ -285,6 +297,8 @@ def measure(path: str, *, feed_dead_s: float, hold_ms: float, old_age_s: float,
         "window": name,
         "holds": kinds["stand_down_hold"], "resumes": kinds["stand_down_resume"],
         "cancels": kinds["stand_down_cancel"],
+        "sub_cause_present": sub_cause_present,
+        "sub_cause_holds": sub_cause_holds, "sub_cause_cancels": sub_cause_cancels,
         "watchdog_strikes": watchdog_strikes, "watchdog_buckets": watchdog_buckets,
         "strike_resubscribe_bursts": max(0, bursts - 1),
         "old_replay_pre_sd": old_h.snap if old_h.snap is not None else (old_h.holds, old_h.cancels),
@@ -362,6 +376,14 @@ def main(argv: list[str] | None = None) -> int:
               f"{row['old_replay_holds']}/{row['old_replay_cancels']} | "
               f"{row['new_replay_holds']}/{row['new_replay_cancels']} |"
               + "".join(f" sweep{d}={v[0]}/{v[1]}" for d, v in row["sweep"].items()), flush=True)
+        # LABELING (2026-10-03): per-sub_cause breakdown of the journaled holds/cancels for this window.
+        if row["holds"] or row["cancels"]:
+            if row["sub_cause_present"]:
+                hh = ", ".join(f"{s}={n}" for s, n in sorted(row["sub_cause_holds"].items())) or "-"
+                cc = ", ".join(f"{s}={n}" for s, n in sorted(row["sub_cause_cancels"].items())) or "-"
+                print(f"|   stale-wing sub_cause -> holds: {hh}; cancels: {cc} |", flush=True)
+            else:
+                print("|   stale-wing sub_cause -> n/a (pre-labeling journal) |", flush=True)
     healthy = [r for r in rows if r["watchdog_strikes"] == 0 and r["strike_resubscribe_bursts"] == 0]
     ages = [x for r in healthy for x in r["feed_ages_all"]]
     gaps = [x for r in healthy for x in r["feed_gaps_all"]]
