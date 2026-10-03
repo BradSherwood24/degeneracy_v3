@@ -588,6 +588,16 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     hold length (`stand_down_hold_ms` 1500) is the dial; unchanged tonight.
   * RE-ARM CONDITIONS (03:30Z / 04:55Z / 20:24Z / 22:00Z entries): A-E merged; shakedown read clean; this line;
     remaining = Brad's word and hand on `v33_mode.txt`. Thresholds unchanged (L6 as amended by L7).
+- 2026-10-03 23:18:42Z -- V3.3 RE-ARMED. TEST FIRE #2 RESUMES AT THE 00:00Z CLOSE. Brad, verbatim: "Sounds good! Go
+  ahead and flip". `pilot/ops/v33_mode.txt` = `armed` (5 bytes, ascii, no newline) written by Claude's hand on
+  Brad's typed word inside the :02-:33 band (precedent: the 03:30Z stand-down); `v32_mode.txt` stays `dry`, so
+  exactly ONE roster is armed. The :40 process for the 00:00Z close reads the mode fresh and runs S5 + reconcile
+  + S4 on live tree a92f054 (main; gates A-E, params sha f4037082). Pre-flight and the 23:00Z shakedown read are
+  the entry immediately above. Test Fire #2 record carried forward unchanged: hedged n=4 (+$0.405), one-legged 2
+  = the pin (-$0.40), net +$0.005, PAUSED -> RESUMED; L7 thresholds (verdict 45 / early kill 15 / one-legged pin
+  2) unchanged; the next naked contract is a KILL. Armed-hours rules in force: foreground checks only; no pulls
+  into the live tree and no heavy work :38-:00; code lands only in a :02-:33 band on Brad's word. The sub-cause
+  label build is NOT in the live tree. Registration line 23:19Z.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
