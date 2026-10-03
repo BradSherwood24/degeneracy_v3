@@ -259,10 +259,12 @@ def test_params_sha_repinned_and_previous_defined():
         PREVIOUS_V33_PARAMS_SHA256_FLAP_R1 as PREV_FLAP_R1,
         PREVIOUS_V33_PARAMS_SHA256_FLAP_R2 as PREV_FLAP_R2,
         PREVIOUS_V33_PARAMS_SHA256_PRINT_THROUGH as PREV_PRINT_THROUGH,
+        PREVIOUS_V33_PARAMS_SHA256_L4 as PREV_L4,
     )
-    # L4 LADDER SHIFT (2026-09-29): re-pinned over the print-through sha (now kept as
-    # PREVIOUS_..._PRINT_THROUGH); E_min 0.05 -> 0.08, ladder 8..18c.
-    assert PIN == "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
+    # 2026-10-03 RE-PIN (stale-wing liveness bounds written explicitly, values unchanged) over the L4 sha
+    # (now kept as PREVIOUS_..._L4). L4 LADDER SHIFT (2026-09-29) had re-pinned over the print-through sha.
+    assert PIN == "f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1"
+    assert PREV_L4 == "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
     assert PREV_PRINT_THROUGH == "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
     assert PREV_FLAP_R2 == "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78"
     assert PREV_FLAP_R1 == "3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac"
