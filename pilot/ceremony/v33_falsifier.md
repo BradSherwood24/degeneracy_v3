@@ -415,6 +415,39 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   lot per slot) -- proper fix = keep the slot in the core until the cancel confirms. 16:00Z close (old code,
   spawned 15:40Z before the merge): armed, 0 alarms, 171 rolls, no entry, writer p50 78 ms. FIRST WINDOW ON THE
   FIXED CODE = 17:00Z close (spawn 16:40Z). Mode stays armed on Brad's standing word.
+- 2026-10-03 03:30Z -- TEST FIRE #2 STOOD DOWN on Brad's order. Brad, verbatim (03:2xZ, after Claude's read of the
+  02:00Z window): "Looks like we got a problem. Lets stand down" -> `ops/v33_mode.txt` = dry by Claude's hand at
+  03:30:34Z; venue clean (0 resting, 0 positions); the 04:00Z close onward runs dry. Test Fire #2 is NOT killed by the
+  frozen rules (one-legged 2 <= 2, n = 4 < 45, no S4 latch); it is PAUSED for engineering. The record, restated from
+  EXECUTOR + VENUE truth where the ledger is wrong:
+  * Armed closes: 10-02 15:00Z .. 10-03 03:00Z = 13 closes; 21:00Z DID NOT RUN (supervisor "close_already_run" on a
+    pre-existing ledger row for that close -- a dedupe defect, item 6 below). Realized: 00:00Z 1 lot at NO 0.07,
+    wings 0.90/0.93, lock 8.45c, settled +$0.089; 01:00Z 3 lots at NO 0.13/0.12/0.11, wings 0.86/0.90, locks
+    8.7-10.8c, settled +$0.316; 02:00Z 2 lots NAKED (orders #23: 0.40 + 0.60 at NO 0.22; #27: 1.00 at NO 0.18;
+    no wings), bucket resolved YES, settled -$0.400. Net +$0.005. Hedged n = 4 (mean realized lock 8.7c, 4/4
+    positive); ONE-LEGGED = 2 CONTRACTS (at the pin; the next one is a KILL). The 02:00Z ledger row says lots 0 /
+    one_legged False / alarms 0 -- FALSE: the executor journaled three `rest_fill` records (ws path) and ten
+    alarms. The S1_LEGGED occurrence for 10-03 was NOT recorded by the engine (count by hand: 1).
+  * The 02:00Z chain: 5 stale-wing hold/resume flaps in 40 s -> real stand-down cancel of 11 rests at 01:46:04Z
+    (venue ids known; DELETEs sent) -> the wing feed returned and the core RE-PLACED 11 rests 230 ms later, before
+    the cancel confirms -> the pre-place venue invariant saw 9 old orders still resting -> rest_invariant_violation
+    x9 -> EXECUTOR STAND-DOWN -> two creates (#23, #27) had already passed the check and rested at the venue ->
+    the stand-down cancels nothing it owns and the stood-down core issues no actions -> #23/#27 filled at
+    01:50:21/23/58Z (fractional 0.40 + 0.60, then 1.00), seen by the executor, never hedged. NOT the #115 path
+    (no `cancel_deferred_unacked` / `cancel_after_ack` records).
+  * Executor stand-downs in 3 of 12 run windows: 15:00Z (17 orphans, expired unfilled), 02:00Z (2 orphans, FILLED
+    naked), 03:00Z (1 violation, 12 holds, 0 WS drops, no fills). Stale-wing holds were common all evening (22:00Z
+    39, 23:00Z 36) -- the hold fires without WS drops. The ledger `alarms` field read 0 in all three incident
+    windows.
+  * BUILDS REQUIRED BEFORE ANY RE-ARM (pre-registered here; each a reviewed PR Brad merges): (1) an executor
+    stand-down must CANCEL EVERY REST IT OWNS and the core must keep hedging fills on anything still live until
+    flat; (2) after a stale-wing cancel the core must NOT re-place inside the cancel-confirm window (hold placement
+    until outstanding cancels confirm); (3) one-legged / rung-fill accounting for the ledger, the day guard and
+    the report must come from EXECUTOR truth (`rest_fill`), and the ledger `alarms` counter must include executor
+    alarms; (4) stale-wing hold sensitivity reviewed (holds without feed drops); (5) the #115 residuals (batch
+    create path; a fill in the ack->DELETE gap of a deferred-cancelled slot is dropped by the core ladder); (6)
+    supervisor dedupe skipped a live close on a pre-existing ledger row. Items 1-3 gate the re-arm; 4-6 are
+    recorded for the same PR series or the one after. Thresholds unchanged (L6 as amended by L7).
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
