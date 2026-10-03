@@ -560,6 +560,34 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     `ledger_reconcile_mismatch`); (iii) no `reconcile_failed`, no uncaught exception, no `venue_fills_*` kinds in
     dry; (iv) the venue invariant never stands the executor down on a live-feed window (the old 3-of-12 rate was
     the re-place race). Anything else is a finding before re-arm.
+- 2026-10-03 23:04Z -- SHAKEDOWN WINDOW 23:00Z READ CLEAN; PRE-FLIGHT CLEAN; BRAD'S VOTE TO RE-ARM FOR THE 00:00Z CLOSE
+  (his "8PM local window"). Brad, verbatim: "Sounds good, lets build the labeling fix. Meanwhile, id vote to take
+  it off dry for the 8PM local window". The flip itself is Brad's hand (V33_ARMING section B: :02-:33 UTC window,
+  never :38-:59; the :40 process reads `v33_mode.txt` fresh) and is recorded by its own line when it happens.
+  * 23:00Z WINDOW (first on main 296f776+/418ca69, dry, params sha f4037082 in `window_meta`) against the 22:00Z
+    pre-stated criteria: (i) holds: ONE `stand_down_hold` -> `stand_down_cancel` at window t+555 s (T-644 s),
+    11 tracked `would_cancel_rest`, ZERO re-place after -- and it was NOT staleness: strike feed alive (strike vs
+    bucket server-ts lag max 0.09 s all window, inter-frame gap max 0.93 s), both wing books ticked within 0.2 s
+    of the hold, no suspect. Cause by book reconstruction: the YES-leg wing strike `KXBTCD-26OCT0319-T84699.99`
+    (yes 0.97-0.99 all window) had its last NO bid (0.01) lifted at t+555, so `yes_ask` = None -- NO OFFER on the
+    hedge leg at any price; the NO side stayed empty through the close. Standing the rests down is the CORRECT
+    response (never rest a rung whose hedge cannot be bought); the old predicate would have done the same.
+    (ii) ledger row carries `alarms_breakdown` {total 0}, `reconcile`, `one_legged_contracts` 0, `unbooked_fills`
+    [], `reconcile_mismatch` False -- a byte-clean dry reconcile. (iii) no `reconcile_failed`, no `venue_fills_*`,
+    no exception. (iv) no `rest_invariant_*`, no executor stand-down. VERDICT: CLEAN on all four; one
+    diagnosability finding -> the sub-cause label build (`fix/v33-stale-wing-subcause`, Opus 4.8, in flight; a
+    LABEL, no behaviour change; NOT to be pulled into the live tree while a window is armed outside :02-:33).
+  * PRE-FLIGHT at 23:04Z (read-only through the proxy): balance $66.1517 (exchange_index 2: $53.0399); resting
+    orders 0; unsettled positions 0; proxy `orders_enabled` true, `max_contracts_per_order` 2, prefixes KXBTC15M /
+    KXBTCD / KXBTC, daily budget 30000; falsifier `STATUS: FROZEN`; live loader sha f4037082 verified; live suite
+    1536 passed / 1 skipped; V3.2 already dry (so the flip touches `v33_mode.txt` only). Supervisor pid 11588.
+  * EXPOSURE STATED BEFORE THE FLIP: Test Fire #2 is PAUSED at one-legged 2 = the pin; the NEXT naked contract is a
+    KILL. Known residual path: a rung FILL landing inside the 1.5 s stale-wing hold (or before the tracked cancels
+    confirm) while the hedge leg has no offer (tonight's `wing_no_ask` case) -> the wing batch WAITS for a priced
+    book; if none returns by the cutoff, that lot is one-legged. Gate E now guarantees the ledger SEES it. The
+    hold length (`stand_down_hold_ms` 1500) is the dial; unchanged tonight.
+  * RE-ARM CONDITIONS (03:30Z / 04:55Z / 20:24Z / 22:00Z entries): A-E merged; shakedown read clean; this line;
+    remaining = Brad's word and hand on `v33_mode.txt`. Thresholds unchanged (L6 as amended by L7).
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
