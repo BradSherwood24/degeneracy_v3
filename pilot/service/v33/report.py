@@ -159,6 +159,10 @@ def build_v33_report(rows: list[dict[str, Any]],
     tot_stand_downs = 0
     tot_netted = 0
     tot_netted_realised = _ZERO
+    tot_unbooked = 0          # GATE E: executor-known fills the core did not book
+    tot_orphan = 0            # GATE E: orphan rung fills (owned fill the core had lost, hedged by gate A)
+    tot_reconcile_mismatch = 0
+    tot_alarms = 0
     for r in rows:
         if not _is_window_row(r):
             continue
@@ -176,6 +180,13 @@ def build_v33_report(rows: list[dict[str, Any]],
         row_netted_realised = sum((_dec(n.get("realised")) or _ZERO for n in netted), _ZERO)
         tot_netted += len(netted)
         tot_netted_realised += row_netted_realised
+        row_unbooked = len(r.get("unbooked_fills") or [])
+        row_orphan = sum(1 for rf in _row_rung_fills(r) if rf.get("orphan"))
+        tot_unbooked += row_unbooked
+        tot_orphan += row_orphan
+        if r.get("reconcile_mismatch"):
+            tot_reconcile_mismatch += 1
+        tot_alarms += int(r.get("alarms", 0) or 0)
         windows.append({
             "close_time": r.get("close_time"),
             "mode": r.get("effective_mode") or r.get("mode"),
@@ -193,6 +204,13 @@ def build_v33_report(rows: list[dict[str, Any]],
             "netted_sets": len(netted),                   # D5: venue-netted wing pairs this window
             "netted_realised": row_netted_realised,
             "writer": r.get("writer_stats") or {},
+            # GATE E: executor-truth reconciliation receipts per window.
+            "unbooked_fills": len(r.get("unbooked_fills") or []),
+            "reconcile_mismatch": bool(r.get("reconcile_mismatch")),
+            "one_legged_contracts": r.get("one_legged_contracts"),
+            "orphan_rung_fills": sum(1 for rf in _row_rung_fills(r) if rf.get("orphan")),
+            "alarms": int(r.get("alarms", 0) or 0),
+            "alarms_breakdown": r.get("alarms_breakdown") or {},
         })
     roll_ratio = (Decimal(tot_single) / Decimal(tot_rolls)) if tot_rolls else None
     return {
@@ -214,6 +232,11 @@ def build_v33_report(rows: list[dict[str, Any]],
             "stand_downs": tot_stand_downs,
             "netted_sets": tot_netted,                 # D5: venue-netted wing pairs
             "netted_realised": tot_netted_realised,
+            # GATE E: executor-truth reconciliation totals.
+            "unbooked_fills": tot_unbooked,
+            "orphan_rung_fills": tot_orphan,
+            "reconcile_mismatch_windows": tot_reconcile_mismatch,
+            "alarms": tot_alarms,
         },
     }
 
@@ -516,8 +539,16 @@ def build_falsifier_gate_table(rows: list[dict[str, Any]],
     n_min = load_v33_params().n_min
     cap_num, cap_den, cap_ratio = _capture_at_margin(rows, V33_FALSIFIER_CAPTURE_MARGIN_C, n_min)
 
+    # GATE E: the one-legged COUNT comes from the RECONCILED row (``one_legged_contracts`` = rest-filled
+    # lots not covered by a completed wing pair, from executor truth) when present — the 02:00Z row carried
+    # two naked lots but ZERO wing_batch_sets, so the pre-gate-E batch-sum below read 0 and missed the pin.
+    # Old rows (pre-gate-E, no reconciled field) fall back to the one-legged wing-batch fill_count sum.
     one_legged = _ZERO
     for r in realised:
+        row_ol = _dec(r.get("one_legged_contracts"))
+        if row_ol is not None:
+            one_legged += row_ol
+            continue
         for b in (r.get("wing_batch_sets") or []):
             if b.get("one_legged"):
                 one_legged += _cnt(b.get("fill_count"))   # D3: Decimal, fractional-safe
@@ -1001,6 +1032,15 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
             line += "   [BUCKET MISMATCH]"
         if w.get("netted_sets"):
             line += f"   [NETTED {w['netted_sets']} = {_c(w.get('netted_realised'))}]"
+        # GATE E: surface executor-truth reconciliation anomalies inline (clean windows show nothing).
+        if w.get("unbooked_fills"):
+            line += f"   [UNBOOKED {w['unbooked_fills']}]"
+        if w.get("orphan_rung_fills"):
+            line += f"   [ORPHAN {w['orphan_rung_fills']}]"
+        if w.get("reconcile_mismatch"):
+            line += "   [RECONCILE MISMATCH]"
+        if w.get("alarms"):
+            line += f"   [alarms {w['alarms']}]"
         lines.append(line)
     t = report["totals"]
     lines.append("-" * len(lines[0]))
@@ -1017,6 +1057,14 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
         lines.append(
             f"  netted wing pairs (D5, adjacent-bucket overlap, $1/contract realised now) = "
             f"{t['netted_sets']}  realised={_c(t.get('netted_realised'))}")
+    # GATE E: executor-truth reconciliation totals (shown only when there is something to report).
+    if (t.get("unbooked_fills") or t.get("orphan_rung_fills") or t.get("reconcile_mismatch_windows")
+            or t.get("alarms")):
+        lines.append(
+            f"  reconciliation (gate E): unbooked_fills={t.get('unbooked_fills', 0)}  "
+            f"orphan_rung_fills={t.get('orphan_rung_fills', 0)}  "
+            f"reconcile_mismatch_windows={t.get('reconcile_mismatch_windows', 0)}  "
+            f"alarms={t.get('alarms', 0)}")
 
     lines.extend(_render_writer(report["windows"]))
     lines.extend(_render_scoreboard(report["scoreboard"]))

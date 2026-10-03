@@ -84,6 +84,12 @@ from service.v33.ledger import (
     v33_pending_credit,
     v33_settlement_backfill_sweep,
 )
+from service.v33.reconcile import (
+    ExecFill,
+    alarm_breakdown,
+    reconcile_exec_truth_only,
+    reconcile_live,
+)
 from service.v33.stops import (
     V33_S1_LEGGED_LATCH_THRESHOLD,
     decide_v33_arming,
@@ -300,8 +306,20 @@ class V33Driver:
         self._real_stand_downs: int = 0
         self._quote_end_cancel: bool = False
         self._dry_sim_fills: int = 0        # count of simulated rung fills (dry only)
+        # GATE E (2026-10-03 02:00Z): EXECUTOR-TRUTH rest fills, captured as the driver journals each
+        # ``rest_fill`` — INDEPENDENT of whether the core books it (the 02:00Z core lost two owned orders
+        # whose fills the executor saw and journaled). Reconciled against core truth at _finalize.
+        self._exec_truth_fills: list[ExecFill] = []
         # SO-3 deep-end observation ladder (19..28c): observation-only, runs in EVERY mode, never places.
         self.deep_obs = DeepObservationLadder(params, state.close_epoch)
+
+    def _driver_alarm(self, name: str, detail: dict) -> None:
+        """Journal a DRIVER operational alarm as kind ``alarm`` and count it under ``driver_alarm`` (gate E
+        item 3: the ledger ``alarms`` field includes driver alarms, not just the WS recorder's). The
+        journal record is identical to the pre-gate-E direct ``journal.append('alarm', ...)``; only the
+        counter is new."""
+        self.counts["driver_alarm"] += 1
+        self.journal.append("alarm", {"alarm": name, **detail}, self.clock())
 
     # --- clock source ---
     def _stamp(self, server_ts: float) -> None:
@@ -395,6 +413,10 @@ class V33Driver:
                              "order_id": rec.order_id, "rest_price": rec.price,
                              "exec_price": pf.get("price"), "count": _count_out(count), "path": "ws"},
                             self.clock())
+        # GATE E: executor truth — this ws fill is recorded whether or not the core books it.
+        self._exec_truth_fills.append(ExecFill(count=count, coid=rec.client_order_id,
+                                               order_id=rec.order_id, price=rec.price,
+                                               ticker=market, source="ws"))
         # D1: V33Fill carries the fill's OWN market ticker as the last-resort bucket attribution channel.
         self._pump([V33Fill(order_id=rec.order_id, client_order_id=rec.client_order_id,
                             count=count, price=rec.price, side="no", server_ts=server_ts,
@@ -420,6 +442,11 @@ class V33Driver:
         self.journal.append("rest_fill", {"client_order_id": rec.client_order_id, "order_id": order_id,
                                           "rest_price": rec.price, "count": _count_out(delta),
                                           "path": "poll", "market": rec.ticker}, self.clock())
+        # GATE E: executor truth records the venue CUMULATIVE ``filled`` (a MAX source), not the
+        # core-relative delta — so the reconciled count never depends on what the core had booked.
+        self._exec_truth_fills.append(ExecFill(count=filled, coid=rec.client_order_id,
+                                               order_id=order_id, price=rec.price,
+                                               ticker=rec.ticker, source="poll"))
         # D1: the poll knows the order's market via the retained RestRecord (``rec.ticker``).
         self._pump([V33Fill(order_id=order_id, client_order_id=rec.client_order_id,
                             count=delta, price=rec.price, side="no", server_ts=server_ts,
@@ -486,7 +513,7 @@ class V33Driver:
         while q:
             guard += 1
             if guard > _PUMP_GUARD:
-                self.journal.append("alarm", {"alarm": "pump_runaway", "guard": guard}, self.clock())
+                self._driver_alarm("pump_runaway", {"guard": guard})
                 break
             ev = q.popleft()
             self.state, actions = decide_v33(self.params, self.state, ev)
@@ -525,7 +552,7 @@ class V33Driver:
         while q:
             guard += 1
             if guard > _PUMP_GUARD:
-                self.journal.append("alarm", {"alarm": "pump_runaway", "guard": guard}, self.clock())
+                self._driver_alarm("pump_runaway", {"guard": guard})
                 break
             ev = q.popleft()
             self.state, actions = decide_v33(self.params, self.state, ev)
@@ -539,8 +566,7 @@ class V33Driver:
                     self._journal_action(a, ts)
                 except Exception as e:  # noqa: BLE001
                     self._async_errors += 1
-                    self.journal.append("alarm", {"alarm": "journal_action_error", "kind": str(a.kind),
-                                                  "error": str(e)}, self.clock())
+                    self._driver_alarm("journal_action_error", {"kind": str(a.kind), "error": str(e)})
             self._apply_executor_standdown(ts)
             self._maybe_eval(getattr(ev, "server_ts", None))
             if order_actions:
@@ -566,8 +592,7 @@ class V33Driver:
                     result = await fut
                 except Exception as e:  # noqa: BLE001 — one action's failure must not wedge the loop
                     self._async_errors += 1
-                    self.journal.append("alarm", {"alarm": "async_dispatch_error", "error": str(e)},
-                                        self.clock())
+                    self._driver_alarm("async_dispatch_error", {"error": str(e)})
                     continue
                 self._apply_executor_standdown(ts)
                 if result:
@@ -577,12 +602,10 @@ class V33Driver:
                         self._ingest_async(result)
                     except Exception as e:  # noqa: BLE001
                         self._async_errors += 1
-                        self.journal.append("alarm", {"alarm": "async_ingest_error", "error": str(e)},
-                                            self.clock())
+                        self._driver_alarm("async_ingest_error", {"error": str(e)})
         except Exception as e:  # noqa: BLE001
             self._async_errors += 1
-            self.journal.append("alarm", {"alarm": "async_dispatch_fatal", "error": str(e)},
-                                self.clock())
+            self._driver_alarm("async_dispatch_fatal", {"error": str(e)})
 
     def _ingest_async(self, events: list[Any]) -> None:
         """Re-enter the async pump on the loop with the executor's result events. Synchronous (decide never
@@ -594,8 +617,7 @@ class V33Driver:
         if reason and not self.state.stood_down:
             self.state = replace(self.state, stood_down=True)
             self.counts["executor_standdown"] += 1
-            self.journal.append("alarm", {"alarm": "executor_standdown", "reason": reason},
-                                self.clock())
+            self._driver_alarm("executor_standdown", {"reason": reason})
         # GATE C(ii) (2026-10-03 02:00Z naked fill): an executor stand-down CANCELS every order the executor
         # owns (one-shot, off the loop); the sweep's OrderCancelled events re-enter decide so any racing fill
         # is booked and hedged (gate A). The pre-fix stand-down cancelled nothing it owned.
@@ -613,14 +635,14 @@ class V33Driver:
             events = await self.executor.standdown_sweep_async(server_ts)
         except Exception as e:  # noqa: BLE001 -- the sweep must never wedge the loop
             self._async_errors += 1
-            self.journal.append("alarm", {"alarm": "standdown_sweep_error", "error": str(e)}, self.clock())
+            self._driver_alarm("standdown_sweep_error", {"error": str(e)})
             return
         if events:
             try:
                 self._ingest_async(events)
             except Exception as e:  # noqa: BLE001
                 self._async_errors += 1
-                self.journal.append("alarm", {"alarm": "async_ingest_error", "error": str(e)}, self.clock())
+                self._driver_alarm("async_ingest_error", {"error": str(e)})
 
     # --- journaling ---
     def _journal_action(self, a, server_ts: float) -> None:
@@ -879,16 +901,66 @@ def _v33_writer_stats(driver: V33Driver) -> dict[str, Any]:
     return out
 
 
+def _fetch_venue_fills_v33(proxy: Any, close_iso: str, driver: V33Driver, journal: StreamJournal,
+                           clock: Callable[[], float]) -> list[dict[str, Any]] | None:
+    """GATE E (armed only, BEST-EFFORT): the venue's ``/portfolio/fills`` since the window start, FILTERED
+    to our bucket orders by ``order_id`` (the executor's RestBook / by-order-id map). It is a cross-check
+    on the ws/poll executor truth; a failed or unreadable GET is journaled ``venue_fills_unavailable`` and
+    the window still reconciles against the executor's own observed fills. NEVER called in dry / tests (the
+    reconcile ``venue_fills`` arg is injected or absent there — no network from an automated context)."""
+    try:
+        min_ts = int(close_epoch(close_iso)) - 1800   # the quote window opens well within 30 min of close
+        body = proxy.rest_get("/portfolio/fills", {"min_ts": min_ts})
+    except Exception as e:  # noqa: BLE001 — best-effort; the executor's own fills carry the reconciliation
+        journal.append("venue_fills_unavailable", {"error": str(e)}, clock())
+        return None
+    fills = (body or {}).get("fills") if isinstance(body, dict) else None
+    if not isinstance(fills, list):
+        journal.append("venue_fills_unavailable", {"reason": "no fills list in /portfolio/fills"}, clock())
+        return None
+    known_oids = set(getattr(driver.executor, "_by_order_id", {}) or {})
+    out: list[dict[str, Any]] = []
+    for f in fills:
+        if not isinstance(f, dict):
+            continue
+        oid = f.get("order_id")
+        # Only OUR bucket orders. The account is SHARED across pilots, so this filter FAILS CLOSED: an
+        # empty ``known_oids`` (we acked nothing this window) means we own nothing to reconcile, so NO venue
+        # fill is ours. The pre-fix ``known_oids and ...`` disabled the filter on an empty map and would
+        # have ingested another pilot's fills as ours (false unbooked / mismatch / one-legged -> false KILL).
+        if oid is None or oid not in known_oids:
+            continue
+        cnt = f.get("count_fp")
+        if cnt is None:
+            cnt = f.get("count")
+        out.append({"order_id": oid, "client_order_id": f.get("client_order_id"),
+                    "count": cnt if cnt is not None else 0, "price": f.get("price"),
+                    "ticker": f.get("ticker") or f.get("market_ticker")})
+    journal.append("venue_fills_fetched", {"min_ts": min_ts, "ours": len(out),
+                                           "total": len(fills)}, clock())
+    return out
+
+
 def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: str, resolved_mode: str,
               effective_mode: str, degrade: str | None, params: V33Params, strike_disc, bucket_map,
               journal_path: str, summary_path: str, ledger_path: str, strike_lag, bucket_lag,
               clock: Callable[[], float], m15_tickers=None, lag_stats=None, armed: bool = False,
-              degrade_reason: str | None = None) -> dict:
+              degrade_reason: str | None = None, recon=None, reconcile_alarms: int = 0) -> dict:
     journal.close()
     gz = R._gzip_journal(journal_path)
     final_path = os.path.abspath(gz.get("final_path") or journal_path)
     m = _compute_v33_money(driver)
     dry_sim = m.get("dry_sim", not armed)
+    # GATE E: the single ``alarms`` number is driver + core + executor + ws (+ this window's reconcile
+    # mismatch), with an auditable breakdown. ``ws_counts['alarm']`` alone (the pre-gate-E field) read 0 on
+    # 02:00Z while the executor had journaled nine invariant alarms and the driver one stand-down alarm.
+    alarms = alarm_breakdown(driver_counts=dict(driver.counts),
+                             executor_counts=dict(driver.executor.counts),
+                             ws_counts=dict(shared.counts), reconcile_alarms=reconcile_alarms)
+    # GATE E: the row's economic facts (lots_filled, one_legged) and the defence-in-depth receipts come
+    # from the RECONCILED set, never the core alone. In dry / no-fill windows the executor-truth set is
+    # empty, so the reconciled values equal the core's and the row is byte-identical to the pre-gate-E row.
+    recon_fields = recon.as_row_fields() if recon is not None else {}
     row = build_v33_ledger_row(
         close_time=close_iso, resolved_mode=resolved_mode, effective_mode=effective_mode,
         degrade=degrade, params=params, state=driver.state, driver_counts=dict(driver.counts),
@@ -902,12 +974,15 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         rung_fills=m.get("rung_fills"), wing_batch_sets=m.get("wing_batch_sets"),
         held_legs=m.get("held_legs"), floor_booked=m.get("floor_booked"),
         realized_delta=m.get("realized_delta"), realized_lock=m.get("realized_lock"),
-        one_legged=m.get("one_legged"), realized_unsettled=m.get("realized_unsettled", False),
-        lots_filled=m.get("lots_filled", 0), m15_tickers=list(m15_tickers or []),
+        one_legged=recon_fields.get("one_legged", m.get("one_legged")),
+        realized_unsettled=m.get("realized_unsettled", False),
+        lots_filled=recon_fields.get("lots_filled", m.get("lots_filled", 0)),
+        m15_tickers=list(m15_tickers or []),
         m15_frames=shared.m15_frames, deep_obs=driver.deep_obs.summary(),
         print_through=print_through_summary(driver.state),
         netted_sets=m.get("netted_sets"),   # D5: venue-netted wing pairs
         writer_stats=_v33_writer_stats(driver),
+        alarms_breakdown=alarms, reconcile=recon_fields,
     )
     append_v33_ledger_row(row, ledger_path)
     summary = {
@@ -1161,13 +1236,53 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             logger.warning("[V33] Ctrl+C — flushing streamed journal.")
         finally:
-            if armed and driver.state.one_legged:
+            # GATE E (2026-10-03 02:00Z): reconcile the window against EXECUTOR truth (the driver's observed
+            # fills + executor.fills + a best-effort venue /portfolio/fills), while the journal is still
+            # open so the defence-in-depth receipts (unbooked_fill, ledger_reconcile_mismatch) are recorded.
+            # Fail-safe: a reconciliation error must NEVER wedge the window close -> fall back to core truth.
+            recon = None
+            reconcile_alarms = 0
+            try:
+                venue_fills = (_fetch_venue_fills_v33(proxy, close_iso, driver, journal, clock)
+                               if armed else None)
+                recon = reconcile_live(driver, venue_fills)
+                for ub in recon.unbooked_fills:
+                    journal.append("unbooked_fill", ub, clock())
+                if recon.reconcile_mismatch:
+                    reconcile_alarms = 1
+                    journal.append("alarm", {"alarm": "ledger_reconcile_mismatch",
+                                             **(recon.mismatch_detail or {})}, clock())
+            except Exception as e:  # noqa: BLE001 -- gate E accounting never blocks the close/row write
+                # The reconcile_failed alarm IS a kind-``alarm`` journal record, so it must be COUNTED or
+                # the live alarms_breakdown.total would under-count it vs the journal / a rebuild.
+                reconcile_alarms = 1
+                journal.append("alarm", {"alarm": "reconcile_failed", "error": str(e)}, clock())
+                # STRICTER-OF-THE-TWO fallback: a mid-reconcile error must NOT drop the window back to the
+                # blind core (the 02:00Z failure mode read core one_legged False with two lots naked).
+                # Reconcile executor truth against the completed-hedge coverage ALONE (no core, no venue) so
+                # a naked fill is still surfaced on the row and counted one-legged; if even that raises,
+                # recon stays None and the S1 belt below uses the raw executor-truth evidence.
+                try:
+                    recon = reconcile_exec_truth_only(driver)
+                except Exception:  # noqa: BLE001
+                    recon = None
+            # S1_LEGGED comes from the RECONCILED one-legged (executor truth), never the core alone: the
+            # 02:00Z core read one_legged False while the executor held two naked lots. If reconciliation
+            # failed OUTRIGHT (recon None), the fallback is the STRICTER of the two -- the core mirror OR any
+            # executor-truth rest fill observed this window (never the blind core alone), so a naked lot
+            # still latches S1 even when every reconcile path raised.
+            s1_one_legged = (recon.one_legged if recon is not None
+                             else (bool(driver.state.one_legged) or bool(driver._exec_truth_fills)))
+            if armed and s1_one_legged:
                 try:
                     utc_day = close_iso[:10]
                     n = record_legged_occurrence(_resolve_v33_guard_path(utc_day), utc_day, close_iso,
-                                                 "ladder set left one-legged below lock floor", clock())
+                                                 "ladder set left one-legged below lock floor (reconciled "
+                                                 "against executor truth)", clock())
+                    olc = str(recon.one_legged_contracts) if recon is not None else None
                     journal.append("s1_legged_occurrence",
-                                   {"count": n, "latch_threshold": V33_S1_LEGGED_LATCH_THRESHOLD}, clock())
+                                   {"count": n, "latch_threshold": V33_S1_LEGGED_LATCH_THRESHOLD,
+                                    "one_legged_contracts": olc}, clock())
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[V33] S1_LEGGED record failed: %s", e)
             summary = _finalize(journal=journal, shared=shared, driver=driver, close_iso=close_iso,
@@ -1176,7 +1291,8 @@ def main(argv: list[str] | None = None) -> int:
                                 journal_path=journal_path, summary_path=summary_path, ledger_path=args.ledger,
                                 strike_lag=lag_sampler.mean("strikes"), bucket_lag=lag_sampler.mean("buckets"),
                                 lag_stats=lag_sampler.summaries(), clock=clock,
-                                m15_tickers=list(m15_disc.tickers), armed=armed, degrade_reason=degrade_reason)
+                                m15_tickers=list(m15_disc.tickers), armed=armed, degrade_reason=degrade_reason,
+                                recon=recon, reconcile_alarms=reconcile_alarms)
             logger.info("[V33] window done: %s", summary)
     finally:
         hard_stop.cancel()  # normal exit / _finalize error: disarm the belt-and-braces hard stop
