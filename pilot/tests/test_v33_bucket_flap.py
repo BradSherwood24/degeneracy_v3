@@ -66,7 +66,8 @@ def _flap_params(**over):
     # relax freshness so a multi-second flap replay does not trip the stale-wing hold; keep the DEFAULT
     # bucket_switch_deb_ms (3000) / hysteresis (15) unless overridden.
     return _params(tol=Decimal("0.01"), deb_ms=0,
-                   freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0, **over)
+                   freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0, **over)
 
 
 def _ack_all(params, st, t):
@@ -190,7 +191,8 @@ def test_strand_flip_back_before_max_pending_resets():
 # ===========================================================================
 def test_hold_stale_wing_800ms_then_fresh_resumes():
     # (d) a stale wing for 800 ms then fresh -> no cancel; hold then resume, ladder intact.
-    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=1500)
+    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=1500,
+                strike_feed_dead_s=1.0)   # gate D: the 2 s silence below is a DEAD strike feed (> 1.0 s)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
@@ -208,7 +210,8 @@ def test_hold_stale_wing_800ms_then_fresh_resumes():
 
 def test_hold_stale_wing_1600ms_cancels_once():
     # (e) a stale wing past the hold (1600 ms > 1500) -> cancel-all ONCE.
-    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=1500)
+    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=1500,
+                strike_feed_dead_s=1.0)   # gate D: the 2 s silence below is a DEAD strike feed (> 1.0 s)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
@@ -224,7 +227,8 @@ def test_hold_stale_wing_1600ms_cancels_once():
 def test_hold_rung_fill_during_hold_emits_wing_batch():
     # (f) a rung fill DURING a hold still books + spawns its wing batch (the hold is for the RESTS only);
     # the wings take once the strike book is fresh again.
-    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=1500)
+    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=1500,
+                strike_feed_dead_s=1.0)   # gate D: the 2 s silence below is a DEAD strike feed (> 1.0 s)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)
@@ -280,9 +284,11 @@ def test_fixture_flap_debounced_zero_cancel_all_vs_old_many():
     # the debounced core produces ZERO bucket-change cancel-alls on the real flap; the old (no debounce,
     # no hysteresis) core produces >= 6 (the finding recorded 11 flips -> would_cancel bursts).
     new = _params(tol=Decimal("0.01"), deb_ms=0,
-                  freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)   # deb 3000, hyst 15
+                  freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)   # deb 3000, hyst 15
     old = _params(tol=Decimal("0.01"), deb_ms=0, bucket_switch_deb_ms=0, bucket_switch_hysteresis_usd=0,
-                  freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)   # pre-fix behaviour
+                  freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)   # pre-fix behaviour
     fix, new_cancels = _replay_flap_fixture(new)
     _fix2, old_cancels = _replay_flap_fixture(old)
     assert fix["flips"] >= 6

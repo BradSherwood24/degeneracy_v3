@@ -72,7 +72,8 @@ def _params(weights=WEIGHTS, **over) -> V33Params:
     # mechanism/parity helpers use (test_v33_core._params, test_v33_golden._sweep_params). The weighting
     # mechanism is E_min-invariant; the SHIPPED 8..18c ladder is asserted end-to-end in test_v33_core.
     base = dict(E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
-                freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)
+                freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)
     base.update(over)
     p = replace(load_v33_params(), **base)
     if weights is not None:

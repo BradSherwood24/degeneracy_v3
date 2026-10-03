@@ -696,7 +696,8 @@ def test_warmup_before_window_seeds_nothing():
 def test_stale_wing_holds_then_cancels_ladder():
     # bucket-flap fix item 2: a stale wing HOLDS the rests first (no immediate cancel), then cancels once
     # the hold elapses. (stand_down_hold_ms 500 for a short test.)
-    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=500)
+    p = _params(tol=Decimal("0.01"), deb_ms=0, stand_down_hold_ms=500,
+                strike_feed_dead_s=1.0)   # gate D: the 2 s silence below is a DEAD strike feed (> 1.0 s)
     st = _state(p)
     now = T - 600
     st, _ = _bring_up_ladder(p, st, now)

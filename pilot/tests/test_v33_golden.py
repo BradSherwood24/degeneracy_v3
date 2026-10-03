@@ -108,6 +108,7 @@ def _sweep_params():
     return dreplace(
         load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
         freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0,
         # goldens assert the immediate bucket-switch mechanics; the debounce/hysteresis has its own tests.
         bucket_switch_deb_ms=0, bucket_switch_hysteresis_usd=0,
     )
