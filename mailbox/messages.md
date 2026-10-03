@@ -1434,3 +1434,47 @@ measured tonight and parked: Brad's $3-payout dual-bucket idea -- no simultaneou
 windows, the sequential ones are the spot move not a dislocation, two adjacent singles already net into it.
 
 -- Claude
+
+## 2026-10-03 ~04:55Z -- Claude -> house: Test Fire #2 -- the rocket ran, and two contracts stood naked (pre-compact)
+
+The day in one line: the morning's arithmetic said +40% on the capital that had to be there in 17 days with
+the lucky night removed; the evening put Test Fire #2 on the stand under L7 (verdict n 45), it ran 12 armed
+windows, hedged four contracts cleanly (mean lock 8.7c, all positive, +$0.405), and left two naked on the
+02:00Z bucket for -$0.40. Brad stood it down at 03:30Z: "Looks like we got a problem. Lets stand down." Net
+for the fire +$0.005; one-legged 2, exactly the pin. Paused, not killed.
+
+What was built today: L7 (PR #113, n 15 -> 45, early kill stays 15); the proxy budget 30000 (Brad's env,
+restart 13:15Z, pid 22952); the false S1 occurrence removed and the arm at 13:54Z on Brad's "Good to go on
+both. Lets run it!" (PR #114); the cancel-before-ack fix after the 15:00Z orphan-rest incident (PR #115,
+merged 16:03Z, first fixed window 17:00Z); Registration entries #116 and #117.
+
+What went wrong, exactly (full brief: pilot/build/v33_naked_fill_2026_10_03.md): a stale-wing hold flapped
+five times and expired into a cancel-all; the core re-placed 230 ms later, before the deletes confirmed; the
+venue pre-flight saw the old orders and stood the executor down; two of the new creates had already passed
+the check and rested at the venue. Three defects then stacked. (1) A cancel event with no order id is matched
+to the first pending order by None == None, so nine pre-flight rejections evicted nine innocent pending
+orders from the core's ladder. (2) The in-flight guard from #115 starts after the pre-flight GET, so the
+cancel for one of the survivors was a no-op; and a stood-down executor cancels nothing it owns. (3) The core's
+fill handler returns silently on a fill whose order it no longer has. The venue filled the two survivors at
+01:50Z, the executor journaled all three fills, the core discarded them, no wing was ever sent. The ledger row
+reports 0 lots, 0 alarms. The venue invariant and the fill handler both worked; the one-legged pin is doing its
+job.
+
+Builds before any re-arm, in order (A-D gate; E-H same series): A hedge every executor-owned fill even when
+stood down; B cancel identity by client_order_id, never None == None; C in-flight guard from the top of the
+place call + stand-down cancels every owned rest + stood-down executor still takes wings; D no re-place inside
+the cancel-confirm window after a stale-wing cancel; E accounting from executor truth; F hold sensitivity
+measured, not felt; G #115 residuals; H supervisor dedupe (21:00Z skipped on a stale row).
+
+Scoreboard since the 09-15 re-arm: balance $52.00 -> $66.15; settled return on deployed cost 10.5%; peak
+capital tied in one hour $20.39; designed (lock-only) gain +$8.53 = 41% on that peak. Brad: "we do need to
+migrate to render soon." Both rosters dry. Live tree 3fab469 + this PR.
+
+Lessons the house keeps: (1) a "residual" that drops a fill is not a residual -- a dropped fill is this
+strategy's only failure mode; (2) a cancel for an order that has no venue id yet needs identity, deferral and
+an owner, all three; (3) a stand-down must leave nothing resting; (4) the ledger must be built from what the
+executor and the venue saw, never from what the core remembers; (5) the belts held twice -- 17 orphans at
+15:00Z expired unfilled, 2 at 02:00Z filled -- and the frozen pin now stands at its limit.
+
+-- Claude
+
