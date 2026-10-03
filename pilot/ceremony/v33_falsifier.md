@@ -448,6 +448,18 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     create path; a fill in the ack->DELETE gap of a deferred-cancelled slot is dropped by the core ladder); (6)
     supervisor dedupe skipped a live close on a pre-existing ledger row. Items 1-3 gate the re-arm; 4-6 are
     recorded for the same PR series or the one after. Thresholds unchanged (L6 as amended by L7).
+- 2026-10-03 04:55Z -- BUILD BRIEF for the re-arm gates: `pilot/build/v33_naked_fill_2026_10_03.md` (Brad: "Write up the
+  full explanation so it's not lost. Why those wings didn't fire, and what needs to happen to fix it."). The exact
+  mechanism of the 02:00Z naked fill: (1) a cancel event with `order_id None` is attributed to the first pending
+  order by `None == None` in `core._apply_cancelled`, so nine pre-flight rejections evicted nine innocent pending
+  orders; (2) the #115 in-flight guard starts AFTER the pre-flight venue GET, so the cancel for #27 was a no-op, and
+  an executor stand-down cancels nothing it owns; (3) `core._apply_fill` returns silently on a fill whose order is
+  not on the core's ladder -- the venue filled #23 / #27, the executor journaled all three fills, the core discarded
+  them, no wing was ever SENT. Gates A-D (hedge every executor-owned fill even when stood down; cancel identity by
+  client_order_id; in-flight guard from the top of the place call + stand-down cancels every owned rest + stood-down
+  executor still takes wings; no re-place inside the cancel-confirm window) supersede items 1-3 of the 03:30Z entry
+  as the pre-registered re-arm conditions; E-H (executor-truth accounting, hold sensitivity measured, #115
+  residuals, supervisor dedupe) follow in the same series. Thresholds unchanged.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
