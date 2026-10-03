@@ -70,13 +70,17 @@ def _sd_cancels(acts):
 # ===========================================================================
 # shipped defaults (measured) and the loader
 # ===========================================================================
-def test_shipped_defaults_are_the_measured_values_and_sha_unchanged():
+def test_shipped_values_are_the_measured_defaults_and_pinned():
+    from service.v33.params import FROZEN_V33_PARAMS_SHA256, PREVIOUS_V33_PARAMS_SHA256_L4
     p = load_v33_params()
-    assert p.strike_feed_dead_s == V33_STRIKE_FEED_DEAD_S_DEFAULT
-    assert p.wing_book_max_age_s == V33_WING_BOOK_MAX_AGE_S_DEFAULT
-    # optional keys: absent from the shipped JSON -> the frozen sha is the L4 one, untouched.
-    assert "strike_feed_dead_s" not in p.raw and "wing_book_max_age_s" not in p.raw
-    assert p.sha256 == "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
+    assert p.strike_feed_dead_s == V33_STRIKE_FEED_DEAD_S_DEFAULT == 4.0
+    assert p.wing_book_max_age_s == V33_WING_BOOK_MAX_AGE_S_DEFAULT == 30.0
+    # 2026-10-03 RE-PIN: both keys are written EXPLICITLY in the shipped JSON (registered-specs rule), so
+    # the frozen sha enforces them; the L4 sha (keys absent) is kept as history.
+    assert p.raw["strike_feed_dead_s"] == 4.0 and p.raw["wing_book_max_age_s"] == 30.0
+    assert p.sha256 == FROZEN_V33_PARAMS_SHA256
+    assert PREVIOUS_V33_PARAMS_SHA256_L4 == "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
+    assert p.sha256 != PREVIOUS_V33_PARAMS_SHA256_L4
     assert p.wing_book_max_age_s >= p.freshness_max_age_s
 
 

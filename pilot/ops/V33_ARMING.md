@@ -12,7 +12,7 @@ The S5 gate (`service.v33.stops.v33_arming_check` + `decide_v33_arming`, wired i
 what actually enforces arming. For V3.3 it checks, in one place: the falsifier
 (`ceremony/v33_falsifier.md`) carries a line exactly `STATUS: FROZEN`; the params sha is verified
 (`load_v33_params` self-checks `FROZEN_V33_PARAMS_SHA256` =
-`295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def`); proxy `/health` shows
+`f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1`); proxy `/health` shows
 `orders_enabled: true` with caps that allow `max_contracts_per_order` in `[lots_per_rung, K*lots_per_rung]`
 = `[1, 11]` (so a proxy cap of **2** OR **11** both arm -- the wings chunk to <= cap), cover BOTH `KXBTC-`
 and `KXBTCD-`, and leave >= 500 creates in today's budget; reconcile-first sees no inherited un-settled
@@ -64,7 +64,7 @@ dry rather than sizing wings against a guess. Any miss => the window runs DRY an
    ```
    python -c "import json,hashlib; o=json.load(open('policy/v33_params.json')); print(hashlib.sha256(json.dumps(o,sort_keys=True,separators=(',',':')).encode()).hexdigest())"
    ```
-   must print `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def` and equal
+   must print `f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1` and equal
    `service.v33.params.FROZEN_V33_PARAMS_SHA256`.
 
 An OPTIONAL smaller first armed step is `rungs` 3 (~$6 in flight) -- a params amendment (its own dated

@@ -79,7 +79,11 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # lowest-edge rungs and keeps the depth. shadow_Es (0.08/0.10/0.12) stay inside the new margin range
 # [0.08, 0.18]; deep_obs_rungs 10 now observes margins 19..28c (was 16..25c; observation only). V3.3
 # STAYS DRY -- this is a params-only re-pin, not a mode flip. -> re-pinned.
-FROZEN_V33_PARAMS_SHA256 = "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
+# RE-PIN (2026-10-03, after gate D / PR #120): the two stale-wing liveness bounds are now written EXPLICITLY
+# in policy/v33_params.json (strike_feed_dead_s 4.0, wing_book_max_age_s 30.0 -- the measured defaults below,
+# unchanged in value) so the loader ENFORCES them (registered-specs rule) instead of trusting an absent key.
+# Everything else byte-identical. V3.3 STAYS DRY -- params-only re-pin, not a mode flip. -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1"
 # History (add-only law). Kept DEFINED so prior-regime ledger rows stay identifiable.
 PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
 PREVIOUS_V33_PARAMS_SHA256_L1_R2 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
@@ -88,13 +92,14 @@ PREVIOUS_V33_PARAMS_SHA256_L2_R2 = "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334
 PREVIOUS_V33_PARAMS_SHA256_L3 = "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
 PREVIOUS_V33_PARAMS_SHA256_FLAP_R1 = "3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac"
 PREVIOUS_V33_PARAMS_SHA256_FLAP_R2 = "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78"
+# The sha the L4 ladder shift (2026-09-29) froze; superseded by the 2026-10-03 liveness-bounds re-pin.
+PREVIOUS_V33_PARAMS_SHA256_L4 = "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
 # The sha the print-through re-pin (2026-09-26) froze; superseded by the L4 ladder shift (2026-09-29).
 PREVIOUS_V33_PARAMS_SHA256_PRINT_THROUGH = "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
 
 # STALE-WING LIVENESS (2026-10-03, gate D rewrite): the two NEW wing-gate bounds are OPTIONAL policy keys
-# (like ``rung_lots``): absent in the shipped JSON -> these MEASURED code defaults, so the shipped policy
-# file and its FROZEN sha (pinned in the frozen falsifier's Registration) are UNCHANGED. A future policy
-# may set either key explicitly (that would be a deliberate re-pin + Registration line). Measurement:
+# (like ``rung_lots``): absent -> these MEASURED code defaults. Since the 2026-10-03 re-pin the shipped
+# JSON sets BOTH explicitly to these same values, so the pinned sha enforces them. Measurement:
 # pilot/build/v33_stale_wing_measurement_2026_10_03.md (journals 2026-09-30..2026-10-03).
 V33_STRIKE_FEED_DEAD_S_DEFAULT = 4.0
 V33_WING_BOOK_MAX_AGE_S_DEFAULT = 30.0
