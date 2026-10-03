@@ -152,6 +152,10 @@ _ORDER_ACTION_KINDS = frozenset({
 })
 
 
+# Informational core actions: journaled, NEVER routed to an executor (D5 netting record; gates A/B alarm).
+_INFO_ACTION_KINDS = frozenset({V33ActionKind.WING_NETTED, V33ActionKind.ALARM})
+
+
 def async_writer_enabled(cli_flag: bool) -> bool:
     """Whether the OFF-LOOP async order writer is selected. CLI --async-writer wins; else the
     DV3_V33_ASYNC_WRITER env var (1/true/yes/on). DEFAULT OFF — the synchronous V33LiveExecutor stays the
@@ -393,7 +397,7 @@ class V33Driver:
         # D1: V33Fill carries the fill's OWN market ticker as the last-resort bucket attribution channel.
         self._pump([V33Fill(order_id=rec.order_id, client_order_id=rec.client_order_id,
                             count=count, price=rec.price, side="no", server_ts=server_ts,
-                            market_ticker=market)])
+                            market_ticker=market, source="ws")])
 
     def on_poll_fill(self, order_id: str, filled_count: Any, server_ts: float) -> None:
         """Book a rung fill discovered by the order-status poll (ARMED belt-and-braces). Feeds the DELTA
@@ -418,7 +422,7 @@ class V33Driver:
         # D1: the poll knows the order's market via the retained RestRecord (``rec.ticker``).
         self._pump([V33Fill(order_id=order_id, client_order_id=rec.client_order_id,
                             count=delta, price=rec.price, side="no", server_ts=server_ts,
-                            market_ticker=rec.ticker)])
+                            market_ticker=rec.ticker, source="poll")])
 
     # --- DRY ladder-fill simulation (the ideal rule; never in armed) ---
     def _simulate_ladder_fills(self, market: str, trade: Trade, now: float) -> None:
@@ -497,12 +501,12 @@ class V33Driver:
                 q.extend(self.executor.place_batch(places, ts))
                 for a in others:
                     self._journal_action(a, ts)
-                    if a.kind != V33ActionKind.WING_NETTED:   # D5: informational, no venue order
+                    if a.kind not in _INFO_ACTION_KINDS:   # D5 / gate A: informational, no venue order
                         q.extend(self.executor.on_action(a, self.state, ts))
             else:
                 for a in actions:
                     self._journal_action(a, ts)
-                    if a.kind != V33ActionKind.WING_NETTED:   # D5: informational, no venue order
+                    if a.kind not in _INFO_ACTION_KINDS:   # D5 / gate A: informational, no venue order
                         q.extend(self.executor.on_action(a, self.state, ts))
             self._apply_executor_standdown(ts)
             self._maybe_eval(getattr(ev, "server_ts", None))
@@ -661,6 +665,13 @@ class V33Driver:
             legs = [{"ticker": lg.ticker, "side": lg.side, "count": _count_out(lg.count),
                      "fill_price": lg.limit} for lg in a.legs]
             payload = {"legs": legs, "count": _count_out(a.count), "realised": a.lock}
+        elif k == V33ActionKind.ALARM:
+            # GATES A/B (2026-10-03): a named alarm raised by the pure core (orphan_rung_fill_hedged,
+            # cancel_unattributed, orphan_fill_not_bucket, orphan_rung_fill_unpriced). Journaled as ``alarm``.
+            rk = "alarm"
+            payload = {"alarm": a.reason, "client_order_id": a.client_order_id, "order_id": a.order_id,
+                       "ticker": a.ticker, "count": _count_out(a.count), "price": a.price,
+                       "stood_down": self.state.stood_down}
         elif k == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW:
             rk = "shadow_fill_outside_window"
             payload = {"E": a.shadow_E, "offer": a.offer, "print": a.print_price, "count": a.count,

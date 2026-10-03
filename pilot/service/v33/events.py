@@ -34,6 +34,11 @@ class V33Fill(Fill):
     record names the bucket. A plain V3.2 ``Fill`` (no ticker) simply yields None there."""
 
     market_ticker: str | None = None
+    # GATE A (2026-10-03): which channel reported the fill. ``"poll"`` marks a DELTA the driver derived from
+    # the venue's CUMULATIVE count over what the core had booked (``on_poll_fill``); every other source
+    # (``"ws"``, the dry sim, None) is a per-trade INCREMENT. The core's off-ladder (orphan) dedupe sums only
+    # increments, so a poll catch-up and a late ws echo of the same lots are never hedged twice.
+    source: str | None = None
 
 
 __all__ = [

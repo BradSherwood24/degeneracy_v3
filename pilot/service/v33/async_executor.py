@@ -421,7 +421,10 @@ class V33AsyncExecutor(V33LiveExecutor):
         self._record_alarm("rest_invariant_violation", detail)
         if self.stand_down_reason is None:
             self.stand_down_reason = "rest_invariant_violation"
-        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+        # GATE B (2026-10-03 02:00Z): carry the coid. The pre-fix id-less event was attributed by the core
+        # to the FIRST pending order (None == None): nine of these evicted nine innocent pending rungs.
+        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                               client_order_id=coid)]
 
     async def _cancel_stray_async(self, r: dict[str, Any], now: float) -> None:
         """Async twin of V33LiveExecutor._cancel_stray (priority-paced DELETE; fail-closed)."""
@@ -459,7 +462,8 @@ class V33AsyncExecutor(V33LiveExecutor):
             return []
         if oid is None:
             self._bump("cancel_noop")
-            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                                   client_order_id=coid)]
         if rec is None:
             rec = self.attribute(coid=coid, order_id=oid)
         exch = rec.exchange_index if rec is not None else None
@@ -533,7 +537,10 @@ class V33AsyncExecutor(V33LiveExecutor):
                              "delete_status": last_status, "last_status": st.status}, self.clock())
         self._record_alarm("cancel_failed", {"order_id": oid, "exchange_index": exch,
                                              "delete_status": last_status})
-        return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0))]
+        return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0),
+                               client_order_id=(rec.client_order_id if rec is not None else coid),
+                               price=(rec.price if rec is not None else None),
+                               market_ticker=(rec.ticker if rec is not None else None))]
 
     async def _confirm_cancel_filled_async(self, order_id: str, now: float) -> tuple[int, Decimal]:
         """Async twin of LiveExecutor._confirm_cancel_filled (the confirm polls run OFF the loop).
@@ -678,7 +685,8 @@ class V33AsyncExecutor(V33LiveExecutor):
         self.amend_fallbacks += 1
         if oid is None:
             self._bump("amend_fallback_noop")
-            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                                   client_order_id=coid_old)]
         self.cancels_attempted += 1
         self.journal.append("cancel_rest",
                             {"order_id": oid, "client_order_id": coid_old, "exchange_index": exch,

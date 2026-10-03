@@ -1,0 +1,182 @@
+{
+ "provenance": "Extracted read-only from pilot/journals_v33/20261003T020000Z.jsonl.gz (the 2026-10-03 02:00Z Test Fire #2 naked-fill window; post-seal, not holdout). Kinds: the core place_rest intents after the stand_down_cancel/resume, the executor place_rest sends, rest_invariant_violation (coid_attempted), the executor_standdown alarm, the stood-down core's cancel_rest burst (order_id null), and the three ws rest_fill records. dt = journal local_ts - 1790992200 (01:50:00Z). No books are carried: the test supplies synthetic whole-cent books that solve n_top = 0.22 (the observed ladder top).",
+ "close_time": "2026-10-03T02:00:00Z",
+ "close_epoch": 1790992800,
+ "t0_epoch": 1790992200.0,
+ "bucket_ticker": "KXBTC-26OCT0222-B84650",
+ "bucket_floor_cap": [
+  84600.0,
+  84699.99
+ ],
+ "strike_sd": "KXBTCD-26OCT0222-T84599.99",
+ "strike_su": "KXBTCD-26OCT0222-T84699.99",
+ "places": [
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-23",
+   "price": "0.22",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-24",
+   "price": "0.21",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-25",
+   "price": "0.20",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-26",
+   "price": "0.19",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-27",
+   "price": "0.18",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-28",
+   "price": "0.17",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-29",
+   "price": "0.16",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-30",
+   "price": "0.15",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-31",
+   "price": "0.14",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-32",
+   "price": "0.13",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-33",
+   "price": "0.12",
+   "count": 1,
+   "ticker": "KXBTC-26OCT0222-B84650",
+   "dt": -235.669
+  }
+ ],
+ "executor_posts": [
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-27",
+   "dt": -235.05
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-23",
+   "dt": -235.008
+  }
+ ],
+ "rejections": [
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-31",
+   "dt": -235.053
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-25",
+   "dt": -235.039
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-33",
+   "dt": -235.033
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-24",
+   "dt": -235.027
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-28",
+   "dt": -235.008
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-30",
+   "dt": -234.96
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-29",
+   "dt": -234.836
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-26",
+   "dt": -234.764
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-32",
+   "dt": -234.686
+  }
+ ],
+ "executor_standdown_dt": -235.053,
+ "precfix_core_cancel_list": [
+  "v33-2026-10-03T02:00:00Z-24",
+  "v33-2026-10-03T02:00:00Z-25",
+  "v33-2026-10-03T02:00:00Z-26",
+  "v33-2026-10-03T02:00:00Z-27",
+  "v33-2026-10-03T02:00:00Z-28",
+  "v33-2026-10-03T02:00:00Z-29",
+  "v33-2026-10-03T02:00:00Z-30",
+  "v33-2026-10-03T02:00:00Z-31",
+  "v33-2026-10-03T02:00:00Z-32",
+  "v33-2026-10-03T02:00:00Z-33"
+ ],
+ "fills": [
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-23",
+   "order_id": "01a0ff70-9760-789b-827d-26ad2ddb5006",
+   "count": "0.40",
+   "price": "0.22",
+   "market": "KXBTC-26OCT0222-B84650",
+   "path": "ws",
+   "dt": 21.468
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-23",
+   "order_id": "01a0ff70-9760-789b-827d-26ad2ddb5006",
+   "count": "0.60",
+   "price": "0.22",
+   "market": "KXBTC-26OCT0222-B84650",
+   "path": "ws",
+   "dt": 23.675
+  },
+  {
+   "coid": "v33-2026-10-03T02:00:00Z-27",
+   "order_id": "01a0ff70-9760-7a84-a75d-a99eb4bce248",
+   "count": "1",
+   "price": "0.18",
+   "market": "KXBTC-26OCT0222-B84650",
+   "path": "ws",
+   "dt": 58.363
+  }
+ ]
+}

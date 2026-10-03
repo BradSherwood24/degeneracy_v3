@@ -206,6 +206,11 @@ class RungFill:
     # the ledger/report allocation table. ``count`` is the lots filled in THIS event (may be < weight on a
     # partial); ``weight`` is the rung's full configured size. None when the fill's margin is out of range.
     weight: int | None = None
+    # GATE A (2026-10-03 02:00Z naked fill): a fill on an EXECUTOR-OWNED order the core no longer had on its
+    # ladder (evicted, cancelled, or never known), booked from the fill event itself and HEDGED. True only
+    # when the price is not a legitimate rung of the current ladder geometry (the margin array is then left
+    # untouched); a legitimate-rung orphan is booked as an ordinary rung fill with ``orphan`` False.
+    orphan: bool = False
 
 
 @dataclass(frozen=True)
@@ -425,7 +430,13 @@ class V33State:
     # D1: the hour is stood down fail-closed when a fill cannot be attributed to a named bucket.
     bucket_unknown: bool = False
     amend_cross_pending: Mapping[str, int] = field(default_factory=dict)
-    rest_allotment_done: bool = False                    # every rung filled (or max_sets) -> stop quoting
+    # GATE A: the sum of per-trade INCREMENT fills (ws / dry-sim / executor POST response; NOT the poll's
+    # cumulative-derived delta) reported per rung coid, whether or not the order was on the ladder. An
+    # off-ladder (orphan) increment books only ``seen - booked`` (clipped to the event's own count), so a
+    # late ws echo of lots a cancel-confirm or poll already booked is never hedged twice, while a fill the
+    # cancel-confirm MISSED (unreadable status -> 0) is still hedged.
+    fill_seen_by_coid: Mapping[str, Decimal] = field(default_factory=dict)
+    rest_allotment_done: bool = False                   # every rung filled (or max_sets) -> stop quoting
 
     coalesce_open: CoalesceGroup | None = None
     wing_batches: tuple[WingBatch, ...] = ()
@@ -957,9 +968,23 @@ def _apply_cancelled(
     """An OrderCancelled. Three cases: (1) the executor's amend->cancel->create FALLBACK for the rolling
     order -> drop it and PLACE a fresh rung at the roll's target; (2) a bucket-change / stand-down /
     quote-end cancel -> decrement the outstanding count; (3) any of the above with a partial fill before
-    the cancel -> book the delta via the still-live order or ``cancel_ctx`` (cumulative -> delta)."""
+    the cancel -> book the delta via the still-live order or ``cancel_ctx`` (cumulative -> delta).
+
+    GATE B (2026-10-03 02:00Z naked fill) -- IDENTITY. The event is attributed by ``order_id`` when it has
+    one, else by ``client_order_id``, and NEVER by ``None == None``: the pre-fix lookup matched a venue-id-less
+    rejection to the FIRST pending order, so nine pre-flight rejections evicted nine innocent pending rungs
+    (two of which then rested live, owned by nobody, and filled naked). An event that names no order at all
+    matches nothing and raises ``cancel_unattributed`` instead of touching the ladder. The bucket-change
+    ``outstanding_cancels`` count (which counts only orders that HAD a venue id) is decremented only by an
+    event that carries a venue id.
+
+    GATE A -- a cancel-confirm that surfaces a fill on an order the core has neither on its ladder nor in
+    ``cancel_ctx`` (an executor-owned order the core lost) is still BOOKED and HEDGED from the event's own
+    coid / price / market ticker (``orphan_rung_fill_hedged``)."""
     actions: list[V33Action] = []
     filled = _q_count(event.filled_count_before_cancel)
+    ev_oid = event.order_id
+    ev_coid = getattr(event, "client_order_id", None)
 
     # book a partial fill first (attribute by live order, else cancel_ctx), before we drop slots.
     coid: str | None = None
@@ -967,18 +992,28 @@ def _apply_cancelled(
     rung: int | None = None
     E_rung: Decimal | None = None
     retained_Sd: int | None = None
-    live_order = next((o for o in st.ladder if o.order_id == event.order_id), None)
+    if ev_oid is not None:
+        live_order = next((o for o in st.ladder if o.order_id == ev_oid), None)
+    elif ev_coid is not None:
+        live_order = next((o for o in st.ladder if o.client_order_id == ev_coid), None)
+    else:
+        live_order = None   # GATE B: no identity -> matches NOTHING (never the first pending order)
     if live_order is not None:
         coid, price, rung, E_rung, retained_Sd = (
             live_order.client_order_id, live_order.price, live_order.rung, live_order.E_rung,
             live_order.bucket_Sd,
         )
     else:
-        ctx = st.cancel_ctx.get(event.order_id)
+        ctx = st.cancel_ctx.get(ev_oid) if ev_oid is not None else None
+        if ctx is None and ev_coid is not None:
+            ctx = next((c for c in st.cancel_ctx.values() if c[0] == ev_coid), None)
         if ctx is not None:
             # D1: the 5th element is the retained bucket_Sd (the rung's OWN bucket) — this is the incident
             # path (fill surfaced by the cancel confirm after the ladder was torn down on a bucket change).
             coid, price, rung, E_rung, retained_Sd = ctx
+    if ev_oid is None and ev_coid is None:
+        actions.append(V33Action(kind=V33ActionKind.ALARM, reason="cancel_unattributed",
+                                 count=filled))
     if filled > 0 and coid is not None and price is not None:
         already = _q_count(st.rest_booked_by_coid.get(coid, _ZERO))
         delta = filled - already
@@ -987,9 +1022,27 @@ def _apply_cancelled(
                                      E_rung if E_rung is not None else params.E_min, now,
                                      retained_Sd=retained_Sd)
             actions += wa
+    elif filled > 0 and coid is None:
+        # GATE A: a fill surfaced by the cancel-confirm on an order the core does not know. Book + hedge it
+        # from the event itself (the executor's RestRecord supplies its coid / price / market ticker).
+        o_coid = ev_coid if ev_coid is not None else (f"orphan-oid-{ev_oid}" if ev_oid else None)
+        o_price = getattr(event, "price", None)
+        if o_coid is not None and o_price is not None:
+            already = _q_count(st.rest_booked_by_coid.get(o_coid, _ZERO))
+            delta = filled - already
+            if delta > 0:
+                st, oa = _book_orphan_fill(params, st, o_coid, ev_oid, Decimal(o_price), delta,
+                                           getattr(event, "market_ticker", None), now)
+                actions += oa
+        else:
+            actions.append(V33Action(kind=V33ActionKind.ALARM, reason="orphan_rung_fill_unpriced",
+                                     order_id=ev_oid, client_order_id=ev_coid, count=filled))
 
-    rp = next((r for r in st.rolls_in_flight
-               if event.order_id is not None and r.order_id == event.order_id), None)
+    rp = None
+    if ev_oid is not None:
+        rp = next((r for r in st.rolls_in_flight if r.order_id == ev_oid), None)
+    elif ev_coid is not None:
+        rp = next((r for r in st.rolls_in_flight if r.old_coid == ev_coid), None)
     if rp is not None:
         # FALLBACK: the amend failed and the executor cancelled -> drop the old order and place a fresh
         # one at the roll's target (same end state as a successful amend, fresh queue). L5: re-place the
@@ -1006,7 +1059,10 @@ def _apply_cancelled(
         target = rp.target_price
         if st.cap is not None and target > st.cap:
             target = st.cap
-        if (not st.rest_allotment_done and still_resting and _in_window(params, st, now)
+        # GATE C(iii): a STOOD-DOWN core never quotes -- the fallback re-place is skipped (the executor
+        # refuses a new rest when stood down; an amend it refuses is routed back here as a plain cancel).
+        if (not st.rest_allotment_done and not st.stood_down and still_resting
+                and _in_window(params, st, now)
                 and target >= params.n_min and st.n_top is not None
                 and _filled_contracts(st) + _resting_contracts(st) + replace_count <= _allotment(params)):
             r_rung, r_E = _rung_of(st.n_top, target), _e_rung(params, st.n_top, target)
@@ -1018,7 +1074,10 @@ def _apply_cancelled(
     # bucket-change / stand-down / shrink cancel: drop the slot (if still present) and decrement the count.
     if live_order is not None:
         st = replace(st, ladder=_drop_order(st.ladder, live_order.client_order_id))
-    if st.outstanding_cancels > 0:
+    # GATE B: only an event for an order that HAD a venue id can resolve a counted bucket-change cancel
+    # (``_cancel_all(track_outstanding=True)`` counts live orders only); a pending order's rejection /
+    # no-op cancel never decrements it.
+    if ev_oid is not None and st.outstanding_cancels > 0:
         st = replace(st, outstanding_cancels=st.outstanding_cancels - 1)
     # PRINT-THROUGH F2: if this was a stall cancel, drop it from the trigger's pending list and finalise
     # once they have all confirmed (any racing fill was booked above, so the shortfall is now the TRUTH).
@@ -1067,8 +1126,16 @@ def _apply_fill(
     # rung fill? match a ladder order by coid.
     order = next((o for o in st.ladder if o.client_order_id == event.client_order_id), None)
     if order is None:
-        return st, actions
+        # GATE A (2026-10-03 02:00Z naked fill): the pre-fix ``return`` here DISCARDED a fill on an order the
+        # executor owned but the core had lost (two NO lots expired naked, -$0.40). Every owned fill is now
+        # booked and hedged from the event itself -- including when the core is stood down.
+        st, oa = _apply_orphan_fill(params, st, event, now)
+        return st, actions + oa
     delta = _q_count(event.count)
+    if delta > 0 and event.client_order_id is not None and getattr(event, "source", None) != "poll":
+        seen = dict(st.fill_seen_by_coid)
+        seen[event.client_order_id] = _q_count(seen.get(event.client_order_id, _ZERO) + delta)
+        st = replace(st, fill_seen_by_coid=seen)
     # N1: skip lots an amend CROSS already booked for this order_id (the venue echoes the crossed taker
     # fill on the WS ``fill`` channel with a fresh trade_id the driver's dedup cannot catch).
     oid = order.order_id if order.order_id is not None else event.order_id
@@ -1095,6 +1162,73 @@ def _apply_fill(
     return st, actions
 
 
+def _apply_orphan_fill(
+    params: V33Params, st: V33State, event: Fill, now: float
+) -> tuple[V33State, list[V33Action]]:
+    """GATE A: a private Fill whose coid matches NO ladder order and NO wing leg. The executor attributed it
+    to an order it OWNS (the driver only pumps fills its RestBook recognises), so it is a real bucket-NO
+    lot that must be hedged whatever the core remembers. Attribution, in order: the ``cancel_ctx`` record
+    for this coid (the rung's own bucket / rung), else the fill's OWN market ticker. A ticker that names a
+    market which is NOT one of the window's buckets (e.g. a strike) is not a rung fill: alarmed, not booked.
+
+    DEDUPE (cancel-confirm vs late ws echo): ``fill_seen_by_coid`` accumulates every reported lot; only the
+    excess over what is already BOOKED for the coid (by any path: ws, poll, cancel-confirm cumulative) is
+    booked, clipped to this event's own count. So a ws echo of lots a cancel-confirm already booked hedges
+    nothing twice, while a fill the cancel-confirm missed (unreadable status -> 0) is still hedged."""
+    count = _q_count(event.count) if event.count is not None else _ZERO
+    coid = event.client_order_id
+    if count <= 0 or coid is None:
+        return st, []
+    ticker = getattr(event, "market_ticker", None)
+    ctx = next(((oid, c) for oid, c in st.cancel_ctx.items() if c[0] == coid), None)
+    if ctx is None and ticker and _sd_for_bucket_ticker(st, ticker) is None:
+        return st, [V33Action(kind=V33ActionKind.ALARM, reason="orphan_fill_not_bucket",
+                              client_order_id=coid, order_id=event.order_id, ticker=ticker,
+                              count=count, price=event.price)]
+    booked = _q_count(st.rest_booked_by_coid.get(coid, _ZERO))
+    if getattr(event, "source", None) == "poll":
+        # the poll's count is ALREADY (venue cumulative - booked): book it as is, never add it to the
+        # increment sum (a later ws echo of the same lots then nets to zero against ``booked``).
+        delta = count
+    else:
+        seen = dict(st.fill_seen_by_coid)
+        seen_new = _q_count(seen.get(coid, _ZERO) + count)
+        seen[coid] = seen_new
+        st = replace(st, fill_seen_by_coid=seen)
+        delta = min(count, seen_new - booked)
+    if delta <= 0:
+        return st, []     # already booked (e.g. by the cancel-confirm cumulative) -- nothing new to hedge
+    retained_Sd = ctx[1][4] if ctx is not None else None
+    order_id = event.order_id if event.order_id is not None else (ctx[0] if ctx is not None else None)
+    return _book_orphan_fill(params, st, coid, order_id, event.price, delta, ticker, now,
+                             retained_Sd=retained_Sd)
+
+
+def _book_orphan_fill(
+    params: V33Params, st: V33State, coid: str, order_id: str | None, price: Decimal, delta: Decimal,
+    ticker: str | None, now: float, *, retained_Sd: int | None = None,
+) -> tuple[V33State, list[V33Action]]:
+    """GATE A: book ``delta`` lots of an executor-owned bucket-NO order the core lost, at ``price``, and let
+    the coalesced wing batch hedge it (D2: the batch hedges the strikes of the bucket the fill landed in).
+    The rung / E_rung are DERIVED from the price vs the current ladder geometry when that is a legitimate
+    rung (0 <= rung < K at the current n_top); otherwise the fill is labelled ``orphan`` and the margin
+    array is left untouched. Works stood down and with an empty ladder: a stood-down core must still hedge
+    (``_wing_step`` never reads ``stood_down``); it must not quote (``_converge`` does). Always raises
+    ``orphan_rung_fill_hedged``."""
+    if st.n_top is not None:
+        rung = _rung_of(st.n_top, price)
+        legit = 0 <= rung < params.rungs
+        E_rung = _e_rung(params, st.n_top, price)
+    else:
+        rung, legit, E_rung = 0, False, params.E_min
+    alarm = V33Action(kind=V33ActionKind.ALARM, reason="orphan_rung_fill_hedged",
+                      client_order_id=coid, order_id=order_id, ticker=ticker, count=delta, price=price)
+    st, wa = _book_rung_fill(params, st, coid, price, delta, rung, E_rung, now,
+                             retained_Sd=retained_Sd, fill_ticker=ticker, orphan=not legit,
+                             order_id=order_id)
+    return st, [alarm] + wa
+
+
 # ---------------------------------------------------------------------------
 # Rung fill booking + coalesced wings
 # ---------------------------------------------------------------------------
@@ -1112,6 +1246,7 @@ def _sd_for_bucket_ticker(st: V33State, ticker: str | None) -> int | None:
 def _book_rung_fill(
     params: V33Params, st: V33State, coid: str, price: Decimal, delta: Decimal, rung: int,
     E_rung: Decimal, now: float, *, retained_Sd: int | None = None, fill_ticker: str | None = None,
+    orphan: bool = False, order_id: str | None = None,
 ) -> tuple[V33State, list[V33Action]]:
     """Book ``delta`` filled lots of rung ``coid`` at ``price``: record the RungFill, remove the rung
     from the ladder (Q3 no refill), and COALESCE the fill into the open wing group (Q2). The fill's margin
@@ -1131,7 +1266,8 @@ def _book_rung_fill(
     # remove the (now filled) rung from the live ladder; a filled rung is not refilled inside the window.
     ladder = st.ladder
     order = next((o for o in ladder if o.client_order_id == coid), None)
-    order_id = order.order_id if order is not None else None
+    if order is not None:
+        order_id = order.order_id
     # D1 attribution: order's own bucket (live) -> retained bucket (cancel_ctx / caller) -> fill's own
     # market ticker inverted -> None (fail-closed). The pre-fix ``rest_bucket_Sd or spot_Sd`` fallback is
     # GONE: after a bucket change ``rest_bucket_Sd`` is None and ``spot_Sd`` is the NEW bucket, which is
@@ -1167,14 +1303,18 @@ def _book_rung_fill(
     rf = RungFill(rung=rung, E_rung=E_rung, price=price, count=_q_count(delta), server_ts=now,
                   coid=coid, order_id=order_id, W=st.W, n_top=st.n_top,
                   bucket_ticker=fill_bucket_ticker, bucket_Sd=fill_Sd, bucket_Su=fill_Su,
-                  weight=(_weight_of_rung(params, rung) if 0 <= rung < len(params.rung_lots) else None))
+                  weight=(_weight_of_rung(params, rung)
+                          if (not orphan and 0 <= rung < len(params.rung_lots)) else None),
+                  orphan=orphan)
     # MARGIN ARRAY (Brad R4): mark this fill's margin as consumed (state 2) and tie the 2-slot to THIS
     # fill (``filled_at``). A rare fill on a STRANDED order (margin outside the nominal array) is still
     # booked (rungs_filled ++, the exposure cap holds) but leaves the array untouched — the exposure
     # guard, not the array, is the true K-lot cap.
     margin_state = st.margin_state
     filled_at = st.filled_at
-    if 0 <= m < len(margin_state):
+    # GATE A: an ``orphan`` fill (price not a legitimate rung of the current geometry) never touches the
+    # margin array -- it is booked, capped by the exposure guard, and hedged, but it consumes no slot.
+    if not orphan and 0 <= m < len(margin_state):
         if margin_state[m] != 2:
             ms = list(margin_state)
             ms[m] = 2

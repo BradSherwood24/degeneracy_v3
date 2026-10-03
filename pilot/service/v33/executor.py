@@ -548,7 +548,8 @@ class V33LiveExecutor(LiveExecutor):
             self._bump("rest_rate_limited")
             self.journal.append("rate_limited_reject",
                                 {"client_order_id": coid, "ticker": ticker, **detail}, self.clock())
-            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                                   client_order_id=coid)]
         return super()._reject_place(coid, ticker, now, detail, unknown=unknown, n=n)
 
     # =====================================================================
@@ -878,7 +879,9 @@ class V33LiveExecutor(LiveExecutor):
         if self.stand_down_reason is None:
             self.stand_down_reason = "rest_invariant_violation"
         # Feed a filled-0 confirm so the core clears the pending slot; the stand-down blocks any replace.
-        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+        # V3.3 gate B: carry the coid so the core drops EXACTLY this pending order.
+        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                               client_order_id=coid)]
 
     def _cancel_stray(self, r: dict[str, Any], now: float) -> None:
         """DELETE one unattributable ``v33-*`` stray (priority-paced -- the cancel is safety-critical).
