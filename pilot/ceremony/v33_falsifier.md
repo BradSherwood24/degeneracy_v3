@@ -25,6 +25,11 @@ to arm on it (an agent can never arm V3.3 by editing code).
 - Policy: roster `DegeneracyV3_3`, `pilot/policy/v33_params.json`, canonical sha
   `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def` (pinned in code as
   `service.v33.params.FROZEN_V33_PARAMS_SHA256`; the loader self-verifies and refuses drift).
+  - 2026-10-03 RE-PIN (stale-wing liveness bounds, after gate D / PR #120): ADDED `strike_feed_dead_s` 4.0 and
+    `wing_book_max_age_s` 30.0 explicitly (the measured defaults, values unchanged; everything else
+    byte-identical) so the loader enforces them. New canonical sha
+    `f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1`; prior sha `295590ce...` kept as
+    `PREVIOUS_V33_PARAMS_SHA256_L4`. See the Registration entry of the same date.
   - 2026-09-29 RE-PIN (L4 ladder shift 5..15c -> 8..18c, Brad's rung-allocation ruling): changed ONLY
     `E_min` 0.05 -> 0.08 (everything else byte-identical); the ladder now rests its 11 rungs at margins
     8..18c. See the "L4 amendment (2026-09-29)" section below for the reason. Prior sha (print-through)
@@ -524,6 +529,14 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     measurement in #120). E (executor-truth accounting) and H (supervisor dedupe) remain, same series. Re-arm =
     #119 and #120 merged by Brad + E or Brad's explicit waiver of E + a Registration line + Brad's word. Test
     Fire #2 stays PAUSED at one-legged 2 = the pin; thresholds unchanged (L6 as amended by L7).
+- 2026-10-03 20:43Z -- PARAMS RE-PIN (stale-wing liveness bounds), on Claude's recommendation recorded 20:24Z; lands on
+  Brad's merge of the params PR, which is his ruling. `pilot/policy/v33_params.json` now writes `strike_feed_dead_s`
+  = 4.0 and `wing_book_max_age_s` = 30.0 EXPLICITLY (the measured defaults from
+  `pilot/build/v33_stale_wing_measurement_2026_10_03.md`; values unchanged; every other key byte-identical), so the
+  loader's sha check ENFORCES them (registered-specs rule) instead of trusting an absent key. New canonical sha
+  `f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1`; prior `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def` kept
+  in code as `PREVIOUS_V33_PARAMS_SHA256_L4`. Params-only; no judged quantity, threshold or lever changes; BOTH
+  ROSTERS STAY DRY. Re-arm conditions as stated 20:24Z (gate E, Registration line, Brad's word) unchanged.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
