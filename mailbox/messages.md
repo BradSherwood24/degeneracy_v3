@@ -1478,3 +1478,20 @@ executor and the venue saw, never from what the core remembers; (5) the belts he
 
 -- Claude
 
+## 2026-10-03 20:24Z -- Claude -> Brad: gates A-D built and reviewed, two PRs waiting on you
+
+Brad, the two PRs are up and both carry an Opus 4.8 APPROVE WITH NITS. #119 is gates A, B, C and G: the core now
+hedges any fill on an order the executor owns even when it is stood down, cancels are matched by client order id
+and never by None against None, the in-flight guard starts at the top of the place call, and an executor stand-down
+sweeps every rest it owns while still taking wings. #120 is the stale-wing rewrite: "stale" now means the strike
+feed is dead or a wing book is missing or suspect, never a single quiet strike, and every cancel-all that can be
+followed by a re-place waits for its cancels to confirm. On the 02:00Z journal the new predicate produces zero
+holds; the real 15:00Z stall still stands down. Merge #119 first, then #120; re-arm needs both.
+
+Two things for you to rule on, both in the Registration entry: (1) the two new safety bounds, 4.0 s feed-dead and
+30 s wing-book, are optional keys with code defaults so the params sha did not move -- I recommend re-pinning them
+in the JSON; (2) my process slip: the builders ran on Opus 5.5 because I passed a model override that defeated the
+agent's 4.8 pin. The reviews ran on 4.8. Your call whether that is enough. E and H are next.
+
+-- Claude
+

@@ -460,6 +460,70 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   executor still takes wings; no re-place inside the cancel-confirm window) supersede items 1-3 of the 03:30Z entry
   as the pre-registered re-arm conditions; E-H (executor-truth accounting, hold sensitivity measured, #115
   residuals, supervisor dedupe) follow in the same series. Thresholds unchanged.
+- 2026-10-03 20:24Z -- RE-ARM GATES A-D BUILT AND REVIEWED, NOT MERGED; both rosters DRY. Brad, verbatim, on the
+  stale-wing question ("Should we add logic to check for that condition or remove the stale wing cancel since
+  'stale' just means no trades, right? Thats not a WS problem on either ours or kalshis side"), after the finding
+  below: "Agreed, go ahead and build using the normal processes. Opus 4.8 builder agents and reviewer agents".
+  * FINDING (02:00Z journal, measured): "stale wing" = a wing STRIKE book with no `orderbook_delta` for more than
+    `freshness_max_age_s` = 1.0 s. Not trades, not the WebSocket: a quiet deep strike. The no-leg wing T84699.99
+    had 143 inter-delta gaps > 1 s (26 > 2.5 s) in the window, the yes-leg T84499.99 284 > 1 s, zero WS drops.
+    The fatal hold: T84699.99 quiet 2.9 s while T84599.99 pushed 44 frames in the same 1.6 s -> 1.5 s hold ->
+    UNTRACKED `_cancel_all` -> resume 230 ms later -> `_place_all` with 11 cancels unconfirmed. The bucket-change
+    path tracked its cancels and waited; the stale path did not. The wing TAKE already freshness-gates itself at
+    fill time, so the rest-level stale cancel protected nothing extra. Item (4) of the 03:30Z entry ("hold
+    sensitivity reviewed") is hereby MEASURED: 85 journals 09-30..10-03, 1,747 journaled holds; under the old
+    predicate replayed over full windows 3,140 holds / 589 cancels; every hold in the 73 live-feed windows was a
+    quiet-book artefact (`pilot/build/v33_stale_wing_measurement_2026_10_03.md`).
+  * GATE D IS A REWRITE, not a wait (clarifies the 04:55Z wording; thresholds and judged quantities unchanged):
+    the rest-level stale predicate becomes wing book MISSING or SUSPECT, or strike FEED dead (`strike_feed_ts` =
+    latest `book_ts` on ANY of the ~188 strike books; dead when older than `strike_feed_dead_s`), or a wing book
+    older than `wing_book_max_age_s`; a single quiet strike is never stale. The wing-take gate keeps the loose
+    per-strike bound. EVERY cancel-all that can be followed by a re-place tracks its cancels and places only when
+    `outstanding_cancels == 0` (the 04:55Z "no re-place inside the cancel-confirm window", now on all paths).
+    v32 byte-identical; the shadow keeps 1.0 s. Under the new predicate: 02:00Z -> 0 holds / 0 cancels (old
+    replay 47 / 5); the REAL 10-02 15:00Z strike stall -> still stands down (20 holds / 11 cancels); all 395
+    remaining holds fall inside the 12 stall/lag windows, none in the 73 live-feed windows.
+  * MEASURED DEFAULTS, RECORDED HERE (registered values; provenance = the measurement md): `strike_feed_dead_s` =
+    4.0 s (live-feed strike inter-frame gap p99.9 0.13 s, max 0.97 s; max live feed age vs eval clock 2.96 s;
+    stalls 8-75 s); `wing_book_max_age_s` = 30.0 s (quiet wing books on a live feed reach 13.8 s, p99.99 11.15 s;
+    a take refused at this bound is a naked fill). Shipped as OPTIONAL keys with code defaults; the params JSON
+    and its sha 295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def are UNCHANGED. OPEN FOR BRAD:
+    re-pin both values in `pilot/policy/v33_params.json` (new sha, loader-enforced) vs leave optional. Claude
+    recommends re-pin; the reviewer recommends at minimum this line.
+  * PR #119 `fix/v33-hedge-owned-fills` = gates A, B, C, G (head d5d099c): `_apply_fill` books a fill whose coid
+    is on no ladder order as an `orphan` RungFill from the event's own ticker/price/count, alarms
+    `orphan_rung_fill_hedged`, and its wing batch fires TAKE_WINGS INCLUDING when the core is stood down;
+    `OrderCancelled` carries `client_order_id` and `_apply_cancelled` never matches `None == None`
+    (`cancel_unattributed` alarm); in-flight registration from the TOP of the single and batch create paths (a
+    cancel during the pre-flight skips the POST); executor stand-down runs `standdown_sweep_async` (DELETE every
+    live owned rest, confirm, emit the cancel events so a racing fill is hedged); the stood-down executor still
+    answers TAKE_WINGS / RETRY_WING / cancels and refuses PLACE / AMEND. Golden replay of the 02:00Z event order
+    from a committed fixture: the driver stand-down landed BEFORE the first rejection, so the ladder empties and
+    #23 / #27 arrive as ORPHANS -- gate A, not B, is what hedges them: TAKE_WINGS 2.00 lots on T84599.99 yes /
+    T84699.99 no, three orphan alarms (0.40, 0.60, 1). 13/14 new core tests fail on the pre-fix core. Opus 4.8
+    REVIEW: APPROVE WITH NITS (`pilot/build/v33_hedge_owned_fills_review.md`); one DEFECT fixed on the branch
+    (an unpriced owned orphan fill raised on the ingest path; now `orphan_rung_fill_unpriced` fail-closed).
+    Residuals recorded: sync executor has B but not the sweep (live runs async, journal-confirmed); orders with
+    an unknown POST outcome stay unowned (listed by the sweep); orphan lots can exceed the allotment, unenforced
+    live; the ledger counts orphan lots but does not label them and `alarms` still excludes executor alarms
+    (gate E). Suite 1439 passed / 10 skipped (1492 / 5 with the census CSV present).
+  * PR #120 `fix/v33-stale-wing-liveness` = gate D rewrite + gate F measurement (head d2583f3). Opus 4.8 REVIEW:
+    APPROVE WITH NITS, no code change (`pilot/build/v33_stale_wing_liveness_review.md`); mutation-checked (the
+    untracked cancel reproduces "PLACE_REST while the venue still holds 11 of our rests"); measurement reproduced
+    independently. MERGE COMPATIBILITY with #119 clean (disjoint functions). The one residual on #120 ALONE --
+    `outstanding_cancels` is a count and any `OrderCancelled` decremented it -- is closed by #119's "only a
+    counted cancel decrements", in either merge order. RE-ARM REQUIRES BOTH PRs MERGED. NIT recorded: a dead-feed
+    stand-down shares the journal reason `stale_or_missing_wing` with missing/suspect/too-old (sub-cause
+    annotation = follow-up). Suite 1483 passed / 5 skipped (1487 / 1 with the census CSV).
+  * PROCESS DISCLOSURE: both BUILDERS ran on Opus 5.5, not Opus 4.8 -- the orchestrator passed a model override
+    that replaced the agent definition's 4.8 pin (PR #120's commit trailers say Opus 5.5; PR #119's say Fable
+    5.1 as instructed, written by Opus 5.5). The first #119 reviewer was launched the same way and was killed
+    before pushing; BOTH REVIEWS then ran on true Opus 4.8. Recorded in memory so it does not recur. OPEN FOR
+    BRAD: whether the 4.8 reviews are sufficient cover or either PR is to be rebuilt.
+  * STATUS OF THE 03:30Z / 04:55Z CONDITIONS: A, B, C, D built and reviewed (G folded into #119; F = the
+    measurement in #120). E (executor-truth accounting) and H (supervisor dedupe) remain, same series. Re-arm =
+    #119 and #120 merged by Brad + E or Brad's explicit waiver of E + a Registration line + Brad's word. Test
+    Fire #2 stays PAUSED at one-legged 2 = the pin; thresholds unchanged (L6 as amended by L7).
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
