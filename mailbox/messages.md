@@ -1495,3 +1495,15 @@ agent's 4.8 pin. The reviews ran on 4.8. Your call whether that is enough. E and
 
 -- Claude
 
+## 2026-10-03 22:00Z -- Claude -> Brad: all five gates merged, dry shakedown running
+
+Brad, #123 is merged on your word and the live tree is on main 296f776, dry. The suite is green on the live
+checkout and the loader enforces the re-pinned bounds. The supervisor spawns a fresh process per close, so the
+23:00Z close is the first window on the new code; 22:00Z was already running on the old build when the pull landed.
+I have written the shakedown's pass criteria into the Registration before seeing a single window: near-zero stale
+holds on a live feed, every row carrying the reconcile fields with no spurious mismatch, no reconcile failures,
+and no executor stand-down from the venue invariant. I will read the first windows against that list and report.
+Not armed, not arming; the flip stays your word. H is the one build left and it does not gate the re-arm.
+
+-- Claude
+

@@ -537,6 +537,29 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   `f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1`; prior `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def` kept
   in code as `PREVIOUS_V33_PARAMS_SHA256_L4`. Params-only; no judged quantity, threshold or lever changes; BOTH
   ROSTERS STAY DRY. Re-arm conditions as stated 20:24Z (gate E, Registration line, Brad's word) unchanged.
+- 2026-10-03 22:00Z -- GATES A-E MERGED; DRY SHAKEDOWN ORDERED, NO RE-ARM. Brad, verbatim: "Go ahead and merge once
+  everything is reviewed and ready. Dont go live though. Lets run it dry with the new code as a shake down".
+  Merged to main on his word, in order: #119 (A/B/C/G, a9bbc7a), #120 (D rewrite + F, 2703265), #122 (params
+  re-pin, 6839214; "Go ahead and merge the re-pin"), #123 (E, 296f776; Opus 4.8 APPROVE WITH NITS, four defects
+  fixed on the branch: `reconcile_failed` counted; the reconcile-exception fallback is executor-truth-only, never
+  the blind core, with S1 additionally latched on any executor-truth fill; rebuild poll deltas SUM not MAX; venue
+  fills filter fails closed). The reviewer's answer to "can the pin under-see a naked contract after this PR?":
+  not on the live path with print-through OFF; the one latent path is the aggregate one-legged subtraction under a
+  print-through over-hedge -- per-order one-legged is REQUIRED before print-through is ever enabled (recorded).
+  Live tree = main 296f776, pulled 21:57Z, dry; full suite 1536 passed / 1 skipped on the live checkout; params
+  sha f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1 enforced by the live loader. Gate E was
+  built AND reviewed on Opus 4.8 (the A-D builders ran on Opus 5.5, disclosed 20:24Z; Brad merged with that known).
+  * RE-ARM CONDITIONS STATUS: A, B, C, D, E merged (G in #119, F in #120); H (supervisor dedupe) outstanding and
+    NOT a re-arm gate. Remaining for re-arm: this dry shakedown read clean + a Registration line + Brad's word.
+    Test Fire #2 stays PAUSED at one-legged 2 = the pin.
+  * SHAKEDOWN (dry, the supervisor spawns `python -m service.run_v33` per close, so the first window on the new
+    code is the 23:00Z close; the 22:00Z window was already running on 2ed9ff5-era code when the pulls landed).
+    What a clean read means, pre-stated: (i) `stand_down_hold` / `stand_down_cancel` ~0 on live-feed windows
+    (the 10-02/10-03 dry windows ran 12-39 holds each under the old predicate); (ii) every ledger row carries
+    `alarms_breakdown`, `reconcile`, `one_legged_contracts`; dry rows reconcile byte-identically (no spurious
+    `ledger_reconcile_mismatch`); (iii) no `reconcile_failed`, no uncaught exception, no `venue_fills_*` kinds in
+    dry; (iv) the venue invariant never stands the executor down on a live-feed window (the old 3-of-12 rate was
+    the re-place race). Anything else is a finding before re-arm.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
