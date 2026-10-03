@@ -48,6 +48,11 @@ class V33ActionKind(str, enum.Enum):
     # the driver journals ``wing_netted`` and the ledger books the realised $1. No WOULD_ twin -- it is a
     # record of a venue event, not one of our order intents (it journals the same in every mode).
     WING_NETTED = "WING_NETTED"
+    # GATES A/B (2026-10-03 02:00Z naked fill): INFORMATIONAL only -- the pure core cannot journal, so it
+    # raises a named alarm as an action (``reason`` = the alarm name; ``client_order_id`` / ``order_id`` /
+    # ``ticker`` / ``count`` / ``price`` carry the detail). The driver journals it as kind ``alarm`` and
+    # NEVER routes it to an executor. No WOULD_ twin (it journals the same in every mode).
+    ALARM = "ALARM"
 
 
 _V33_WOULD_TWIN: dict[V33ActionKind, V33ActionKind] = {

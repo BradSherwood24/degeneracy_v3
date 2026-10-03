@@ -534,8 +534,10 @@ class LiveExecutor:
                 self._record_alarm("rest_rejected_standdown",
                                    {"consecutive": self._consecutive_rejects})
         # Feed the core an OrderCancelled(filled 0) so it clears the pending slot and re-solves. The
-        # placed order never became live (order_id None) -> match the pending's None order_id.
-        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+        # placed order never became live (order_id None). V3.3 gate B: carry the coid so the core drops
+        # EXACTLY this pending order (never "the first pending order" by None == None).
+        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                               client_order_id=coid)]
 
     def _rest_body(self, action, coid: str, exch: int) -> dict[str, Any]:
         n = action.price if action.price is not None else Decimal(0)
@@ -742,7 +744,7 @@ class LiveExecutor:
                 if self.stand_down_reason is None:
                     self.stand_down_reason = "rest_invariant_unbooked_fill"
                 return [OrderCancelled(order_id=None, server_ts=now,
-                                       filled_count_before_cancel=Decimal(0))]
+                                       filled_count_before_cancel=Decimal(0), client_order_id=coid)]
             if fill_events:
                 # a surprise fill on a tracked stray was booked -> route it to the core as the entry
                 # (mirrors the cancel-race entry); the place is short-circuited (never place on a fresh fill).
@@ -763,7 +765,8 @@ class LiveExecutor:
             self.stand_down_reason = "rest_invariant_violation"
         # Feed the core a filled-0 confirm so it clears the pending slot; the stand-down (applied this
         # event, before the queued OrderCancelled is decided) guarantees no replacement rest is placed.
-        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                               client_order_id=coid)]
 
     # ---- CANCEL_REST ----
     def _cancel_rest(self, action, now: float) -> list[Any]:
@@ -776,7 +779,8 @@ class LiveExecutor:
             # nothing to cancel on the exchange (a still-pending create with no order_id yet). Clear
             # the core's slot with a filled-0 confirm.
             self._bump("cancel_noop")
-            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                                   client_order_id=coid)]
         if rec is None:
             rec = self.attribute(coid=coid, order_id=oid)
         exch = rec.exchange_index if rec is not None else None
@@ -866,7 +870,10 @@ class LiveExecutor:
                                              "delete_status": last_status})
         # Return a filled-0 confirm so the core's slot resolves; stand-down + the pre-PLACE invariant
         # guarantee no replacement rest is placed while this one rests on the venue.
-        return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0))]
+        return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0),
+                               client_order_id=(rec.client_order_id if rec is not None else coid),
+                               price=(rec.price if rec is not None else None),
+                               market_ticker=(rec.ticker if rec is not None else None))]
 
     def _resolve_cancel_from_status(self, st: OrderStatus, rec, oid: str, delete_status, now: float,
                                     expired: bool) -> list[Any] | None:
@@ -918,7 +925,10 @@ class LiveExecutor:
                              "reduced_by": (str(rb) if rb is not None else None),
                              "filled_before_cancel": out_val, "via": via}, self.clock())
         return [OrderCancelled(order_id=oid, server_ts=now,
-                               filled_count_before_cancel=event_filled)]
+                               filled_count_before_cancel=event_filled,
+                               client_order_id=(rec.client_order_id if rec is not None else None),
+                               price=(rec.price if rec is not None else None),
+                               market_ticker=(rec.ticker if rec is not None else None))]
 
     def _confirm_cancel_filled(self, order_id: str, now: float) -> int:
         """Poll order-status up to CANCEL_CONFIRM_POLLS times; return filled_count_before_cancel.
@@ -1078,7 +1088,8 @@ class LiveExecutor:
             # nothing on the venue to cancel (amend had no order id) -> tell the core the slot is clear
             # so it re-places on the next tick.
             self._bump("amend_fallback_noop")
-            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0))]
+            return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                                   client_order_id=coid_old)]
         self.cancels_attempted += 1
         self.journal.append("cancel_rest",
                             {"order_id": oid, "client_order_id": coid_old, "exchange_index": exch,

@@ -152,6 +152,10 @@ _ORDER_ACTION_KINDS = frozenset({
 })
 
 
+# Informational core actions: journaled, NEVER routed to an executor (D5 netting record; gates A/B alarm).
+_INFO_ACTION_KINDS = frozenset({V33ActionKind.WING_NETTED, V33ActionKind.ALARM})
+
+
 def async_writer_enabled(cli_flag: bool) -> bool:
     """Whether the OFF-LOOP async order writer is selected. CLI --async-writer wins; else the
     DV3_V33_ASYNC_WRITER env var (1/true/yes/on). DEFAULT OFF — the synchronous V33LiveExecutor stays the
@@ -276,6 +280,7 @@ class V33Driver:
         self._async = async_writer is not None
         self._aw = async_writer
         self._async_errors = 0
+        self._standdown_sweep_scheduled = False   # gate C(ii): the executor stand-down sweep runs once
         # feed_gap_max_s (build brief §6): the largest WALL gap between consecutive WS feed frames while the
         # ladder is quoting (live/pending rungs) — the DIRECT proof the loop is not freezing the feed.
         self._last_feed_wall: float | None = None
@@ -393,7 +398,7 @@ class V33Driver:
         # D1: V33Fill carries the fill's OWN market ticker as the last-resort bucket attribution channel.
         self._pump([V33Fill(order_id=rec.order_id, client_order_id=rec.client_order_id,
                             count=count, price=rec.price, side="no", server_ts=server_ts,
-                            market_ticker=market)])
+                            market_ticker=market, source="ws")])
 
     def on_poll_fill(self, order_id: str, filled_count: Any, server_ts: float) -> None:
         """Book a rung fill discovered by the order-status poll (ARMED belt-and-braces). Feeds the DELTA
@@ -418,7 +423,7 @@ class V33Driver:
         # D1: the poll knows the order's market via the retained RestRecord (``rec.ticker``).
         self._pump([V33Fill(order_id=order_id, client_order_id=rec.client_order_id,
                             count=delta, price=rec.price, side="no", server_ts=server_ts,
-                            market_ticker=rec.ticker)])
+                            market_ticker=rec.ticker, source="poll")])
 
     # --- DRY ladder-fill simulation (the ideal rule; never in armed) ---
     def _simulate_ladder_fills(self, market: str, trade: Trade, now: float) -> None:
@@ -497,12 +502,12 @@ class V33Driver:
                 q.extend(self.executor.place_batch(places, ts))
                 for a in others:
                     self._journal_action(a, ts)
-                    if a.kind != V33ActionKind.WING_NETTED:   # D5: informational, no venue order
+                    if a.kind not in _INFO_ACTION_KINDS:   # D5 / gate A: informational, no venue order
                         q.extend(self.executor.on_action(a, self.state, ts))
             else:
                 for a in actions:
                     self._journal_action(a, ts)
-                    if a.kind != V33ActionKind.WING_NETTED:   # D5: informational, no venue order
+                    if a.kind not in _INFO_ACTION_KINDS:   # D5 / gate A: informational, no venue order
                         q.extend(self.executor.on_action(a, self.state, ts))
             self._apply_executor_standdown(ts)
             self._maybe_eval(getattr(ev, "server_ts", None))
@@ -591,6 +596,31 @@ class V33Driver:
             self.counts["executor_standdown"] += 1
             self.journal.append("alarm", {"alarm": "executor_standdown", "reason": reason},
                                 self.clock())
+        # GATE C(ii) (2026-10-03 02:00Z naked fill): an executor stand-down CANCELS every order the executor
+        # owns (one-shot, off the loop); the sweep's OrderCancelled events re-enter decide so any racing fill
+        # is booked and hedged (gate A). The pre-fix stand-down cancelled nothing it owned.
+        if (reason and self._async and not self._standdown_sweep_scheduled
+                and hasattr(self.executor, "standdown_sweep_async")):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:   # no loop (a sync harness): nothing to schedule on; retried next call
+                return
+            self._standdown_sweep_scheduled = True
+            loop.create_task(self._standdown_sweep_task(server_ts))
+
+    async def _standdown_sweep_task(self, server_ts: float) -> None:
+        try:
+            events = await self.executor.standdown_sweep_async(server_ts)
+        except Exception as e:  # noqa: BLE001 -- the sweep must never wedge the loop
+            self._async_errors += 1
+            self.journal.append("alarm", {"alarm": "standdown_sweep_error", "error": str(e)}, self.clock())
+            return
+        if events:
+            try:
+                self._ingest_async(events)
+            except Exception as e:  # noqa: BLE001
+                self._async_errors += 1
+                self.journal.append("alarm", {"alarm": "async_ingest_error", "error": str(e)}, self.clock())
 
     # --- journaling ---
     def _journal_action(self, a, server_ts: float) -> None:
@@ -661,6 +691,13 @@ class V33Driver:
             legs = [{"ticker": lg.ticker, "side": lg.side, "count": _count_out(lg.count),
                      "fill_price": lg.limit} for lg in a.legs]
             payload = {"legs": legs, "count": _count_out(a.count), "realised": a.lock}
+        elif k == V33ActionKind.ALARM:
+            # GATES A/B (2026-10-03): a named alarm raised by the pure core (orphan_rung_fill_hedged,
+            # cancel_unattributed, orphan_fill_not_bucket, orphan_rung_fill_unpriced). Journaled as ``alarm``.
+            rk = "alarm"
+            payload = {"alarm": a.reason, "client_order_id": a.client_order_id, "order_id": a.order_id,
+                       "ticker": a.ticker, "count": _count_out(a.count), "price": a.price,
+                       "stood_down": self.state.stood_down}
         elif k == ActionKind.SHADOW_FILL_OUTSIDE_WINDOW:
             rk = "shadow_fill_outside_window"
             payload = {"E": a.shadow_E, "offer": a.offer, "print": a.print_price, "count": a.count,

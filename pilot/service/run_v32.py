@@ -604,7 +604,8 @@ class FrozenExecutor:
                 rec.status = "cancelled"  # RETAINED for late-fill attribution (F-1)
                 oid = rec.order_id
             self.counts["synth_cancelled"] += 1
-            return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0))]
+            return [OrderCancelled(order_id=oid, server_ts=now, filled_count_before_cancel=Decimal(0),
+                                   client_order_id=coid)]
 
         if k == ActionKind.WOULD_AMEND_REST:
             # amend-first replace (dry/shakedown twin): simulate the venue's amend so the requote state

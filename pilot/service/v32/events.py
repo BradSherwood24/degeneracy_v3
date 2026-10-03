@@ -83,6 +83,17 @@ class OrderCancelled:
     order_id: str
     server_ts: float
     filled_count_before_cancel: Decimal = Decimal(0)
+    # V3.3 gate B (2026-10-03 02:00Z naked fill): the client_order_id of the order this event resolves,
+    # when the executor knows it. A pre-flight rejection / no-op cancel has NO venue id (``order_id`` None);
+    # without the coid the V3.3 core attributed it by ``None == None`` to the FIRST pending order and evicted
+    # an innocent rung that then rested live, owned by nobody. Default None keeps every V3.2 caller and the
+    # frozen V3.2 core byte-identical (the V3.2 core never reads it).
+    client_order_id: str | None = None
+    # V3.3 gate A: the resting price and market of the cancelled order (from the executor's RestRecord), so
+    # a fill surfaced only by the cancel-confirm on an order the core no longer tracks can still be booked
+    # and hedged on its own bucket. Default None (V3.2 never reads them).
+    price: Decimal | None = None
+    market_ticker: str | None = None
 
 
 @dataclass(frozen=True)
