@@ -280,6 +280,7 @@ class V33Driver:
         self._async = async_writer is not None
         self._aw = async_writer
         self._async_errors = 0
+        self._standdown_sweep_scheduled = False   # gate C(ii): the executor stand-down sweep runs once
         # feed_gap_max_s (build brief §6): the largest WALL gap between consecutive WS feed frames while the
         # ladder is quoting (live/pending rungs) — the DIRECT proof the loop is not freezing the feed.
         self._last_feed_wall: float | None = None
@@ -595,6 +596,31 @@ class V33Driver:
             self.counts["executor_standdown"] += 1
             self.journal.append("alarm", {"alarm": "executor_standdown", "reason": reason},
                                 self.clock())
+        # GATE C(ii) (2026-10-03 02:00Z naked fill): an executor stand-down CANCELS every order the executor
+        # owns (one-shot, off the loop); the sweep's OrderCancelled events re-enter decide so any racing fill
+        # is booked and hedged (gate A). The pre-fix stand-down cancelled nothing it owned.
+        if (reason and self._async and not self._standdown_sweep_scheduled
+                and hasattr(self.executor, "standdown_sweep_async")):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:   # no loop (a sync harness): nothing to schedule on; retried next call
+                return
+            self._standdown_sweep_scheduled = True
+            loop.create_task(self._standdown_sweep_task(server_ts))
+
+    async def _standdown_sweep_task(self, server_ts: float) -> None:
+        try:
+            events = await self.executor.standdown_sweep_async(server_ts)
+        except Exception as e:  # noqa: BLE001 -- the sweep must never wedge the loop
+            self._async_errors += 1
+            self.journal.append("alarm", {"alarm": "standdown_sweep_error", "error": str(e)}, self.clock())
+            return
+        if events:
+            try:
+                self._ingest_async(events)
+            except Exception as e:  # noqa: BLE001
+                self._async_errors += 1
+                self.journal.append("alarm", {"alarm": "async_ingest_error", "error": str(e)}, self.clock())
 
     # --- journaling ---
     def _journal_action(self, a, server_ts: float) -> None:

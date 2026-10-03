@@ -51,7 +51,7 @@ from service.orders.envelope import (
     parse_single_response,
 )
 from service.proxy_writer import ProxyWriter
-from service.v32.actions import ActionKind
+from service.v32.actions import ActionKind, V32Action
 from service.v32.core import BUY_NO
 from service.v32.events import Fill, OrderAck, OrderAmended, OrderCancelled
 from service.v32.executor import (
@@ -74,6 +74,7 @@ from service.v32.executor import (
 from datetime import datetime, timezone
 
 from service.v33.actions import V33ActionKind
+from service.v33.events import V33Fill
 from service.v33.async_writer import (
     CLASS_CANCEL,
     CLASS_POLL,
@@ -156,6 +157,14 @@ class V33AsyncExecutor(V33LiveExecutor):
         # until expiry. Now the cancel is DEFERRED and executed the instant the ack lands.
         self._inflight_creates: set[str] = set()
         self._cancel_pending: set[str] = set()
+        # GATE C (2026-10-03 02:00Z naked fill): venue order ids with a DELETE currently in flight (so the
+        # stand-down sweep and a racing core CANCEL_REST never double-DELETE one order; the first resolves
+        # it and reports the one OrderCancelled), and the one-shot latch of the stand-down sweep.
+        self._cancel_oids_inflight: set[str] = set()
+        self._standdown_swept = False
+        self.standdown_sweep_cancels = 0
+        self.places_refused_stood_down = 0
+        self.amends_refused_stood_down = 0
         self.wing_venue_confirms = 0
         self.wing_venue_confirmed_count = Decimal(0)
         # 2026-10-02 (02:00Z 429 storm): a wing 429 is a DEFINITIVE non-execution; the retry cadence backs
@@ -233,13 +242,18 @@ class V33AsyncExecutor(V33LiveExecutor):
         if k == V33ActionKind.UNWIND_WINGS:
             return await self._unwind_wings_async(action, now)
         if k == ActionKind.PLACE_REST:
+            if self.stand_down_reason is not None:
+                return self._refuse_place_stood_down(action.client_order_id or "", now, "dispatch")
             self._pending_place_price = action.price
             return await self._place_rest_async(action, now)
         if k == ActionKind.CANCEL_REST:
             return await self._cancel_rest_async(action, now)
         if k == ActionKind.AMEND_REST:
+            if self.stand_down_reason is not None:
+                return await self._refuse_amend_stood_down(action, now)
             return await self._amend_rest_async(action, now)
         if k in (ActionKind.TAKE_WINGS, ActionKind.RETRY_WING):
+            # GATE C(iii): a STOOD-DOWN executor still hedges -- wings / retries / cancels are always answered.
             return await self._take_wings_async(state, now)
         if k in (ActionKind.WOULD_PLACE_REST, ActionKind.WOULD_CANCEL_REST,
                  ActionKind.WOULD_AMEND_REST, ActionKind.WOULD_TAKE_WINGS):
@@ -251,28 +265,41 @@ class V33AsyncExecutor(V33LiveExecutor):
     # PLACE_REST — async twin of V33LiveExecutor._place_rest (pace) + LiveExecutor._place_rest
     # =====================================================================
     async def _place_rest_async(self, action, now: float) -> list[Any]:
-        await self._pacer.acquire_async(COST_CREATE, "create")
+        """GATE C(i) (2026-10-03 02:00Z): the coid is registered IN FLIGHT at the very top -- before the pacer
+        and the pre-flight GET -- so a CANCEL_REST arriving at ANY point of the call is deferred (the
+        pre-fix registration around the POST only let #27's cancel, landing 3 ms before its POST inside the
+        pre-flight, fall through as a no-op: #27 then rested owned by nobody and filled naked). Cleared on
+        EVERY exit path (finally); a raise also drops any deferred cancel (#115 review N3)."""
         coid = action.client_order_id or ""
-        ticker = action.ticker or ""
-        exch = self._exch(ticker)
-        if exch is None:
-            return self._reject_place(coid, ticker, now, {"reason": "no_exchange_index"})
-        violation = await self._pre_place_invariant_async(coid, now, place_price=action.price)
-        if violation is not None:
-            return violation
-        body = self._rest_body(action, coid, exch)
-        self.journal.append("place_rest", {**{k: v for k, v in body.items()
-                                              if k != "self_trade_prevention_type"},
-                                          "n": action.price, "bucket_Sd": self._bucket_sd(ticker)},
-                            self.clock())
         self._inflight_creates.add(coid)
         try:
-            resp = await self._apost(REL_SINGLE_CREATE, body, CLASS_REST, slot=coid)
+            return await self._place_rest_inflight_async(action, coid, now)
         except BaseException:
             self._cancel_pending.discard(coid)   # review N3: no deferred cancel may outlive a create that raised
             raise
         finally:
             self._inflight_creates.discard(coid)
+
+    async def _place_rest_inflight_async(self, action, coid: str, now: float) -> list[Any]:
+        await self._pacer.acquire_async(COST_CREATE, "create")
+        ticker = action.ticker or ""
+        exch = self._exch(ticker)
+        if exch is None:
+            self._cancel_pending.discard(coid)   # nothing was sent; the rejection event resolves the slot
+            return self._reject_place(coid, ticker, now, {"reason": "no_exchange_index"})
+        violation = await self._pre_place_invariant_async(coid, now, place_price=action.price)
+        if violation is not None:
+            self._cancel_pending.discard(coid)   # never POSTed; the rejection (with coid) resolves the slot
+            return violation
+        skip = self._skip_before_post(coid, now)
+        if skip is not None:
+            return skip
+        body = self._rest_body(action, coid, exch)
+        self.journal.append("place_rest", {**{k: v for k, v in body.items()
+                                              if k != "self_trade_prevention_type"},
+                                          "n": action.price, "bucket_Sd": self._bucket_sd(ticker)},
+                            self.clock())
+        resp = await self._apost(REL_SINGLE_CREATE, body, CLASS_REST, slot=coid)
         self.rests_placed += 1
         self._bump("rest_post")
         if not resp.ok:
@@ -300,28 +327,112 @@ class V33AsyncExecutor(V33LiveExecutor):
         self._bump("rest_acked")
         events: list[Any] = [OrderAck(client_order_id=coid, order_id=oid, server_ts=now)]
         if parsed.fill_count > 0:
-            events.append(Fill(order_id=oid, client_order_id=coid, count=parsed.fill_count,
-                               price=action.price if action.price is not None else Decimal(0),
-                               side="no", server_ts=now))
+            events.append(V33Fill(order_id=oid, client_order_id=coid, count=parsed.fill_count,
+                                  price=action.price if action.price is not None else Decimal(0),
+                                  side="no", server_ts=now, market_ticker=ticker))
         if coid in self._cancel_pending:
-            # The core cancelled this slot while the create was in flight (stand-down / bucket change /
-            # quote end). Execute that cancel NOW that the venue id is known, so the order never rests
-            # unowned. The cancel-confirm path books any fill that landed in between.
+            events += await self._cancel_after_ack_async(coid, oid, exch, now)
+        return events
+
+    async def _cancel_after_ack_async(self, coid: str, oid: str, exch: int | None, now: float) -> list[Any]:
+        """The core (or the stand-down sweep) cancelled this slot while its create was in flight (stand-down
+        / bucket change / quote end). Execute that cancel NOW that the venue id is known, so the order never
+        rests unowned. The cancel-confirm path books any fill that landed in the ack->DELETE gap (its
+        OrderCancelled carries coid / price / ticker, so the core hedges it even off-ladder -- gate A)."""
+        self._cancel_pending.discard(coid)
+        self._bump("cancel_after_ack")
+        rec = self.rest_book.get(coid)
+        return await self._delete_and_resolve_async(rec, oid, exch, coid, now, via="cancel_after_ack")
+
+    def _skip_before_post(self, coid: str, now: float) -> list[Any] | None:
+        """GATE C: the last check before a create POST. If the slot was cancelled while this create sat in
+        the pacer / pre-flight, or the executor stood down meanwhile (a sibling's pre-flight tripped the
+        invariant), the POST is NOT sent -- nothing reaches the venue, so nothing can rest unowned. The
+        coid-carrying OrderCancelled resolves the core's pending slot (gate B)."""
+        if coid in self._cancel_pending:
             self._cancel_pending.discard(coid)
-            self._bump("cancel_after_ack")
-            self.cancels_attempted += 1
-            rec = self.rest_book.get(coid)
-            self.journal.append("cancel_rest",
-                                {"order_id": oid, "client_order_id": coid, "exchange_index": exch,
-                                 "via": "cancel_after_ack"}, self.clock())
-            wr = await self._adelete(cancel_path(oid, exch), CLASS_CANCEL, slot=self._slot(oid))
-            self._bump("cancel_delete")
-            if wr.status_code == 404:
-                self.cancel_404s += 1
-            if wr.ok:
-                events += await self._resolve_cancel_success_async(wr, rec, oid, now)
-            else:
-                events += await self._cancel_nonok_async(wr, rec, oid, exch, coid, now)
+            reason = "cancelled_in_flight"
+        elif self.stand_down_reason is not None:
+            reason = "stood_down"
+        else:
+            return None
+        self._bump("place_skipped_before_post")
+        self.journal.append("place_skipped_before_post",
+                            {"client_order_id": coid, "reason": reason,
+                             "stand_down_reason": self.stand_down_reason}, self.clock())
+        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                               client_order_id=coid)]
+
+    def _refuse_place_stood_down(self, coid: str, now: float, where: str) -> list[Any]:
+        """GATE C(iii): a stood-down executor refuses every NEW rest (nothing is sent)."""
+        self.places_refused_stood_down += 1
+        self._bump("place_refused_stood_down")
+        self.journal.append("place_refused_stood_down",
+                            {"client_order_id": coid, "stand_down_reason": self.stand_down_reason,
+                             "where": where}, self.clock())
+        return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
+                               client_order_id=coid)]
+
+    async def _refuse_amend_stood_down(self, action, now: float) -> list[Any]:
+        """GATE C(iii): a stood-down executor refuses an AMEND (no re-price of an owned rest while stood
+        down) and CANCELS the order instead -- the stand-down's intent. The core receives the cancel as the
+        roll's fallback and, being stood down, does not re-place."""
+        self.amends_refused_stood_down += 1
+        self._bump("amend_refused_stood_down")
+        self.journal.append("amend_refused_stood_down",
+                            {"order_id": action.order_id, "client_order_id": action.client_order_id,
+                             "stand_down_reason": self.stand_down_reason}, self.clock())
+        return await self._cancel_rest_async(
+            V32Action(kind=ActionKind.CANCEL_REST, order_id=action.order_id,
+                      client_order_id=action.client_order_id), now)
+
+    async def standdown_sweep_async(self, now: float) -> list[Any]:
+        """GATE C(ii) (2026-10-03 02:00Z): on an executor stand-down, cancel EVERY order this executor owns
+        that may still rest at the venue -- the stand-down used to cancel nothing it owned while the
+        stood-down core issued no actions, so #23 / #27 rested until they filled naked. One-shot. Creates
+        still IN FLIGHT get a deferred cancel (executed on ack, or the POST is skipped); every other owned
+        record with a venue id and no confirmed cancel is DELETEd on the cancel lane, confirmed, and
+        reported as ``OrderCancelled(order_id, client_order_id, filled_count_before_cancel, price,
+        market_ticker)`` so any racing fill is booked and hedged by the core (gate A)."""
+        if self._standdown_swept or self.stand_down_reason is None:
+            return []
+        self._standdown_swept = True
+        deferred = sorted(c for c in self._inflight_creates if c)
+        for c in deferred:
+            self._cancel_pending.add(c)
+        targets: list[RestRecord] = []
+        seen: set[str] = set()
+        for rec in list(self.rest_book.values()):
+            if (rec.order_id is None or rec.order_id in seen or rec.cancel_confirmed_ts is not None
+                    or rec.status not in ("live", "filled", "cancel_failed")):
+                continue
+            seen.add(rec.order_id)
+            targets.append(rec)
+        unknown = [r.client_order_id for r in self.rest_book.values()
+                   if r.order_id is None and r.status == "unknown"]
+        info = {"reason": self.stand_down_reason, "cancel": [r.client_order_id for r in targets],
+                "deferred_in_flight": deferred, "unknown_outcome_unowned": unknown}
+        self.journal.append("standdown_sweep", info, self.clock())
+        self._record_alarm("standdown_sweep", info)
+        results = await asyncio.gather(
+            *(self._cancel_rest_async(V32Action(kind=ActionKind.CANCEL_REST, order_id=r.order_id,
+                                                client_order_id=r.client_order_id), now)
+              for r in targets),
+            return_exceptions=True)
+        events: list[Any] = []
+        errors = 0
+        for r, res in zip(targets, results):
+            if isinstance(res, BaseException):
+                errors += 1
+                self.journal.append("standdown_sweep_error",
+                                    {"order_id": r.order_id, "client_order_id": r.client_order_id,
+                                     "error": str(res)}, self.clock())
+                continue
+            events += res
+        self.standdown_sweep_cancels += len(targets) - errors
+        self.journal.append("standdown_sweep_done",
+                            {"cancelled": len(targets) - errors, "errors": errors,
+                             "events": len(events)}, self.clock())
         return events
 
     # =====================================================================
@@ -469,17 +580,32 @@ class V33AsyncExecutor(V33LiveExecutor):
         exch = rec.exchange_index if rec is not None else None
         if exch is None and rec is not None:
             exch = self._exch(rec.ticker)
-        self.cancels_attempted += 1
-        self.journal.append("cancel_rest",
-                            {"order_id": oid, "client_order_id": coid, "exchange_index": exch},
-                            self.clock())
-        wr = await self._adelete(cancel_path(oid, exch), CLASS_CANCEL, slot=self._slot(oid))
-        self._bump("cancel_delete")
-        if wr.status_code == 404:
-            self.cancel_404s += 1
-        if wr.ok:
-            return await self._resolve_cancel_success_async(wr, rec, oid, now)
-        return await self._cancel_nonok_async(wr, rec, oid, exch, coid, now)
+        return await self._delete_and_resolve_async(rec, oid, exch, coid, now)
+
+    async def _delete_and_resolve_async(self, rec, oid: str, exch: int | None, coid, now: float,
+                                        via: str | None = None) -> list[Any]:
+        """DELETE one owned order on the cancel lane and resolve it by status truth. GATE C: a DELETE already
+        in flight for this order (the stand-down sweep racing a core CANCEL_REST, or the ack-path cancel) is
+        NOT repeated -- that DELETE's own OrderCancelled resolves the order for the core."""
+        if oid in self._cancel_oids_inflight:
+            self._bump("cancel_dup_inflight")
+            return []
+        self._cancel_oids_inflight.add(oid)
+        try:
+            self.cancels_attempted += 1
+            payload = {"order_id": oid, "client_order_id": coid, "exchange_index": exch}
+            if via is not None:
+                payload["via"] = via
+            self.journal.append("cancel_rest", payload, self.clock())
+            wr = await self._adelete(cancel_path(oid, exch), CLASS_CANCEL, slot=self._slot(oid))
+            self._bump("cancel_delete")
+            if wr.status_code == 404:
+                self.cancel_404s += 1
+            if wr.ok:
+                return await self._resolve_cancel_success_async(wr, rec, oid, now)
+            return await self._cancel_nonok_async(wr, rec, oid, exch, coid, now)
+        finally:
+            self._cancel_oids_inflight.discard(oid)
 
     async def _resolve_cancel_success_async(self, wr, rec, oid: str, now: float) -> list[Any]:
         """Async twin of LiveExecutor._resolve_cancel_success (reduced_by + status-truth MAX)."""
@@ -687,17 +813,7 @@ class V33AsyncExecutor(V33LiveExecutor):
             self._bump("amend_fallback_noop")
             return [OrderCancelled(order_id=None, server_ts=now, filled_count_before_cancel=Decimal(0),
                                    client_order_id=coid_old)]
-        self.cancels_attempted += 1
-        self.journal.append("cancel_rest",
-                            {"order_id": oid, "client_order_id": coid_old, "exchange_index": exch,
-                             "via": "amend_fallback"}, self.clock())
-        wr = await self._adelete(cancel_path(oid, exch), CLASS_CANCEL, slot=self._slot(oid))
-        self._bump("cancel_delete")
-        if wr.status_code == 404:
-            self.cancel_404s += 1
-        if wr.ok:
-            return await self._resolve_cancel_success_async(wr, rec, oid, now)
-        return await self._cancel_nonok_async(wr, rec, oid, exch, coid_old, now)
+        return await self._delete_and_resolve_async(rec, oid, exch, coid_old, now, via="amend_fallback")
 
     # =====================================================================
     # TAKE_WINGS / RETRY_WING — async twin of V33LiveExecutor._take_wings (chunked; WING lane)
@@ -948,25 +1064,60 @@ class V33AsyncExecutor(V33LiveExecutor):
         return events
 
     async def _place_one_chunk_async(self, actions: list, now: float) -> list[Any]:
+        """GATE G (#115 residual): the batch create gets the SAME in-flight / deferred-cancel handling as the
+        single path -- every coid of the chunk is registered in flight at the top (before the pre-flights),
+        a slot cancelled or an executor stood down before the POST is never sent, a slot cancelled during
+        the POST is cancelled on its ack, and the registration is cleared on every exit path."""
+        coids = [a.client_order_id or "" for a in actions]
+        for c in coids:
+            self._inflight_creates.add(c)
+        try:
+            return await self._place_one_chunk_inflight_async(actions, now)
+        except BaseException:
+            for c in coids:
+                self._cancel_pending.discard(c)   # review N3: no deferred cancel outlives a create that raised
+            raise
+        finally:
+            for c in coids:
+                self._inflight_creates.discard(c)
+
+    async def _place_one_chunk_inflight_async(self, actions: list, now: float) -> list[Any]:
         events: list[Any] = []
         entries: list[dict[str, Any]] = []
         by_coid: dict[str, Any] = {}
         for a in actions:
             coid = a.client_order_id or ""
             ticker = a.ticker or ""
+            if self.stand_down_reason is not None:
+                events += self._refuse_place_stood_down(coid, now, "batch")
+                self._cancel_pending.discard(coid)
+                continue
             exch = self._exch(ticker)
             if exch is None:
+                self._cancel_pending.discard(coid)
                 events += self._reject_place(coid, ticker, now, {"reason": "no_exchange_index"})
                 continue
             self._pending_place_price = a.price
             violation = await self._pre_place_invariant_async(coid, now, place_price=a.price)
             if violation is not None:
+                self._cancel_pending.discard(coid)
                 events += violation
                 continue
             entries.append(self._rest_body(a, coid, exch))
             by_coid[coid] = a
-            self.journal.append("place_rest", {"client_order_id": coid, "ticker": ticker,
+        # last check before the POST (a cancel / stand-down that landed during the pre-flights).
+        kept_entries: list[dict[str, Any]] = []
+        for e in entries:
+            skip = self._skip_before_post(e.get("client_order_id") or "", now)
+            if skip is not None:
+                events += skip
+                by_coid.pop(e.get("client_order_id") or "", None)
+                continue
+            kept_entries.append(e)
+            a = by_coid[e.get("client_order_id") or ""]
+            self.journal.append("place_rest", {"client_order_id": a.client_order_id, "ticker": a.ticker,
                                                "n": a.price, "batch": True}, self.clock())
+        entries = kept_entries
         if not entries:
             return events
         await self._pacer.acquire_async(COST_CREATE * len(entries), "batch_create")
@@ -982,15 +1133,17 @@ class V33AsyncExecutor(V33LiveExecutor):
         for coid, a in by_coid.items():
             p = by_parsed.get(coid)
             if not resp.ok or p is None or p.error or p.order_id is None:
+                self._cancel_pending.discard(coid)   # nothing rests at the venue; nothing to cancel
                 events += self._reject_place(coid, a.ticker or "", now,
                                              {"status": resp.status_code, "batch": True})
                 continue
             oid = p.order_id
+            exch = self._exch(a.ticker or "")
             self.rest_book[coid] = RestRecord(
                 client_order_id=coid, order_id=oid,
                 price=a.price if a.price is not None else Decimal(0),
                 count=int(a.count), ticker=a.ticker or "", bucket_Sd=self._bucket_sd(a.ticker or ""),
-                placed_ts=now, status="live", exchange_index=self._exch(a.ticker or ""),
+                placed_ts=now, status="live", exchange_index=exch,
                 expiration_epoch=self._expiration_epoch(a),
             )
             self._by_order_id[oid] = coid
@@ -999,9 +1152,11 @@ class V33AsyncExecutor(V33LiveExecutor):
             self._bump("rest_acked")
             events.append(OrderAck(client_order_id=coid, order_id=oid, server_ts=now))
             if p.fill_count and p.fill_count > 0:
-                events.append(Fill(order_id=oid, client_order_id=coid, count=p.fill_count,
-                                   price=a.price if a.price is not None else Decimal(0),
-                                   side="no", server_ts=now))
+                events.append(V33Fill(order_id=oid, client_order_id=coid, count=p.fill_count,
+                                      price=a.price if a.price is not None else Decimal(0),
+                                      side="no", server_ts=now, market_ticker=a.ticker or None))
+            if coid in self._cancel_pending:
+                events += await self._cancel_after_ack_async(coid, oid, exch, now)
         return events
 
     # =====================================================================
