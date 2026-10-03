@@ -220,6 +220,24 @@ def test_venue_fills_included_and_filtered_to_our_orders():
     assert any(k == "venue_fills_fetched" for k, _ in journal.records)
 
 
+def test_venue_fetch_fails_closed_on_empty_known_oids():
+    """REVIEW fix: the account is SHARED across pilots, so an empty ``_by_order_id`` (we acked nothing this
+    window) must ingest NO venue fills -- the pre-fix ``known_oids and ...`` disabled the filter and would
+    have booked ANOTHER pilot's fills as ours (false unbooked / mismatch / one-legged -> false KILL)."""
+    from service.run_v33 import _fetch_venue_fills_v33
+
+    class _P:
+        def rest_get(self, path, params=None):
+            return {"fills": [{"order_id": "other-pilot", "count_fp": "5", "ticker": "KXOTHER"}]}
+
+    journal = _FakeJournal()
+    driver = SimpleNamespace(executor=SimpleNamespace(_by_order_id={}))   # we own nothing this window
+    venue = _fetch_venue_fills_v33(_P(), "2026-10-03T02:00:00Z", driver, journal, lambda: 0.0)
+    assert venue == []
+    fetched = [obj for k, obj in journal.records if k == "venue_fills_fetched"]
+    assert fetched and fetched[0]["ours"] == 0
+
+
 # ---------------------------------------------------------------------------
 # 5. alarm breakdown sums to alarms; executor alarms counted
 # ---------------------------------------------------------------------------
@@ -275,6 +293,49 @@ def test_poll_cumulative_maxed_over_ws_partial():
                               ExecFill(count=D("1.0"), coid="a", order_id="oa", source="poll")],
                   core_rest_fills=None, hedged_lots=D(0))
     assert r.exec_lots == 1 and r.one_legged is True
+
+
+def test_rebuild_sums_multiple_poll_deltas_on_one_order():
+    """REVIEW fix: the journal poll ``rest_fill`` carries a DELTA, so an order filled in TWO poll deltas
+    (0.40 then 0.60) must SUM to 1.00 in the rebuild. The pre-fix poll=MAX bucket read 0.60 (the larger
+    delta) and HID 0.40 of a possibly-naked lot -- the dangerous direction for a one-legged audit."""
+    recs = [
+        {"kind": "rest_fill", "obj": {"client_order_id": "a", "order_id": "oa", "count": "0.40",
+                                      "rest_price": "0.20", "market": B, "path": "poll"}},
+        {"kind": "rest_fill", "obj": {"client_order_id": "a", "order_id": "oa", "count": "0.60",
+                                      "rest_price": "0.20", "market": B, "path": "poll"}},
+    ]
+    out = rebuild_from_records(recs)
+    assert out["lots_filled"] == 1 and out["exec_lots"] == 1
+    assert out["one_legged"] is True and out["one_legged_contracts"] == 1
+
+
+def test_rebuild_mixed_ws_and_poll_increments_sum():
+    """ws increment 0.40 + poll delta 0.60 on the SAME order (disjoint lots a healthy core books once per
+    channel) -> 1.00. (One sum bucket; the pre-fix MAX-across read max(0.40, 0.60) = 0.60.)"""
+    recs = [
+        {"kind": "rest_fill", "obj": {"client_order_id": "a", "order_id": "oa", "count": "0.40",
+                                      "rest_price": "0.20", "market": B, "path": "ws"}},
+        {"kind": "rest_fill", "obj": {"client_order_id": "a", "order_id": "oa", "count": "0.60",
+                                      "rest_price": "0.20", "market": B, "path": "poll"}},
+    ]
+    out = rebuild_from_records(recs)
+    assert out["lots_filled"] == 1 and out["one_legged_contracts"] == 1
+
+
+def test_reconcile_exec_truth_only_surfaces_one_legged_without_core():
+    """REVIEW fix (gate E item 4): the STRICTER fail-safe used when ``reconcile_live`` raises -- executor
+    truth vs completed-hedge coverage ALONE, no core input. A naked fill is still one-legged, so a
+    mid-reconcile error can NEVER drop the window back to the blind core (the 02:00Z failure mode)."""
+    from service.v33.reconcile import reconcile_exec_truth_only
+
+    drv = SimpleNamespace(
+        _exec_truth_fills=_exec_from_fixture(),
+        executor=SimpleNamespace(fills=[]),
+        state=SimpleNamespace(rest_fills=(), one_legged=False, wing_batches=()))
+    r = reconcile_exec_truth_only(drv)
+    assert r.exec_lots == 2 and r.lots_filled == 2 and r.core_lots == 0
+    assert r.one_legged is True and r.one_legged_contracts == 2
 
 
 # ---------------------------------------------------------------------------

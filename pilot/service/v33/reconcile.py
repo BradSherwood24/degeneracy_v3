@@ -282,6 +282,23 @@ def reconcile_live(driver: Any, venue_fills: Iterable[Mapping[str, Any]] | None 
     )
 
 
+def reconcile_exec_truth_only(driver: Any, venue_fills: Iterable[Mapping[str, Any]] | None = None
+                              ) -> ReconcileResult:
+    """The STRICTER fail-safe (2026-10-03 gate E item 4): reconcile executor truth against the
+    completed-hedge coverage ALONE, with NO core input (``core_rest_fills=None``). Used when the full
+    ``reconcile_live`` raises mid-window: it must NEVER drop the window back to the blind core (the 02:00Z
+    failure mode read core one_legged False while two lots were naked). lots_filled = executor truth,
+    one_legged = executor lots not covered by a completed wing pair — so a naked fill is still surfaced on
+    the row and counted one-legged even when the core-vs-executor reconcile could not run."""
+    state = getattr(driver, "state", None)
+    return reconcile(
+        exec_fills=executor_truth_fills(driver, venue_fills),
+        core_rest_fills=None,
+        hedged_lots=_hedged_lots_from_state(state),
+        core_one_legged=bool(getattr(state, "one_legged", False)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Alarm accounting (gate E item 3): driver + core + executor + ws, with a breakdown
 # ---------------------------------------------------------------------------
@@ -318,10 +335,15 @@ def alarm_breakdown(*, driver_counts: Mapping[str, int], executor_counts: Mappin
 # ---------------------------------------------------------------------------
 # REBUILD: a reconciled row from journal events (the ledger rebuild / daily replay)
 # ---------------------------------------------------------------------------
-# The journal rest_fill record carries a per-EVENT increment for BOTH paths: the ws handler journals the
-# event count, and the poll handler journals the DELTA over what was booked (run_v33.on_poll_fill). So the
-# rebuild sums rest_fill counts regardless of path; keying by order maxes across sources all the same.
-_REBUILD_SOURCE = {"ws": "ws", "poll": "poll"}
+# The journal rest_fill record carries a per-EVENT INCREMENT for BOTH paths: the ws handler journals the
+# event count, and the poll handler journals the DELTA over what the core had booked (run_v33.on_poll_fill).
+# Both are increments, so the rebuild must SUM every rest_fill per order (a single lot is journaled by
+# EITHER channel, never both, when the core books healthily). They therefore share ONE sum bucket
+# ("journal") — the pre-fix split that put poll in a MAX bucket under-counted an order with two poll deltas
+# (MAX 0.60 over deltas 0.40+0.60 instead of SUM 1.00); this direction HIDES a naked lot in an audit, so
+# it is summed. (Over-counting only in the rare core-fail case where both channels re-report the same lot
+# — the SAFE direction for the one-legged pin.)
+_REBUILD_SOURCE = "journal"
 
 
 def _records_iter(records: Iterable[Any]):
@@ -352,7 +374,7 @@ def rebuild_from_records(records: Iterable[Any]) -> dict[str, Any]:
             exec_fills.append(ExecFill(
                 count=_dc(obj.get("count", 0)), coid=obj.get("client_order_id"),
                 order_id=obj.get("order_id"), price=obj.get("rest_price"),
-                ticker=obj.get("market"), source=_REBUILD_SOURCE.get(str(obj.get("path")), "ws")))
+                ticker=obj.get("market"), source=_REBUILD_SOURCE))
         elif kind == "take_wings":
             # the lots the core committed to a two-legged hedge (retry_wing is a single-leg top-up, not a
             # new coalesced take -> excluded, so it never double-counts coverage).

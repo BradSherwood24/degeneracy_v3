@@ -84,7 +84,12 @@ from service.v33.ledger import (
     v33_pending_credit,
     v33_settlement_backfill_sweep,
 )
-from service.v33.reconcile import ExecFill, alarm_breakdown, reconcile_live
+from service.v33.reconcile import (
+    ExecFill,
+    alarm_breakdown,
+    reconcile_exec_truth_only,
+    reconcile_live,
+)
 from service.v33.stops import (
     V33_S1_LEGGED_LATCH_THRESHOLD,
     decide_v33_arming,
@@ -919,8 +924,12 @@ def _fetch_venue_fills_v33(proxy: Any, close_iso: str, driver: V33Driver, journa
         if not isinstance(f, dict):
             continue
         oid = f.get("order_id")
-        if oid is None or (known_oids and oid not in known_oids):
-            continue   # only OUR bucket orders (the account is shared across pilots)
+        # Only OUR bucket orders. The account is SHARED across pilots, so this filter FAILS CLOSED: an
+        # empty ``known_oids`` (we acked nothing this window) means we own nothing to reconcile, so NO venue
+        # fill is ours. The pre-fix ``known_oids and ...`` disabled the filter on an empty map and would
+        # have ingested another pilot's fills as ours (false unbooked / mismatch / one-legged -> false KILL).
+        if oid is None or oid not in known_oids:
+            continue
         cnt = f.get("count_fp")
         if cnt is None:
             cnt = f.get("count")
@@ -1244,12 +1253,26 @@ def main(argv: list[str] | None = None) -> int:
                     journal.append("alarm", {"alarm": "ledger_reconcile_mismatch",
                                              **(recon.mismatch_detail or {})}, clock())
             except Exception as e:  # noqa: BLE001 -- gate E accounting never blocks the close/row write
-                recon = None
+                # The reconcile_failed alarm IS a kind-``alarm`` journal record, so it must be COUNTED or
+                # the live alarms_breakdown.total would under-count it vs the journal / a rebuild.
+                reconcile_alarms = 1
                 journal.append("alarm", {"alarm": "reconcile_failed", "error": str(e)}, clock())
+                # STRICTER-OF-THE-TWO fallback: a mid-reconcile error must NOT drop the window back to the
+                # blind core (the 02:00Z failure mode read core one_legged False with two lots naked).
+                # Reconcile executor truth against the completed-hedge coverage ALONE (no core, no venue) so
+                # a naked fill is still surfaced on the row and counted one-legged; if even that raises,
+                # recon stays None and the S1 belt below uses the raw executor-truth evidence.
+                try:
+                    recon = reconcile_exec_truth_only(driver)
+                except Exception:  # noqa: BLE001
+                    recon = None
             # S1_LEGGED comes from the RECONCILED one-legged (executor truth), never the core alone: the
             # 02:00Z core read one_legged False while the executor held two naked lots. If reconciliation
-            # failed, fall back to the core's own one_legged mirror (defence, not optimism).
-            s1_one_legged = recon.one_legged if recon is not None else driver.state.one_legged
+            # failed OUTRIGHT (recon None), the fallback is the STRICTER of the two -- the core mirror OR any
+            # executor-truth rest fill observed this window (never the blind core alone), so a naked lot
+            # still latches S1 even when every reconcile path raised.
+            s1_one_legged = (recon.one_legged if recon is not None
+                             else (bool(driver.state.one_legged) or bool(driver._exec_truth_fills)))
             if armed and s1_one_legged:
                 try:
                     utc_day = close_iso[:10]
