@@ -251,6 +251,10 @@ def compute_ladder_money_math(state, *, dry_sim: bool) -> dict[str, Any]:
             "coid": rf.coid,
             "order_id": rf.order_id,
             "batch": bidx,
+            # GATE A/E: an orphan rung fill is one the executor owned but the core had lost from its ladder
+            # (booked from the fill event itself and hedged). Labelled here so the reconciled row/report
+            # can surface it; a legitimate-rung fill carries orphan False (back-compat: absent pre-gate-E).
+            "orphan": bool(getattr(rf, "orphan", False)),
         })
 
     # cash paid = Σ rung rest cost (n x count, maker fee 0) + Σ wing cost (price x count + fee_total).
@@ -376,10 +380,19 @@ def build_v33_ledger_row(
     print_through: list[Any] | None = None,
     netted_sets: list[Any] | None = None,
     writer_stats: dict[str, Any] | None = None,
+    alarms_breakdown: dict[str, int] | None = None,
+    reconcile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
     (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row.
-    ``deep_obs`` is the SO-3 deep-end observation ladder summary (19..28c; observation only)."""
+    ``deep_obs`` is the SO-3 deep-end observation ladder summary (19..28c; observation only).
+
+    GATE E (2026-10-03): ``alarms_breakdown`` (driver/core/executor/ws/reconcile) sets the single
+    ``alarms`` number and rides the row as ``alarms_breakdown``; absent, ``alarms`` falls back to the
+    pre-gate-E ``ws_counts['alarm']`` (stand-down rows, unit tests). ``reconcile`` carries the gate E
+    executor-truth reconciliation (unbooked_fills, reconcile_mismatch, one_legged_contracts, the
+    exec/core/hedged lots) and, when present, its ``lots_filled`` / ``one_legged`` are what the caller
+    already passed in (the caller merges them before calling)."""
     money = {
         "rung_fills": rung_fills or [],
         "wing_batch_sets": wing_batch_sets or [],
@@ -414,7 +427,11 @@ def build_v33_ledger_row(
         "would_cancels": int(driver_counts.get("would_cancel_rest", 0)),
         "would_takes": int(driver_counts.get("would_take_wings", 0)),
         "shadow": _shadow_summary(state),
-        "alarms": int(ws_counts.get("alarm", 0)),
+        # GATE E: the single alarms number = driver + core + executor + ws (+ reconcile), with the
+        # auditable split in ``alarms_breakdown``. Pre-gate-E fallback (no breakdown) = ws alarms only.
+        "alarms": (int(alarms_breakdown.get("total", 0)) if alarms_breakdown is not None
+                   else int(ws_counts.get("alarm", 0))),
+        "alarms_breakdown": alarms_breakdown or {},
         "synth_counts": dict(executor_counts),
         "strike_lag_seconds": strike_lag_seconds,
         "bucket_lag_seconds": bucket_lag_seconds,
@@ -443,6 +460,13 @@ def build_v33_ledger_row(
         # OFF-LOOP writer telemetry (2026-09-30): feed_gap_max_s is the DIRECT proof the loop is not
         # freezing the feed; the nested ``writer`` block carries queue depth / latency / class mix.
         "writer_stats": writer_stats or {},
+        # GATE E: the executor-truth reconciliation receipts (empty {} on a dry / no-fill / unit row).
+        # ``lots_filled`` / ``one_legged`` above already reflect the reconciled values (merged by the
+        # caller); these fields are the per-fill unbooked quantities, the mismatch flag, and the lot splits.
+        "reconcile": reconcile or {},
+        "unbooked_fills": (reconcile or {}).get("unbooked_fills", []),
+        "reconcile_mismatch": bool((reconcile or {}).get("reconcile_mismatch", False)),
+        "one_legged_contracts": (reconcile or {}).get("one_legged_contracts"),
         "flushed_at": now,
     }
     return row
