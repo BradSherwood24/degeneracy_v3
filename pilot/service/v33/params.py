@@ -91,6 +91,14 @@ PREVIOUS_V33_PARAMS_SHA256_FLAP_R2 = "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5
 # The sha the print-through re-pin (2026-09-26) froze; superseded by the L4 ladder shift (2026-09-29).
 PREVIOUS_V33_PARAMS_SHA256_PRINT_THROUGH = "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
 
+# STALE-WING LIVENESS (2026-10-03, gate D rewrite): the two NEW wing-gate bounds are OPTIONAL policy keys
+# (like ``rung_lots``): absent in the shipped JSON -> these MEASURED code defaults, so the shipped policy
+# file and its FROZEN sha (pinned in the frozen falsifier's Registration) are UNCHANGED. A future policy
+# may set either key explicitly (that would be a deliberate re-pin + Registration line). Measurement:
+# pilot/build/v33_stale_wing_measurement_2026_10_03.md (journals 2026-09-30..2026-10-03).
+V33_STRIKE_FEED_DEAD_S_DEFAULT = 4.0
+V33_WING_BOOK_MAX_AGE_S_DEFAULT = 30.0
+
 # Valid stall-policy strings (print-through). ``complete_else_unwind`` (default): take the bucket-NO
 # ourselves at the current NO ask if the resulting lock >= the floor, else unwind the pre-taken wings.
 # ``complete`` / ``unwind``: force one branch (for tuning / kill-switch).
@@ -187,6 +195,16 @@ class V33Params:
     stand_down_hold_ms: int              # on a stale/missing-wing stand-down with a live ladder, HOLD the
                                          # rests (no new places/rolls, no cancel) up to this; resume if
                                          # freshness returns, else cancel-all. 0 = cancel immediately.
+    # STALE-WING LIVENESS (2026-10-03, gate D rewrite; values MEASURED, see
+    # pilot/build/v33_stale_wing_measurement_2026_10_03.md). Replaces V3.2's 1.0 s per-strike age on the
+    # V3.3 wing gates (``freshness_max_age_s`` stays in the policy, unread by the V3.3 wing gates; the
+    # imported V3.2 shadow completion still reads it). OPTIONAL keys: absent -> the
+    # ``V33_*_DEFAULT`` constants above (the shipped JSON and its frozen sha are unchanged).
+    strike_feed_dead_s: float            # the strike CONNECTION is dead iff no strike book frame's own ts is
+                                         # within this of the eval clock (any of ~188 strikes proves life)
+    wing_book_max_age_s: float           # LOOSE per-wing-strike age bound (belt-and-braces) on both the
+                                         # rest W and the wing TAKE gate; a quiet book on a live feed is
+                                         # the same book. >= freshness_max_age_s (loosen-only).
     # L2 (2026-09-23): wing-take chunking + write pacing + batched poll.
     max_contracts_per_order_hint: int  # upper bound on the wing chunk cap; actual cap = min(this, proxy)
     write_tokens_per_s: int            # Basic-tier write-token refill rate (100/s)
@@ -353,6 +371,20 @@ def load_v33_params(
             f"{raw['bucket_switch_max_pending_ms']} must be >= bucket_switch_deb_ms="
             f"{raw['bucket_switch_deb_ms']}"
         )
+    # STALE-WING LIVENESS (2026-10-03): both bounds positive and finite; the per-wing bound may only
+    # LOOSEN the V3.2 per-strike age, never tighten it (fail closed).
+    feed_dead = float(raw.get("strike_feed_dead_s", V33_STRIKE_FEED_DEAD_S_DEFAULT))
+    wing_age = float(raw.get("wing_book_max_age_s", V33_WING_BOOK_MAX_AGE_S_DEFAULT))
+    if not (0.0 < feed_dead < float("inf")) or not (0.0 < wing_age < float("inf")):
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: strike_feed_dead_s={feed_dead} / wing_book_max_age_s="
+            f"{wing_age} must be finite and > 0"
+        )
+    if wing_age < float(raw["freshness_max_age_s"]):
+        raise V33ParamsInvalid(
+            f"v33 policy at {path} is invalid: wing_book_max_age_s={wing_age} < freshness_max_age_s="
+            f"{raw['freshness_max_age_s']} (the per-wing bound may only loosen the V3.2 age)"
+        )
     shadow_Es = tuple(Decimal(str(x)) for x in raw["shadow_Es"])
     # Fail closed (ruling L-6, generalised for the ladder): every shadow E must lie WITHIN the live
     # ladder's margin range [E_min, E_min + (rungs-1)c], else the in-process shadow tracks a rung the
@@ -389,6 +421,8 @@ def load_v33_params(
         bucket_switch_hysteresis_usd=int(raw["bucket_switch_hysteresis_usd"]),
         bucket_switch_max_pending_ms=int(raw["bucket_switch_max_pending_ms"]),
         stand_down_hold_ms=int(raw["stand_down_hold_ms"]),
+        strike_feed_dead_s=feed_dead,
+        wing_book_max_age_s=wing_age,
         max_contracts_per_order_hint=int(raw["max_contracts_per_order_hint"]),
         write_tokens_per_s=int(raw["write_tokens_per_s"]),
         write_bucket_size=int(raw["write_bucket_size"]),

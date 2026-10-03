@@ -83,7 +83,8 @@ def _params(**over):
     # in test_v33_params.py / test_v33_hardening.py.
     p = replace(load_v33_params(), E_min=Decimal("0.05"))
     base = dict(print_through=True, tol=Decimal("0.01"), deb_ms=0,
-                freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)
+                freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)
     base.update(over)
     return replace(p, **base)
 
@@ -172,7 +173,8 @@ def test_no_trigger_when_feature_off():
     # L4 (2026-09-29): PIN E_min 0.05 (controlled ladder, n_top 0.50) -- this builds params directly rather
     # than via _params(), so it needs the same pin; print_through stays False (feature-off check).
     p = replace(load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
-                freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)  # print_through False
+                freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)  # print_through False
     st = _bring_up(p, _state(p), T - 600)
     st, acts = _feed(p, st, Trade(B_SD, Decimal("0.49"), "yes", Decimal(5), T - 599))
     assert not [a for a in acts if a.kind == ActionKind.TAKE_WINGS] and st.print_through == ()

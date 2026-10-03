@@ -270,8 +270,9 @@ def test_pipeline_executor_fraction_reaches_core_and_sizes_wings():
     assert rf.count == Decimal("0.44") and rf.bucket_Sd == 79600 and rf.bucket_ticker == B_SD_T
 
     # close the coalesce window on the 79600 strikes -> wings size 0.44 on STK_SD/STK_SU.
-    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 3))
+    # gate D (2026-10-03): the take may fire on the first tick off the quiet-but-live STK_SD book.
+    st, a0 = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 3))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.76"), now + 3))
-    take = [a for a in acts if a.kind == ActionKind.TAKE_WINGS][0]
+    take = [a for a in a0 + acts if a.kind == ActionKind.TAKE_WINGS][0]
     assert take.count == Decimal("0.44")
     assert {l.ticker for l in take.legs} == {STK_SD, STK_SU}

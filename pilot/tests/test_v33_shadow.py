@@ -56,7 +56,8 @@ def _load_fixture():
 def _dry_driver():
     fix = _load_fixture()
     p = dr(load_v33_params(), tol=Decimal("0.01"), deb_ms=0,
-           freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)
+           freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)
     cts = fix["close_epoch"]
     st = V33State.new(fix["close_time"], cts, BK, p, shakedown=True)
     drv = RUN.V33Driver(p, st, J(), FrozenExecutor(BK), dry_sim=True, clock=lambda: 0.0)

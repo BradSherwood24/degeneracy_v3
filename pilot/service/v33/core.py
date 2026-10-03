@@ -378,6 +378,13 @@ class V33State:
     bucket_tops: Mapping[int, TopOfBook] = field(default_factory=dict)
     bucket_ts: Mapping[int, float] = field(default_factory=dict)
     bucket_tickers: Mapping[int, str] = field(default_factory=dict)
+    # STALE-WING LIVENESS (2026-10-03, gate D rewrite): the latest ``book_ts`` folded from ANY strike
+    # (KXBTCD) book. The strike connection carries ~188 markets, so any strike frame proves the feed is
+    # alive; a single quiet deep-wing book is NOT staleness (it is the same book). The wing gates read
+    # feed liveness (``strike_feed_dead_s``) plus a LOOSE per-strike bound (``wing_book_max_age_s``)
+    # instead of V3.2's 1.0 s per-strike age. (The bucket connection needs no analogue: the spot bucket's
+    # own book is already gated at ``bucket_freshness_max_age_s`` = 30 s, R-STALE-SPOT.)
+    strike_feed_ts: float | None = None
 
     # current quote context (recomputed each book tick)
     spot_Sd: int | None = None
@@ -700,6 +707,7 @@ def decide_v33(
 
     if isinstance(event, BookUpdate):
         st = _fold_book(st, event)
+        st = _stamp_strike_feed(st, event)
         st = _recompute_context(params, st, now)
         st, _ = _shadow_complete(params, st, now)
         st, wa = _wing_step(params, st, now)
@@ -743,6 +751,48 @@ def decide_v33(
         return st, wa + pa + qa
 
     return st, actions
+
+
+# ---------------------------------------------------------------------------
+# Strike-feed liveness + the V3.3 wing gate (gate D rewrite, 2026-10-03)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class _WingLawView:
+    """The ONE field the reused V3.2 wing law (``_compute_W`` / ``_wing_prices``) reads off its params:
+    the per-strike age bound. V3.3 hands the V3.2 law this view carrying ``wing_book_max_age_s`` (the
+    LOOSE bound) instead of the V3.2 1.0 s ``freshness_max_age_s``, so the V3.2 law is reused UNCHANGED
+    (book present, not suspect, valid prices) and the V3.2 core keeps its own 1.0 s semantics
+    byte-identically."""
+
+    freshness_max_age_s: float
+
+
+def _stamp_strike_feed(st: V33State, event: BookUpdate) -> V33State:
+    """Record the strike connection's liveness: the latest ``book_ts`` (the frame's OWN server ts, NOT the
+    monotone eval clock, so a lagging/stalled connection ages out) of any STRIKE book fold."""
+    cls = classify_ticker(event.market_ticker, st.bucket_map)
+    if cls is None or cls[0] != "strike":
+        return st
+    book_ts = event.book_ts if event.book_ts is not None else event.server_ts
+    if st.strike_feed_ts is not None and book_ts <= st.strike_feed_ts:
+        return st
+    return replace(st, strike_feed_ts=book_ts)
+
+
+def _strike_feed_alive(params: V33Params, st: V33State, now: float) -> bool:
+    """The strike connection is ALIVE iff some strike frame's own ts is within ``strike_feed_dead_s`` of
+    the eval clock (same clock-interleave tolerance as ``_fresh``). Never seen -> dead."""
+    return _fresh(now, st.strike_feed_ts, params.strike_feed_dead_s)
+
+
+def _v33_compute_W(st: V33State, Sd: int, Su: int, now: float, params: V33Params) -> Decimal | None:
+    """W for the REST decision: the strike feed must be alive, then the UNCHANGED V3.2 ``_compute_W``
+    (books present, not suspect, valid asks) with the LOOSE per-strike bound ``wing_book_max_age_s``.
+    The bound is the SAME one the wing TAKE gate uses, so the ladder never rests a rung whose fill the take
+    gate would refuse to hedge."""
+    if not _strike_feed_alive(params, st, now):
+        return None
+    return _compute_W(st, Sd, Su, now, _WingLawView(params.wing_book_max_age_s))  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +881,7 @@ def _recompute_context(params: V33Params, st: V33State, now: float) -> V33State:
     cap = None
     n_top = None
     if spot_Sd is not None and spot_Su is not None and not spot_bucket_stale:
-        W = _compute_W(st, spot_Sd, spot_Su, now, params)
+        W = _v33_compute_W(st, spot_Sd, spot_Su, now, params)
         cap = _bucket_cap(st, spot_Sd)
         budget = (_TWO - params.E_min - W) if W is not None else None
         n_top = solve_n(budget, cap)
@@ -1278,12 +1328,19 @@ def _batch_bucket(params: V33Params, b: WingBatch) -> tuple[int | None, int | No
 def _wing_prices_for_bucket(
     st: V33State, sd: int | None, su: int | None, now: float, params: V33Params
 ) -> tuple[Decimal, Decimal] | None:
-    """The V3.2 ``_wing_prices`` gate (fresh, valid, non-suspect strike books) evaluated for a SPECIFIC
+    """The V3.2 ``_wing_prices`` gate (present, valid, non-suspect strike books) evaluated for a SPECIFIC
     bucket rather than the current spot — by temporarily viewing ``st`` with ``spot_Sd/Su`` = the fill's
-    bucket. The pure V3.2 law is reused UNCHANGED (never reimplemented); only the bucket it reads moves."""
+    bucket. The pure V3.2 law is reused UNCHANGED (never reimplemented); only the bucket it reads moves.
+
+    STALE-WING LIVENESS (2026-10-03): the strike FEED must be alive (``strike_feed_dead_s``), and the
+    per-strike age bound is the LOOSE ``wing_book_max_age_s`` (belt-and-braces), not V3.2's 1.0 s: a deep
+    wing strike is a quiet book, and a quiet book on a live feed is the same, truthful book."""
     if sd is None or su is None:
         return None
-    return _wing_prices(replace(st, spot_Sd=sd, spot_Su=su), now, params)
+    if not _strike_feed_alive(params, st, now):
+        return None
+    return _wing_prices(replace(st, spot_Sd=sd, spot_Su=su), now,
+                        _WingLawView(params.wing_book_max_age_s))  # type: ignore[arg-type]
 
 
 def _wing_step(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V33Action]]:
@@ -2094,6 +2151,21 @@ def _cancel_all(st: V33State, *, track_outstanding: bool = False) -> tuple[V33St
     return st, actions
 
 
+def _cancel_all_then_replace(st: V33State) -> tuple[V33State, list[V33Action]]:
+    """Gate D (2026-10-03, the 02:00Z naked-fill incident): EVERY cancel-all that can be followed by a
+    re-place TRACKS its cancels and arms ``awaiting_replace``, exactly like the bucket-change path. The
+    place path then holds while ``outstanding_cancels > 0`` and re-places only once the ladder is clear, so
+    a cancel-all is never raced by a re-place of the same slots while the venue still holds the old rests.
+    (Pre-fix the stale-wing hold-expiry cancelled untracked, the feed read fresh 230 ms later, and
+    ``_place_all`` re-placed 11 over 11 unconfirmed cancels.) ``awaiting_replace`` is only ever SET here
+    (never cleared): a no-op cancel-all over an empty ladder leaves an earlier pending re-place intact."""
+    had_orders = bool(st.ladder)
+    st, ca = _cancel_all(st, track_outstanding=True)
+    if had_orders:
+        st = replace(st, awaiting_replace=True)
+    return st, ca
+
+
 def _standdown(st: V33State, reason: str) -> tuple[V33State, list[V33Action]]:
     if reason == st.last_standdown_reason:
         return replace(st, stand_down_reason=reason), []
@@ -2255,13 +2327,17 @@ def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, li
             st = replace(st, hold_reason=None, hold_since=None,
                          last_standdown_reason="stale_or_missing_wing",
                          stand_down_reason="stale_or_missing_wing")
-            st, ca = _cancel_all(st)
+            # gate D: TRACKED cancels + awaiting_replace -> the resume path waits for every confirm.
+            st, ca = _cancel_all_then_replace(st)
             return st, ca + [V33Action(kind=ActionKind.STAND_DOWN,
                                        reason="stale_or_missing_wing_cancel")]
         # any other no-quote reason (or hold disabled / nothing to protect): cancel + stand down as before.
+        # gate D audit: no_spot_bucket / stale_bucket / n_below_min (and stale_or_missing_wing with the hold
+        # disabled) can all RESUME on the next healthy tick, so their cancels are tracked too; past_quote_end
+        # and stood_down never resume (tracking them is harmless and keeps the count exact).
         if st.hold_since is not None:
             st = replace(st, hold_reason=None, hold_since=None)
-        st, ca = _cancel_all(st)
+        st, ca = _cancel_all_then_replace(st)
         st, sa = _standdown(st, no_quote_reason)
         return st, ca + sa
 
@@ -2280,15 +2356,16 @@ def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, li
     # bucket change: cancel ALL rungs on the old bucket, place the open slots on the new one after confirms.
     if (st.rest_bucket_Sd is not None and st.rest_bucket_Sd != st.spot_Sd
             and not st.rolls_in_flight and st.ladder):
-        st, ca = _cancel_all(st, track_outstanding=True)
-        st = replace(st, awaiting_replace=True, rest_bucket_Sd=None)
+        st, ca = _cancel_all_then_replace(st)
+        st = replace(st, rest_bucket_Sd=None)
         return st, actions + ca
 
-    # hold while bucket-change cancels are unconfirmed.
+    # hold while ANY tracked cancel-all (bucket change, stale-wing hold expiry, or any resumable no-quote
+    # stand-down -- gate D) is unconfirmed: never re-place over rests the venue may still hold.
     if st.awaiting_replace and st.outstanding_cancels > 0:
         return st, actions
 
-    # place: first placement, or place the open slots after a bucket-change cancel confirmed.
+    # place: first placement, or place the open slots once every tracked cancel confirmed.
     if not st.ladder and not st.rolls_in_flight:
         if st.awaiting_replace:
             st = replace(st, awaiting_replace=False)

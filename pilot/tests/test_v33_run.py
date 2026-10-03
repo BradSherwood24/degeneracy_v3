@@ -111,7 +111,8 @@ def _dry_driver():
     # study locks (prices 0.45..0.35, n_top 0.45). Shipped policy is E_min 0.08 (8..18c); no 8..18c study
     # exists for this window, so the dry-run parity stays at the study's E_min. Mechanism is E_min-invariant.
     p = dr(load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
-           freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0)
+           freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
+                strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)
     cts = fix["close_epoch"]
     st = V33State.new(fix["close_time"], cts, BK, p, shakedown=True)  # DRY -> WOULD_* twins
     drv = RUN.V33Driver(p, st, J(), FrozenExecutor(BK), dry_sim=True, clock=lambda: 0.0)

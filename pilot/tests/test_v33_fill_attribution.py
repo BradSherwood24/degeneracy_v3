@@ -224,8 +224,11 @@ def test_wings_solved_on_fill_bucket_strikes_not_spot_strikes():
     st, _ = _feed(p, st, OrderCancelled(o313.order_id, T - 598.0, Decimal("0.44")))
 
     # keep the 79600-bucket strike books fresh and advance past the coalesce window to take the wings.
-    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), T - 597))
+    # gate D (2026-10-03): the take fires on the FIRST post-coalesce tick, priced off the quiet-but-live
+    # STK_SD book (feed alive, age < wing_book_max_age_s), so collect both ticks' actions.
+    st, a0 = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), T - 597))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.76"), T - 597))
+    acts = a0 + acts
     takes = [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
     assert len(takes) == 1
     legs = takes[0].legs
@@ -283,9 +286,9 @@ def _take_one_batch_with_a_missing_leg(p, st, now):
     """Fill one rung, take its wings, then report ONE wing leg filled and the other unfilled."""
     o = _order_at(st, "0.47")
     st, _ = _feed(p, st, Fill(o.order_id, o.client_order_id, Decimal("1.00"), o.price, "no", now))
-    st, _ = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.2))
+    st, a0 = _feed(p, st, BookUpdate(STK_SU, _top("0.36", "0.37"), now + 0.2))
     st, acts = _feed(p, st, BookUpdate(STK_SD, _sd("0.76"), now + 0.2))
-    assert [a for a in acts if a.kind == ActionKind.TAKE_WINGS]
+    assert [a for a in a0 + acts if a.kind == ActionKind.TAKE_WINGS]   # gate D: first tick may take
     yes_leg = next(l for l in st.wing_legs if l.side == "yes")
     no_leg = next(l for l in st.wing_legs if l.side == "no")
     st, _ = _feed(p, st, Fill(None, yes_leg.client_order_id, Decimal("1.00"), yes_leg.limit, "yes",
