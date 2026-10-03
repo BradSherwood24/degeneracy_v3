@@ -355,3 +355,14 @@ def test_stood_down_roll_fallback_does_not_replace():
     assert not _kinds(a, ActionKind.PLACE_REST)
     assert o.client_order_id not in {x.client_order_id for x in st.ladder}
 
+
+
+def test_ack_path_cancel_of_an_uncounted_create_never_decrements_outstanding_cancels():
+    """A create still in flight when the core cancelled it was PENDING (never counted); its later
+    ack-path OrderCancelled(order_id, coid) must not resolve one of the COUNTED bucket-change cancels."""
+    p = _params()
+    st, _, t = _place_23_to_33(p)
+    st = dr(st, ladder=(), outstanding_cancels=2, awaiting_replace=True)
+    st, _ = _run(p, st, [OrderCancelled(order_id="oid-late", server_ts=t + 0.1,
+                                        filled_count_before_cancel=Decimal(0), client_order_id=COID[30])])
+    assert st.outstanding_cancels == 2

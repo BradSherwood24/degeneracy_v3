@@ -1074,10 +1074,12 @@ def _apply_cancelled(
     # bucket-change / stand-down / shrink cancel: drop the slot (if still present) and decrement the count.
     if live_order is not None:
         st = replace(st, ladder=_drop_order(st.ladder, live_order.client_order_id))
-    # GATE B: only an event for an order that HAD a venue id can resolve a counted bucket-change cancel
-    # (``_cancel_all(track_outstanding=True)`` counts live orders only); a pending order's rejection /
-    # no-op cancel never decrements it.
-    if ev_oid is not None and st.outstanding_cancels > 0:
+    # GATE B: only an event for an order the core COUNTED can resolve a counted bucket-change cancel --
+    # ``_cancel_all(track_outstanding=True)`` counts live orders only and remembers each in ``cancel_ctx``.
+    # A pending order's rejection / no-op cancel, or the ack-path cancel of a create that was still in
+    # flight when the core cancelled it (never counted), never decrements it.
+    if (ev_oid is not None and (live_order is not None or ev_oid in st.cancel_ctx)
+            and st.outstanding_cancels > 0):
         st = replace(st, outstanding_cancels=st.outstanding_cancels - 1)
     # PRINT-THROUGH F2: if this was a stall cancel, drop it from the trigger's pending list and finalise
     # once they have all confirmed (any racing fill was booked above, so the shortfall is now the TRUTH).
