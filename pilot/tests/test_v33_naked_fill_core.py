@@ -305,6 +305,20 @@ def test_orphan_fill_on_a_non_bucket_market_is_alarmed_not_booked():
     assert st.rest_fills == () and not st.bucket_unknown
 
 
+def test_orphan_fill_with_no_price_is_alarmed_unpriced_not_crashed():
+    """REVIEW (gate A hardening): an owned orphan fill with no price must fail-closed (``orphan_rung_fill_
+    unpriced``), NOT raise on the decide ingest path. Mirrors the cancel-confirm orphan branch's own guard.
+    An unpriced fill books nothing and leaves the dedupe accumulator (``fill_seen_by_coid``) untouched."""
+    p = _params()
+    ts = T0 + 21.0
+    st = _healthy_empty(p, ts)
+    seen_before = dict(st.fill_seen_by_coid)
+    st, a = _run(p, st, [V33Fill(order_id="oid-np", client_order_id="v33-ghost-np", count=Decimal(1),
+                                 price=None, side="no", server_ts=ts, market_ticker=B, source="ws")])
+    assert [x.reason for x in _alarms(a)] == ["orphan_rung_fill_unpriced"]
+    assert st.rest_fills == () and dict(st.fill_seen_by_coid) == seen_before
+
+
 def test_dry_sim_ladder_fill_path_unchanged_no_alarm():
     """A fill on a LIVE ladder rung (the dry-sim / normal path) books exactly as before: no orphan alarm."""
     p = _params()

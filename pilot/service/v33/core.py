@@ -1182,6 +1182,15 @@ def _apply_orphan_fill(
     if count <= 0 or coid is None:
         return st, []
     ticker = getattr(event, "market_ticker", None)
+    # REVIEW (gate A hardening): an owned fill with no price cannot be booked (``_book_orphan_fill`` derives
+    # the rung from ``_rung_of(n_top, price)``). The sibling cancel-confirm orphan branch already guards this
+    # (``orphan_rung_fill_unpriced``); without the symmetric guard here an unpriced fill raised on the decide
+    # ingest path (brief lesson 3: an ingest exception drops events elsewhere). Owned fills are always priced
+    # live (ws = rec.price, poll = rec.price, POST = action.price), so this is fail-closed defence, not a
+    # normal path. Guarded BEFORE ``fill_seen_by_coid`` is touched so a dropped fill never skews the dedupe.
+    if event.price is None:
+        return st, [V33Action(kind=V33ActionKind.ALARM, reason="orphan_rung_fill_unpriced",
+                              client_order_id=coid, order_id=event.order_id, ticker=ticker, count=count)]
     ctx = next(((oid, c) for oid, c in st.cancel_ctx.items() if c[0] == coid), None)
     if ctx is None and ticker and _sd_for_bucket_ticker(st, ticker) is None:
         return st, [V33Action(kind=V33ActionKind.ALARM, reason="orphan_fill_not_bucket",
