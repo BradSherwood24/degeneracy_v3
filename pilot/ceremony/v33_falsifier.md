@@ -619,6 +619,34 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     touches a quoting lever): hysteresis on `n_min` -- stand down at `n_top < n_min`, resume only at
     `n_top >= n_min + 1c` (or after a short hold), mirroring the bucket-switch fix. No threshold or judged quantity
     changes. Sub-cause labels (PR #127, label only, review in flight) are NOT in the live tree.
+- 2026-10-04 02:05Z -- ARMED WINDOWS 01:00Z AND 02:00Z: NO FILLS, NO MONEY, ONE INVARIANT TRIP CLEANED UP BY THE NEW
+  SWEEP, ONE NEW RACE NAMED. Venue truth at 02:05Z: 63 orders created across the two windows, ALL 63 `canceled`,
+  0 filled; resting 0; unsettled positions 0; balance $66.1517 UNCHANGED. Test Fire #2 record unchanged (hedged 4,
+  one-legged 2 = the pin). Live tree af1a62d (PR #127 sub-cause labels pulled 00:25Z in band on Brad's word).
+  * 01:00Z: full 11-rung ladder from T-600 s (n_top 0.33, W 1.57), a mid-window bucket change 84700 -> 84800 at
+    T-320 s handled by tracked cancel-all + 11 re-places, 292 amend sends / 146 confirms (convergence rolls),
+    7 `n_below_min` stand-downs late in the window, 48 coids / 48 cancel confirms, 2 `rest_invariant_phantom`
+    (via `book_confirm`, age 0.0 s -- the recheck belt, counted as `executor_phantom` 2, headline alarms 0),
+    0 fills, reconcile clean, `stand_down_sub_causes` {} (no stale-wing episode).
+  * 02:00Z: ladder from T-600 s (n_top 0.15); n_top oscillated 0.15/0.14/0.13 so the top rung was cancelled and
+    re-placed repeatedly (coids -15/-16/-17 at 0.15). At T-522.8 s (t+377.21) the core CANCELLED coid -14 (the
+    0.14 rung, venue order ...6b60c4) and 10 ms later PLACED coid -18 at the SAME price 0.14; the executor's
+    pre-flight GET saw ...6b60c4 still resting (its DELETE confirmed at t+378.04) -> `rest_invariant_violation`
+    (`count_resting 10, dup_price true`) -> executor stand-down -> **`standdown_sweep` cancelled all 9 owned rests,
+    every DELETE confirmed by t+379.72, venue left at 0 resting** (gate C did exactly what it was built for; the
+    old code left 17 orphans in this situation on 10-02). Alarms 3 = `rest_invariant_violation` +
+    `executor_standdown` (driver) + `standdown_sweep`; `alarms_breakdown` {driver 1, executor 2}. Cost: no
+    quoting from T-522 s to the close. No exposure at any moment.
+  * THE RACE (new, named): a SINGLE-SLOT cancel followed by an immediate re-place at the same price. Gate D (#120)
+    tracks cancels on every CANCEL-ALL path; the per-rung convergence path (drop a rung, then re-create the slot
+    when `n_top` moves back) does not wait for that rung's DELETE to confirm, and the venue invariant --
+    correctly by its rules -- reads the still-resting old order as a duplicate. Proposed build (Claude's
+    recommendation, needs Brad's word): (a) in the executor's pre-flight invariant, an order with OUR OWN DELETE
+    in flight is "cancelling", not "resting" -- excluded from `count_resting` and `dup_price`; and (b) in the
+    core, no `PLACE_REST` at a price whose previous order has an unconfirmed cancel (per-slot outstanding-cancel
+    gate, the slot waits one confirm). (a) alone removes the false trip; (b) alone removes the race; both =
+    belt and braces. No threshold or judged-quantity change. The `n_min` hysteresis proposal (00:04Z entry)
+    stands separately; tonight's oscillation 0.15/0.14/0.13 is the same churn one rung higher.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
