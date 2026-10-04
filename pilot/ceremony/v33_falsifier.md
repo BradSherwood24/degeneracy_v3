@@ -598,6 +598,27 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   2) unchanged; the next naked contract is a KILL. Armed-hours rules in force: foreground checks only; no pulls
   into the live tree and no heavy work :38-:00; code lands only in a :02-:33 band on Brad's word. The sub-cause
   label build is NOT in the live tree. Registration line 23:19Z.
+- 2026-10-04 00:03Z -- FIRST ARMED WINDOW ON THE FIVE-GATE BUILD (00:00Z close, Test Fire #2 resumed): NO FILLS, NO
+  MONEY, CLEAN OWNERSHIP, ONE QUALITY FINDING. `window_meta` effective_mode armed, params sha f4037082, async writer
+  on. Bucket `KXBTC-26OCT0320-B84750`. Venue truth (read-only via proxy at 00:02Z): 45 orders created in the
+  window, ALL 45 `canceled`, 0 filled; resting now 0; unsettled positions 0; balance $66.1517 UNCHANGED. Journal:
+  `cancel_confirmed` 45 (= the venue's 45, every created order cancelled by us), `cancel_deferred_unacked` 18 ->
+  `place_skipped_before_post` 15 (those 15 coids are ABSENT from the venue list) + `cancel_after_ack` 3 (present,
+  cancelled); `rest_invariant_*` 0; `standdown_sweep` 0; `alarm` 0; `venue_fills_fetched` {ours 0, total 0};
+  ledger row lots 0 / one_legged False / one_legged_contracts 0 / alarms 0 with breakdown / reconcile clean.
+  Test Fire #2 record unchanged: hedged n=4, one-legged 2 (the pin), net +$0.005.
+  * WHAT WORKED (the re-arm gates under load): 28 cancel-alls with tracked cancels and NOT ONE venue-invariant trip
+    or executor stand-down (the pre-gate code tripped 3 of 12 armed windows on this exact pattern); the #119
+    deferred-cancel / skip-before-POST path fired 18 times and left nothing unowned at the venue; gate E's
+    reconcile ran live (venue fills fetched, row clean).
+  * FINDING (quality, not safety): `n_below_min` FLAPPED 28 times. `n_top` sat at 0.04-0.05 against `n_min` 0.05
+    from T-629 s to T-305 s (W 1.859-1.869: the wings were expensive, spot near the bucket edge), so every tick
+    across the threshold cancelled the single placeable rung and the next tick re-placed it: 60 coids, 45 venue
+    creates, 45 cancels, 0 fills, `write_paced` 10, no 429. The bucket-switch debounce/hysteresis (BUCKET-FLAP FIX
+    2026-09-23) and the stale-wing hold have no analogue on the `n_min` gate. Proposed build (needs Brad's word; it
+    touches a quoting lever): hysteresis on `n_min` -- stand down at `n_top < n_min`, resume only at
+    `n_top >= n_min + 1c` (or after a short hold), mirroring the bucket-switch fix. No threshold or judged quantity
+    changes. Sub-cause labels (PR #127, label only, review in flight) are NOT in the live tree.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
