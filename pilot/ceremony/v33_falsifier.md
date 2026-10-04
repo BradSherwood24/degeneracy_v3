@@ -647,6 +647,40 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     gate, the slot waits one confirm). (a) alone removes the false trip; (b) alone removes the race; both =
     belt and braces. No threshold or judged-quantity change. The `n_min` hysteresis proposal (00:04Z entry)
     stands separately; tonight's oscillation 0.15/0.14/0.13 is the same churn one rung higher.
+- 2026-10-04 06:40Z -- 06:00Z CLOSE: FIRST FILLS OF THE RE-ARMED TEST FIRE #2 -- 8 LOTS, ALL HEDGED, EVERY SET LOCKED A
+  LOSS. Mechanism: adverse selection in a 450 ms repricing, not a defect. Windows 03:00Z-05:00Z: no fills.
+  * FACTS (venue + journal + reconciled row). Bucket `KXBTC-26OCT0402-B84850`. At 05:51:10.300Z four bucket-NO rests
+    filled (NO 0.37/0.36/0.35/0.34, 1 lot each, maker) and at 05:51:10.681Z four more (0.33/0.32/0.31/0.30). Wings
+    taken in two coalesced batches + one retry within 500 ms, all IOC taker, all filled: YES `KXBTCD-26OCT0402-
+    T84799.99` 8 lots @0.99; NO `T84899.99` 8 lots @0.66/0.66/0.71/0.72. Venue: 16 fills, 0 resting, 0 unsettled
+    after close; balance $66.1517 -> $65.9259 (-$0.2258 incl. fees). Reconciled row: lots 8, hedged 8,
+    one_legged_contracts 0, unbooked 0, mismatch False, alarms 0 (breakdown all 0); `venue_fills_fetched` ours 8 /
+    total 16; `stand_down_sub_causes` {wing_no_ask_sd: 1} (the Sd YES leg at 0.99 lost its ask at T-441 s ->
+    hold -> tracked cancel, the FIRST labelled sub-cause in a live journal). Gates A-E and the sweep did their jobs.
+  * MECHANISM (v33_eval + fills, 06:00Z journal). From T-559 s to T-530.9 s the pin sat at n_top 0.34-0.40 (W
+    1.50-1.56) and the ladder rested 11 rungs at NO 0.27-0.38 (convergence had just rolled the top rungs UP to
+    0.37/0.38 at T-539 s). Between t+670.10 and t+670.17 -- 70 ms -- W jumped 1.558 -> 1.657 and n_top fell
+    0.34 -> 0.26; 60 ms later (t+670.23) four rungs filled 8-11c ABOVE the new pin; by t+670.24 n_top was
+    0.16-0.18 and at t+670.55 four more filled 12-17c above it. The same spot jump lifted the bucket YES (filling
+    our NO rests) and re-priced both strikes against us in the same instant; no amend was possible (first amend
+    after the jump at t+671.63). W_at_fill 1.637 / 1.705 vs W 1.528 at the last roll: the ladder was 11-18c stale
+    for well under a second and that was enough. Rung labels -8..-13 (E_rung -0.03..-0.08). lock_solved at fill
+    -2.4c..; realized lock per batch -$0.1504 (4 sets, -3.8c) and -$0.2005 (4 sets, -5.0c) = -$0.3509, mean -4.4c
+    per set. The wing take is UNCONDITIONAL on a rung fill (ruling F-2) -- correct: the alternative was 8 naked
+    lots; the `retry_wing` at limit 0.76 filled the last Su leg at 0.72 behind the $1 floor of two held legs.
+  * FROZEN-RULE ARITHMETIC (realised rows, L6/L7): Test Fire #2 hedged sets n = 12 (10-03 00:00Z 1 set +$0.0845,
+    01:00Z 3 sets +$0.2933, 10-04 06:00Z 8 sets -$0.3509) = +$0.0269 total, MEAN +0.22c per set; one-legged
+    contracts 2 (10-03, the pin) + 0 tonight. EARLY KILL fires at n >= 15 if mean < +2.0c: reaching +2.0c at n=15
+    needs the next 3 sets to realise +$0.2731 together (+9.1c each; the best hedged set so far is +9.8c). S4 day
+    loss: -$0.23 of the $3.00 line. Verdict bar +4.0c at n >= 45. The report's gate table over today alone reads
+    mean -4.39c, 0% positive, n 8 (n-too-small).
+  * WHAT THIS IS: the structural risk the house already measured (maker-flip replay 08-25: leave/requote fills
+    ~1.005 + tail = adverse selection; rung-allocation 09-29: slippage ~-5c at every depth) arriving in one 450 ms
+    event. Not the re-place race (02:00Z), not staleness, not accounting. Mitigations are STRUCTURE, not gates:
+    deeper margins (the 09-29 finding favoured 14-16c placed margins, 0.77c/lot-window), a smaller allotment at
+    shallow n, or cancel-on-W-jump (pull rests when W moves > X c in < Y ms before the sweep arrives -- the
+    bucket sweep and the strike re-price are the same event, so this is a race against ~60 ms). Brad's ruling
+    pending; nothing changed; V3.3 remains ARMED at this line.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
