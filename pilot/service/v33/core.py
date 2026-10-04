@@ -415,6 +415,14 @@ class V33State:
                                                         # re-debounce; a sign flip re-debounces (R2 pacing).
     awaiting_replace: bool = False                       # bucket change: cancelled all, place after confirms
     outstanding_cancels: int = 0                          # bucket-change cancels awaiting OrderCancelled
+    # SINGLE-SLOT CANCEL/RE-PLACE RACE (2026-10-04, part b): venue order_id -> NO-space price of a rung we
+    # asked the venue to CANCEL whose OrderCancelled has NOT yet arrived. The place path HOLDS any price in
+    # this map's VALUES (never re-places a slot whose previous order's DELETE is still in flight), so the
+    # executor's pre-flight invariant never sees the old order still resting at the place price and trips
+    # ``rest_invariant_violation {dup_price}`` -> stand-down. Keyed by order_id so the confirm (which
+    # carries the order_id) clears it EXACTLY. Bound: a never-confirming cancel blocks only ITS price, and
+    # only until quote end -- the quote-end cancel-all + stand-down run regardless of this gate.
+    cancel_pending_px: Mapping[str, Decimal] = field(default_factory=dict)
     rest_bucket_Sd: int | None = None                    # the bucket the ladder is on
     last_replace_ts: float | None = None
     replace_count: int = 0                               # ladder placements + rolls (feeds the alarm)
@@ -1116,6 +1124,10 @@ def _apply_cancelled(
     filled = _q_count(event.filled_count_before_cancel)
     ev_oid = event.order_id
     ev_coid = getattr(event, "client_order_id", None)
+    # part (b): the venue order for this id has left the book -> release the price it HELD so the convergence
+    # at the tail of this handler (and the next tick) may re-place that slot. Keyed by order_id, so a roll
+    # fallback / stand-down / shrink confirm each unblock EXACTLY their own price.
+    st = _clear_cancel_pending(st, ev_oid)
 
     # book a partial fill first (attribute by live order, else cancel_ctx), before we drop slots.
     coid: str | None = None
@@ -1227,6 +1239,9 @@ def _apply_fill(
     """A private fill. A wing-leg fill updates leg status; a rung fill books the rung (at its PRE-roll
     resting price if a roll is in flight for it) and spawns/joins the coalesced wing batch."""
     actions: list[V33Action] = []
+    # part (b): a rung that we asked to cancel FILLED before the confirm -> its order has left the book, so
+    # release any price it HELD (a no-op for wing/non-rung fills, whose order_id was never armed).
+    st = _clear_cancel_pending(st, event.order_id)
     # PRINT-THROUGH complete taker fill (armed F3): book the bucket-NO from the IOC response, not optimistically.
     res = _pt_apply_complete_fill(params, st, event, now)
     if res is not None:
@@ -2024,6 +2039,7 @@ def _pt_cancel_unfilled_rungs(
             continue                            # already filled+dropped, or never placed
         actions.append(_cancel_action(st, o))
         st = _remember_cancel_ctx(st, o)
+        st = _arm_cancel_pending(st, o)         # part (b): hold this price until its cancel confirms
         if st.n_top is not None:
             m = _margin_of(params, st.n_top, o.price)
             if 0 <= m < len(ms):
@@ -2367,6 +2383,33 @@ def _remember_cancel_ctx(st: V33State, order: RestOrder) -> V33State:
     return replace(st, cancel_ctx=ctx)
 
 
+def _arm_cancel_pending(st: V33State, order: RestOrder) -> V33State:
+    """Part (b), single-slot cancel/re-place race: remember the PRICE of a rung we just asked the venue to
+    CANCEL (an order that HAS a venue id) so the place path HOLDS that price until the matching
+    OrderCancelled (or a fill on it) resolves it (``_clear_cancel_pending``). A pending-order cancel (no
+    venue id) is a no-op here -- nothing rests at the venue, so nothing can trip the invariant."""
+    if order.order_id is None:
+        return st
+    cp = dict(st.cancel_pending_px)
+    cp[order.order_id] = order.price
+    return replace(st, cancel_pending_px=cp)
+
+
+def _clear_cancel_pending(st: V33State, order_id: str | None) -> V33State:
+    """Resolve a slot's held price once its venue order leaves the book (cancel confirm / fill). Keyed by
+    order_id so DIFFERENT prices never unblock each other. A no-op if the id was never armed."""
+    if order_id is None or order_id not in st.cancel_pending_px:
+        return st
+    cp = dict(st.cancel_pending_px)
+    cp.pop(order_id, None)
+    return replace(st, cancel_pending_px=cp)
+
+
+def _held_cancel_prices(st: V33State) -> set[Decimal]:
+    """The NO-space prices currently HELD by an unconfirmed single-slot cancel (part b)."""
+    return set(st.cancel_pending_px.values())
+
+
 def _cancel_all(st: V33State, *, track_outstanding: bool = False) -> tuple[V33State, list[V33Action]]:
     """Cancel EVERY live/pending rung (no new place). Removes them from the ladder and remembers each
     live order's cancel context so a partial fill caught only by the cancel is still booked + hedged."""
@@ -2376,6 +2419,7 @@ def _cancel_all(st: V33State, *, track_outstanding: bool = False) -> tuple[V33St
         actions.append(_cancel_action(st, o))
         if o.order_id is not None:
             st = _remember_cancel_ctx(st, o)
+            st = _arm_cancel_pending(st, o)   # part (b): hold this price until its cancel confirms
             n_live += 1
     st = replace(st, ladder=(), rolls_in_flight=(), converging_dir=0)
     if track_outstanding:
@@ -2462,10 +2506,13 @@ def _place_all(params: V33Params, st: V33State, now: float) -> tuple[V33State, l
     if budget <= 0 or st.rungs_filled >= params.max_sets_per_hour:
         return replace(st, rest_allotment_done=True), actions
     used = 0
+    held = _held_cancel_prices(st)   # part (b): never re-place a price whose prior cancel is unconfirmed
     for m, price in slots:
         w = _weight_of_margin(params, m)
         if w <= 0 or used + w > budget:
             continue  # weight-0 slot (never state 1, defensive) or would overrun the allotment
+        if price in held:
+            continue  # single-slot race: the old order at this price is still cancelling -> retry next tick
         rung = m - _emin_cents(params)
         st, a = _place_one(params, st, price, rung, params.E_min + rung * _CENT, now, count=w)
         actions += a
@@ -2638,8 +2685,14 @@ def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, li
            and o.client_order_id not in inflight_old and o.price not in target
            and o.client_order_id not in pt_covered
            and st.rest_booked_by_coid.get(o.client_order_id, 0) == 0]
-    # VACANT = target prices with no committed order (live/pending price or in-flight target).
-    VACANT = sorted(p for p in target if p not in occupied and p not in inflight_targets)
+    # VACANT = target prices with no committed order (live/pending price or in-flight target). Part (b):
+    # a price whose previous order's cancel is still UNCONFIRMED (``cancel_pending_px``) is HELD -- it is
+    # neither created at nor rolled TO until the confirm clears it, so the executor's pre-flight invariant
+    # never sees two of ours at that price (the single-slot race). The held slot reappears in VACANT on the
+    # very next tick after the confirm (``_clear_cancel_pending``), so it is not dropped, only deferred.
+    held = _held_cancel_prices(st)
+    VACANT = sorted(p for p in target
+                    if p not in occupied and p not in inflight_targets and p not in held)
 
     if not OUT and not VACANT:
         # converged (nothing to move/place); clear the convergence flag once nothing is in flight.
@@ -2689,6 +2742,7 @@ def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, li
         # extra OUT with no vacant slot (n_min/cap suppressed the deep end) -> CANCEL (shrink).
         for o in OUT_sorted[pairs:pairs + remaining]:
             st = _remember_cancel_ctx(st, o)
+            st = _arm_cancel_pending(st, o)   # part (b): the single-slot race -- hold this price
             actions.append(_cancel_action(st, o))
             st = replace(st, ladder=_drop_order(st.ladder, o.client_order_id),
                          outstanding_cancels=st.outstanding_cancels + (1 if o.order_id else 0))
