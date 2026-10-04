@@ -479,6 +479,18 @@ class V33State:
     pending_switch_hyst_met: bool = False                # the hysteresis was satisfied at least once pending
     hold_reason: str | None = None                       # the stand-down reason currently being HELD
     hold_since: float | None = None                      # when the hold began
+    # STALE-WING SUB-CAUSE (2026-10-03 labeling fix): the DIAGNOSTIC label for WHY the REST W gate
+    # (``_v33_compute_W``) returned None. LABEL ONLY -- no gate, dedup, falsifier or behaviour reads
+    # these; the stand-down REASON strings are unchanged.
+    #  * ``wing_sub_cause`` is the CURRENT classification, refreshed every ``_recompute_context`` when the
+    #    W gate RAN and returned None (else None). The ``v33_eval`` record and the PLAIN stale stand_down
+    #    read it.
+    #  * ``hold_sub_cause`` is the label captured at the instant a stale/missing-wing HOLD began; it is
+    #    carried through to the ``stand_down_hold`` / ``stand_down_cancel`` / ``stand_down_resume`` that
+    #    end the hold (never cleared on the healthy path -- the next hold overwrites it, and only a
+    #    resume/cancel immediately following a hold ever reads it).
+    wing_sub_cause: str | None = None
+    hold_sub_cause: str | None = None
 
     @classmethod
     def new(
@@ -806,6 +818,67 @@ def _v33_compute_W(st: V33State, Sd: int, Su: int, now: float, params: V33Params
     return _compute_W(st, Sd, Su, now, _WingLawView(params.wing_book_max_age_s))  # type: ignore[arg-type]
 
 
+def wing_unavailable_cause(params: V33Params, st: V33State, now: float) -> str | None:
+    """DIAGNOSTIC label for WHY the REST W gate (``_v33_compute_W``) returned None. Evaluated ONLY when
+    that gate returned None (the caller holds that contract); returns the FIRST failing check in the EXACT
+    order ``_strike_feed_alive`` then the V3.2 ``_compute_W`` apply, so the label is always the check that
+    actually failed, never a later one that merely happens to also be true:
+
+        feed_dead
+        -> wing_missing_sd / wing_missing_su      (no book ever for that strike)
+        -> wing_suspect_sd / wing_suspect_su      (malformed-delta / seq-gap book)
+        -> wing_too_old_sd / wing_too_old_su      (older than the LOOSE ``wing_book_max_age_s``)
+        -> wing_no_ask_sd  (yes_ask None: no NO bid on Sd)  / wing_no_ask_su (no_ask None: no YES bid on Su)
+        -> wing_price_invalid_sd / wing_price_invalid_su    (ask outside the gate's (0, 1) range)
+        -> unknown
+
+    PURE, LABEL ONLY: no state change, never raises (any surprise -> ``unknown``). The two wing strikes
+    are the CURRENT spot pair (``st.spot_Sd`` / ``st.spot_Su``); with no spot pair there is no wing to
+    blame (that stand-down is ``no_spot_bucket``, not ``stale_or_missing_wing``) -> ``unknown``. The price
+    bound mirrors ``_compute_W``'s OPEN interval ``_ZERO < ask < _ONE`` (an ask at exactly 1 fails the rest
+    gate, so it is labelled invalid here too), NOT the take gate's half-open ``<= _ONE``: this label
+    describes the REST gate that drives the ``stale_or_missing_wing`` stand-down."""
+    try:
+        Sd = st.spot_Sd
+        Su = st.spot_Su
+        if Sd is None or Su is None:
+            return "unknown"
+        # 1. strike CONNECTION liveness -- the gate's first check.
+        if not _strike_feed_alive(params, st, now):
+            return "feed_dead"
+        # 2..N mirror ``_compute_W``'s own order (missing, then suspect, then age, then ask-present, then
+        # price validity), Sd before Su within each class, using the LOOSE per-strike bound the V3.3 gate
+        # hands the V3.2 law.
+        sd_top = st.strike_tops.get(Sd)
+        su_top = st.strike_tops.get(Su)
+        if sd_top is None:
+            return "wing_missing_sd"
+        if su_top is None:
+            return "wing_missing_su"
+        if sd_top.suspect:
+            return "wing_suspect_sd"
+        if su_top.suspect:
+            return "wing_suspect_su"
+        bound = params.wing_book_max_age_s
+        if not _fresh(now, st.strike_ts.get(Sd), bound):
+            return "wing_too_old_sd"
+        if not _fresh(now, st.strike_ts.get(Su), bound):
+            return "wing_too_old_su"
+        ya = sd_top.yes_ask
+        na = su_top.no_ask
+        if ya is None:
+            return "wing_no_ask_sd"
+        if na is None:
+            return "wing_no_ask_su"
+        if not (_ZERO < ya < _ONE):
+            return "wing_price_invalid_sd"
+        if not (_ZERO < na < _ONE):
+            return "wing_price_invalid_su"
+        return "unknown"
+    except Exception:  # noqa: BLE001 -- a diagnostic label must never break the pump.
+        return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Context (spot / W / cap / n_top / shadows / E_rung refresh)
 # ---------------------------------------------------------------------------
@@ -891,7 +964,10 @@ def _recompute_context(params: V33Params, st: V33State, now: float) -> V33State:
     W = None
     cap = None
     n_top = None
-    if spot_Sd is not None and spot_Su is not None and not spot_bucket_stale:
+    # the W gate RUNS only when a fresh spot pair exists; otherwise W is None for a DIFFERENT stand-down
+    # reason (no_spot_bucket / stale_bucket) and there is no wing to blame.
+    gate_ran = spot_Sd is not None and spot_Su is not None and not spot_bucket_stale
+    if gate_ran:
         W = _v33_compute_W(st, spot_Sd, spot_Su, now, params)
         cap = _bucket_cap(st, spot_Sd)
         budget = (_TWO - params.E_min - W) if W is not None else None
@@ -907,9 +983,14 @@ def _recompute_context(params: V33Params, st: V33State, now: float) -> V33State:
 
     st = replace(
         st, spot_Sd=spot_Sd, spot_Su=spot_Su, W=W, cap=cap, n_top=n_top,
-        spot_bucket_stale=spot_bucket_stale, shadows=shadows,
+        spot_bucket_stale=spot_bucket_stale, shadows=shadows, wing_sub_cause=None,
         pending_switch_Sd=pend_Sd, pending_switch_since=pend_since, pending_switch_hyst_met=pend_hyst,
     )
+    # LABELING (2026-10-03): when the W gate RAN and returned None, classify the sub-cause for the
+    # stale/missing-wing diagnostics. The classifier reads the NOW-updated spot pair off ``st``. LABEL
+    # ONLY -- no gate reads ``wing_sub_cause``; it never changes the quote/stand-down decision.
+    if gate_ran and st.W is None:
+        st = replace(st, wing_sub_cause=wing_unavailable_cause(params, st, now))
     # refresh each rung's LIVE labels (BOTH rung AND E_rung) from the current n_top — BLOCKING #1
     # (reviewer 2026-09-22): rung was previously left stale while E_rung tracked n_top, corrupting the
     # §6 per-rung falsifier key after any roll. They must move together and stay the live position.
@@ -2468,7 +2549,10 @@ def _converge(params: V33Params, st: V33State, now: float) -> tuple[V33State, li
         if (no_quote_reason == "stale_or_missing_wing" and params.stand_down_hold_ms > 0
                 and (st.ladder or st.rolls_in_flight)):
             if st.hold_since is None:
-                st = replace(st, hold_reason=no_quote_reason, hold_since=now)
+                # capture the sub-cause at the instant the hold begins; it rides the hold through to the
+                # resume/cancel that ends it (label only).
+                st = replace(st, hold_reason=no_quote_reason, hold_since=now,
+                             hold_sub_cause=st.wing_sub_cause)
                 return st, [V33Action(kind=ActionKind.STAND_DOWN,
                                       reason="stale_or_missing_wing_hold")]  # journalled as stand_down_hold
             if (now - st.hold_since) * 1000.0 < params.stand_down_hold_ms:

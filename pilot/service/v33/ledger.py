@@ -382,6 +382,7 @@ def build_v33_ledger_row(
     writer_stats: dict[str, Any] | None = None,
     alarms_breakdown: dict[str, int] | None = None,
     reconcile: dict[str, Any] | None = None,
+    stand_down_sub_causes: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
     (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row.
@@ -411,6 +412,9 @@ def build_v33_ledger_row(
         "params_sha": params.sha256 if params is not None else params_sha,
         "stand_down": stand_down_reason is not None,
         "stand_down_reason": stand_down_reason,
+        # LABELING (2026-10-03): additive per-label tally of stale/missing-wing stand-down episodes this
+        # window (empty {} when there were none). Diagnostics only; no economics read it.
+        "stand_down_sub_causes": dict(stand_down_sub_causes or {}),
         "strike_count": int(strike_count),
         "bucket_count": int(bucket_count),
         "spot_bucket_ticker": last_quoted_bucket_ticker,
