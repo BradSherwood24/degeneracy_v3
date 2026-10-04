@@ -682,6 +682,45 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     bucket sweep and the strike re-price are the same event, so this is a race against ~60 ms). Brad's ruling
     pending; nothing changed; V3.3 remains ARMED at this line.
 
+- 2026-10-04 22:40Z -- ARMED WINDOWS 07:00Z-22:00Z: THREE WINDOWS FILLED (3 + 11 + 11 LOTS, ALL HEDGED, ALL POSITIVE),
+  TWO MORE SINGLE-SLOT RACE TRIPS (08:00Z, 19:00Z) CLEANED BY THE SWEEP. Balance $65.9259 -> $69.4130 (+$3.4871 since
+  the 06:00Z row; +$3.2613 on the UTC day). Venue after the 22:00Z close: 0 resting, 0 positions.
+  * 14:00Z CLOSE (bucket `KXBTC-26OCT0410-B85250`, Sd 85200 / Su 85300): FULL LADDER, 11 SETS, +$1.5794 venue /
+    +$1.5797 ledger `realized_delta` (ledger `ladder_lock` +1.4634, the taker-fee-on-maker-rest reserve). Two sweeps:
+    13:46:27.283Z 2 lots (NO 0.30, 0.31) -> wings 240 ms later YES `T85199.99` 2@0.77 + NO `T85299.99` 2@0.82
+    (W 1.59, lock 10c/11c); 13:48:05.509Z 9 lots (NO 0.11-0.21) -> wings within 245-315 ms, four 2-lot chunks +
+    one 1-lot, YES 9@0.88 + NO 9@0.78 (W 1.66, lock 13c-23c). Fees $0.2206, all taker on the wings, 0 on rests.
+    Settled 14:02:37Z: YES wing 11.00, NO wing 11.00, bucket NO 0 = $22.00 revenue on $20.20 cost. Row: alarms 0,
+    one_legged_contracts 0, reconcile clean, `venue_fills_fetched` ours 11 / total 23. Held from T-812 s.
+  * 18:00Z CLOSE (`B85350`): 3 LOTS at 17:52Z (NO avg 0.08) -> wings YES `T85299.99` 3@0.95 + NO `T85399.99` 3@0.87
+    (W 1.82); +$0.2662 realized (ledger lock +0.2502); fees $0.034. Settled 18:02:48Z. Alarms 0, reconcile clean.
+  * 20:00Z CLOSE (`B85450`): FULL LADDER AGAIN, 11 LOTS at 19:46Z (NO avg 0.23) -> wings YES `T85399.99` 11@0.69 avg +
+    NO `T85499.99` 11@0.91 avg (W 1.60); +$1.6421 realized (ledger lock +1.5051); fees $0.2283. Settled 20:02:47Z
+    (bucket leg 20:12:07Z). Alarms 0, reconcile clean. 30 replaces only: the pin sat still.
+  * 08:00Z and 19:00Z: THE SINGLE-SLOT RACE AGAIN (named in the 02:05Z entry), both at the DEEPEST rung price 0.10:
+    `rest_invariant_violation` {dup_price true, count_resting 8 / 6, strays []} at T-404.5 s / T-665.8 s ->
+    executor stand-down -> `standdown_sweep` cancelled 10 / 8 owned rests, 0 errors, 0 exposure (08:00Z also
+    logged 1 `cancel_deferred_unacked` + 2 `rest_invariant_phantom` via book_confirm, the belts). Cost: no quoting
+    for the remaining 6.7 / 11.1 minutes. Tonight's tally for this race: 3 trips (02:00Z, 08:00Z, 19:00Z) in 22
+    armed windows, every one cleaned, none with money at risk. The proposed two-part fix (pre-flight treats an
+    order with our own DELETE in flight as cancelling; core gates a same-price re-place on that slot's cancel
+    confirm) stands as recorded 02:05Z, awaiting Brad's word. Other windows 07:00Z-22:00Z: no fills; stand-downs
+    were `n_below_min` flaps and one 12:00Z stale-wing hold (`wing_no_ask_sd`). 21:00Z: no row (the $250-bucket
+    hour, no co-settling $100 buckets). The live tree ran 727d469 all day (main is docs-only ahead).
+  * FROZEN-RULE ARITHMETIC (realised rows, L6/L7): Test Fire #2 hedged sets n = 37 (12 through the 06:00Z row,
+    +3 +11 +11 today) = +$3.5149 realised, MEAN +9.50c per set, 29/37 positive sets (the 8 of 06:00Z are the
+    negatives). EARLY KILL (n >= 15, mean < +2.0c) did NOT fire: at n=15 the mean was already above the line
+    once the 14:00Z sets landed. Verdict bar +4.0c at n >= 45: 8 sets away, current mean +9.50c. One-legged
+    contracts 2 (10-03) = the pin; one more naked contract = KILL. S4 day loss today: none (day +$3.26).
+  * RECORDED ALONGSIDE (observational, not a quantity above): the early-exit study (`pilot/build/
+    v33_early_exit_study_2026_10_04.md`, PR #131) -- a held set is not sellable above $2 except in ms flickers
+    (>+2c net 0.04% of held time across 27 windows); the +$2..+$4 on-screen jumps during 14:00Z were last-trade
+    marks (+36c/set) while the executable unwind was -0.8c/set. Settlement is the exit. Brad's sizing question
+    ("1/3 of the balance per 11-rung ladder, scale the lots to keep the ratio") -> compounding Monte Carlo to
+    follow in `pilot/build/mc/`; NOTE for any sizing step: the one-legged pin (<= 2 CONTRACTS) and S4 ($3.00 day
+    loss) are written in contracts and dollars, so lots > 1 per rung changes what those pins mean -- an amendment
+    with Brad's words precedes any size change, as L5 already requires for `rung_lots`.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
