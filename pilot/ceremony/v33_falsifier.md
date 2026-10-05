@@ -769,6 +769,43 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     count from here. Candidate V3.4 items named here for the record, not proposed: exempt rung < 0 from the
     sign-flip re-debounce (or pull stranded rests immediately), and the clock/feed skew (~1.2 s tonight).
 
+- 2026-10-05 17:15Z -- RACE FIX MERGED AND LIVE (PR #135, main e30191e, live tree pulled 17:02Z in band, 1575 tests
+  pass in the live tree, params sha f4037082 unchanged, STILL ARMED). Brad, verbatim: "Go ahead with that build. Opus
+  4.8 agents please" (22:5xZ 10-04) and "Let's merge after this window ends and run it armed" (16:4xZ 10-05) after
+  Claude's assessment that the change adds no one-leg path (fill/wing paths untouched; it DELAYS a same-price
+  re-place by one cancel confirm and excludes only our own in-flight DELETEs from the pre-flight invariant) and
+  that a dry window cannot exercise the race (no venue latency in dry). Built + reviewed on Opus 4.8 (review
+  `pilot/build/v33_single_slot_race_review.md`: APPROVE WITH NITS, no defects, nits = test-coverage only). FIRST
+  ARMED WINDOW ON THE FIX = 18:00Z close (spawn 17:40Z). Read: journal kind `rest_invariant_cancelling_excluded`,
+  its counter, no `rest_invariant_violation {dup_price}` from our own cancels, no held price lingering past its
+  confirm. Mechanism change only; no quantity above changes.
+  * 10-05 00:00Z (registered 00:45Z, adverse repricing): the real ledger `ledger/v33_ledger.jsonl` reconcile reads
+    core_lots 2 / exec_lots 2 / hedged_lots 2 / one_legged_contracts 0; `rungs_filled 3` in the journal summary
+    counts a 0.06 + 0.94 fractional fill as two events. Venue: NO 0.41 (0.06+0.94) at 23:54:35.57Z and NO 0.40 at
+    23:54:36.99Z; wings NO Su 1@0.84 at +243 ms, YES Sd 1@0.82 + NO Su 1@0.83 at +240 ms after the 2nd fill, and
+    the first lot's YES leg via `retry_wing` at 23:54:38.76Z (3.2 s after its fill, 1@0.81). Both sets hedged;
+    the 3.2 s one-legged INTERVAL on lot 1 is the wing-retry path, not a naked contract. -$0.1506.
+  * 10-05 02:00Z CLOSE (`KXBTC-26OCT0422-B86650`): 8 LOTS, 8 SETS, ALL HEDGED, +$0.9077 (venue $16.00 on $14.89 +
+    $0.2025 fees). 1 lot at 01:53:12Z (NO 0.40) + 7 at 01:53:20Z (NO 0.40-0.47); wings YES `T86599.99` 8@0.56-0.62,
+    NO `T86699.99` 8@0.84-0.87, all inside the same second as each fill. Reconcile 8/8/8, one_legged 0, alarms 0.
+  * 10-05 01:00Z-17:00Z otherwise: no fills, no stand-downs except 14:00Z and 16:00Z = `stale_or_missing_wing` with
+    the NEW sub-cause `feed_dead` (11 and 32 hold events). Journal measurement: 14:00Z strike-feed record gaps of
+    2-3.7 s throughout the window and one 14.4 s gap; 16:00Z gaps 2-3 s and one 8.4 s gap at T-89 s. The 4.0 s
+    liveness bound (gate D, params re-pin #122) held the ladder down during the dead stretches as designed; no
+    exposure. This is the laptop's link, not the market: the same hours carried the largest record counts of the
+    day (1.55 M). Expected to disappear with the Render move (Phase 2 started 10-04: proxy repo
+    github.com/BradSherwood24/degeneracy-proxy, DO-list `pilot/ops/RENDER_SETUP_2026_10_04.md`).
+  * FROZEN-RULE ARITHMETIC AT n >= 45 (report `--days 3`, realised rows 10-03..10-05, the Test Fire #2 campaign):
+    realised rung-fills n = 47; mean true lock +8.54c (>= +4.0c PASS); per-rung shortfall +0.38c (<= 3.0c PASS);
+    %positive 80.43% (>= 80% PASS -- ONE negative set from the line; the 10 negative sets are 06:00Z 10-04 x8 and
+    00:00Z 10-05 x2, both adverse repricing); capture ratio @10c 1.00 (>= 0.50 PASS); one-legged contracts: ledger
+    0 for 10-03..10-05 + the 2 carried by Registration from 10-03 02:00Z (that row was never rebuilt in the live
+    ledger; the report's all-history line reads 14 = the Test Fire #1 10-02 rows, outside this campaign) = 2
+    (<= 2 PASS); single-order roll ratio 1.00 PASS. Report line: `VERDICT: ALIVE-so-far`. The n >= 45 bar is
+    CROSSED. The formal verdict, and anything that follows it (promotion step per L5 `rung_lots`, the contract/
+    dollar pin amendment the compounding MC (#133) says must precede any size step, V3.4 scope), is Brad's dated
+    word, not this entry. Balance $70.1699 (day +$0.7571 = -0.1506 + 0.9077). S4 day loss: none.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
