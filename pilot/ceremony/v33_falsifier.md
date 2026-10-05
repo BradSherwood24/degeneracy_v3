@@ -720,6 +720,54 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     follow in `pilot/build/mc/`; NOTE for any sizing step: the one-legged pin (<= 2 CONTRACTS) and S4 ($3.00 day
     loss) are written in contracts and dollars, so lots > 1 per rung changes what those pins mean -- an amendment
     with Brad's words precedes any size change, as L5 already requires for `rung_lots`.
+- 2026-10-05 00:45Z -- 00:00Z CLOSE: 2 LOTS, BOTH HEDGED, BOTH LOCKED A LOSS -- ADVERSE REPRICING AGAIN (the 06:40Z
+  mechanism), AND THIS TIME THE ROLL GATE THAT HELD THE STALE RESTS IS NAMED. Brad saw "$4.15 for a $4 payout" on
+  the screen at 8PM local and asked "typical wings moving on us or something concerning?" Windows 23:00Z: no fills.
+  * FACTS (venue + journal + reconciled row). Bucket `KXBTC-26OCT0420-B86450` (Sd 86400 / Su 86500). Two bucket-NO
+    rests filled, maker, fee 0: NO 0.41 at 23:54:35.570Z (venue split 0.06 + 0.94 of one lot, one order) and NO 0.40
+    at 23:54:36.986Z. Wings taken IOC taker within 250 ms of each fill: set 1 YES `KXBTCD-26OCT0420-T86399.99` @0.82
+    (limit 0.82) + NO `T86499.99` @0.84 (limit 0.86), lock -8.77c; set 2 NO `T86499.99` @0.83 (limit 0.85) + YES
+    `T86399.99` @0.81 on the `retry_wing` (first IOC at 0.84 missed; retry limit 0.83 filled 0.81), lock -8.71c.
+    Both locks inside `lock_floor` -0.10, so the take was correct by ruling F-2 (the alternative was 2 naked lots).
+    Fees $0.0406 (all taker, wings). Cost $4.1506 for a $4.00 floor. Settled 00:02:47Z ABOVE the bucket: bucket NO
+    2.00 + YES wing 2.00 = $4.00 revenue. Balance $69.4130 -> $69.2624 (-$0.1506 = ledger `realized_delta`
+    -0.1506 to the cent). Row: lots 2, hedged 2, one_legged_contracts 0, unbooked 0, mismatch False, alarms 0,
+    `venue_fills_fetched` ours 3 / total 7; `stand_down_sub_causes` {}; `rest_invariant_phantom` 70 (all via the
+    read-path filter, headline alarms 0); unsettled positions at the venue after close: 0.
+  * MECHANISM (v33_eval + amend_rest + fills, 00:00Z journal; local clock ~1.2 s ahead of venue stamps). At
+    23:54:29.3 and 23:54:34.3 convergence rolled the two TOP rungs UP to NO 0.40 and 0.41 (n_top 0.40-0.41,
+    W 1.48-1.50). At 23:54:35.33 local W jumped 1.50 -> 1.78 in ~100 ms and settled 1.68 (n_top 0.41 -> 0.13 ->
+    0.22): fair bucket NO by the strikes was ~0.32, so the 0.40/0.41 rests were 18-19c ABOVE the new top (rung
+    labels -17/-19, `E_rung` -0.09/-0.11 -- "stranded above the top", the transient core.py allows by design).
+    The venue lifted them at 35.570Z and 36.986Z. NO AMEND WAS SENT between 34.3 and 39.3: the roll gate is a
+    START debounce `deb_ms` 5000 with SIGN-FLIP re-debounce (core.py, the `since_ms < params.deb_ms` return in
+    the convergence step). The 34.3 roll was upward (+1); the need after the jump was downward (-1) -- a sign flip
+    -- so convergence waited the full 5 s from `last_replace_ts` 34.3 and the first downward amend went at
+    39.311. The stale window the debounce opened was 5.0 s; the first fill arrived 1.3 s into it (venue time; our
+    feed showed the jump ~240 ms before that fill, not enough for an amend round trip of 60-100 ms plus the
+    skew), the second 2.7 s into it -- the second set was avoidable. This is the 06:40Z mechanism (spot jump
+    re-prices the strikes and sweeps the bucket in the same instant) with the piece the 06:40Z entry could not
+    see: WHY the ladder held the stale rests for seconds rather than ~1.5 s -- the anti-flap debounce treats a
+    fast adverse move exactly like flap.
+  * CENSUS (all armed realised rows, the ledger as of this entry): 66 rung fills, 23 of them stranded (rung < 0),
+    35%. Stranded fills net +$0.1936 (the 09-30 22:00Z, 10-01 23:00Z, 10-02 00:00Z and 10-04 14:00Z stranded fills
+    locked POSITIVE: W moved the other way, or the rung sat a cent above); the two losing windows are 10-04 06:00Z
+    (8/8 stranded, -$0.3509) and tonight (3/3, -$0.1844 lock / -$0.1506 realised). In-ladder fills (rung >= 0):
+    43, +$3.8658. A stale rest above the top is routine in this ladder; it costs money when the wings jump
+    AGAINST the rest in the same event that fills it.
+  * FROZEN-RULE ARITHMETIC (realised rows, L6/L7): Test Fire #2 hedged sets n = 39 (37 through the 22:40Z entry
+    +2 tonight) = +$3.3643 realised (+$3.5149 - $0.1506), MEAN +8.63c per set, 29/39 positive (the 8 of 06:00Z
+    and the 2 of 00:00Z are the negatives). Verdict bar +4.0c at n >= 45: 6 sets away, current mean +8.63c.
+    One-legged contracts 2 (10-03) = the pin; one more naked contract = KILL. S4 day loss (UTC 10-05): -$0.15 of
+    the $3.00 line.
+  * BRAD'S RULING (00:3xZ, his words): "That is concerning, but also speed is something I plan to wrap into V3.4,
+    along with much more. Lets take a note of this window and watch for any others like it." So: NO lever
+    changes, NO build on `deb_ms` or a stranded-rung fast pull in V3.3; the mitigation (speed) is V3.4 scope.
+    V3.3 remains ARMED at this line. Watch instrument recorded alongside (observational, reads the ledger only):
+    `python -m service.v33.stranded_watch --days 7` lists every armed realised window with stranded fills, its
+    stranded lock, depth and realised delta, and flags the ADVERSE ones (stranded lock < 0) -- the thing to
+    count from here. Candidate V3.4 items named here for the record, not proposed: exempt rung < 0 from the
+    sign-flip re-debounce (or pull stranded rests immediately), and the clock/feed skew (~1.2 s tonight).
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 

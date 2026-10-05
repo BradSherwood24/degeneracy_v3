@@ -346,3 +346,23 @@ Brad's hand), the MUST CONFIRM list, the V3.2 Q4 close-line template, and the ro
 - Editing `v32_mode.txt` (shakedown/dry/armed).
 - Copying the mode file / day-guards at cutover.
 - Anything on Render (workspace, services, disk, env, deploy button).
+
+## 12. Stranded-fill watch (adverse repricing) -- registered 2026-10-05 00:45Z
+
+Brad, on the 00:00Z close of 2026-10-05 ($4.15 paid for a $4.00 floor): "Lets take a note of this window and
+watch for any others like it." The note is the Registration entry; this is the watch. It reads the V3.3 ledger
+and REPORTS -- it never touches the proxy or an order.
+
+```powershell
+cd C:\Users\Brads\Python_stuff\degeneracy_v3\pilot
+python -m service.v33.stranded_watch --days 7            # table
+python -m service.v33.stranded_watch --days 7 --write    # + ops\v33_stranded_watch.{txt,json} (gitignored)
+```
+
+- **stranded** = a rung fill whose `rung` label is `< 0`: the rest sat ABOVE `n_top` when it filled, i.e. the
+  wings had already re-priced against it and the roll had not moved it (the `deb_ms` 5000 START debounce with
+  sign-flip re-debounce holds a stale rest for up to 5 s after a reversal). Routine: ~35% of armed fills.
+- **ADVERSE** = a window whose stranded fills' realised lock sums below zero. The two so far: 10-04 06:00Z
+  (8/8, -$0.35) and 10-05 00:00Z (3/3, -$0.18). Those are the ones to count.
+- Only ARMED realised rows are read (dry rows carry simulated fills). No verdict rule attaches to this table;
+  the mitigation (speed) is V3.4 scope by Brad's ruling, and the levers remain his.

@@ -1515,3 +1515,16 @@ label fix stays out of the live tree until a :02-:33 band after your go.
 
 -- Claude
 
+
+## 2026-10-05 00:50Z -- Claude -> Brad: the $4.15 set, registered; the watch is up
+
+The 00:00Z close paid $4.1506 for a $4.00 floor (2 lots, both hedged, -$0.1506 to the cent against the venue).
+Same mechanism as 06:00Z (adverse repricing), with the missing piece named: the two top rungs had just rolled UP
+at 23:54:34; W jumped 1.50 -> 1.78 in ~100 ms at 23:54:35; the roll gate's 5 s START debounce re-debounced on
+the sign flip, so no amend went until 23:54:39 and the venue lifted the stale 0.41 / 0.40 rests at 35.6 s and
+37.0 s. Registration entry 00:45Z has the facts, the mechanism, the census (23 of 66 armed fills stranded, net
++$0.19; two adverse windows) and your ruling verbatim (V3.4 scope; take a note; watch). Nothing changed in the
+live tree; V3.3 stays armed. Watch: `python -m service.v33.stranded_watch --days 7` (reads the ledger, reports,
+flags ADVERSE windows). TF#2: n=39, +$3.3643, mean +8.63c, 29/39 positive, 6 sets from the n>=45 bar.
+
+-- Claude
