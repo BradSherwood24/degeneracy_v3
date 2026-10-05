@@ -162,6 +162,13 @@ class V33AsyncExecutor(V33LiveExecutor):
         # it and reports the one OrderCancelled), and the one-shot latch of the stand-down sweep.
         self._cancel_oids_inflight: set[str] = set()
         self._standdown_swept = False
+        # SINGLE-SLOT CANCEL/RE-PLACE RACE (2026-10-04, part a): the pre-flight invariant classifies a venue
+        # order with a DELETE of OURS in flight (``_cancel_oids_inflight``: sent, not yet resolved) as
+        # CANCELLING, not RESTING -- excluded from count_resting, the dup_price test, and strays. Pre-fix,
+        # a per-rung roll that cancelled a rung at P and re-placed at P ~1 ms later (DELETE confirm ~100-800
+        # ms behind) saw the old order still resting -> ``rest_invariant_violation {dup_price}`` -> stand-down
+        # (02:00Z/08:00Z/19:00Z 2026-10-04). A real stray (no DELETE of ours in flight) still trips as before.
+        self.rest_invariant_cancelling_excluded = 0
         self.standdown_sweep_cancels = 0
         self.places_refused_stood_down = 0
         self.amends_refused_stood_down = 0
@@ -466,6 +473,33 @@ class V33AsyncExecutor(V33LiveExecutor):
             out.append({"order_id": oid, "client_order_id": coid, "exchange_index": exch})
         return out
 
+    def _exclude_cancelling(self, entries: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+        """Part (a): drop resting-LIST entries for which WE have a DELETE IN FLIGHT (sent, not yet resolved
+        -- ``_cancel_oids_inflight``, armed in ``_delete_and_resolve_async`` before the DELETE is awaited and
+        discarded in its ``finally``). Engine truth (our in-flight cancel) beats the lagging list read, so the
+        old order a per-rung roll just cancelled is NOT counted as resting, is NOT a dup against the re-place
+        at the same price, and is NOT a stray. A real stray (no DELETE of ours in flight) is untouched and
+        still trips. Journals + counts each exclusion. Applied AFTER ``_filter_phantoms`` (a cancelling order
+        is not yet cancel-CONFIRMED, so the phantom belt keeps it) and before every ``_invariant_verdict``."""
+        if not entries:
+            return entries
+        kept: list[dict[str, Any]] = []
+        excl_oids: list[Any] = []
+        excl_coids: list[Any] = []
+        for r in entries:
+            oid = r.get("order_id")
+            if oid is not None and oid in self._cancel_oids_inflight:
+                excl_oids.append(oid)
+                excl_coids.append(r.get("client_order_id"))
+                continue
+            kept.append(r)
+        if excl_oids:
+            self.rest_invariant_cancelling_excluded += len(excl_oids)
+            self._bump("rest_invariant_cancelling_excluded", len(excl_oids))
+            self.journal.append("rest_invariant_cancelling_excluded",
+                                {"order_ids": excl_oids, "coids": excl_coids}, self.clock())
+        return kept
+
     async def _pre_place_invariant_async(self, coid: str, now: float,
                                          place_price: Any = None) -> list[Any] | None:
         """Async twin of V33LiveExecutor._pre_place_invariant. First read decides on a healthy partial
@@ -491,6 +525,9 @@ class V33AsyncExecutor(V33LiveExecutor):
         first = self._filter_phantoms(first, now)
         if not first:
             return None
+        first = self._exclude_cancelling(first, now)   # part (a): a DELETE of ours in flight is not RESTING
+        if not first:
+            return None
         overflow, dup, strays = self._invariant_verdict(first, place_price)
         if not (overflow or dup or strays):
             return None
@@ -501,6 +538,9 @@ class V33AsyncExecutor(V33LiveExecutor):
         if not reread:
             return None
         reread = self._filter_phantoms(reread, now)
+        if not reread:
+            return None
+        reread = self._exclude_cancelling(reread, now)   # part (a): re-check after the recheck sleep too
         if not reread:
             return None
         overflow, dup, strays = self._invariant_verdict(reread, place_price)
