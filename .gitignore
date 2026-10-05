@@ -20,6 +20,8 @@ pilot/ops/v33_mode.txt
 pilot/ops/replay_tripwire.txt
 pilot/ops/replay_tripwire.json
 pilot/ops/replay_daily.log
+pilot/ops/v33_stranded_watch.txt
+pilot/ops/v33_stranded_watch.json
 # generated box-report artifacts (regenerated on each run; only the README is tracked)
 pilot/reports/*.json
 
