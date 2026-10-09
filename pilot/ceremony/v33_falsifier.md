@@ -806,6 +806,100 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     dollar pin amendment the compounding MC (#133) says must precede any size step, V3.4 scope), is Brad's dated
     word, not this entry. Balance $70.1699 (day +$0.7571 = -0.1506 + 0.9077). S4 day loss: none.
 
+- 2026-10-08 22:15Z -- OUTAGE 10-06 21:55Z .. 10-08 12:36Z (LAPTOP BATTERY), RESTART, FIRST FILL AFTER, n = 60 GATE TABLE,
+  BRAD'S RULING. Written after the fact from the Windows System log, the journals and the venue.
+  * OUTAGE: the laptop was unplugged ~20:23Z 10-06; Critical Battery Trigger 21:54:47Z; Windows system-initiated
+    shutdown 21:55:03Z (Kernel-Power 524/109/1074). Powered back on 03:57Z 10-07. Neither the v33 supervisor (a
+    manual detached run) nor the proxy was a registered startup task, so neither came back; nothing ran until the
+    restart. The 22:00Z 10-06 journal cuts at 21:54:47Z with `ladder_live` 0 and 0 fills; every rest carries the
+    2-minute expiration, so no exposure survived (VENUE CONFIRMED 12:38Z 10-08: 0 resting, 0 positions, balance
+    $70.9251). Mode file `armed` throughout. ~37 armed windows missed (22:00Z 10-06 .. 12:00Z 10-08); Kalshi listed no
+    hourly BTC markets for 10-08 06Z-09Z, so ~34 tradeable. Cost estimate (REST trade history + the pilot's own W /
+    solve_n law, calibrated on 10 known windows: finds full-ladder sweeps exactly, misses stranded-rung fills):
+    ~6 windows with fills, ~26 sets, ~$3.5 of lock; realistic ~$2-3.5. The lesson is operational, not strategic:
+    register the startup tasks (runbook sec 4) or finish the Render move; a laptop on battery is a kill switch.
+  * RESTART on Brad's word 12:36Z 10-08 (just past the band; nothing was running, so no mid-window change): proxy via
+    `Start-ScheduledTask DegeneracyProxy` (health ok, cap 2, budget 30000); supervisor detached from pilot/ with
+    `DV3_V33_ASYNC_WRITER=1`, logs `pilot/logs_v33/supervisor.manual7.{out,err}`; boot sweep found 0; first window
+    13:00Z. The live tree stayed main e30191e (sha f4037082...). Brad: "We back!"
+  * FIRST FILL AFTER THE OUTAGE, 22:00Z 10-08: 1 set, top rung NO 0.40 (n_top 0.40), lock +8.23c, realised +9.91c,
+    hedged, 0 alarms, reconcile clean. 9 clean windows since the restart; the #135 race fix's
+    `rest_invariant_cancelling_excluded` fired in the 14Z and 16Z windows (working as built). Balance $71.02.
+  * FROZEN-RULE ARITHMETIC AT n = 60 (report `--days 5` = exactly Test Fire #2, 10-04..10-08): 60 realised rung fills
+    over 84 armed windows (9 with fills); realised +$4.87 (balance $66.15 -> $71.02); mean true lock +7.77c (>= +4.0c
+    PASS); per-rung shortfall worst +1.16c (<= 3.0c PASS); %POSITIVE 77.97% (>= 80% FAIL; it was 80.43% at n = 47);
+    capture ratio 1.00 PASS; one-legged 0 in the ledger + the 2 carried from 10-03 02:00Z = 2 (<= 2 PASS); roll ratio
+    100% PASS. The frozen table therefore read `VERDICT: KILL: %positive` -- the verdict gate, not an early kill;
+    the pilot was armed and filling. The 14 negative fills are all stranded (rung < 0) in the three ADVERSE windows
+    (10-04 06Z, 10-05 00Z, 10-05 20Z) plus two near-zero margins; stranded watch 24/61 fills (39%), net -$0.03.
+  * BRAD'S RULING (~22:15Z 10-08, his words, on the n = 60 table with %positive FAIL): "Lets keep it going." And:
+    "I'm thinking test fire #3 will be testing Render hosting." So: V3.3 STAYS ARMED past the %positive line on
+    Brad's dated word; no lever moves; the formal Test Fire #2 verdict remains his to pronounce; Test Fire #3 is
+    pencilled as the Render-hosted run.
+
+- 2026-10-09 21:25Z -- 20:00Z CLOSE: 5 LOTS SWEPT IN THE 400 ms BEFORE QUOTE END, ALL HEDGED AT THE VENUE (5/5/5,
+  -$0.048), BUT THE LEDGER DOUBLE-COUNTED THEM AND THE FROZEN TABLE NOW READS `KILL: one-legged 9.51 > 2`. The table's
+  figure is an ACCOUNTING ARTEFACT, shown here against the venue; the ruling on what it means is Brad's.
+  * WHAT THE VENUE SAYS (GET fills + settlements, 21:0xZ): bucket `KXBTC-26OCT0916-B82250` NO 5.00 contracts, maker,
+    fee 0, six fill events at 19:55:00.110Z-00.473Z (NO 0.35, 0.34, 0.32, 0.31, and 0.30 split 0.51 + 0.49 on one
+    order), cost $1.6200. Wings taker: YES `KXBTCD-26OCT0916-T82199.99` 5.00 (1.00 @0.91, 2.00 @0.91, 1.51 @0.91,
+    0.49 @0.92; $4.5549, fee $0.0286) and NO `T82299.99` 5.00 (0.49 @0.77, 1.00 @0.77, 2.00 @0.75, 1.51 @0.75;
+    $3.7798, fee $0.0647), all at 19:55:01.36Z-02.93Z, within 3 s of the fills. Settled 20:02:43Z: bucket YES
+    (BTC inside), `T82299.99` NO pays $5.00, `T82199.99` YES pays $5.00 = $10.00 revenue on $9.9547 + $0.0933 fees
+    = -$0.0480 real (-0.96c per set). Balance $71.02 -> $70.9762. Positions after settlement 0, resting 0. Five sets,
+    FULLY HEDGED, zero naked exposure at any point the venue can show.
+  * MECHANISM (20:00Z journal, 1.35 M records; local clock ~1.2 s behind venue stamps). The ladder sat 5 rungs NO
+    0.30-0.35 (amended into place 19:54:51, n_top then 0.30-0.35). At quote end the core stood down
+    `past_quote_end` and sent 5 `cancel_rest` at 19:55:01.264 local; the venue had ALREADY lifted all five at
+    19:55:00.110-00.473Z -- a sweep in the last 400 ms before T-5:00. The WS fills reached the engine 19:55:01.7-02.8
+    local, AFTER the slots were released, so every fill booked through the gate-A orphan path
+    (`orphan_rung_fill_hedged` x6, `stood_down` false): the core booked 5.00 lots at the fill prices (n_top had
+    dropped to 0.22 by the batch: rung labels -2/-12/-10/-9/-8, four of five stranded -- adverse repricing in the
+    same event, as 10-04 06Z and 10-05 00Z) and took wings per batch (1 lot, 3.51, 0.49). The first IOC on each of the
+    two larger batches missed on one leg (NO limits 0.60/0.76 vs a 0.77 ask; YES 0.94 vs 0.91 fine) and filled on
+    `retry_wing` at 0.79/0.94 limits. Solved lock at fill summed +1.9c for the five lots; realised -4.8c; the
+    difference is wing slippage on the retries. Then `cancel_confirmed via status` (DELETE 404 = already filled,
+    `filled_before_cancel` 1 x5) closed the five orders.
+  * THE ACCOUNTING FAULT (two parts, both in gate E's reconcile, neither in the money path; both confirmed in
+    the code, not inferred). (1) Each lot reached executor truth TWICE under two different keys. The WS fill
+    (`run_v33.on_ws_fill`) records it with coid AND order_id -> `reconcile._canon_key` files it `oid:01a12236...`;
+    the cancel-race booking in the shared executor (`service/v32/executor.py::_finish_cancel`, path `cancel_race`,
+    the `cancel_confirmed via status` / `filled_before_cancel` 1 x5 above) appends a rest-leg record to
+    `executor.fills` with `client_order_id` ONLY -- no `order_id` -- so the same lot is filed `coid:...-271..276`.
+    The per-order MAX that stops a double count never met (its de-dupe set `booked_rest_oids` guards against the
+    AMEND path, not the WS path): `exec_lots` 10, `core_lots` 5 (the core booked under `oid:`), five
+    `unbooked_fill` rows with `order_id null` and `core_count` 0, `lots_filled` 10 (the union),
+    `reconcile_mismatch` True, alarm `ledger_reconcile_mismatch`. This is the first fill-during-cancel race since
+    gate E landed (10-04); every earlier fill arrived with no cancel in flight, so the path never fired.
+    (2) `hedged_lots` 0.49 (`reconcile._hedged_lots_from_state`: sum of `leg_count` over batches with `completed`
+    True): only the last wing batch was credited; the two batches whose missing leg filled on `retry_wing` were
+    not marked `completed` (`_maybe_close_set` needs every leg `filled`; the retried leg is re-minted `pending`
+    under a new coid -- the builder confirms where its fill failed to flip it). So `one_legged_contracts` = 10 - 0.49 = 9.51, `one_legged` True,
+    `s1_legged_occurrence` count 1 (latch threshold 2), `sets_done` 0.49, `floor_booked` $4.51, ledger
+    `realized_delta` -$0.5710 against the venue's -$0.0480, settlement backfill `settlement_payoff` $4.51 on a
+    $10.00 payout. Every one of those numbers is wrong by construction; the venue's are above.
+  * WHAT THE FROZEN TABLE READS NOW (report `--days 5`, 10-05..10-09): mean true lock +7.64c PASS; shortfall +1.16c
+    PASS; %positive 76.36% FAIL (was 77.97%, ruled through on 10-08); capture 1.00 PASS; ONE-LEGGED CONTRACTS 9.51
+    (<= 2) FAIL; roll ratio 1.00 PASS; `VERDICT: KILL: one-legged 9.51 > 2`. The S1_LEGGED day latch stands at 1 of 2
+    on the same artefact; a second such window today would stand the day down automatically (no exposure, lost
+    windows). The 10-03 02:00Z precedent: a one-legged figure the venue contradicted was carried by Registration,
+    not by the ledger.
+  * WHAT THIS ENTRY DOES NOT DO: it does not re-read the frozen rule. The one-legged pin counts CONTRACTS LEFT NAKED;
+    the venue shows zero. Whether the 9.51 is struck as an artefact (and the row's money fields replaced by the venue
+    figures: 5 sets, -$0.0480, 0 one-legged) or the KILL is honoured is BRAD'S WORD. Recommendation on the record:
+    strike it as an artefact (the hedge did its job under the hardest timing the ladder has met -- a full sweep at
+    T-5:00 arriving after stand-down), keep V3.3 armed, and fix the two reconcile faults before the next window
+    repeats them: (a) carry `order_id` on the `cancel_race` rest-leg record (the RestRecord has it) so it merges
+    with the WS record under `oid:`; (b) credit `hedged_lots` for a batch completed on `retry_wing`. Both are ledger/reconcile code, not core, not params; the sha does not move. Not
+    built; awaiting the word. Candidate V3.4 note added to the speed list: the T-5:00 cancel goes out ~1 s after the
+    last fills land; a last-second sweep is now a seen case, not a hypothetical.
+  * ARITHMETIC IF THE ARTEFACT IS STRUCK (venue figures for 20:00Z): Test Fire #2 hedged sets n = 66 (60 + 1 at 22:00Z
+    10-08 + 5 today), realised +$4.87 + $0.0991 - $0.0480 = +$4.92; one-legged 2 (the carried pin), S4 day loss
+    (UTC 10-09) $0.048. %positive falls further (five near-zero negatives: -0.96c per set); that line was already
+    ruled through on 10-08 and the mean-lock verdict stays above +4.0c.
+  * Also today: 21:00Z stood down `no KXBTC range buckets co-settling` (the venue lists no $100 buckets at 21Z; routine).
+    Live tree still main e30191e; main is docs-only ahead (#137 and this PR). V3.3 ARMED at this line.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
