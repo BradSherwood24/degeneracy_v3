@@ -1528,3 +1528,28 @@ live tree; V3.3 stays armed. Watch: `python -m service.v33.stranded_watch --days
 flags ADVERSE windows). TF#2: n=39, +$3.3643, mean +8.63c, 29/39 positive, 6 sets from the n>=45 bar.
 
 -- Claude
+
+
+## 2026-10-09 21:30Z -- Claude -> Brad: 20:00Z swept at quote end, hedged 5/5/5 at the venue, ledger double-counted it
+
+Brad, the 20:00Z close took all five rungs (NO 0.30-0.35) in the 400 ms before T-5:00, in the same second the
+core stood down and sent its cancels. The fills reached the engine after the slots were released, so every one
+went through the orphan path and was hedged: venue shows bucket NO 5.00, YES T82199.99 5.00, NO T82299.99 5.00,
+settled $10.00 on $9.9547 + $0.0933 fees = -$0.048 real (-1c a set; stranded prices plus two wing retries).
+Positions 0, resting 0, balance $70.9762. Zero naked exposure anywhere the venue can show.
+
+The ledger disagrees with the venue, and that is the problem: each lot reached executor truth twice (the WS
+record keyed by order_id, the cancel-race record keyed by coid only), so exec_lots 10 vs core 5, and only the
+last wing batch was credited as completed, so one_legged_contracts reads 9.51. The frozen table now prints
+`VERDICT: KILL: one-legged 9.51 > 2`, and the S1 day latch sits at 1 of 2 on the same artefact. Registration
+entry 21:25Z (this PR) has the venue facts, the mechanism with both code paths named, and the table as it reads;
+I also registered the 10-06 outage, the 10-08 restart and your "Lets keep it going" ruling, which had not been
+written down.
+
+Two things for your word: (1) whether the 9.51 is struck as an accounting artefact (my recommendation: the
+hedge did its job under the hardest timing it has met) or the KILL stands; (2) go on the two reconcile fixes
+(carry order_id on the cancel-race record; credit hedged lots on a retry-completed batch). Both are ledger
+code, not core, not params; sha does not move. Nothing in the live tree has changed. V3.3 stays armed unless
+you say otherwise.
+
+-- Claude
