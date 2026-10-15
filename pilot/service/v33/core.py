@@ -1590,6 +1590,32 @@ def _wing_prices_for_bucket(
                         _WingLawView(params.wing_book_max_age_s))  # type: ignore[arg-type]
 
 
+def _wing_leg_ask(
+    st: V33State, strike: int | None, side: str, now: float, params: V33Params
+) -> Decimal | None:
+    """PARTIAL HEDGE (2026-10-10 incident): the take gate for ONE wing leg in isolation — the SAME
+    per-leg conditions the V3.2 law (``_wing_prices``) applies to each strike, read for a SPECIFIC bucket
+    strike: book present, not suspect, fresh under the LOOSE ``wing_book_max_age_s`` (the bound the
+    both-legs V3.3 gate uses via ``_WingLawView``), an ask present and in ``(0, 1]`` (the take gate's
+    half-open interval, matching ``_wing_prices``). Returns that leg's ask, else None.
+
+    The strike-FEED liveness (``_strike_feed_alive``) is the CALLER's gate, evaluated ONCE for the pair,
+    exactly as in ``_wing_prices_for_bucket`` — not repeated per leg. V3.2 is untouched: this re-expresses
+    its per-strike checks for the single-leg path without changing the shared law, so when BOTH legs pass
+    here ``_wing_prices`` also returns non-None (the partial path is never entered)."""
+    if strike is None:
+        return None
+    top = st.strike_tops.get(strike)
+    if top is None or top.suspect:
+        return None
+    if not _fresh(now, st.strike_ts.get(strike), params.wing_book_max_age_s):
+        return None
+    ask = top.yes_ask if side == BUY_YES else top.no_ask
+    if ask is None or not (_ZERO < ask <= _ONE):
+        return None
+    return ask
+
+
 def _wing_step(params: V33Params, st: V33State, now: float) -> tuple[V33State, list[V33Action]]:
     """Close any expired coalescing group, then take (or retry) the wings for every CLOSED batch.
 
@@ -1631,6 +1657,14 @@ def _wing_step(params: V33Params, st: V33State, now: float) -> tuple[V33State, l
         sd, su = _batch_bucket(params, b)
         prices = _wing_prices_for_bucket(st, sd, su, now, params)
         if prices is None:
+            # PARTIAL HEDGE (2026-10-10 incident): the both-legs law said None, but if the feed is alive
+            # and exactly ONE wing is quotable on its own, SEND that leg now instead of blocking the whole
+            # batch (Brad: "place what orders we can, then treat it like an empty wing"). A not-yet-taken
+            # batch only; once taken this is the retry path's job. Feed-dead / neither leg priceable -> the
+            # helper returns no action and the batch waits exactly as before.
+            if not b.taken:
+                st, a = _take_batch_partial(params, st, b, sd, su, now)
+                actions += a
             continue                       # this batch's bucket has no fresh strike book yet — it waits.
         ya, na = prices
         if not b.taken:
@@ -1685,6 +1719,59 @@ def _take_batch(
         wing_batches=_replace_batch(st.wing_batches, b.index, taken=True),
     )
     return st, [_mk(ActionKind.TAKE_WINGS, st.shakedown, legs=legs, count=count, lock=lock)]
+
+
+def _take_batch_partial(
+    params: V33Params, st: V33State, b: WingBatch, sd: int | None, su: int | None, now: float
+) -> tuple[V33State, list[V33Action]]:
+    """PARTIAL initial take (2026-10-10 20:00Z incident): the both-legs law returned None (one wing's
+    book is missing / suspect / stale / has no ask) but the OTHER wing is quotable on its own and the real
+    risk is climbing. Brad's rule: ``Can both orders fill -> no -> place what orders we can``, then treat
+    the deferred leg like an empty wing. SEND the one priceable leg now and record the missing leg as an
+    ``unfilled`` WingLeg (NO order sent, NO coid minted) — the exact state a leg reaches when its IOC
+    misses (``_apply_fill``'s ``status="unfilled"`` branch). The existing ``_retry_batch`` path (D4 cadence
+    floor, one retry in flight, lock_floor gate, fresh ask + wing_margin) then takes it once its own book
+    is priceable; no new retry logic is added.
+
+    Waits exactly as before (returns no action, batch stays not-taken) when the strike FEED is dead or
+    NEITHER leg is priceable — the ONLY new behaviour is sending the single quotable leg rather than
+    blocking the whole batch. Marks the batch ``taken`` once the one leg is sent so the initial take is
+    never repeated. Both legs are recorded (one ``pending``, one ``unfilled``, each sized to the batch's
+    total), so the taken-batch ``exactly two legs sized to leg_count`` invariant holds. The action carries
+    BOTH legs (the deferred leg unpriced, ``limit=None``) so the driver journals it as the batch's
+    ``take_wings`` with the full count — the journal-rebuild hedge coverage is credited once, truthfully,
+    exactly as a both-legs take; the deferred leg's actual send is a later single-leg ``retry_wing``."""
+    if sd is None or su is None:
+        return st, []
+    if not _strike_feed_alive(params, st, now):
+        return st, []
+    ya = _wing_leg_ask(st, sd, BUY_YES, now, params)
+    na = _wing_leg_ask(st, su, BUY_NO, now, params)
+    if ya is None and na is None:
+        return st, []                      # neither leg priceable — wait, exactly as before.
+    count = _q_count(b.total_count)
+    coid, st = _mint_coid(st)
+    if ya is not None:
+        send_ticker, send_side, send_ask = st.strike_tickers.get(sd, ""), BUY_YES, ya
+        miss_ticker, miss_side = st.strike_tickers.get(su, ""), BUY_NO
+    else:
+        send_ticker, send_side, send_ask = st.strike_tickers.get(su, ""), BUY_NO, na
+        miss_ticker, miss_side = st.strike_tickers.get(sd, ""), BUY_YES
+    send_limit = min(send_ask + params.wing_margin, _LIMIT_CEILING)
+    # the sent leg (priced, pending, real coid) + the deferred leg (unpriced, unfilled, NO coid minted).
+    sent_leg = WingLeg(send_ticker, send_side, count, send_limit, coid, batch=b.index)
+    miss_leg = WingLeg(miss_ticker, miss_side, count, _ZERO, "", status="unfilled", batch=b.index)
+    st = replace(
+        st, wing_legs=st.wing_legs + (sent_leg, miss_leg),
+        wing_batches=_replace_batch(st.wing_batches, b.index, taken=True),
+    )
+    # the ACTION lists both legs (deferred leg limit=None signals "not yet placed") so the driver's
+    # len(legs)==2 journals this as the batch's ``take_wings`` (coverage credited), not a ``retry_wing``.
+    action_legs = (
+        LegOrder(send_ticker, send_side, "buy", count, send_limit),
+        LegOrder(miss_ticker, miss_side, "buy", count, None),
+    )
+    return st, [_mk(ActionKind.TAKE_WINGS, st.shakedown, legs=action_legs, count=count)]
 
 
 def _retry_batch(
