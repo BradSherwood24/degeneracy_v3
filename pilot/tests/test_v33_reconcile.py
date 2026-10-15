@@ -452,3 +452,116 @@ def test_rebuild_cli_close_iso_from_filename():
     assert mod.close_iso_from_filename("20261003T020000Z.jsonl.gz") == "2026-10-03T02:00:00Z"
     assert mod.close_iso_from_filename("20261003T020000Z.jsonl") == "2026-10-03T02:00:00Z"
     assert mod.close_iso_from_filename("not_a_journal.txt") is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-09 20:00Z ladder-sweep incident: the ledger/falsifier read KILL as an
+# ARTEFACT (lots 10 vs 5, hedged 0.49 vs 5, one-legged 9.51) while the venue was
+# fully hedged (5 sets, -$0.048 real, flat). Two root causes, both reporting-only.
+# ---------------------------------------------------------------------------
+class _RecWithOid:
+    def __init__(self, order_id):
+        self.order_id = order_id
+
+
+class _ExecWithAttr:
+    """A fake armed executor carrying ``self.fills`` (incl. the order_id-less cancel_race legs) and the
+    ``attribute(coid=...)`` -> RETAINED RestRecord lookup + the ``_wing_filled`` venue-truth map."""
+
+    def __init__(self, fills, coid_to_oid=None, wing_filled=None):
+        self.fills = fills
+        self._coid_to_oid = coid_to_oid or {}
+        self._wing_filled = wing_filled or {}
+
+    def attribute(self, coid=None, order_id=None):
+        oid = self._coid_to_oid.get(coid)
+        return _RecWithOid(oid) if oid is not None else None
+
+
+def _cancel_race_leg(coid, price):
+    """The leg the V3.2 ``_finish_cancel`` appends: a rest fill with client_order_id but NO order_id."""
+    return {"leg": "rest", "side": "no", "ticker": B, "price": D(price), "exec_price": None,
+            "fee": D(0), "count": 1, "path": "cancel_race", "client_order_id": coid}
+
+
+def test_cancel_race_leg_canonicalised_to_oid_not_double_counted():
+    """BUG 1: the cancel_race rest leg (coid, no order_id) and the SAME lot's ws fill (oid) must collapse to
+    ONE lot. Pre-fix they keyed coid: vs oid: and summed to 10 for 5 real lots."""
+    ws = [ExecFill(count=D(1), coid=f"c{i}", order_id=f"o{i}", source="ws") for i in range(5)]
+    legs = [_cancel_race_leg(f"c{i}", "0.3") for i in range(5)]
+    executor = _ExecWithAttr(legs, coid_to_oid={f"c{i}": f"o{i}" for i in range(5)})
+    fills = executor_truth_fills(SimpleNamespace(_exec_truth_fills=ws, executor=executor), None)
+    # every cancel_race leg now carries its venue order_id (canonical oid: key)
+    assert all(f.order_id is not None for f in fills)
+    r = reconcile(exec_fills=fills, core_rest_fills=None, hedged_lots=D(0))
+    assert r.exec_lots == 5          # NOT 10
+
+
+def test_cancel_race_leg_without_recoverable_oid_still_counts_fail_safe():
+    """Fail-safe: a cancel_race leg whose RestRecord was evicted (attribute -> None) stays coid-keyed and is
+    still COUNTED (fail toward counting the lot — the safe direction for the one-legged pin), never dropped."""
+    ws = [ExecFill(count=D(1), coid="c0", order_id="o0", source="ws")]
+    legs = [_cancel_race_leg("c0", "0.3")]
+    executor = _ExecWithAttr(legs, coid_to_oid={})       # record gone: no oid recoverable
+    fills = executor_truth_fills(SimpleNamespace(_exec_truth_fills=ws, executor=executor), None)
+    r = reconcile(exec_fills=fills, core_rest_fills=None, hedged_lots=D(0))
+    assert r.exec_lots == 2          # coid: + oid: — counted twice, never under-counted
+
+
+def _wbatch(index, counts, *, completed=False):
+    fills = tuple(RungFill(rung=0, E_rung=D("0.05"), price=D("0.3"), count=D(c), server_ts=0,
+                           coid=f"b{index}r{j}", order_id=f"ob{index}r{j}")
+                  for j, c in enumerate(counts))
+    return WingBatch(index=index, server_ts=0, fills=fills, taken=True, completed=completed)
+
+
+def test_retry_completed_batch_credited_from_executor_truth():
+    """BUG 2: a batch whose wings the executor filled (venue truth in ``_wing_filled``) but whose completing
+    Fill has not re-entered ``decide`` (the armed off-loop dispatch races the window close) is NOT yet
+    ``completed`` in core — it must STILL be credited as hedged. Pre-fix only ``completed`` counted."""
+    from service.v33.reconcile import _hedged_lots_from_state
+    b0 = _wbatch(0, [D("0.49")], completed=True)          # the one batch that round-tripped in time
+    b1 = _wbatch(1, [D(1)])                                # taken, not completed, hedged at venue
+    b2 = _wbatch(2, [D(1), D(1), D(1), D("0.51")])         # coalesced 3.51, retry-hedged, not completed
+    wing_filled = {(1, "yes"): D(1), (1, "no"): D(1),
+                   (2, "yes"): D("3.51"), (2, "no"): D("3.51")}
+    state = SimpleNamespace(wing_batches=(b0, b1, b2))
+    executor = _ExecWithAttr([], wing_filled=wing_filled)
+    assert _hedged_lots_from_state(state, None) == D("0.49")      # core-only (the pre-fix artefact)
+    assert _hedged_lots_from_state(state, executor) == D("5.00")  # + executor venue truth
+
+
+def test_half_filled_taken_batch_not_credited_fail_closed():
+    """A batch with only ONE wing filled at the venue is NOT hedged — executor-truth credit requires BOTH
+    wings to reach leg_count, so a genuinely one-legged batch is never hidden."""
+    from service.v33.reconcile import _hedged_lots_from_state
+    b = _wbatch(0, [D(1)])
+    executor = _ExecWithAttr([], wing_filled={(0, "yes"): D(1), (0, "no"): D(0)})
+    state = SimpleNamespace(wing_batches=(b,))
+    assert _hedged_lots_from_state(state, executor) == D(0)
+
+
+def test_incident_20261009_reconcile_live_reads_truthful_row():
+    """END TO END: with both fixes, ``reconcile_live`` on the incident shape reads lots 5 / hedged 5 /
+    one_legged_contracts 0 / one_legged False — the venue truth — instead of lots 10 / hedged 0.49 /
+    one_legged 9.51 (the KILL artefact)."""
+    ws = [ExecFill(count=D(1), coid=f"c{i}", order_id=f"o{i}", price=D("0.3"), ticker=B, source="ws")
+          for i in range(5)]
+    cancel_legs = [_cancel_race_leg(f"c{i}", "0.3") for i in range(5)]
+    wing_filled = {(1, "yes"): D(1), (1, "no"): D(1),
+                   (2, "yes"): D("3.51"), (2, "no"): D("3.51")}
+    executor = _ExecWithAttr(cancel_legs, coid_to_oid={f"c{i}": f"o{i}" for i in range(5)},
+                             wing_filled=wing_filled)
+    core_rf = [RungFill(rung=0, E_rung=D("0.05"), price=D("0.3"), count=D(1), server_ts=0,
+                        coid=f"c{i}", order_id=f"o{i}", bucket_ticker=B, bucket_Sd=82200)
+               for i in range(5)]
+    batches = (_wbatch(0, [D("0.49")], completed=True), _wbatch(1, [D(1)]),
+               _wbatch(2, [D(1), D(1), D(1), D("0.51")]))
+    drv = SimpleNamespace(_exec_truth_fills=ws, executor=executor,
+                          state=SimpleNamespace(rest_fills=tuple(core_rf), one_legged=False,
+                                                wing_batches=batches))
+    r = reconcile_live(drv, None)
+    assert r.lots_filled == 5 and r.exec_lots == 5 and r.core_lots == 5
+    assert r.hedged_lots == D("5.00")
+    assert r.one_legged_contracts == 0 and r.one_legged is False
+    assert r.reconcile_mismatch is False

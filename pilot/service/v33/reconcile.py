@@ -248,8 +248,25 @@ def executor_truth_fills(driver: Any, venue_fills: Iterable[Mapping[str, Any]] |
     for f in (getattr(executor, "fills", ()) or ()):
         if (f.get("leg") if isinstance(f, Mapping) else None) != "rest":
             continue
+        # DOUBLE-COUNT FIX (2026-10-09 20:00Z): the ``cancel_race`` rest leg the V3.2 executor's
+        # ``_finish_cancel`` appends carries the ``client_order_id`` but NO ``order_id`` (it is booked by
+        # coid, de-duped by coid against a re-report). ``_canon_key`` then files it under ``coid:`` while
+        # the SAME lot's ws/poll/venue fill is filed under ``oid:`` — two keys, so the lot is counted
+        # twice (the incident read executor_lots 10 for 5 real lots). Recover the venue ``order_id`` from
+        # the RETAINED RestRecord (the executor keeps it for late-fill attribution) so this leg canonicalises
+        # to the SAME ``oid:`` key and the per-order MAX-across-sources dedup collapses the pair. If the
+        # record was evicted (no oid recoverable) it stays coid-keyed — fail toward COUNTING the lot, the
+        # safe direction for the one-legged pin.
+        order_id = f.get("order_id")
+        if order_id is None and f.get("client_order_id") and executor is not None:
+            try:
+                rec = executor.attribute(coid=f.get("client_order_id"))
+            except Exception:  # noqa: BLE001 -- reporting path never raises on an attribution miss
+                rec = None
+            if rec is not None:
+                order_id = getattr(rec, "order_id", None)
         out.append(ExecFill(count=_dc(f.get("count", 0)), coid=f.get("client_order_id"),
-                            order_id=f.get("order_id"), price=f.get("price"), ticker=f.get("ticker"),
+                            order_id=order_id, price=f.get("price"), ticker=f.get("ticker"),
                             source=str(f.get("path") or "amend")))
     for vf in (venue_fills or ()):
         out.append(ExecFill(count=_dc(vf.get("count", 0)), coid=vf.get("client_order_id"),
@@ -258,11 +275,44 @@ def executor_truth_fills(driver: Any, venue_fills: Iterable[Mapping[str, Any]] |
     return out
 
 
-def _hedged_lots_from_state(state: Any) -> Decimal:
-    """Lots covered by a COMPLETED wing pair (``leg_count`` honours print-through pre-hedges)."""
+def _batch_wings_filled_at_venue(wing_filled: Mapping[Any, Any], b: Any) -> bool:
+    """True when the EXECUTOR has confirmed BOTH wings of coalesced batch ``b`` filled to its ``leg_count``.
+
+    ``wing_filled`` is the armed executor's ``_wing_filled`` map, keyed ``(batch_index, side)`` and summed
+    SYNCHRONOUSLY as each IOC chunk response lands in ``_take_wings`` — BEFORE the completing ``Fill`` is
+    emitted upstream. It is therefore venue truth that is present at finalize even when that ``Fill`` has
+    not yet re-entered ``decide`` (the armed dispatch is off-loop; see below). Both sides must reach
+    ``leg_count`` (a half-filled batch is NOT hedged), so this is fail-closed."""
+    lc = _dc(getattr(b, "leg_count", 0))
+    if lc <= _ZERO:
+        return False
+    idx = getattr(b, "index", None)
+    yes_f = _dc(wing_filled.get((idx, "yes"), _ZERO))
+    no_f = _dc(wing_filled.get((idx, "no"), _ZERO))
+    return (yes_f + _EPS) >= lc and (no_f + _EPS) >= lc
+
+
+def _hedged_lots_from_state(state: Any, executor: Any = None) -> Decimal:
+    """Lots covered by a hedged wing pair (``leg_count`` honours print-through pre-hedges).
+
+    A batch is credited when the core marked it ``completed``, OR — RETRY-CREDIT FIX (2026-10-09 20:00Z) —
+    when the armed executor has confirmed both of a coalesced batch's wings filled even though the core has
+    not yet marked it completed. The armed path dispatches wing takes/retries OFF the loop and re-enters the
+    completing ``Fill`` into ``decide`` asynchronously (``run_v33._dispatch_async``); when a batch is hedged
+    at the venue in the last moments of the window, that ``Fill`` can land AFTER the window loop ends, so at
+    finalize the core shows the batch ``taken`` but not ``completed`` while the venue is fully hedged. The
+    incident hedged 5 lots at the venue (-$0.048 real, flat) but the row read ``hedged_lots 0.49`` — only
+    the one batch whose completing fill happened to round-trip in time. The executor's ``_wing_filled`` map
+    is venue truth captured synchronously, so it credits the retry-completed batches too. Print-through
+    batches are NOT executor-credited (their completion also needs the pre-hedged rung filled — the core's
+    ``completed`` flag is the only correct signal there)."""
+    wing_filled = getattr(executor, "_wing_filled", None) if executor is not None else None
     total = _ZERO
     for b in (getattr(state, "wing_batches", ()) or ()):
         if getattr(b, "completed", False):
+            total += _dc(getattr(b, "leg_count", 0))
+        elif (wing_filled is not None and not getattr(b, "print_through", False)
+              and _batch_wings_filled_at_venue(wing_filled, b)):
             total += _dc(getattr(b, "leg_count", 0))
     return total
 
@@ -277,7 +327,7 @@ def reconcile_live(driver: Any, venue_fills: Iterable[Mapping[str, Any]] | None 
     return reconcile(
         exec_fills=executor_truth_fills(driver, venue_fills),
         core_rest_fills=list(getattr(state, "rest_fills", ()) or ()),
-        hedged_lots=_hedged_lots_from_state(state),
+        hedged_lots=_hedged_lots_from_state(state, getattr(driver, "executor", None)),
         core_one_legged=bool(getattr(state, "one_legged", False)),
     )
 
@@ -294,7 +344,7 @@ def reconcile_exec_truth_only(driver: Any, venue_fills: Iterable[Mapping[str, An
     return reconcile(
         exec_fills=executor_truth_fills(driver, venue_fills),
         core_rest_fills=None,
-        hedged_lots=_hedged_lots_from_state(state),
+        hedged_lots=_hedged_lots_from_state(state, getattr(driver, "executor", None)),
         core_one_legged=bool(getattr(state, "one_legged", False)),
     )
 
