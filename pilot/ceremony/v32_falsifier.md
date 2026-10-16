@@ -328,6 +328,14 @@ showing >= 10 lots [pin] available at every completion (`V32_PROMOTION_MIN_DEPTH
     `tests/test_v33_fill_discovery_fractional.py` / `tests/test_v33_fill_attribution.py`. Build report:
     `pilot/build/v32_fractional_build_report.md`.
 
+- 2026-10-16 13:55Z -- Q4 CLOSE (V3.2 superseded by V3.3; V3.2 DRY now SHUT DOWN). V3.2's armed run ended when V3.3
+  armed (`v32_mode.txt` -> dry at that flip; see `pilot/ceremony/v33_falsifier.md` Registration), and V3.2 then ran DRY
+  on the laptop for the side-by-side. That dry run ends here. Brad, verbatim: "Lets strike the one legged, and shut down
+  V3.2 dry." The laptop scheduled task `DegeneracyV3_2` was disabled 13:54Z (its 14:00Z window ran to completion);
+  nothing places V3.2 orders anywhere (laptop proxy read-only since 2026-10-16 01:32Z). This close line was not appended
+  at the V3.3 flip itself (the `V33_ARMING.md` section D template); it is appended now. V3.2's journals, ledger and
+  falsifier record stay as they are; the daily replay tripwire reads only existing journals.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), registered with this draft

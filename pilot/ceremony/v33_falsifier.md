@@ -1008,6 +1008,18 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     100%, capture 1.00, one-legged 0 PASS, roll ratio 1.00 PASS. Toward Brad's Test Fire #3 rule (> 12 good orders): 10
     good orders so far. Balance after settlement $69.4680 (exchange_index 0 $13.1118, exchange_index 2 $56.3562).
 
+- 2026-10-16 13:55Z -- 10-09 20:00Z ONE-LEGGED 9.51 STRUCK AS AN ARTEFACT; V3.2 DRY SHUT DOWN. Brad, verbatim: "Lets
+  strike the one legged, and shut down V3.2 dry."
+  * STRIKE: the 2026-10-09 20:00Z row's one_legged_contracts 9.51 (and lots_filled 10, hedged_lots 0.49) is struck.
+    Venue truth stands in its place: 5 sets fully hedged, one-legged 0, -$0.0480 real. Cause fixed in PR #140 (merged
+    f20ea29): the cancel_race leg now merges under the venue order_id, and a batch whose wings filled at the venue is
+    credited after the async finalize race; the rebuilt row reads lots 5 / hedged 5 / one-legged 0. The strike corrects
+    Test Fire #2's record only. Test Fire #2 remains CLOSED on the 10-10 20:00Z KILL (mean true lock +1.35c at n = 88
+    and the S4 latch), which this strike does not touch. The 10-09 S1_LEGGED latch count of 1 is likewise an artefact.
+  * V3.2 DRY: laptop scheduled task `DegeneracyV3_2` disabled 13:54Z (`Settings.Enabled = False`); its 14:00Z window ran
+    to completion. V3.2 runs nowhere. Laptop proxy stays read-only (ALLOW_ORDERS=false since 01:32Z). V3.2's Q4 close line
+    is appended under its own Registration in the same PR.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
