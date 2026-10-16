@@ -900,6 +900,69 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   * Also today: 21:00Z stood down `no KXBTC range buckets co-settling` (the venue lists no $100 buckets at 21Z; routine).
     Live tree still main e30191e; main is docs-only ahead (#137 and this PR). V3.3 ARMED at this line.
 
+- 2026-10-10 20:00Z CLOSE -- FULL 11-RUNG SWEEP, -$3.84 REAL; FROZEN TABLE = KILL ON MEAN LOCK (real, not an artefact);
+  V3.3 STOOD DOWN TO DRY ON BRAD'S WORD. Bucket `B83050` (83,000-83,100), spot sat on the 83,000 edge all window.
+  19:54:53.24Z the only YES bid on `T83099.99` was taken -> no NO ask on the upper wing -> `wing_no_ask_su` ->
+  `stand_down_hold` (1500 ms). 19:54:54.25Z spot jumped through 83,000; all 11 rungs (NO 0.49-0.59) lifted in 10 ms
+  inside the hold. The wing step skips a batch whose bucket lacks a valid strike book, so the batch WAITED 37 s for a
+  0.01 YES bid to reappear on `T83099.99` (19:55:31.77Z), then took both wings: 11 YES `T82999.99` @0.80-0.81 (0.60 at
+  the fill) + 11 NO `T83099.99` @0.99, fees $0.128. Venue cost $25.85 for a $22.00 floor -> -$3.84 (-34.9c/set);
+  settled inside the bucket, flat. Decomposition: ~-$1.7 adverse repricing at the sweep, ~-$2.2 from the 37 s wait.
+  * FROZEN TABLE (report `--days 7`): mean true lock +1.35c at n = 88 (< +2.0c) -> `VERDICT: KILL` on its own terms;
+    %positive 70.7% FAIL; one-legged 9.51 = the 10-09 artefact. S4: day loss $3.85 > $3.00 -> latched at the 20:40
+    arm check; "S4 latched on any armed day" is itself a kill clause. Test Fire #2 CLOSES on this KILL; its record
+    stands.
+  * Brad, verbatim, 20:21Z: "Lets leave it stood down" -> `ops/v33_mode.txt` = dry (written by Claude on his word,
+    read back); V3.3 DRY from the 21:00Z close; supervisor left running to journal dry windows.
+  * Design facts recorded for the fix list: (1) the hedge of a filled batch was blocked by a ~1c 0.99 upper wing while
+    the lower wing carried the risk -- the legs are independent tickers; (2) the 1.5 s hold keeps rests live while a
+    wing is unquotable (study 10-12: zeroing it would not have saved this window, cancel RTT 600+ ms vs a 640 ms gap);
+    (3) the lock math treats W as static, but a bucket whose edge equals spot has a wing that must reprice on exactly
+    the sweep that fills the ladder (4th adverse-repricing event: 10-04 06Z, 10-05 00Z, 10-09 20Z, here).
+
+- 2026-10-16 [TIME]Z -- TEST FIRE #3 ARMED: HOSTED ON RENDER (OHIO) WITH TWO FIXES. [DRAFT: Brad confirms wording and
+  the two bracketed items before this merges.]
+  * OUTAGE: the laptop V3.3 supervisor and the signing proxy were down from after the 10-13 23:00Z close until
+    2026-10-15 ~18:13Z (proxy restarted by Claude, read-only use only). Dry journals cover 10-10 21:00Z..10-13 23:00Z.
+    Estimates on the record (memory/Registration only, not falsifier data): dry_sim over that span = 10 windows, 68
+    contracts, +$4.72 (ideal rule); 10-14 from the historical tape = +$0.30..+$2.00 (ideal, validated on one day).
+  * Brad, verbatim, 10-15: "And after the campaign was killed, we ruled no changes to the core strategy, right?
+    Nothing needing fixing, just that one massive flop window. Best course is to eat those windows and keep running"
+    -> Claude: no such ruling on record; two faults named (the hedge block above, and the 10-09 ledger double count),
+    the hedge-side fix recommended. Brad: "Lets get that built and have it's PR trigger the first build hosted. Well
+    need to watch for issues that either can now cause, so lets keep this change as simple as possible. If something
+    breaks, hopefully well know if it's from migrating to render or this. ... Instead of 'Can both orders fill -> no ->
+    don't place orders' that becomes 'Can both orders fill -> no -> place what orders we can'. Then we treat it like an
+    empty wing."
+  * FIX 1 -- LEDGER (PR #140, merged 00:32Z 10-16, main f20ea29; Opus 4.8 build + review APPROVE WITH NITS):
+    reporting-only, `service/v33/reconcile.py`. (a) the `cancel_race` rest leg now merges with its WS fill under the
+    venue `order_id`; (b) a batch whose wings both filled at the venue is credited as hedged even when its completing
+    fill lands after the window loop ends (the async finalize race; the core's completion marking was found correct).
+    The 10-09 20:00Z row rebuilds to venue truth: lots 5, hedged 5, one-legged 0. [BRAD: strike the 10-09 one-legged
+    9.51 as an artefact -- yes / no.]
+  * FIX 2 -- PARTIAL HEDGE (PR #139, merged 00:34Z 10-16, main 04bb3c8; Opus 4.8 build + review APPROVE WITH NITS):
+    `service/v33/core.py` `_wing_step` +87 lines. When only one wing of an untaken batch is priceable, that leg is
+    taken at the fill and the other becomes an `unfilled` leg for the existing `_retry_batch` (cadence floor, one
+    retry in flight, lock_floor). Both priceable -> byte-identical; neither / feed dead -> waits as before. Ladder,
+    margins, debounce, stand-down hold, print-through, params: unchanged. Params sha f4037082 UNCHANGED. Review nit
+    to watch: the journal-only daily rebuild credits a hedge at take time, so a deferred leg that NEVER fills reads
+    one-legged 0 there while the live ledger reads it correctly.
+  * MECHANICS NOTE -- HOST MOVE (per RENDER_MIGRATION_PLAN section 4): proxy = Render private service
+    `degeneracy-proxy` @ degeneracy-proxy 1c75a18, NEW Kalshi key (fingerprint 4388d77c; laptop key d9fac8c8 unchanged
+    on the laptop), caps 2 / KXBTC15M,KXBTCD,KXBTC / 30000. Pilot = background worker `dv3-pilot` @ main 04bb3c8,
+    roster V3_3, disk `/var/dv3`. Gates: 1 PASS (health incl. over the private network), 2 PASS (Kalshi reads from
+    Ohio, 01:00Z row), 6 PASS (Linux suite 1525 passed / 10 skipped; one test fails only when DV3_DATA_DIR is set
+    for the whole run = test isolation, rerun with it unset). Gate 3 shortened on Brad's word: "once we've ran the
+    2:00Z dry, I vote we flip live if all looks good to you". 02:00Z dry row: [RESULT]. Gates 4/5 (restart keeps
+    the disk; boot sweep on restart): [RESULT, in the flip band]. Execution-gap baseline: Render feed lag ~25 ms
+    (buckets) / ~12 ms (strikes) vs the laptop's 0.84-1.06 s, most of which was laptop clock skew.
+  * WHAT TEST FIRE #3 JUDGES: [BRAD: same rules as Test Fire #2 (L7: verdict n >= 45, early kill mean < +2.0c at
+    n >= 15, bar +4.0c, one-legged <= 2 contracts, S4 $3.00, S1 latch 2) in a NEW evaluation window -- yes / other.]
+    Test Fire #2's KILL record stands; #3 is a new window with two behaviour-relevant changes (the hedge path and
+    the host) named here, so its n is not pooled with #2.
+  * NEVER TWO ARMED: laptop V3.3 supervisor not running; laptop V3.2 task runs dry; laptop proxy [read-only from
+    this line -- ALLOW_ORDERS=false, Brad's lever].
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
