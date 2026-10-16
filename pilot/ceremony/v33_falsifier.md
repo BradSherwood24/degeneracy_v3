@@ -987,6 +987,27 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     one-order rolls, wings sized to fills, hand reconcile of the first full sweep against `/portfolio/fills`, no 429s,
     per-rung bucket across a change. New for Test Fire #3: the partial-hedge path (a deferred wing taken by retry).
 
+- 2026-10-16 13:30Z -- TEST FIRE #3, OVERNIGHT ON RENDER: 10 ARMED WINDOWS, FIRST FILL (08:00Z) HAND-RECONCILED TO THE CENT.
+  * 03:00Z..12:00Z closes: 10 armed windows (plus the 01:00Z partial and 02:00Z dry), every window exit 0, stand-downs 0.
+    Async writer 1,100-1,450 writes per window, 0 errors, latency p50 21-25 ms, p99 0.87-1.14 s, max <= 1.73 s; feed gap
+    max 0.11-0.30 s; rolls 2,385 / 2,385 single-order; no `rate_limited` records (03:00Z journal: 0); book empty after
+    close on both the default and `exchange_index=2` order lists. Disk 536 MB / 20 GB.
+  * 08:00Z CLOSE (`KXBTC-26OCT1604-B82150`, 82,100-82,200): full sweep, 11 rung-fill events = 10 contracts (one rung
+    fractional), margins 3..19c, ladder lock +145.04c, one-legged 0. Journal: 5 `take_wings`, 0 `retry_wing` (both wings
+    priceable at every fill; the #139 partial path was not exercised). Venue fills (23 records, chunked at cap 2): bucket
+    NO 10.00, YES `T82099.99` 10.00, NO `T82199.99` 10.00. Kalshi's fill feed labels the NO purchases `action: sell,
+    side: no`; the settlements show them HELD as NO, so this is the feed's representation, not a sale.
+  * VENUE SETTLEMENT (truth): bucket NO 10 cost $3.4500, fee $0 (maker), result yes, revenue $0; YES `T82099.99` 10 cost
+    $8.8920, fee $0.0678, revenue $10.00; NO `T82199.99` 10 cost $5.8160, fee $0.1653, revenue $10.00. Payout $20.00 on 10
+    sets = $2.00 each; net +$1.6089. The ledger's +145.04c is lower by 15.85c = the conservative taker fee reserved on the
+    maker leg (`lock_value`, ~1.6c x 10 rungs at n ~0.345; maker fee is 0 on crypto). Reconciled.
+  * FIRST ARMED WINDOW MUST CONFIRM on Render: 1 K orders accepted PASS; 2 one-order rolls PASS; 3 wings sized to fills,
+    chunked, no rung naked PASS; 4 hand reconcile of the first full sweep PASS; 5 no 429s PASS; 6 per-rung bucket across a
+    change: not exercised (no bucket change during a fill).
+  * Gate table (report `--days 1`, Test Fire #3 window): realised rung-fills n = 10, mean true lock +15.05c, %positive
+    100%, capture 1.00, one-legged 0 PASS, roll ratio 1.00 PASS. Toward Brad's Test Fire #3 rule (> 12 good orders): 10
+    good orders so far. Balance after settlement $69.4680 (exchange_index 0 $13.1118, exchange_index 2 $56.3562).
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
