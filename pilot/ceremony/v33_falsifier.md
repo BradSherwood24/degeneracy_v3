@@ -920,8 +920,8 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     (3) the lock math treats W as static, but a bucket whose edge equals spot has a wing that must reprice on exactly
     the sweep that fills the ladder (4th adverse-repricing event: 10-04 06Z, 10-05 00Z, 10-09 20Z, here).
 
-- 2026-10-16 [TIME]Z -- TEST FIRE #3 ARMED: HOSTED ON RENDER (OHIO) WITH TWO FIXES. [DRAFT: Brad confirms wording and
-  the two bracketed items before this merges.]
+- 2026-10-16 01:30Z -- TEST FIRE #3 REGISTERED (pre-arm): HOSTED ON RENDER (OHIO) WITH TWO FIXES. The arm time, the
+  02:00Z dry row and gates 4/5 are recorded in the entry that follows this one, at the flip.
   * OUTAGE: the laptop V3.3 supervisor and the signing proxy were down from after the 10-13 23:00Z close until
     2026-10-15 ~18:13Z (proxy restarted by Claude, read-only use only). Dry journals cover 10-10 21:00Z..10-13 23:00Z.
     Estimates on the record (memory/Registration only, not falsifier data): dry_sim over that span = 10 windows, 68
@@ -938,8 +938,8 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     reporting-only, `service/v33/reconcile.py`. (a) the `cancel_race` rest leg now merges with its WS fill under the
     venue `order_id`; (b) a batch whose wings both filled at the venue is credited as hedged even when its completing
     fill lands after the window loop ends (the async finalize race; the core's completion marking was found correct).
-    The 10-09 20:00Z row rebuilds to venue truth: lots 5, hedged 5, one-legged 0. [BRAD: strike the 10-09 one-legged
-    9.51 as an artefact -- yes / no.]
+    The 10-09 20:00Z row rebuilds to venue truth: lots 5, hedged 5, one-legged 0. Striking the 10-09 one-legged 9.51
+    as an artefact is NOT yet ruled; it belongs to Test Fire #2, which is closed on the 10-10 KILL either way.
   * FIX 2 -- PARTIAL HEDGE (PR #139, merged 00:34Z 10-16, main 04bb3c8; Opus 4.8 build + review APPROVE WITH NITS):
     `service/v33/core.py` `_wing_step` +87 lines. When only one wing of an untaken batch is priceable, that leg is
     taken at the fill and the other becomes an `unfilled` leg for the existing `_retry_batch` (cadence floor, one
@@ -953,15 +953,20 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     roster V3_3, disk `/var/dv3`. Gates: 1 PASS (health incl. over the private network), 2 PASS (Kalshi reads from
     Ohio, 01:00Z row), 6 PASS (Linux suite 1525 passed / 10 skipped; one test fails only when DV3_DATA_DIR is set
     for the whole run = test isolation, rerun with it unset). Gate 3 shortened on Brad's word: "once we've ran the
-    2:00Z dry, I vote we flip live if all looks good to you". 02:00Z dry row: [RESULT]. Gates 4/5 (restart keeps
-    the disk; boot sweep on restart): [RESULT, in the flip band]. Execution-gap baseline: Render feed lag ~25 ms
+    2:00Z dry, I vote we flip live if all looks good to you". 02:00Z dry row and gates 4/5 (restart keeps the disk;
+    boot sweep on restart, run AFTER the Render proxy has orders enabled so the sweep can cancel): next entry. Execution-gap baseline: Render feed lag ~25 ms
     (buckets) / ~12 ms (strikes) vs the laptop's 0.84-1.06 s, most of which was laptop clock skew.
-  * WHAT TEST FIRE #3 JUDGES: [BRAD: same rules as Test Fire #2 (L7: verdict n >= 45, early kill mean < +2.0c at
-    n >= 15, bar +4.0c, one-legged <= 2 contracts, S4 $3.00, S1 latch 2) in a NEW evaluation window -- yes / other.]
-    Test Fire #2's KILL record stands; #3 is a new window with two behaviour-relevant changes (the hedge path and
-    the host) named here, so its n is not pooled with #2.
-  * NEVER TWO ARMED: laptop V3.3 supervisor not running; laptop V3.2 task runs dry; laptop proxy [read-only from
-    this line -- ALLOW_ORDERS=false, Brad's lever].
+  * WHAT TEST FIRE #3 JUDGES -- Brad, verbatim, 01:2xZ 10-16: "lets lower n. We're only testing that the new ecosystem
+    replicates the laptop. So n>12 good orders confirms 'Can it run through the process?' as Yes." (He wrote "Test
+    fire #2"; #2 closed on the 10-10 KILL, so this is recorded as the rule for #3.) The question is MECHANICAL, not
+    the edge: PASS = more than 12 good orders, a good order being a rung fill whose set completes with both wings
+    filled, the live ledger reconciles to the venue fills, and no contract is left one-legged. CLAUDE'S OPERATIONAL
+    READING, Brad to correct: the money-protecting rules keep running unchanged (one-legged <= 2 contracts, the S4
+    $3.00 day-loss stop, the S1_LEGGED latch at 2, all alarms and stops); the edge gates (mean true lock, %positive,
+    shortfall, capture, the +2.0c early kill) are REPORTED but are not the Test Fire #3 verdict. Test Fire #2's KILL
+    record stands; #3's n is not pooled with #2 (two behaviour-relevant changes: the hedge path and the host).
+  * NEVER TWO ARMED: laptop V3.3 supervisor not running; laptop V3.2 task runs dry. Brad, verbatim: "yes, laptop goes
+    read only" -> laptop proxy ALLOW_ORDERS=false (Brad edits its .env; restart confirmed by /health in the next entry).
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
