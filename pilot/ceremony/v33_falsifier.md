@@ -968,6 +968,25 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   * NEVER TWO ARMED: laptop V3.3 supervisor not running; laptop V3.2 task runs dry. Brad, verbatim: "yes, laptop goes
     read only" -> laptop proxy ALLOW_ORDERS=false (Brad edits its .env; restart confirmed by /health in the next entry).
 
+- 2026-10-16 02:12Z -- TEST FIRE #3 ARMED ON RENDER. FIRST ARMED WINDOW = 03:00Z CLOSE (wake 02:40Z).
+  * 02:00Z CLOSE, FIRST FULL RENDER DRY WINDOW (wake 01:40Z, 1213 s, exit 0): records 986,401 (laptop dry windows
+    770k-1.05M), lag samples 1,808 (~1,800), spot bucket `KXBTC-26OCT1522-B82050` (Sd 82000 / Su 82100), would_places
+    33 (16-88), rolls 211 (123-222), stand-downs 0, feed lag mean 12 ms buckets / 13 ms strikes (p99 113 / 76 ms), no
+    dry_sim fills (quiet hour). The 01:00Z row was a 52 s partial (boot 00:59:18Z after the env-change restart).
+  * WRITE TOKEN: from the worker, a DELETE of a non-existent order while the Render proxy was still read-only returned
+    403 read-only (the proxy checks X-DV3-Token BEFORE read-only; a mismatch returns 401) -> token accepted.
+  * FLIP (Brad's hands, 02:02-02:33Z band): Render proxy `ALLOW_ORDERS=true` + restart -> /health orders_enabled true,
+    fingerprint 4388d77c, caps 2 / KXBTC15M,KXBTCD,KXBTC / 30000, 0 used. Worker `/var/dv3/ops/v33_mode.txt` = armed.
+    Worker restarted AFTER armed (the boot sweep runs only when mode == armed, `service/supervisor.py:309`).
+  * GATE 4 PASS: after the restart the mode file still reads armed and the 01:00Z / 02:00Z journals are on the disk.
+    GATE 5 PASS: `boot_sweep` mode armed, proxy_ready true, found 0, cancelled 0, errors 0, skipped_foreign 0; next
+    wake 02:40:00Z. Gates 1, 2, 6 passed earlier (previous entry). Gate 3 shortened to one full dry window on Brad's word.
+  * NEVER TWO ARMED: laptop proxy restarted 01:32Z with ALLOW_ORDERS=false (/health orders_enabled false, fingerprint
+    d9fac8c8, "orders read-only"); laptop V3.3 supervisor not running; laptop V3.2 task dry.
+  * FIRST ARMED WINDOW MUST CONFIRM (section above) applies to the first Render window with fills: K orders accepted,
+    one-order rolls, wings sized to fills, hand reconcile of the first full sweep against `/portfolio/fills`, no 429s,
+    per-rung bucket across a change. New for Test Fire #3: the partial-hedge path (a deferred wing taken by retry).
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
