@@ -29,7 +29,8 @@ def test_params_load_and_sha_pin():
     assert p.sha256 == FROZEN_V33_PARAMS_SHA256
     assert p.E_min == Decimal("0.08")   # L4 (2026-09-29): ladder shift 5..15c -> 8..18c
     assert p.rungs == 11
-    assert p.lots_per_rung == 1
+    assert p.lots_per_rung == 3   # TF#4 (2026-10-17): 1 -> 3 (even 3-lot ladder)
+    assert p.rung_lots == (3,) * 11   # rung_lots absent -> uniform (3,)*11; allotment = 33
     assert p.tol == Decimal("0.01")
     assert p.deb_ms == 5000
     assert p.wing_coalesce_ms == 150
@@ -63,10 +64,28 @@ def test_l4_ladder_shift_8_to_18():
     assert (E_min_c + p.rungs, E_min_c + p.rungs + p.deep_obs_rungs - 1) == (19, 28)
 
 
+def test_tf4_three_lot_allotment_and_thresholds():
+    """TEST FIRE #4 (2026-10-17): the shipped policy is the EVEN 3-lot ladder (33 contracts/window) and the
+    money-protecting pins scaled with it -- S4 $5.00, one-legged tolerance 6, S1_LEGGED latch 6. The
+    campaign-KILL-on-S4 clause stays True. max_sets_per_hour stays 11 (the rung/fill-event gate)."""
+    from decimal import Decimal as _D
+    from service.v33.core import _allotment
+    from service.v33.falsifier_pins import V33_FALSIFIER_MAX_ONE_LEGGED, V33_KILL_ON_S4_DAY_LOSS
+    from service.v33.stops import V33_S1_LEGGED_LATCH_THRESHOLD, V33_S4_DAY_LOSS_CAP_DOLLARS
+    p = load_v33_params()
+    assert p.lots_per_rung == 3 and p.rung_lots == (3,) * 11
+    assert _allotment(p) == 33 == p.lots_per_rung * p.rungs == sum(p.rung_lots)
+    assert p.max_sets_per_hour == 11          # UNCHANGED: the coarse rung/fill-event gate
+    assert V33_S4_DAY_LOSS_CAP_DOLLARS == _D("5.00")
+    assert V33_KILL_ON_S4_DAY_LOSS is True    # campaign KILL on an S4 latch kept on purpose
+    assert V33_FALSIFIER_MAX_ONE_LEGGED == 6
+    assert V33_S1_LEGGED_LATCH_THRESHOLD == 6
+
+
 def test_hint_below_lots_per_rung_fails_closed(tmp_path):
     with open(DEFAULT_V33_PARAMS_PATH, encoding="utf-8") as f:
         raw = json.load(f)
-    raw["max_contracts_per_order_hint"] = 0  # below lots_per_rung (1)
+    raw["max_contracts_per_order_hint"] = 0  # below max(rung_lots) (3 at the 3-lot ladder)
     q = tmp_path / "v33_params.json"
     q.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(V33ParamsInvalid):

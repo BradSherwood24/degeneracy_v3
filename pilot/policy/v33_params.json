@@ -1,7 +1,7 @@
 {
   "E_min": "0.08",
   "rungs": 11,
-  "lots_per_rung": 1,
+  "lots_per_rung": 3,
   "tol": "0.01",
   "deb_ms": 5000,
   "quote_start_s": 900,

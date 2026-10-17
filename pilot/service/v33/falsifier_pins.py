@@ -35,7 +35,8 @@ V33_FALSIFIER_MIN_RUNG_FILLS_FOR_SHORTFALL = 3         # [pin] a rung is judged 
 V33_FALSIFIER_MIN_PCT_POSITIVE = Decimal("80")         # [pin] % of rung fills with positive realised lock
 V33_CAPTURE_RATIO_MIN = Decimal("0.50")                # [pin] capture ratio at the 10c margin (Reg-3 def)
 V33_FALSIFIER_CAPTURE_MARGIN_C = 10                    # [pin] the margin (cents) the capture ratio reads
-V33_FALSIFIER_MAX_ONE_LEGGED = 2                       # [pin] one-legged contracts tolerated
+V33_FALSIFIER_MAX_ONE_LEGGED = 6                       # [pin] one-legged contracts tolerated (TF#4 2026-10-17:
+#   2 -> 6 for the 3-lot ladder; 6 contracts = two 3-lot rung events. Also the one-legged EARLY KILL threshold.
 V33_FALSIFIER_MIN_SINGLE_ORDER_ROLL_RATIO = Decimal("0.90")  # [pin] >= 90% of rolls move exactly one order
 
 # The shadow E the 10c-margin capture ratio reads (the live V3.2-comparable ideal-shadow edge).

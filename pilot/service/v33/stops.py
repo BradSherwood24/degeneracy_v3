@@ -8,13 +8,15 @@ un-settled KXBTC* position — ``reconcile_positions_clean`` is generic and reus
 here sends an order or reads a key.
 
 The gates carry the ladder's numbers (PLAN_V33 Q5/Q6):
-  * S4 day-loss cap ``$3.00`` (Q5: at K=11 a worst-case one-legged K-rung sweep is ~$1.93 < $3.00, so
-    the V3.2 cap stands; revisit at K >= 16). Banded by the pending-settlement credit exactly as V3.2.
+  * S4 day-loss cap ``$5.00`` (TF#4 2026-10-17: at the 3-lot ladder a worst-case one-legged K-rung sweep is
+    ~$5.79 = 3 x the 1-lot ~$1.93, so the cap no longer bounds a full bad sweep BY DESIGN -- $5.00 is
+    $1.67/1-lot-equivalent, TIGHTER than #3's $3.00, and a 10-10-style window latches it and KILLs the
+    campaign; Brad: "A 10-10 event should kill a test fire"). Banded by the pending-settlement credit as V3.2.
   * S1_LEGGED per contract; the DAY latches after ``V33_S1_LEGGED_LATCH_THRESHOLD`` occurrences.
   * The replace-rate alarm is per LADDER inside the pure core (``replace_rate_alarm_per_min`` = 120);
     the kind constant is here for the ledger/report.
   * S5 arming: the V3.3 falsifier carries ``STATUS: FROZEN`` (L3 draft), the params sha is verified, and
-    the proxy /health caps allow one lot per rung (<= the ``MAX_CONTRACTS_PER_ORDER`` = 2 ceiling) with
+    the proxy /health caps allow the 3-lot ladder (cap in [max(rung_lots)=3, sum(rung_lots)=33]) with
     enough of today's raised budget left at :40.
 """
 
@@ -38,13 +40,19 @@ from service.v32.stops import reconcile_positions_clean  # noqa: F401  (re-expor
 # ---------------------------------------------------------------------------
 # Named thresholds ([pin] candidates for the L3 falsifier)
 # ---------------------------------------------------------------------------
-V33_S4_DAY_LOSS_CAP_DOLLARS = Decimal("3.00")     # [pin] day balance-loss cap (Q5: stands for K=11)
+V33_S4_DAY_LOSS_CAP_DOLLARS = Decimal("5.00")     # [pin] day balance-loss cap (TF#4 2026-10-17: 3.00 -> 5.00
+                                                  # for the 3-lot ladder -- $1.67 per 1-lot-equivalent,
+                                                  # TIGHTER than #3's $3.00; a 10-10-style window
+                                                  # (-$3.84 at 1 lot = ~-$11.50 at 3) latches S4 and KILLs)
 V33_MIN_ORDER_BUDGET_AT_ARM = 500                 # [pin] creates left in today's budget required at :40
-V33_MAX_CONTRACTS_PER_ORDER = 2                   # the proxy's per-order cap TODAY (one lot per rung).
+V33_MAX_CONTRACTS_PER_ORDER = 2                   # the proxy's per-order cap recorded at the last freeze (1 lot).
 # NOTE: the S5 ceiling is K*lots_per_rung (a coalesced wing take is CHUNKED to <= cap, so any cap in
-# [lots_per_rung, K*lots_per_rung] arms; ``v33_caps_agree`` uses that, not this constant). This value
-# just records the current proxy setting for the runbook/report.
-V33_S1_LEGGED_LATCH_THRESHOLD = 2                 # [pin] one-legged sets below floor before a DAY latch
+# [max(rung_lots), sum(rung_lots)] arms; ``v33_caps_agree`` uses the resolved weights, not this constant).
+# At TF#4's 3-lot ladder the band is [3, 33]: the Render proxy cap (2 at the last freeze) MUST be raised to
+# >= 3 before the 3-lot params arm, else S5 degrades to dry. This value just records the setting for the runbook.
+V33_S1_LEGGED_LATCH_THRESHOLD = 6                 # [pin] one-legged contracts below floor before a DAY latch
+                                                  # (TF#4 2026-10-17: 2 -> 6; 6 contracts = two 3-lot rung
+                                                  # events. S1 is still counted PER CONTRACT -- no logic change)
 
 V33_RANGE_TICKER_PROBE = "KXBTC-"     # a range bucket ticker starts here
 V33_STRIKE_TICKER_PROBE = "KXBTCD-"   # a strike ticker starts here

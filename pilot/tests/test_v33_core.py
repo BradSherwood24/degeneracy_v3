@@ -65,7 +65,12 @@ def _params(**over) -> V33Params:
     # anchor. The ladder mechanism (K consecutive cents from n_top, the roll, n_min truncation, the cap) is
     # E_min-invariant, so we PIN E_min to 0.05 here to keep every price assertion exact; the shipped
     # E_min 0.08 / sha are asserted in test_v33_params.py and test_v33_hardening.py.
-    p = replace(load_v33_params(), E_min=Decimal("0.05"))
+    # TF#4 (2026-10-17): the SHIPPED policy is now lots_per_rung 3 (rung_lots (3,)*11). These mechanism
+    # tests' price/count assertions were authored around a 1-lot ladder (one order of count 1 per rung); the
+    # placement/roll mechanism is lot-count-invariant, so PIN to 1 lot here (as E_min is pinned above) to keep
+    # them exact. The shipped 3-lot sizing is asserted in test_v33_params.py; weighted placement is covered by
+    # test_v33_rung_lots.py. A test that wants a different size passes lots_per_rung / rung_lots in ``over``.
+    p = replace(load_v33_params(), E_min=Decimal("0.05"), lots_per_rung=1, rung_lots=(1,) * 11)
     return replace(p, **over) if over else p
 
 

@@ -105,8 +105,12 @@ def _sweep_params():
     # hour's 5..15c ideal study (v33_ladder_ideal.json, absolute per-rung locks at prices 0.45..0.35).
     # The shipped policy is now E_min 0.08 (8..18c); there is no 8..18c ideal study for this window, so the
     # golden stays at the study's E_min 0.05 to remain a meaningful reference. Mechanism is E_min-invariant.
+    # TF#4 (2026-10-17): the shipped policy is now lots_per_rung 3; this golden proves PARITY against the
+    # 5..15c 1-lot ideal study, so PIN lots_per_rung 1 / rung_lots (1,)*11 here (as E_min is pinned) to keep
+    # the per-rung count-1 reference exact. The shipped 3-lot sizing is asserted in test_v33_params.py.
     return dreplace(
-        load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
+        load_v33_params(), E_min=Decimal("0.05"), lots_per_rung=1, rung_lots=(1,) * 11,
+        tol=Decimal("0.01"), deb_ms=0,
         freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
                 strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0,
         # goldens assert the immediate bucket-switch mechanics; the debounce/hysteresis has its own tests.

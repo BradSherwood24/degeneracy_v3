@@ -109,7 +109,8 @@ def test_s4_day_loss_kill_pin_matches_doc():
     doc = _doc()
     assert V33_KILL_ON_S4_DAY_LOSS is True
     assert "`V33_KILL_ON_S4_DAY_LOSS` = True [pin]" in doc
-    assert "S4 day loss >= $3.00 [pin] latched on any armed day -> KILL" in doc
+    # derive the dollar figure from the constant so a future S4 re-pin keeps the Kill-section text in sync
+    assert (f"S4 day loss >= ${V33_S4_DAY_LOSS_CAP_DOLLARS} [pin] latched on any armed day -> KILL") in doc
 
 
 def test_stop_pins_and_sha_match_doc():
@@ -122,10 +123,12 @@ def test_stop_pins_and_sha_match_doc():
 
 
 def test_caps_range_pin_in_doc():
-    """The S5 caps range [lots_per_rung, K*lots_per_rung] = [1, 11] is pinned in the doc."""
+    """The S5 caps range [max(rung_lots), sum(rung_lots)] = [3, 33] (TF#4 3-lot ladder) is pinned in the doc."""
     p = load_v33_params()
-    assert p.lots_per_rung == 1 and p.rungs == 11
-    assert "`[1, 11]` [pin]" in _doc()
+    assert p.lots_per_rung == 3 and p.rungs == 11
+    lo, hi = max(p.rung_lots), sum(p.rung_lots)
+    assert (lo, hi) == (3, 33)
+    assert f"`[{lo}, {hi}]` [pin]" in _doc()
 
 
 def test_bucket_freshness_pin_matches_params_and_doc():

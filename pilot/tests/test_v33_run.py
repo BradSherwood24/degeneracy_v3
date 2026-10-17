@@ -110,7 +110,10 @@ def _dry_driver():
     # L4 (2026-09-29): PIN E_min to 0.05 -- this replays the 2026-09-20 golden and asserts the 5..15c
     # study locks (prices 0.45..0.35, n_top 0.45). Shipped policy is E_min 0.08 (8..18c); no 8..18c study
     # exists for this window, so the dry-run parity stays at the study's E_min. Mechanism is E_min-invariant.
-    p = dr(load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
+    # TF#4 (2026-10-17): shipped lots_per_rung is now 3; this dry-run parity replays the 1-lot 5..15c study,
+    # so pin lots_per_rung 1 / rung_lots (1,)*11 (as E_min is pinned).
+    p = dr(load_v33_params(), E_min=Decimal("0.05"), lots_per_rung=1, rung_lots=(1,) * 11,
+           tol=Decimal("0.01"), deb_ms=0,
            freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
                 strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)
     cts = fix["close_epoch"]
