@@ -254,6 +254,11 @@ class V32State:
     strike_tops: Mapping[int, TopOfBook] = field(default_factory=dict)
     strike_ts: Mapping[int, float] = field(default_factory=dict)
     strike_tickers: Mapping[int, str] = field(default_factory=dict)
+    # OPTIONAL strike ticker -> floor map (discovery). EMPTY for BTC (the default): strike classification
+    # falls through to ``parse_strike_ticker`` (the KXBTCD prefix convention), byte-identical to before. A
+    # second-series dry port (ETH's KXETHD) populates it so ``classify_ticker`` recognises strikes by map
+    # lookup without the prefix parse -- the core stays series-agnostic (anticipated by MULTI_SERIES_DATA_PLAN).
+    strike_floor_map: Mapping[str, int] = field(default_factory=dict)
     bucket_tops: Mapping[int, TopOfBook] = field(default_factory=dict)
     bucket_ts: Mapping[int, float] = field(default_factory=dict)
     bucket_tickers: Mapping[int, str] = field(default_factory=dict)
@@ -611,7 +616,8 @@ def decide_v32(
 # Book fold + context
 # ---------------------------------------------------------------------------
 def _fold_book(st: V32State, event: BookUpdate) -> V32State:
-    cls = classify_ticker(event.market_ticker, st.bucket_map)
+    cls = classify_ticker(event.market_ticker, st.bucket_map,
+                          getattr(st, "strike_floor_map", None))
     if cls is None:
         return st
     kind, floor = cls
