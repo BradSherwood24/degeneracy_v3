@@ -102,10 +102,11 @@ def test_gate_table_kill_low_mean_at_n_over_15():
 
 
 def test_gate_table_kill_on_one_legged():
+    # TF#4 (2026-10-17): the one-legged tolerance is 6 contracts; 7 one-legged > 6 -> KILL.
     r = _sweep_row("2026-09-24T04:00:00Z", realised_c=8)
-    r["wing_batch_sets"] = [{"index": 0, "fill_count": 3, "one_legged": True, "completed": False}]
+    r["wing_batch_sets"] = [{"index": 0, "fill_count": 7, "one_legged": True, "completed": False}]
     gt = build_falsifier_gate_table([r])
-    assert gt["one_legged"] == 3
+    assert gt["one_legged"] == 7
     assert gt["verdict"].startswith("KILL") and "one-legged" in gt["verdict"]
 
 

@@ -71,13 +71,18 @@ def _params(weights=WEIGHTS, **over) -> V33Params:
     # absolute prices below stay meaningful after the L4 shift to E_min 0.08 -- the same pin the other
     # mechanism/parity helpers use (test_v33_core._params, test_v33_golden._sweep_params). The weighting
     # mechanism is E_min-invariant; the SHIPPED 8..18c ladder is asserted end-to-end in test_v33_core.
-    base = dict(E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
+    # TF#4 (2026-10-17): the SHIPPED policy is now lots_per_rung 3. This file's weighting-mechanism tests are
+    # authored around the pre-L5 UNIFORM SINGLE-LOT ladder, so PIN lots_per_rung 1 here; weights=None then
+    # resolves rung_lots to the uniform (1,)*11 (= the pre-L5 default). Explicit weights override rung_lots.
+    base = dict(E_min=Decimal("0.05"), lots_per_rung=1, tol=Decimal("0.01"), deb_ms=0,
                 freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
                 strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)
     base.update(over)
     p = replace(load_v33_params(), **base)
     if weights is not None:
         p = replace(p, rung_lots=tuple(weights))
+    else:
+        p = replace(p, rung_lots=(p.lots_per_rung,) * p.rungs)   # absent -> uniform at the pinned lots
     return p
 
 
@@ -139,7 +144,8 @@ def _write_policy(tmp_path, **mut):
 def test_absent_rung_lots_defaults_to_uniform():
     p = load_v33_params()
     assert p.rung_lots == tuple([p.lots_per_rung] * p.rungs)
-    assert _allotment(p) == p.rungs * p.lots_per_rung == 11
+    # TF#4 (2026-10-17): shipped lots_per_rung 3 -> allotment 3*11 = 33 (rung_lots absent = uniform).
+    assert _allotment(p) == p.rungs * p.lots_per_rung == 33
 
 
 def test_present_rung_lots_loads(tmp_path):

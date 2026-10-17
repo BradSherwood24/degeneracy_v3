@@ -260,18 +260,20 @@ def test_params_sha_repinned_and_previous_defined():
         PREVIOUS_V33_PARAMS_SHA256_FLAP_R2 as PREV_FLAP_R2,
         PREVIOUS_V33_PARAMS_SHA256_PRINT_THROUGH as PREV_PRINT_THROUGH,
         PREVIOUS_V33_PARAMS_SHA256_L4 as PREV_L4,
+        PREVIOUS_V33_PARAMS_SHA256_STALE_WING as PREV_STALE_WING,
     )
-    # 2026-10-03 RE-PIN (stale-wing liveness bounds written explicitly, values unchanged) over the L4 sha
-    # (now kept as PREVIOUS_..._L4). L4 LADDER SHIFT (2026-09-29) had re-pinned over the print-through sha.
-    assert PIN == "f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1"
+    # TF#4 SIZING (2026-10-17): lots_per_rung 1 -> 3; re-pin over the 2026-10-03 stale-wing sha (now kept as
+    # PREVIOUS_..._STALE_WING). The 2026-10-03 re-pin had re-pinned over the L4 sha; L4 over print-through.
+    assert PIN == "80b9d84fbf9809e715d5b0ccfc93c1b3b22a7a22f31702093f528aa049ef0144"
+    assert PREV_STALE_WING == "f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1"
     assert PREV_L4 == "295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def"
     assert PREV_PRINT_THROUGH == "2e60980762ea6531b707c1c0bc93d69577fd3257295238e63f122d53afdd995e"
     assert PREV_FLAP_R2 == "20188bbe76b592198f2f3aa2f1b8ff8857b12cc6b5ad9f5d3f5d75f76030cc78"
     assert PREV_FLAP_R1 == "3fe3919c5b31bbe9bd258fb7a82f5757a50ee0188b94c6bf0fe1f96f1fcb6aac"
     assert PREV_L3 == "c18197d012bea8251982e4fdb948bf85846a453a9873fbd8007a7df9639f36f3"
     assert PREV_L2 == "415b63daa2ff9dd7efa0193409b0e367b545c2ce2334fe44229484cb5395b3c2"
-    assert PIN != PREV_PRINT_THROUGH != PREV_FLAP_R2 != PREV_FLAP_R1 != PREV_L3 != PREV_L2
-    assert PIN not in (PREV_PRINT_THROUGH, PREV_FLAP_R2, PREV_FLAP_R1, PREV_L3, PREV_L2)
+    assert PIN != PREV_STALE_WING != PREV_L4 != PREV_PRINT_THROUGH != PREV_FLAP_R2 != PREV_FLAP_R1 != PREV_L3 != PREV_L2
+    assert PIN not in (PREV_STALE_WING, PREV_L4, PREV_PRINT_THROUGH, PREV_FLAP_R2, PREV_FLAP_R1, PREV_L3, PREV_L2)
     p = load_v33_params()
     assert p.sha256 == PIN and p.write_reserve_tokens == 30 and p.deep_obs_rungs == 10
     assert p.E_min == Decimal("0.08")

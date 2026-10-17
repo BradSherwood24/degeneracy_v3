@@ -12,9 +12,10 @@ The S5 gate (`service.v33.stops.v33_arming_check` + `decide_v33_arming`, wired i
 what actually enforces arming. For V3.3 it checks, in one place: the falsifier
 (`ceremony/v33_falsifier.md`) carries a line exactly `STATUS: FROZEN`; the params sha is verified
 (`load_v33_params` self-checks `FROZEN_V33_PARAMS_SHA256` =
-`f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1`); proxy `/health` shows
-`orders_enabled: true` with caps that allow `max_contracts_per_order` in `[lots_per_rung, K*lots_per_rung]`
-= `[1, 11]` (so a proxy cap of **2** OR **11** both arm -- the wings chunk to <= cap), cover BOTH `KXBTC-`
+`80b9d84fbf9809e715d5b0ccfc93c1b3b22a7a22f31702093f528aa049ef0144`); proxy `/health` shows
+`orders_enabled: true` with caps that allow `max_contracts_per_order` in `[max(rung_lots), sum(rung_lots)]`
+= `[3, 33]` (TF#4 3-lot ladder: a proxy cap anywhere in **[3, 33]** arms -- the wings chunk to <= cap; the
+Render cap of **2** at the last freeze MUST be raised to >= 3 or S5 degrades to dry), cover BOTH `KXBTC-`
 and `KXBTCD-`, and leave >= 500 creates in today's budget; reconcile-first sees no inherited un-settled
 KXBTC* position; the SEPARATE v33 day guard is neither corrupt nor latched; and the banded S4 is not
 `latch`/`pending`. A BELT (R2-N2): an armed window whose `/health` contract cap is unreadable degrades to
@@ -42,8 +43,8 @@ dry rather than sizing wings against a guess. Any miss => the window runs DRY an
      ```
      Invoke-RestMethod http://127.0.0.1:8642/health | ConvertTo-Json -Depth 5
      ```
-     `orders_enabled = true`; caps `max_contracts_per_order` (2 or 11), `ticker_prefixes` (covering
-     `KXBTC`), `daily_order_budget` 8000; `orders_remaining_today` >= 500.
+     `orders_enabled = true`; caps `max_contracts_per_order` (in [3, 33]; TF#4 raised the floor to 3),
+     `ticker_prefixes` (covering `KXBTC`), `daily_order_budget` 8000; `orders_remaining_today` >= 500.
 3. **Task registered.** `DegeneracyV3_3` runs (via `ops/register_supervisor_tasks.ps1 -WithV33`, Brad's
    hand). It has been running DRY.
 4. **>= 2 dry days reviewed.** `python -m service.v33.report --days 3` -- the SIDE-BY-SIDE tracked V3.2,
@@ -56,15 +57,16 @@ dry rather than sizing wings against a guess. Any miss => the window runs DRY an
    calendar says. Dry days alone do not satisfy this.
 4c. **Crypto exchange balance >= $35 (Brad's reminder, same message, verbatim: "we should probably move
    $10 over ... Should be $25 in both right now, lets get it to $15 and $35 into crypto markets").**
-   Kalshi keeps a separate balance per exchange index; crypto (KXBTC*) settles on exchange_index 2. A full
-   K=11 sweep holds ~$21 of bucket-NO plus the two wing takes, so the crypto-side balance must be ~$35
-   before arming. The transfer is Brad's hand (funds are his lever); confirm with the pilot's balance
-   read (`GET /trade-api/v2/portfolio/balance` via the proxy) that the crypto side shows >= $35.
+   Kalshi keeps a separate balance per exchange index; crypto (KXBTC*) settles on exchange_index 2. The $35
+   figure above was the 1-lot sweep (~$21 tied). TF#4 (2026-10-17): a full 3-lot sweep ties ~33 contracts x
+   ~$2 = ~$66; Brad will DEPOSIT to keep a full sweep under 50% of the crypto-side balance (balance >= ~$132)
+   BEFORE arming the 3-lot params. The transfer is Brad's hand (funds are his lever); confirm with the pilot's
+   balance read (`GET /trade-api/v2/portfolio/balance` via the proxy) that the crypto side shows >= ~$132.
 5. **Clean tree + green suite.** `cd pilot && python -m pytest -q` green; the V3.3 params sha:
    ```
    python -c "import json,hashlib; o=json.load(open('policy/v33_params.json')); print(hashlib.sha256(json.dumps(o,sort_keys=True,separators=(',',':')).encode()).hexdigest())"
    ```
-   must print `f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1` and equal
+   must print `80b9d84fbf9809e715d5b0ccfc93c1b3b22a7a22f31702093f528aa049ef0144` and equal
    `service.v33.params.FROZEN_V33_PARAMS_SHA256`.
 
 An OPTIONAL smaller first armed step is `rungs` 3 (~$6 in flight) -- a params amendment (its own dated

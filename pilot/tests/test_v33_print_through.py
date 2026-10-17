@@ -81,7 +81,8 @@ def _params(**over):
     # which lowers n_top 3c; these tests' hard-coded rung prices (n_top 0.50, offers 0.50/0.51/0.52, ...)
     # were authored around the 5..15c anchor and the mechanism is E_min-invariant. Shipped E_min asserted
     # in test_v33_params.py / test_v33_hardening.py.
-    p = replace(load_v33_params(), E_min=Decimal("0.05"))
+    # TF#4 (2026-10-17): shipped lots_per_rung is now 3; these mechanism tests assert count-1 rungs, so pin 1.
+    p = replace(load_v33_params(), E_min=Decimal("0.05"), lots_per_rung=1, rung_lots=(1,) * 11)
     base = dict(print_through=True, tol=Decimal("0.01"), deb_ms=0,
                 freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
                 strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)
@@ -172,7 +173,8 @@ def test_no_trigger_when_no_rest_live():
 def test_no_trigger_when_feature_off():
     # L4 (2026-09-29): PIN E_min 0.05 (controlled ladder, n_top 0.50) -- this builds params directly rather
     # than via _params(), so it needs the same pin; print_through stays False (feature-off check).
-    p = replace(load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
+    p = replace(load_v33_params(), E_min=Decimal("0.05"), lots_per_rung=1, rung_lots=(1,) * 11,
+                tol=Decimal("0.01"), deb_ms=0,
                 freshness_max_age_s=3600.0, bucket_freshness_max_age_s=3600.0,
                 strike_feed_dead_s=3600.0, wing_book_max_age_s=3600.0)  # print_through False
     st = _bring_up(p, _state(p), T - 600)

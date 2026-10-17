@@ -25,6 +25,11 @@ to arm on it (an agent can never arm V3.3 by editing code).
 - Policy: roster `DegeneracyV3_3`, `pilot/policy/v33_params.json`, canonical sha
   `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def` (pinned in code as
   `service.v33.params.FROZEN_V33_PARAMS_SHA256`; the loader self-verifies and refuses drift).
+  - 2026-10-17 RE-PIN (TEST FIRE #4 sizing, Brad's dated go): changed ONLY `lots_per_rung` 1 -> 3 (an EVEN
+    3-lot ladder; `rung_lots` stays ABSENT = uniform (3,)*11). Everything else byte-identical. New canonical
+    sha `80b9d84fbf9809e715d5b0ccfc93c1b3b22a7a22f31702093f528aa049ef0144`; prior sha `f403708257...` kept as
+    `PREVIOUS_V33_PARAMS_SHA256_STALE_WING`. The hour's CONTRACT allotment `sum(rung_lots)` becomes 33
+    (`max_sets_per_hour` 11 stays the rung/fill-event gate). See the 2026-10-17 Registration entry.
   - 2026-10-03 RE-PIN (stale-wing liveness bounds, after gate D / PR #120): ADDED `strike_feed_dead_s` 4.0 and
     `wing_book_max_age_s` 30.0 explicitly (the measured defaults, values unchanged; everything else
     byte-identical) so the loader enforces them. New canonical sha
@@ -67,8 +72,9 @@ ladder; the concrete +16.03c is the 5..15c-era number and is not re-labelled to 
 
 ## Policy (roster `DegeneracyV3_3`, `pilot/policy/v33_params.json`, sha-pinned; loader refuses drift)
 
-sha `295590ce6536be72ab17cecea05dcdc2921db98b05df0b8eacc906d75f532def`. Values: E_min 0.08, rungs 11
-(K), lots_per_rung 1, tol 0.01, deb_ms 5000 (start-of-convergence debounce), max_amends_in_flight 3,
+sha `80b9d84fbf9809e715d5b0ccfc93c1b3b22a7a22f31702093f528aa049ef0144` (TF#4 3-lot sizing, 2026-10-17; prior
+`f403708257...` was the 1-lot stale-wing re-pin). Values: E_min 0.08, rungs 11
+(K), lots_per_rung 3 (TF#4; `rung_lots` absent = uniform (3,)*11, allotment 33), tol 0.01, deb_ms 5000 (start-of-convergence debounce), max_amends_in_flight 3,
 quote_start_s 900 (T-15), quote_end_s 300 (T-5), wing_margin 0.02, lock_floor -0.10,
 no_orders_after_s_to_settle 1, freshness_max_age_s 1.0, bucket_freshness_max_age_s 30.0 [pin],
 wing_coalesce_ms 150, refill_in_window false (Q3 no re-place inside the window), max_sets_per_hour 11,
@@ -113,7 +119,7 @@ counts contracts; a full sweep contributes K); before that the scoreboard prints
     windows). FAIL-CLOSED: at `n >= 45` an UNMEASURABLE capture (no valid ideal-shadow E=0.10 availability
     to measure execution against, ratio None) is a MISS, not a pass -- exactly as V3.2's verdict logic
     treats a None ratio. (Below `n >= 45` the gate reads `n-too-small`.) AND
-  - one-legged <= 2 [pin] contracts, AND
+  - one-legged <= 6 [pin] contracts, AND
   - roll integrity: >= 90% [pin] of rolls move exactly one order (journal-counted).
 - KILL iff ANY of those thresholds is missed at `n >= 45`. No re-spec on the same evaluation window
   (the registered-specs rule): a miss is a kill, not a re-parameterisation.
@@ -139,19 +145,24 @@ the sharp instrument for latency eating a rung's edge.
 
 ## Stops (halt the UTC day; latched in `ops/v33_stops_YYYY-MM-DD.json` -- SEPARATE from V3.2 + the box)
 
-- S4: daily loss >= $3.00 [pin] (`V33_S4_DAY_LOSS_CAP_DOLLARS`), on the ACCOUNT BALANCE via the
-  pending-settlement BAND, count + bucket aware, identical law to V3.2. Q5: at K=11 a worst-case
-  one-legged K-rung sweep is ~$1.93 < $3.00, so the V3.2 cap stands; revisit at K >= 16.
+- S4: daily loss >= $5.00 [pin] (`V33_S4_DAY_LOSS_CAP_DOLLARS`), on the ACCOUNT BALANCE via the
+  pending-settlement BAND, count + bucket aware, identical law to V3.2. TF#4 (2026-10-17): 3.00 -> 5.00 for
+  the 3-lot ladder -- $1.67 per 1-lot-equivalent, TIGHTER than #3's $3.00. At 3 lots a worst-case one-legged
+  K-rung sweep is ~$5.79 (3 x the 1-lot ~$1.93), so the cap no longer bounds a full bad sweep BY DESIGN: a
+  10-10-style window (-$3.84 at 1 lot = ~-$11.50 at 3) latches S4 and KILLs the campaign (Brad: "A 10-10
+  event should kill a test fire").
 - S5 (arming refusal): this file's STATUS line not exactly `STATUS: FROZEN`, the params sha unverified,
   proxy `/health` `orders_enabled` not true or caps absent, caps not covering BOTH `KXBTC-` and
-  `KXBTCD-`, `max_contracts_per_order` outside `[lots_per_rung, K*lots_per_rung]` = `[1, 11]` [pin] (so a
-  proxy cap of 2 OR of 11 both arm; wings chunk to <= cap), fewer than 500 [pin]
+  `KXBTCD-`, `max_contracts_per_order` outside `[max(rung_lots), sum(rung_lots)]` = `[3, 33]` [pin] (TF#4:
+  the 3-lot band; a proxy cap anywhere in [3, 33] arms, wings chunk to <= cap -- the Render cap of 2 at the
+  last freeze MUST be raised to >= 3 before the 3-lot params arm, else S5 degrades to dry), fewer than 500 [pin]
   (`V33_MIN_ORDER_BUDGET_AT_ARM`) creates left in today's budget, a latched stop / corrupt guard for
   today, or an inherited un-settled KXBTC* position (reconcile-first) -> never fires an order (degrade to
   dry). BELT (R2-N2): an armed window whose `/health` contract cap is unreadable degrades to dry rather
   than sizing wings against a guess.
 - S1_LEGGED: a rung set left one-legged below the lock floor at the cutoff stands the HOUR down; the DAY
-  latches after 2 [pin] such occurrences (`V33_S1_LEGGED_LATCH_THRESHOLD` = 2). S1 is per contract.
+  latches after 6 [pin] such occurrences (`V33_S1_LEGGED_LATCH_THRESHOLD` = 6; TF#4 2026-10-17: 2 -> 6, since
+  6 contracts = two 3-lot rung events). S1 is per contract -- the counting logic is unchanged.
 - reconcile-first: any KXBTC* position with non-zero size at :40 refuses to arm.
 
 ## One-legged fill handling
@@ -166,8 +177,8 @@ settlement and flag `one_legged`.
 - mean lock < +2.0c [pin] (`V33_KILL_MEAN_LOCK_CENTS`) already at `n >= 15` [pin]
   (`V33_KILL_MIN_N`) -> KILL the moment `n >= 15` regardless of the other gates (the ladder's premise is
   broken on real fills).
-- one-legged > 2 [pin] contracts -> KILL (the taker completion is systematically failing at K rungs).
-- S4 day loss >= $3.00 [pin] latched on any armed day -> KILL (Brad 2026-09-30: the strategy should not
+- one-legged > 6 [pin] contracts -> KILL (the taker completion is systematically failing at K rungs).
+- S4 day loss >= $5.00 [pin] latched on any armed day -> KILL (Brad 2026-09-30: the strategy should not
   lose; a day at the cap is not an exception to explain, it is the campaign's stop). The report reads the
   V3.3 day-guard files (`ops/v33_stops_YYYY-MM-DD.json`) over its day range and treats an S4 latch as a
   kill entry "S4 day-loss latched on YYYY-MM-DD" (`V33_KILL_ON_S4_DAY_LOSS` = True [pin]); this fires at
@@ -175,11 +186,12 @@ settlement and flag `one_legged`.
 
 ## Promotion
 
-Nothing here promotes automatically. What would JUSTIFY 2 lots per rung, OR rungs deeper than 18c live
-(Brad's dated word, informed by SO-3's measured deep-end absorption): ALIVE at `n >= 45` [pin]
-(`V33_PROMOTION_MIN_N`) completed rung-fills. The SO-3 deep observation ladder (19..28c, observation only)
-measures the deep end's absorption before anyone sizes into it (sec 8, PLAN_V33). The proxy cap
-`MAX_CONTRACTS_PER_ORDER` (2 or 11) stands regardless.
+Nothing here promotes automatically. What would JUSTIFY a size increase (TF#4 2026-10-17 took the EVEN
+ladder to 3 lots/rung on Brad's dated go; per-rung WEIGHTING via `rung_lots` is the next step, "comes
+later"), OR rungs deeper than 18c live (Brad's dated word, informed by SO-3's measured deep-end
+absorption): ALIVE at `n >= 45` [pin] (`V33_PROMOTION_MIN_N`) completed rung-fills. The SO-3 deep
+observation ladder (19..28c, observation only) measures the deep end's absorption before anyone sizes into
+it (sec 8, PLAN_V33). The proxy cap `MAX_CONTRACTS_PER_ORDER` (now in the [3, 33] band) stands regardless.
 
 ## Dry / armed side-by-side protocol (Q4 refined, Brad 2026-09-23)
 
@@ -1019,6 +1031,69 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
   * V3.2 DRY: laptop scheduled task `DegeneracyV3_2` disabled 13:54Z (`Settings.Enabled = False`); its 14:00Z window ran
     to completion. V3.2 runs nowhere. Laptop proxy stays read-only (ALLOW_ORDERS=false since 01:32Z). V3.2's Q4 close line
     is appended under its own Registration in the same PR.
+
+- 2026-10-17 01:09Z -- TEST FIRE #3 CLOSES PASS (Brad's ruling). The host-move test (Render/Ohio + the #139
+  partial-hedge and #140 ledger fixes) replicated the laptop ecosystem; the mechanical question "Can it run
+  through the process?" is answered YES. Brad, verbatim (after the 22:00Z window): "Perfect, so test fire 3
+  was to show same behavior on 2 or more sweeps. I believe we've covered the minimum here and can stamp it as
+  a pass." and "Just so we're on the same page, n>12 was picked because at 1 lot a single full sweep wouldn't
+  satisfy test fire 3." The written rule (previous entry, 2026-10-16 01:30Z) was > 12 good orders.
+  * FACTS (every good order = a rung-fill contract whose set completed with both wings, ledger reconciled to
+    the venue, nothing one-legged): FIFTEEN good orders over THREE sweeps.
+    - 08:00Z 10-16 (`KXBTC-26OCT1604-B82150`): 10 sets, venue net +$1.6089, ledger mean true lock +15.05c,
+      100% positive, 0 one-legged (hand-reconciled to the cent in the 2026-10-16 13:30Z entry).
+    - 22:00Z 10-16: 2 sets, venue net +$0.0036 -- one set -0.31c (legs $1.99 + fees 1.31c), one +0.67c; 0
+      one-legged, ledger reconciled.
+    - 01:00Z 10-17 (`KXBTC-26OCT1621-B81350`, filled AFTER Brad's ruling): 3 rung fills in 2 fill events --
+      00:47:15Z two rungs NO @0.42/0.43 (maker fee 0), wings 2x YES `T81299.99` @0.90 + 2x NO `T81399.99`
+      @0.58 (taker); 00:49:50Z one rung NO @0.32, wings YES @0.90 + NO `T81399.99`-neighbour @0.69. Set locks
+      +7.66c, +6.66c, +6.87c; venue net +$0.2119, which EQUALS the balance change exactly ($69.4716 ->
+      $69.6835); 0 one-legged, positions flat, 0 resting at close.
+  * TOTALS over Test Fire #3: 15 sets, total venue net +$1.8244, 14/15 sets positive, no stops latched,
+    ledger reconciled to the venue on every sweep, final crypto-side balance $69.6835. The written rule was
+    n > 12; Brad ruled PASS at 12 (the minimum, two sweeps), and the 01:00Z window then took the count to 15,
+    so the PASS stands on BOTH his reading AND the letter (15 > 12).
+  * HONEST GAP: the #139 partial-hedge path (a deferred wing taken by `_retry_batch`) NEVER fired during Test
+    Fire #3 -- every fill had both wings priceable at take time -- so that path remains UNEXERCISED live.
+  * Test Fire #3's n is not pooled with #2 (two behaviour-relevant changes: the hedge path and the host).
+
+- 2026-10-17 01:09Z -- TEST FIRE #4 REGISTERED (pre-arm; the arm itself is Brad's mode-file flip + a deposit,
+  recorded at the flip). SIZING ONLY: an EVEN 3-lot ladder (3 contracts per rung on all 11 rungs). Brad,
+  verbatim: "We narrow the scope of this test fire to only sizing. Weighting lots on the ladder comes later."
+  * WHAT CHANGES (this PR, params + falsifier pins; NOTHING else in the strategy): `lots_per_rung` 1 -> 3 in
+    `policy/v33_params.json` (`rung_lots` stays ABSENT = uniform (3,)*11, so per-rung weighting is deferred),
+    canonical sha re-pinned to `80b9d84fbf9809e715d5b0ccfc93c1b3b22a7a22f31702093f528aa049ef0144` (prior
+    `f403708257...`). The hour's CONTRACT allotment `sum(rung_lots)` = 33; `max_sets_per_hour` stays 11 (the
+    rung/fill-event gate). The money-protecting pins scale with it (Claude proposed scaling S4 to $9.00,
+    one-legged to <= 6, S1_LEGGED to 6):
+    - S4 day-loss cap $3.00 -> $5.00 (`V33_S4_DAY_LOSS_CAP_DOLLARS`). Brad, verbatim: "I agree with all
+      purposed except the S4, $3 now seems a little high. 3x scale, but lets tighten here. How does $5 sound?"
+      The campaign-KILL clause (`V33_KILL_ON_S4_DAY_LOSS` = True) is KEPT ON PURPOSE. Brad, verbatim: "A 10-10
+      event should kill a test fire, so I agree with $5." NOTE: $5.00 = $1.67 per 1-lot-equivalent, TIGHTER
+      than #3's $3.00; a worst-case one-legged 3-lot sweep is ~$5.79, so the cap no longer bounds a full bad
+      sweep by design, and a 10-10-style window (-$3.84 at 1 lot = ~-$11.50 at 3) latches S4 and KILLs #4.
+    - one-legged tolerance (the report verdict + early kill, `V33_FALSIFIER_MAX_ONE_LEGGED`) 2 -> 6 contracts
+      (= two 3-lot rung events).
+    - S1_LEGGED day latch (`V33_S1_LEGGED_LATCH_THRESHOLD`) 2 -> 6. S1 is still counted PER CONTRACT -- the
+      counting logic is unchanged; 6 contracts = two 3-lot rung events.
+  * PASS RULE (n): more than 90 good orders (a good order = a rung-fill contract whose set completes with both
+    wings filled, the live ledger reconciles to the venue fills, and nothing is left one-legged beyond the
+    tolerance). Brad first said, verbatim: "As for n, I'm thinking >30 would be a minimum." then corrected
+    himself, verbatim: "you caught me thinking 1 lot on n>30, at this scale I meant n>90. So three full sweeps
+    minimum." ARITHMETIC: a full 3-lot sweep is 33 contracts, so 2 full sweeps = 66 < 90 and 3 = 99 > 90 --
+    n > 90 therefore needs AT LEAST three full sweeps (three windows with fills, at minimum).
+  * WHAT #4 REPORTS (not the verdict, which is the n > 90 mechanical rule above): per-contract lock against
+    #3's per-contract figures (did 3 lots per rung lock the same edge per contract?); partial-fill wing
+    sizing correctness (the coalesced/chunked wing take sized to the 3-lot fills, and -- if it finally fires
+    -- the #139 partial-hedge path); and the capital envelope.
+  * CAPITAL / ARM SEQUENCING (Brad's levers, before any arm): a full 3-lot sweep ties ~33 contracts x ~$2 =
+    ~$66 of cost. Brad will DEPOSIT to keep a full sweep under 50% of the crypto-side balance (balance >=
+    ~$132) BEFORE arming. The Render proxy `max_contracts_per_order` (2 at the last freeze) MUST be raised to
+    >= 3 or S5 degrades to dry. CAUTION: merging this PR may auto-deploy the Render worker, which is currently
+    ARMED on the 1-lot params; the worker mode must be DRY (or the deposit + proxy-cap raise done) BEFORE the
+    3-lot params go live -- Brad's hands.
+  * Test Fire #4's n is NOT pooled with #3 or #2 (a sizing change is behaviour-relevant; each fire is its own
+    evaluation window).
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 

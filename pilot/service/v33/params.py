@@ -10,7 +10,7 @@ WHAT CHANGED vs V3.2 (see pilot/build/v33_l1_core_build_report.md):
   * ``E`` (the single-rung edge) -> ``E_min`` (the LADDER TOP anchor). The ladder rests ``rungs``
     one-lot NO bids at consecutive cents from ``n_top = n(E_min, W)`` down; rung k has margin
     ``E_min + k`` cents.
-  * ``contracts`` (order size) -> ``lots_per_rung`` (lots on EACH rung; 1). The whole allotment is
+  * ``contracts`` (order size) -> ``lots_per_rung`` (lots on EACH rung; 3 since TF#4 2026-10-17). The whole allotment is
     ``rungs * lots_per_rung`` (uniform) OR ``sum(rung_lots)`` when the OPTIONAL per-rung weight
     vector ``rung_lots`` is set (L5, 2026-09-29). ``rung_lots`` is a list of ``rungs`` non-negative
     ints, index k = rung k (k=0 = top rung at margin E_min, k=K-1 = deepest); a 0 means that rung is
@@ -83,8 +83,17 @@ DEFAULT_V33_PARAMS_PATH = os.path.join(
 # in policy/v33_params.json (strike_feed_dead_s 4.0, wing_book_max_age_s 30.0 -- the measured defaults below,
 # unchanged in value) so the loader ENFORCES them (registered-specs rule) instead of trusting an absent key.
 # Everything else byte-identical. V3.3 STAYS DRY -- params-only re-pin, not a mode flip. -> re-pinned.
-FROZEN_V33_PARAMS_SHA256 = "f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1"
+# TEST FIRE #4 SIZING (2026-10-17, Brad's dated go): ``lots_per_rung`` 1 -> 3 (an EVEN 3-lot ladder; the
+# OPTIONAL ``rung_lots`` key stays ABSENT, so the resolved vector is the uniform (3,)*11 -- weighting the
+# ladder comes later, Brad's word). The ONLY JSON value changed is ``lots_per_rung``; the hour's CONTRACT
+# allotment ``sum(rung_lots)`` becomes 3*11 = 33 (``max_sets_per_hour`` = 11 stays the rung/fill-event
+# gate). Everything else byte-identical. Paired in the same campaign amendment with S4 $3.00 -> $5.00, the
+# one-legged tolerance 2 -> 6 contracts and the S1_LEGGED day latch 2 -> 6 (service.v33.stops /
+# falsifier_pins). V3.3 arm is Brad's mode-file lever + a deposit; see the 2026-10-17 Registration. -> re-pinned.
+FROZEN_V33_PARAMS_SHA256 = "80b9d84fbf9809e715d5b0ccfc93c1b3b22a7a22f31702093f528aa049ef0144"
 # History (add-only law). Kept DEFINED so prior-regime ledger rows stay identifiable.
+# The sha the 2026-10-03 stale-wing liveness-bounds re-pin froze; superseded by the TF#4 3-lot sizing.
+PREVIOUS_V33_PARAMS_SHA256_STALE_WING = "f403708257fe7b3a91583882aa98e0f107289c851247e5d3c841bca5e61da1b1"
 PREVIOUS_V33_PARAMS_SHA256_L1_R1 = "32d6cefcc16400420a6934a3f4ad44d34a2119ad5d83aec628596920c308d36f"
 PREVIOUS_V33_PARAMS_SHA256_L1_R2 = "c0201af78015e24fa7d8984d9f9747215330f5bee29fd2567290c2653c244a20"
 PREVIOUS_V33_PARAMS_SHA256_L1_R4 = "6dc7cb5b8bcc0790a04a698f130cfe99a2a52326dca3ef46ea784e7f8a11a421"
@@ -143,7 +152,7 @@ class V33Params:
                          n + fee(n) <= 2 - E_min - W, capped at no_ask(B) - 0.01, floored at n_min.
       * ``rungs``        ladder depth K: rest K one-lot NO bids at n_top, n_top-1c, ... n_top-(K-1)c
                          (truncated from the bottom at n_min; the top honours the post-only cap).
-      * ``lots_per_rung`` lots on EACH rung (1). The hour's allotment is rungs * lots_per_rung.
+      * ``lots_per_rung`` lots on EACH rung (3 since TF#4 2026-10-17). The hour's allotment is rungs * lots_per_rung.
       * ``tol`` / ``deb_ms`` roll gate: ``deb_ms`` debounces the START of a convergence (|n_top - anchor|
                          >= tol); once committed, each subsequent cent rolls as soon as the prior amend
                          acks (no re-debounce) while the sign is unchanged; a sign flip re-debounces
