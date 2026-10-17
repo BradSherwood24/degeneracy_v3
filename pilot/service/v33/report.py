@@ -840,8 +840,8 @@ def _num(v: Decimal | None) -> str:
     return f"{v:.1f}" if v is not None else "n/a"
 
 
-def _render_scoreboard(sb: dict[str, Any]) -> list[str]:
-    lines = ["", "LADDER SCOREBOARD (DegeneracyV3_3, rolling K-rung ladder) -- per margin, "
+def _render_scoreboard(sb: dict[str, Any], label: str = "DegeneracyV3_3") -> list[str]:
+    lines = ["", f"LADDER SCOREBOARD ({label}, rolling K-rung ladder) -- per margin, "
              "DRY separated from realised", "-" * 92]
     cap = sb["capture_10c"]
     lines.append(f"  capture ratio @ {cap['margin_c']}c = live {cap['live']} / shadow {cap['shadow']} = "
@@ -1012,7 +1012,7 @@ def _render_writer(windows: list[dict[str, Any]]) -> list[str]:
     return out
 
 
-def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
+def _render(report: dict[str, Any], sxs: dict[str, Any], label: str = "DegeneracyV3_3") -> str:
     lines: list[str] = []
     header = ["close_time".ljust(22), "mode".ljust(10), "bucket".ljust(26), "rungs".rjust(6),
               "cts".rjust(4), "shal".rjust(6), "deep".rjust(6), "ladderLk".rjust(10), "rolls".rjust(6)]
@@ -1071,7 +1071,7 @@ def _render(report: dict[str, Any], sxs: dict[str, Any]) -> str:
             f"alarms={t.get('alarms', 0)}")
 
     lines.extend(_render_writer(report["windows"]))
-    lines.extend(_render_scoreboard(report["scoreboard"]))
+    lines.extend(_render_scoreboard(report["scoreboard"], label))
     lines.extend(_render_allocation(report["allocation"]))
     lines.extend(_render_gate_table(report["gate_table"]))
     lines.extend(_render_deep_end(report["deep_end"]))
@@ -1116,6 +1116,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="V3.3 ops dir holding v33_stops_*.json (default: the resolved live ops dir); "
                          "the L6 S4 day-loss campaign kill scans it over the report's day range.")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--label", default="DegeneracyV3_3",
+                    help="Scoreboard roster label in the header (e.g. DegeneracyV3_3_ETH for the ETH dry "
+                         "ledger). Cosmetic; the per-window rows self-label via their roster/series fields.")
     args = ap.parse_args(argv)
 
     ops_dir = args.ops_dir if args.ops_dir is not None else ops_dir_v33()
@@ -1127,7 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"report": report, "side_by_side": sxs}, sort_keys=True,
                          default=lambda o: str(o)))
     else:
-        print(_render(report, sxs))
+        print(_render(report, sxs, args.label))
     return 0
 
 

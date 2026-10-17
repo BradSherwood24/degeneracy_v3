@@ -126,14 +126,19 @@ class ClockTick:
 # ---------------------------------------------------------------------------
 # Ticker classifiers (pure)
 # ---------------------------------------------------------------------------
-def parse_strike_ticker(ticker: str) -> int | None:
+def parse_strike_ticker(ticker: str, prefix: str = STRIKE_SERIES_PREFIX) -> int | None:
     """``"KXBTCD-26AUG3006-T77799.99"`` -> ``77800`` (the sim's ``strike_of``: round(strike)+0.01
     pattern). Returns None for a non-strike ticker or an unparseable suffix.
 
     The floor int returned is the KEY the core uses for strike books; Su = Sd + bucket_width shares
     the same key convention (a $100 bucket [Sd, Sd+100) pairs strike floors Sd and Sd+100).
+
+    ``prefix`` is the strike-series prefix (default ``KXBTCD``). A second-series port (e.g. ETH's
+    ``KXETHD``) passes its own prefix; the ``-T<threshold.99>`` sub-tick convention — ``round(x+0.01)``
+    — is identical across the crypto strike series (verified 2026-10-17: ``KXETHD-...-T1704.99`` -> 1705),
+    so only the prefix differs. With the default prefix this is byte-identical to the historic call.
     """
-    if not ticker.startswith(STRIKE_SERIES_PREFIX + "-"):
+    if not ticker.startswith(prefix + "-"):
         return None
     if "-T" not in ticker:
         return None
@@ -158,14 +163,25 @@ def parse_bucket_ticker(
 
 
 def classify_ticker(
-    ticker: str, bucket_map: Mapping[str, tuple[float, float]]
+    ticker: str, bucket_map: Mapping[str, tuple[float, float]],
+    strike_floor_map: Mapping[str, int] | None = None,
 ) -> tuple[str, int] | None:
     """Classify a market ticker -> ("strike", floor) | ("bucket", floor) | None. Buckets take
-    precedence (a ticker present in the discovery map is a bucket); otherwise try the strike pattern.
+    precedence (a ticker present in the discovery map is a bucket); otherwise classify as a strike.
+
+    ``strike_floor_map`` (ticker -> int floor) is an OPTIONAL discovery map consulted for the strike
+    floor BEFORE the ``parse_strike_ticker`` prefix convention. BTC leaves it empty/None and falls
+    through to the KXBTCD parse exactly as before (byte-identical); a second-series dry port (ETH's
+    KXETHD) populates it so strikes classify by lookup without the BTC prefix. Strikes and buckets are
+    disjoint ticker sets, so the bucket-first precedence is unchanged.
     """
     fc = bucket_map.get(ticker)
     if fc is not None:
         return ("bucket", int(round(float(fc[0]))))
+    if strike_floor_map:
+        k = strike_floor_map.get(ticker)
+        if k is not None:
+            return ("strike", int(k))
     k = parse_strike_ticker(ticker)
     if k is not None:
         return ("strike", k)

@@ -296,7 +296,8 @@ def _fetch_series_markets(proxy: Any, series: str, close_iso: str) -> list[dict]
 
 
 def discover_strike_ladder(
-    proxy: Any, close_iso: str, now_epoch: float, dead_statuses=DEAD_STATUSES
+    proxy: Any, close_iso: str, now_epoch: float, dead_statuses=DEAD_STATUSES,
+    *, series: str = STRIKE_SERIES, parse_floor: Callable[[str], int | None] = parse_strike_ticker,
 ) -> StrikeDiscovery:
     """Every LIVE hourly strike (KXBTCD) co-settling at ``close_iso``, all generations.
 
@@ -305,8 +306,12 @@ def discover_strike_ladder(
     whole co-settling ladder is subscribed. Captures ``exchange_index`` per ticker (fail-closed to
     None) for the Phase-3 dispatch, and the strike floor via ``parse_strike_ticker`` (the same key
     convention the pure core uses). Returns an empty discovery (stand-down) when nothing live
-    co-settles."""
-    markets = _fetch_series_markets(proxy, STRIKE_SERIES, close_iso)
+    co-settles.
+
+    ``series`` / ``parse_floor`` parameterize the strike series for a second-series dry port (ETH's
+    ``KXETHD`` with a ``KXETHD``-bound ``parse_strike_ticker``); both default to the BTC constants so
+    this call is byte-identical for the live V3.2/V3.3 BTC tree."""
+    markets = _fetch_series_markets(proxy, series, close_iso)
     ladders = _group_ladders(markets, close_iso)
     tickers: list[str] = []
     floor_by: dict[str, int] = {}
@@ -321,7 +326,7 @@ def discover_strike_ladder(
             if not tk:
                 continue
             tk = str(tk)
-            floor = parse_strike_ticker(tk)
+            floor = parse_floor(tk)
             if floor is None:
                 # fall back to the record's floor_strike if the ticker suffix is unparseable
                 fs = m.get("floor_strike")

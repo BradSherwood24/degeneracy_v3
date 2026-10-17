@@ -380,6 +380,11 @@ class V33State:
     strike_tops: Mapping[int, TopOfBook] = field(default_factory=dict)
     strike_ts: Mapping[int, float] = field(default_factory=dict)
     strike_tickers: Mapping[int, str] = field(default_factory=dict)
+    # OPTIONAL strike ticker -> floor map (discovery). EMPTY for BTC (the default): strike classification
+    # falls through to ``parse_strike_ticker`` (the KXBTCD prefix), byte-identical. The ETH dry roster
+    # populates it (via V33State.new) so the reused V3.2 ``_fold_book`` / ``_stamp_strike_feed`` classify
+    # KXETHD strikes by lookup, not by the BTC prefix -- same series-agnostic core.
+    strike_floor_map: Mapping[str, int] = field(default_factory=dict)
     bucket_tops: Mapping[int, TopOfBook] = field(default_factory=dict)
     bucket_ts: Mapping[int, float] = field(default_factory=dict)
     bucket_tickers: Mapping[int, str] = field(default_factory=dict)
@@ -509,6 +514,7 @@ class V33State:
         params: V33Params,
         *,
         shakedown: bool = False,
+        strike_floor_map: Mapping[str, int] | None = None,
     ) -> "V33State":
         shadows = {str(E): ShadowSub(E=E) for E in params.shadow_Es}
         # margin array: indices 0..(E_min_c + K - 1); 0 below E_min, 1 (open order wanted) for the K
@@ -528,6 +534,7 @@ class V33State:
             shakedown=shakedown,
             shadows=shadows,
             margin_state=margin_state,
+            strike_floor_map=dict(strike_floor_map or {}),
         )
 
     # ------------------------------------------------------------------
@@ -801,7 +808,8 @@ class _WingLawView:
 def _stamp_strike_feed(st: V33State, event: BookUpdate) -> V33State:
     """Record the strike connection's liveness: the latest ``book_ts`` (the frame's OWN server ts, NOT the
     monotone eval clock, so a lagging/stalled connection ages out) of any STRIKE book fold."""
-    cls = classify_ticker(event.market_ticker, st.bucket_map)
+    cls = classify_ticker(event.market_ticker, st.bucket_map,
+                          getattr(st, "strike_floor_map", None))
     if cls is None or cls[0] != "strike":
         return st
     book_ts = event.book_ts if event.book_ts is not None else event.server_ts
