@@ -1,4 +1,4 @@
-"""V3.3 stops / arming gate (L2): the SEPARATE v33 day-guard file, S4 $3.00 cap banding, S1_LEGGED
+"""V3.3 stops / arming gate (L2): the SEPARATE v33 day-guard file, S4 $5.00 cap banding (TF#4), S1_LEGGED
 occurrence latch, S5 caps agreement, reconcile-first reuse, and the one arm-or-degrade decision."""
 
 from __future__ import annotations
@@ -117,35 +117,42 @@ def test_arming_check_threads_rung_lots(tmp_path):
     assert any("max(rung_lots)=3" in r for r in dec.reasons)
 
 
-def test_s4_cap_is_three_dollars():
-    assert V33_S4_DAY_LOSS_CAP_DOLLARS == Decimal("3.00")
+def test_s4_cap_is_five_dollars():
+    # TF#4 (2026-10-17): $3.00 -> $5.00 for the 3-lot ladder (tighter per 1-lot-equivalent).
+    assert V33_S4_DAY_LOSS_CAP_DOLLARS == Decimal("5.00")
 
 
 def test_s4_latch_when_loss_exceeds_cap_under_every_resolution():
-    # start 54, now 50 -> loss 4 > cap 3 with no pending credit -> latch.
-    d = v33_s4_decision(Decimal("54"), Decimal("50"), (Decimal(0), Decimal(0)))
+    # start 54, now 48 -> loss 6 > cap 5 with no pending credit -> latch.
+    d = v33_s4_decision(Decimal("54"), Decimal("48"), (Decimal(0), Decimal(0)))
     assert d.kind == "latch"
 
 
 def test_s4_clear_when_loss_within_cap():
+    # loss 1.5 < cap 5 -> clear.
     d = v33_s4_decision(Decimal("54"), Decimal("52.5"), (Decimal(0), Decimal(0)))
     assert d.kind == "clear"
 
 
 def test_s4_pending_when_credit_straddles_cap():
-    # loss 4 now, but a pending floor of $2 would bring it to $2 (< cap) at best, $4 at worst -> pending.
-    d = v33_s4_decision(Decimal("54"), Decimal("50"), (Decimal(0), Decimal(2)))
+    # loss 6 now, but a pending floor of $2 would bring it to $4 (< cap 5) at best, $6 at worst -> pending.
+    d = v33_s4_decision(Decimal("54"), Decimal("48"), (Decimal(0), Decimal(2)))
     assert d.kind == "pending"
 
 
 def test_s1_legged_latch_threshold(tmp_path):
+    # TF#4 (2026-10-17): the latch threshold is 6 one-legged occurrences (was 2); below it, no day latch.
+    assert V33_S1_LEGGED_LATCH_THRESHOLD == 6
     path = v33_day_guard_path(str(tmp_path), DAY)
-    n1 = record_legged_occurrence(path, DAY, "w1", "legged", ts=0.0)
-    assert n1 == 1
-    n2 = record_legged_occurrence(path, DAY, "w2", "legged", ts=1.0)
-    assert n2 == V33_S1_LEGGED_LATCH_THRESHOLD == 2
+    for i in range(V33_S1_LEGGED_LATCH_THRESHOLD - 1):
+        n = record_legged_occurrence(path, DAY, f"w{i}", "legged", ts=float(i))
+        assert n == i + 1
+        assert v33_latched_stop_kind(read_day_guard(path, DAY)) is None   # not yet latched
+    n_last = record_legged_occurrence(path, DAY, "w_last", "legged",
+                                      ts=float(V33_S1_LEGGED_LATCH_THRESHOLD))
+    assert n_last == V33_S1_LEGGED_LATCH_THRESHOLD == 6
     guard = read_day_guard(path, DAY)
-    assert count_legged(guard) == 2
+    assert count_legged(guard) == 6
     assert v33_latched_stop_kind(guard) == "S1_LEGGED"
 
 

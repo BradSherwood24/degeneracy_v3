@@ -391,9 +391,10 @@ def test_report_gate_table_counts_reconciled_one_legged_without_wing_batch_sets(
                 "one_legged_contracts": ol, "ladder": {}}
     gt = build_falsifier_gate_table([_row(2)])
     assert gt["one_legged"] == 2                               # reconciled, not the (empty) batch sum
-    # one more than the pin (<= 2) is an immediate KILL, driven by the reconciled count.
-    gt3 = build_falsifier_gate_table([_row(3)])
-    assert gt3["one_legged"] == 3 and gt3["verdict"].startswith("KILL")
+    # TF#4 (2026-10-17): the tolerance is <= 6; one more than the pin (7 > 6) is an immediate KILL,
+    # driven by the reconciled count.
+    gt7 = build_falsifier_gate_table([_row(7)])
+    assert gt7["one_legged"] == 7 and gt7["verdict"].startswith("KILL")
 
 
 def test_report_window_surfaces_unbooked_orphan_and_alarms():

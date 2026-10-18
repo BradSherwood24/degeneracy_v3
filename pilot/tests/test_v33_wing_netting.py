@@ -60,7 +60,10 @@ def _sd(ask):
 
 
 def _params(**over) -> V33Params:
-    p = replace(load_v33_params(), E_min=Decimal("0.05"), tol=Decimal("0.01"), deb_ms=0,
+    # TF#4 (2026-10-17): shipped lots_per_rung is now 3; these netting tests assert count-1 sets, so pin 1
+    # (tests that want weights pass rung_lots in ``over``, which overrides this).
+    p = replace(load_v33_params(), E_min=Decimal("0.05"), lots_per_rung=1, rung_lots=(1,) * 11,
+                tol=Decimal("0.01"), deb_ms=0,
                 bucket_switch_deb_ms=0, bucket_switch_hysteresis_usd=0)
     return replace(p, **over) if over else p
 
