@@ -7,15 +7,18 @@ historical-data/
 pilot/journals/
 pilot/journals_v32/
 pilot/journals_v33/
+pilot/journals_v33_eth/
 pilot/logs/
 pilot/logs_v32/
 pilot/logs_v33/
+pilot/logs_v33_eth/
 
 # --- runtime state (machine-local, not source) ---
 pilot/ledger/
 pilot/ops/mode.txt
 pilot/ops/v32_mode.txt
 pilot/ops/v33_mode.txt
+pilot/ops/v33_eth_mode.txt
 # daily replay tripwire artifacts (regenerated each run by tools/daily_replay.py)
 pilot/ops/replay_tripwire.txt
 pilot/ops/replay_tripwire.json
