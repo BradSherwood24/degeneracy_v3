@@ -1094,6 +1094,29 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     3-lot params go live -- Brad's hands.
   * Test Fire #4's n is NOT pooled with #3 or #2 (a sizing change is behaviour-relevant; each fire is its own
     evaluation window).
+- 2026-10-18 19:11Z -- TEST FIRE #4 ARMED ON RENDER (3 LOTS/RUNG) -- FIRST WINDOW (19:00Z) FILLED AND RECONCILED.
+  * BETWEEN #3's CLOSE AND THIS ARM: the worker stayed armed on the 1-lot params (04bb3c8). Its windows
+    after 10-17 01:00Z (the window that closed #3) through 10-18 18:00Z are counted by NEITHER fire (#3 was closed;
+    #4 not yet armed). Venue figures for the record: 10-17 06/08/12/13/14/20Z + 10-18 01Z = 25 sets, net +$0.8268
+    (balance $69.6835 -> $70.5103 before the deposit); all both-winged, 0 one-legged.
+  * FUNDING: Brad deposited $70.00 (landed on exchange_index 0) and moved it to the crypto shard via
+    kalshi.com/account/exchange-indexes -> 17:48Z balance_breakdown idx2 $137.3985, idx0 $3.1118 (total $140.5103).
+    A full 33-lot sweep (~$66) = ~48% of the crypto-side balance (Brad's < 50% line).
+  * PROXY: Render proxy `MAX_CONTRACTS_PER_ORDER=11` (Claude's suggestion: wing_cap = min(hint 11, proxy cap), so a
+    multi-rung wing goes as one order), restarted by Brad; /health 18:13Z: orders_enabled true, key fp 4388d77c,
+    token_required true, caps max_contracts_per_order 11, daily_order_budget 30000 (4201 used).
+  * DEPLOY: #147 merged deae9d3, #148 (ETH dry, shared-core additive edits, reviewed APPROVE WITH NITS) and #149
+    (test-only fix: ETH test no longer compares lots with BTC) merged -> main 81cac04. Full suite on merged main
+    1609 passed. Worker manual deploy: stop_idle 18:10:47Z, boot 18:11:05Z, boot_sweep mode armed, found 0,
+    cancelled 0, errors 0; RENDER_GIT_COMMIT 81cac0470b148036e87eefd9ffb47bc073faa245.
+  * NO DRY WINDOW FIRST -- Brad's call. Claude had suggested one dry window before arming; Brad, verbatim:
+    "Lets run it live. Full send ya know lol." The worker's mode file stayed armed through the redeploy; the 18:40Z
+    wake was the first 3-lot window.
+  * FIRST 3-LOT WINDOW, 19:00Z CLOSE (KXBTC-26OCT1815-B81050): ledger row effective_mode armed, params_sha 80b9d84f,
+    degrade_reason null (Brad's worker shell, 19:11Z). ONE rung filled for all 3 lots in one event at 18:54:58.267Z
+    (NO @0.32, maker, fee 0); wings 198 ms later, sized to the fill: YES T80999.99 x3 @0.98 (venue matched 1 + 2),
+    NO T81099.99 x3 @0.64, fees $0.0526. 3 sets x +4.25c = +$0.1274 = the balance change ($140.5103 -> $140.6377)
+    to the cent; positions flat, 0 resting, 0 one-legged. Test Fire #4 good orders: 3 of > 90.
 
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
