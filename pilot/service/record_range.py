@@ -190,15 +190,18 @@ class RangeDiscovery:
         }
 
 
-def _fetch_range_markets(proxy: ProxyAuth, close_iso: str) -> list[dict]:
+def _fetch_range_markets(proxy: ProxyAuth, close_iso: str, series: str = RANGE_SERIES) -> list[dict]:
     """Paged GET /markets for the range series, narrowed to the target close (status-agnostic —
-    exactly the shape WakeContext._fetch_series_markets uses; final filtering is downstream)."""
+    exactly the shape WakeContext._fetch_series_markets uses; final filtering is downstream).
+
+    ``series`` defaults to the BTC ``KXBTC`` range series; a second-series dry port passes its own
+    (e.g. ETH's ``KXETH``). With the default this is byte-identical to the historic call."""
     target = close_epoch(close_iso)
     out: list[dict] = []
     cursor: str | None = None
     for _ in range(_MAX_PAGES):
         params: dict[str, Any] = {
-            "series_ticker": RANGE_SERIES,
+            "series_ticker": series,
             "min_close_ts": target,
             "max_close_ts": target,
             "limit": 1000,
@@ -218,14 +221,19 @@ def discover_range_markets(
     close_iso: str,
     now_epoch: float,
     dead_statuses=DEAD_STATUSES,
+    *,
+    series: str = RANGE_SERIES,
 ) -> RangeDiscovery:
     """Every LIVE range bucket co-settling at `close_iso`, across ALL widths/generations.
 
     Unlike wake's leg discovery (which SELECTS one smallest-window ladder), the recorder keeps them
     ALL: `_group_ladders` buckets the co-settling markets by (event_ticker, open_time); each
     all-non-dead generation contributes every one of its markets. Floor AND cap are captured per
-    bucket. Returns an empty `RangeDiscovery` (stand-down) when nothing live co-settles."""
-    markets = _fetch_range_markets(proxy, close_iso)
+    bucket. Returns an empty `RangeDiscovery` (stand-down) when nothing live co-settles.
+
+    ``series`` defaults to the BTC ``KXBTC`` range series; a second-series dry port passes its own
+    (e.g. ETH's ``KXETH``). With the default this is byte-identical to the historic call."""
+    markets = _fetch_range_markets(proxy, close_iso, series=series)
     ladders = _group_ladders(markets, close_iso)
     buckets: list[Bucket] = []
     generations = 0

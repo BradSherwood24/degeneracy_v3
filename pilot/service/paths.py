@@ -118,6 +118,37 @@ def mode_path_v33() -> str:
     return os.path.join(ops_dir_v33(), "v33_mode.txt")
 
 
+# --- V3.3 ETH DRY roster writable locations (own journals/logs/ledger/mode file; SAME ops dir +
+# DV3_DATA_DIR routing) ---
+# The ETH dry side-by-side (``run_v33_eth``) measures whether the pump-fader has edge on the ETH hourly
+# markets. It is DRY BY CONSTRUCTION (never arms, no write-capable executor), so it needs no day-guard or
+# falsifier. It keeps its writable state SEPARATE from BOTH the BTC V3.3 ladder and V3.2: its own journal
+# dir, log dir, ledger (``v33_eth_ledger.jsonl``) and mode file (``v33_eth_mode.txt``, in the SHARED ops
+# dir). With DV3_DATA_DIR unset these resolve under the pilot checkout; set, they relocate under the data
+# dir the same way. The BTC V3.2/V3.3 paths are untouched.
+
+
+def journal_dir_v33_eth() -> str:
+    return os.path.join(_writable_base(), "journals_v33_eth")
+
+
+def log_dir_v33_eth() -> str:
+    return os.path.join(_writable_base(), "logs_v33_eth")
+
+
+def ledger_path_v33_eth() -> str:
+    return os.path.join(ledger_dir_v33(), "v33_eth_ledger.jsonl")
+
+
+def ops_dir_v33_eth() -> str:
+    """Writable ops dir for the ETH dry roster (the same shared ``ops`` dir; its own mode file)."""
+    return os.path.join(_writable_base(), "ops")
+
+
+def mode_path_v33_eth() -> str:
+    return os.path.join(ops_dir_v33_eth(), "v33_eth_mode.txt")
+
+
 def supervisor_log_path() -> str:
     """The supervisor's own structured (JSON-per-window) log -- lives with the other logs."""
     return os.path.join(log_dir_v32(), "supervisor.out")

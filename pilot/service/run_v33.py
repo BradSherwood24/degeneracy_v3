@@ -963,7 +963,8 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
               effective_mode: str, degrade: str | None, params: V33Params, strike_disc, bucket_map,
               journal_path: str, summary_path: str, ledger_path: str, strike_lag, bucket_lag,
               clock: Callable[[], float], m15_tickers=None, lag_stats=None, armed: bool = False,
-              degrade_reason: str | None = None, recon=None, reconcile_alarms: int = 0) -> dict:
+              degrade_reason: str | None = None, recon=None, reconcile_alarms: int = 0,
+              series: str | None = None, roster: str = "DegeneracyV3_3") -> dict:
     journal.close()
     gz = R._gzip_journal(journal_path)
     final_path = os.path.abspath(gz.get("final_path") or journal_path)
@@ -1002,10 +1003,12 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
         writer_stats=_v33_writer_stats(driver),
         alarms_breakdown=alarms, reconcile=recon_fields,
         stand_down_sub_causes=dict(driver._stand_down_sub_causes),
+        series=series, roster=roster,
     )
     append_v33_ledger_row(row, ledger_path)
     summary = {
-        "roster": "DegeneracyV3_3", "close_time": close_iso, "stand_down": False,
+        "roster": roster, "close_time": close_iso, "stand_down": False,
+        **({"series": series} if series else {}),
         "resolved_mode": resolved_mode, "effective_mode": effective_mode, "degrade": degrade,
         "dry_sim": bool(dry_sim), "params_sha": params.sha256, "journal_path": final_path,
         "records": len(journal), "strike_count": len(strike_disc.tickers),
@@ -1027,14 +1030,15 @@ def _finalize(*, journal: StreamJournal, shared, driver: V33Driver, close_iso: s
 
 def _stand_down(summary_path: str, ledger_path: str, close_iso: str, reason: str, *,
                 resolved_mode: str, effective_mode: str, degrade: str | None,
-                params_sha: str | None, clock: Callable[[], float]) -> int:
+                params_sha: str | None, clock: Callable[[], float],
+                series: str | None = None, roster: str = "DegeneracyV3_3") -> int:
     sd = StandDown(close_iso, reason)
     write_standdown_summary(summary_path, sd, clock)
     row = build_v33_ledger_row(
         close_time=close_iso, resolved_mode=resolved_mode, effective_mode=effective_mode,
         degrade=degrade, params=None, state=None, driver_counts={}, executor_counts={}, ws_counts={},
         strike_count=0, bucket_count=0, journal_path=None, record_count=0, stand_down_reason=reason,
-        params_sha=params_sha, now=clock())
+        params_sha=params_sha, now=clock(), series=series, roster=roster)
     append_v33_ledger_row(row, ledger_path)
     logger.info("[V33] stand down %s: %s", close_iso, reason)
     return 0

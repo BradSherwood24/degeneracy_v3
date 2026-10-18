@@ -383,6 +383,8 @@ def build_v33_ledger_row(
     alarms_breakdown: dict[str, int] | None = None,
     reconcile: dict[str, Any] | None = None,
     stand_down_sub_causes: dict[str, int] | None = None,
+    roster: str = "DegeneracyV3_3",
+    series: str | None = None,
 ) -> dict[str, Any]:
     """One V3.3 window row. ``dry_sim`` marks a row whose fills were the DRY ideal-fill SIMULATION
     (never realised money). The LADDER summary + the per-rung / per-batch money math ride every row.
@@ -401,7 +403,10 @@ def build_v33_ledger_row(
     }
     ladder = _ladder_summary(state, money, driver_counts, executor_counts) if state is not None else {}
     row: dict[str, Any] = {
-        "roster": "DegeneracyV3_3",
+        # ``roster`` defaults to the BTC ``DegeneracyV3_3``; the ETH dry roster passes
+        # ``DegeneracyV3_3_ETH`` (+ ``series="KXETH"``) so its rows are self-labelled even though it
+        # writes to its own ledger file. With the defaults this is byte-identical to the BTC row.
+        "roster": roster,
         "close_time": close_time,
         "mode": resolved_mode,
         "effective_mode": effective_mode,
@@ -473,6 +478,10 @@ def build_v33_ledger_row(
         "one_legged_contracts": (reconcile or {}).get("one_legged_contracts"),
         "flushed_at": now,
     }
+    # ETH dry roster: self-label the underlying series. Added only when provided, so a BTC row
+    # (``series`` None) carries no such key and is byte-identical to the historic row.
+    if series is not None:
+        row["series"] = series
     return row
 
 
