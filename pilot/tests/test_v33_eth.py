@@ -72,15 +72,18 @@ def test_eth_params_load_and_sha_pin():
 
 
 def test_eth_params_strategy_knobs_identical_to_btc():
-    """Margins / rungs / lots / shadow_Es / floors are UNCHANGED from BTC — only the $5-geometry constants
-    differ. Guards against an accidental strategy change sneaking into the ETH copy."""
+    """Margins / rungs / shadow_Es / floors are UNCHANGED from BTC — only the $5-geometry constants
+    differ. Guards against an accidental strategy change sneaking into the ETH copy. Lots are NOT compared:
+    BTC moved to 3 lots/rung for Test Fire #4 (PR #147, a sizing-only test); the ETH DRY logger stays at
+    1 lot/rung (per-contract measurement, comparable with the BTC 1-lot dry history)."""
     eth = load_v33_eth_params()
     btc = load_v33_params()
-    for f in ("E_min", "rungs", "lots_per_rung", "tol", "quote_start_s", "quote_end_s", "wing_margin",
+    for f in ("E_min", "rungs", "tol", "quote_start_s", "quote_end_s", "wing_margin",
               "lock_floor", "n_min", "max_sets_per_hour", "shadow_Es", "deep_obs_rungs",
               "max_contracts_per_order_hint", "print_through"):
         assert getattr(eth, f) == getattr(btc, f), f"ETH {f} drifted from BTC"
-    # the ONLY intended differences:
+    assert eth.lots_per_rung == 1, "ETH DRY logger is pinned at 1 lot/rung"
+    # the ONLY intended differences (plus sizing, above):
     assert eth.bucket_width != btc.bucket_width
     assert eth.bucket_switch_hysteresis_usd != btc.bucket_switch_hysteresis_usd
 
