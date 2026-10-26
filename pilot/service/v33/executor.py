@@ -61,7 +61,11 @@ from service.v32.executor import (  # inherited, UNCHANGED wire law
 logger = logging.getLogger(__name__)
 
 _KXBTC_PREFIX = "KXBTC"          # covers range (KXBTC-) and strikes (KXBTCD-) via startswith
-_V33_COID_PREFIX = "v33-"        # OUR roster's coid prefix (core._mint_coid); NEVER v32-*
+_KXETH_PREFIX = "KXETH"          # the ETH roster: covers range (KXETH-) and strikes (KXETHD-) via startswith
+_V33_COID_PREFIX = "v33-"        # OUR (BTC) roster's coid prefix (core._mint_coid); NEVER v32-*
+_V33E_COID_PREFIX = "v33e-"      # the ETH roster's coid prefix. NOTE ``"v33e-".startswith("v33-")`` is
+#   False and ``"v33-".startswith("v33e-")`` is False, so the BTC sweep can never cancel an ETH order and
+#   vice versa even though both run the same hour on one shared account (asserted in the tests).
 _V32_COID_PREFIX = "v32-"        # the concurrently-armed V3.2 roster — the sweep must skip it
 
 DEFAULT_BATCH_CREATE_MAX = 8     # Kalshi batch chunk size (Basic-tier token bucket: 8*10 = 80 < 100)
@@ -310,6 +314,7 @@ class V33LiveExecutor(LiveExecutor):
         write_bucket_size: float = 100.0,
         write_reserve_tokens: float = 0.0,
         enable_print_through: bool = False,
+        coid_prefix: str = _V33_COID_PREFIX,
     ) -> None:
         # write-token pacer (MUST-FIX-4 + L3 R2-N1 reserve): a Basic-tier bucket so the initial 11-create
         # ladder / chunked wing bursts never blow the 100 tokens/s budget; cancels + wing takes are
@@ -328,6 +333,11 @@ class V33LiveExecutor(LiveExecutor):
             self._rl_writer, bucket_map, exchange_index_by_ticker, journal, close_epoch, quote_end_s,
             clock=clock, sleep=sleep,
         )
+        # The roster's coid prefix. ``self.COID_PREFIX`` (an INSTANCE attribute here) shadows the class
+        # default so the sweep / attribution scope to THIS roster's coids; the wing-chunk coids share it.
+        # DEFAULT ``v33-`` keeps the BTC executor byte-identical; the ETH executor passes ``v33e-``.
+        self.COID_PREFIX = coid_prefix
+        self._wing_coid_prefix = f"{coid_prefix}wc-"
         self.k_rungs = int(k_rungs)
         self.batch_create = bool(batch_create)
         self.batch_create_max = max(1, int(batch_create_max))
@@ -682,7 +692,8 @@ class V33LiveExecutor(LiveExecutor):
 
     def _mint_wing_coid(self) -> str:
         self._wing_coid_seq = getattr(self, "_wing_coid_seq", 0) + 1
-        return f"v33-wc-{self._wing_coid_seq}"
+        # ``self._wing_coid_prefix`` is ``v33-wc-`` for BTC (byte-identical) and ``v33e-wc-`` for ETH.
+        return f"{self._wing_coid_prefix}{self._wing_coid_seq}"
 
     def _wing_chunk_entry(self, leg, exch: int, count: Any, coid: str) -> dict[str, Any]:
         from service.orders.translate import to_v2_order
@@ -990,11 +1001,18 @@ class V33LiveExecutor(LiveExecutor):
 # Startup safety: cancel any of OUR (v33-*) open orders in KXBTC* before arming
 # ===========================================================================
 def cancel_stale_open_orders(writer: ProxyWriter, journal: Any,
-                             clock: Callable[[], float] = time.time) -> dict[str, Any]:
-    """On an armed prepare(): GET our resting orders and DELETE any KXBTC* order whose coid is ``v33-*``
-    (a prior crashed V3.3 process). It NEVER cancels a ``v32-*`` order (the concurrently-armed V3.2
-    roster) nor a missing-coid / foreign order — the two rosters share one account, so V3.3 clears ONLY
-    its own rests (V3.2 has its own sweep for v32-*). Fail-closed / never raises out of startup."""
+                             clock: Callable[[], float] = time.time, *,
+                             ticker_prefix: str = _KXBTC_PREFIX,
+                             coid_prefix: str = _V33_COID_PREFIX) -> dict[str, Any]:
+    """On an armed prepare(): GET our resting orders and DELETE any ``<ticker_prefix>*`` order whose coid
+    is ``<coid_prefix>*`` (a prior crashed process of THIS roster). It NEVER cancels another roster's order
+    (``v32-*``, or the SIBLING V3.3 roster's) nor a missing-coid / foreign order — every roster shares one
+    account, so each clears ONLY its own rests. Fail-closed / never raises out of startup.
+
+    The defaults (``KXBTC`` + ``v33-``) keep the BTC roster byte-identical. The ETH roster passes
+    ``ticker_prefix=KXETH`` (covers KXETH- + KXETHD-) + ``coid_prefix=v33e-``; because ``"v33e-"`` does not
+    start with ``"v33-"`` (and ``KXETH`` not with ``KXBTC``), the BTC sweep can never touch an ETH rest and
+    vice versa."""
     result = {"found": 0, "cancelled": 0, "errors": 0, "skipped_foreign": 0}
     try:
         body = writer.rest_get(OPEN_ORDERS_PATH, {"status": "resting"})
@@ -1009,11 +1027,12 @@ def cancel_stale_open_orders(writer: ProxyWriter, journal: Any,
             continue
         ticker = str(o.get("ticker") or o.get("market_ticker") or "")
         oid = o.get("order_id")
-        if not ticker.startswith(_KXBTC_PREFIX) or not oid:
+        if not ticker.startswith(ticker_prefix) or not oid:
             continue
         coid = o.get("client_order_id")
-        # ONLY our v33 rests. A v32-* order (or anything else, incl. a missing coid) is left untouched.
-        if not (coid and str(coid).startswith(_V33_COID_PREFIX)):
+        # ONLY this roster's rests. Another roster's order (v32-*, the sibling V3.3 roster's, or anything
+        # with a missing/foreign coid) is left untouched.
+        if not (coid and str(coid).startswith(coid_prefix)):
             result["skipped_foreign"] += 1
             journal.append("startup_skip_foreign_order",
                            {"ticker": ticker, "order_id": oid, "client_order_id": coid}, clock())

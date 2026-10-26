@@ -93,10 +93,12 @@ from service.v33.reconcile import (
 from service.v33.stops import (
     V33_S1_LEGGED_LATCH_THRESHOLD,
     decide_v33_arming,
+    guard_has_s4_latch,
     record_legged_occurrence,
     v33_day_guard_path,
     v33_s4_decision,
 )
+from service.v33.series import BTC_SPEC, V33SeriesSpec
 from service.paths import (
     checkout_ops_dir,
     data_dir,
@@ -191,17 +193,48 @@ def resolve_v33_mode(cli_mode: str | None, mode_txt_path: str) -> str:
     return m if m in VALID_MODES_V33 else "dry"
 
 
-def _resolve_v33_guard_path(utc_day: str) -> str:
-    """The V3.3 day-guard file for ``utc_day`` (mid-day-cutover safety mirrors run_v32's guard resolve)."""
-    primary = v33_day_guard_path(ops_dir_v33(), utc_day)
+def _resolve_v33_guard_path(utc_day: str, spec: V33SeriesSpec = BTC_SPEC) -> str:
+    """The V3.3 day-guard file for ``utc_day`` (mid-day-cutover safety mirrors run_v32's guard resolve).
+    ``spec`` selects the roster's guard ops dir + filename prefix (BTC default byte-identical)."""
+    primary = v33_day_guard_path(spec.guard_ops_dir_fn(), utc_day, spec.guard_prefix)
     if data_dir() is None:
         return primary
-    checkout = v33_day_guard_path(checkout_ops_dir(), utc_day)
+    checkout = v33_day_guard_path(checkout_ops_dir(), utc_day, spec.guard_prefix)
     if primary != checkout and not os.path.exists(primary) and os.path.exists(checkout):
         logger.warning("[V33] DV3_DATA_DIR set but data-dir day-guard %s missing while checkout %s "
                        "exists -> using the CHECKOUT guard for %s.", primary, checkout, utc_day)
         return checkout
     return primary
+
+
+def _account_pending_credit(ledger_path: str, spec: V33SeriesSpec, utc_day: str):
+    """The ACCOUNT-WIDE (pessimistic, optimistic) pending-settlement credit band for ``utc_day`` = THIS
+    roster's unsettled-armed credit PLUS the sibling roster's (Brad's one-account-S4 ruling: the balance is
+    shared, so a sibling's un-backfilled held set credits this roster's S4 band too). The sibling ledger is
+    read fail-closed: a missing/unreadable sibling ledger contributes NOTHING, so while the sibling has no
+    armed unsettled rows (today's reality for the dry-by-construction ETH roster until Brad arms it) the
+    band equals this roster's own — byte-identical to the pre-account-wide BTC computation."""
+    rows = list(load_v33_rows(ledger_path))
+    if spec.sibling_ledger_path_fn is not None:
+        try:
+            rows += list(load_v33_rows(spec.sibling_ledger_path_fn()))
+        except Exception as e:  # noqa: BLE001 — a sibling-ledger read never blocks this roster's arming
+            logger.warning("[V33] sibling ledger read for account-wide S4 failed (ignored): %s", e)
+    return v33_pending_credit(rows, utc_day)
+
+
+def _sibling_s4_latched(utc_day: str, spec: V33SeriesSpec) -> bool:
+    """True iff the SIBLING roster's day guard carries an S4 latch today (account-wide S4 cross-stop). A
+    missing/unreadable sibling guard -> a fresh empty ``DayGuard`` -> no latch, so this cross-stop can never
+    spuriously halt this roster (fail-safe): BTC stays byte-identical while the ETH guard is absent."""
+    if spec.sibling_guard_ops_dir_fn is None or spec.sibling_guard_prefix is None:
+        return False
+    try:
+        path = v33_day_guard_path(spec.sibling_guard_ops_dir_fn(), utc_day, spec.sibling_guard_prefix)
+        return guard_has_s4_latch(read_day_guard(path, utc_day))
+    except Exception as e:  # noqa: BLE001 — the cross-read never blocks this roster's arming
+        logger.warning("[V33] sibling S4 cross-read failed (ignored): %s", e)
+        return False
 
 
 # ===========================================================================
@@ -219,7 +252,7 @@ def build_executor_v33(
     effective_mode: str, *, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
     params: V33Params, writer: ProxyWriter | None, clock: Callable[[], float] = time.time,
     batch_create: bool = False, wing_cap: int | None = None,
-    async_writer: AsyncOrderWriter | None = None,
+    async_writer: AsyncOrderWriter | None = None, coid_prefix: str = "v33-",
 ) -> Any:
     """``armed`` -> the real ``V33LiveExecutor`` (requires a ProxyWriter); everything else -> the reused
     dry ``FrozenExecutor`` (refuses a real action kind). ``wing_cap`` = the chunk cap for coalesced wing
@@ -247,7 +280,7 @@ def build_executor_v33(
                 wing_cap=wing_cap, write_tokens_per_s=params.write_tokens_per_s,
                 write_bucket_size=params.write_bucket_size,
                 write_reserve_tokens=params.write_reserve_tokens,
-                enable_print_through=params.print_through,
+                enable_print_through=params.print_through, coid_prefix=coid_prefix,
             )
         return V33LiveExecutor(
             writer, bucket_map, exchange_index_by_ticker, journal, close_epoch_val,
@@ -255,7 +288,7 @@ def build_executor_v33(
             wing_cap=wing_cap, write_tokens_per_s=params.write_tokens_per_s,
             write_bucket_size=params.write_bucket_size,
             write_reserve_tokens=params.write_reserve_tokens,
-            enable_print_through=params.print_through,
+            enable_print_through=params.print_through, coid_prefix=coid_prefix,
         )
     return R.FrozenExecutor(bucket_map)
 
@@ -1047,18 +1080,23 @@ def _stand_down(summary_path: str, ledger_path: str, close_iso: str, reason: str
 # ===========================================================================
 # main
 # ===========================================================================
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, spec: V33SeriesSpec = BTC_SPEC) -> int:
+    """The V3.3 window process for ONE series. ``spec`` defaults to ``BTC_SPEC`` (the live BTC ladder,
+    byte-identical to the historic path); ``service.run_v33_eth_live`` calls this with ``ETH_LIVE_SPEC`` so
+    the ETH ladder arms through this SAME code — no forked/copied armed logic. Every BTC-specific literal
+    (series, coid prefix, sweep/position scope, roster, paths, falsifier, day-guard, 15M presence) is read
+    from ``spec``."""
     parser = argparse.ArgumentParser(
         description="V3.3 rolling-ladder window process (shakedown/dry/armed; missing mode -> dry, "
                     "never armed; armed degrades to dry unless S5 + reconcile + day-latch + S4 pass).")
     parser.add_argument("--close", default=None, help="Target close ISO (UTC). Default: next :00.")
     parser.add_argument("--mode", default=None, choices=list(VALID_MODES_V33),
-                        help="Override the mode (else read ops/v33_mode.txt; unknown/absent -> dry).")
-    parser.add_argument("--journal-dir", default=journal_dir_v33())
-    parser.add_argument("--log-dir", default=log_dir_v33())
-    parser.add_argument("--ledger", default=ledger_path_v33())
-    parser.add_argument("--mode-file", default=mode_path_v33())
-    parser.add_argument("--falsifier", default=DEFAULT_FALSIFIER_PATH_V33)
+                        help="Override the mode (else read the roster mode file; unknown/absent -> dry).")
+    parser.add_argument("--journal-dir", default=spec.journal_dir_fn())
+    parser.add_argument("--log-dir", default=spec.log_dir_fn())
+    parser.add_argument("--ledger", default=spec.ledger_path_fn())
+    parser.add_argument("--mode-file", default=spec.mode_path_fn())
+    parser.add_argument("--falsifier", default=spec.falsifier_path_fn())
     parser.add_argument("--proxy-base", default=None, help="Override the proxy base URL.")
     parser.add_argument("--flush-every", type=int, default=200)
     parser.add_argument("--batch-create", action="store_true",
@@ -1089,11 +1127,13 @@ def main(argv: list[str] | None = None) -> int:
     resolved_mode = resolve_v33_mode(args.mode, args.mode_file)
 
     try:
-        params = load_v33_params()
+        # BTC keeps the literal ``load_v33_params`` call (patchable; byte-identical); ETH supplies its own
+        # frozen loader via the spec (``load_params`` is None for BTC = "use the default BTC loader").
+        params = load_v33_params() if spec.load_params is None else spec.load_params()
     except (V33ParamsShaMismatch, V33ParamsInvalid, KeyError, OSError, ValueError) as e:
         return _stand_down(summary_path, args.ledger, close_iso, f"params_load_failed: {e}",
                            resolved_mode=resolved_mode, effective_mode="shakedown", degrade=None,
-                           params_sha=None, clock=clock)
+                           params_sha=None, clock=clock, series=spec.ledger_series, roster=spec.roster)
 
     # prepare(): settlement backfill for prior ARMED windows still realized_unsettled (dry_sim skipped).
     try:
@@ -1111,42 +1151,52 @@ def main(argv: list[str] | None = None) -> int:
     degrade: str | None = None
     degrade_reason: str | None = None
 
-    strike_disc = R.discover_strike_ladder(proxy, close_iso, clock())
-    range_disc = discover_range_markets(proxy, close_iso, clock())
-    m15_disc, m15_error = R.discover_co_settling_15m_safe(proxy, close_iso, clock())
+    # Discovery parameterised by series: BTC defaults are byte-identical; ETH passes its series + the
+    # KXETHD-bound strike-floor parser, and has NO 15-minute series (``spec.has_m15`` False -> no m15 leg).
+    strike_disc = R.discover_strike_ladder(proxy, close_iso, clock(), series=spec.strike_series,
+                                           parse_floor=spec.strike_parse)
+    range_disc = discover_range_markets(proxy, close_iso, clock(), series=spec.range_series)
+    if spec.has_m15:
+        m15_disc, m15_error = R.discover_co_settling_15m_safe(proxy, close_iso, clock())
+        m15_tickers = list(m15_disc.tickers)
+    else:
+        m15_disc, m15_error, m15_tickers = None, None, []
     bucket_map = R.build_bucket_map(range_disc)
     bucket_map, dropped_width = R.filter_buckets_to_width(bucket_map, params.bucket_width)
 
     if not bucket_map:
         return _stand_down(summary_path, args.ledger, close_iso,
-                           f"no KXBTC range buckets co-settling at {close_iso}",
+                           f"no {spec.range_series} range buckets co-settling at {close_iso}",
                            resolved_mode=resolved_mode, effective_mode=effective_mode, degrade=degrade,
-                           params_sha=params.sha256, clock=clock)
+                           params_sha=params.sha256, clock=clock, series=spec.ledger_series,
+                           roster=spec.roster)
     if not strike_disc.tickers:
         return _stand_down(summary_path, args.ledger, close_iso,
-                           f"no KXBTCD strike ladder co-settling at {close_iso}",
+                           f"no {spec.strike_series} strike ladder co-settling at {close_iso}",
                            resolved_mode=resolved_mode, effective_mode=effective_mode, degrade=degrade,
-                           params_sha=params.sha256, clock=clock)
+                           params_sha=params.sha256, clock=clock, series=spec.ledger_series,
+                           roster=spec.roster)
     obs_width = R.observed_bucket_width(bucket_map)
     if obs_width is not None and obs_width != params.bucket_width:
         return _stand_down(summary_path, args.ledger, close_iso,
                            f"bucket width {obs_width} != params.bucket_width {params.bucket_width}",
                            resolved_mode=resolved_mode, effective_mode=effective_mode, degrade=degrade,
-                           params_sha=params.sha256, clock=clock)
+                           params_sha=params.sha256, clock=clock, series=spec.ledger_series,
+                           roster=spec.roster)
 
-    logger.info("[V33] %s: %d strikes, %d buckets, mode=%s effective=%s", close_iso,
+    logger.info("[%s] %s: %d strikes, %d buckets, mode=%s effective=%s", spec.log_tag, close_iso,
                 len(strike_disc.tickers), len(bucket_map), resolved_mode, effective_mode)
 
     journal_path = os.path.join(args.journal_dir, journal_filename(close_iso))
     journal = StreamJournal(journal_path, flush_every=args.flush_every)
     journal.open()
     journal.append("window_meta",
-                   {"roster": "DegeneracyV3_3", "close_time": close_iso, "resolved_mode": resolved_mode,
+                   {"roster": spec.roster, "close_time": close_iso, "resolved_mode": resolved_mode,
                     "effective_mode": effective_mode, "params_sha": params.sha256,
-                    "strike_series": STRIKE_SERIES, "range_series": RANGE_SERIES,
+                    "strike_series": spec.strike_series, "range_series": spec.range_series,
                     "strike_count": len(strike_disc.tickers), "bucket_count": len(bucket_map),
                     "bucket_width": params.bucket_width, "rungs": params.rungs,
-                    "m15_series": FIFTEEN_SERIES, "m15_tickers": list(m15_disc.tickers)}, clock())
+                    "m15_series": spec.m15_series, "m15_tickers": list(m15_tickers)}, clock())
 
     # --- arming resolution (S5 + reconcile-first + day latch + S4) ---
     writer: ProxyWriter | None = None
@@ -1160,7 +1210,7 @@ def main(argv: list[str] | None = None) -> int:
             positions = None
             logger.warning("[V33] positions read failed: %s", e)
         utc_day = close_iso[:10]
-        guard_path = _resolve_v33_guard_path(utc_day)
+        guard_path = _resolve_v33_guard_path(utc_day, spec)
         day_guard = read_day_guard(guard_path, utc_day)
         s4 = None
         try:
@@ -1168,14 +1218,21 @@ def main(argv: list[str] | None = None) -> int:
             if bal.ok and not day_guard.corrupt:
                 start, _first = ensure_balance_start(guard_path, utc_day, bal.dollars, clock())
                 if start is not None:
-                    pending = v33_pending_credit(load_v33_rows(args.ledger), utc_day)
+                    # ACCOUNT-WIDE S4 band: this roster's unsettled credit PLUS the sibling roster's (the
+                    # balance is shared). While the sibling has no armed unsettled rows (today's reality) the
+                    # band is this roster's own -> byte-identical to the pre-account-wide BTC computation.
+                    pending = _account_pending_credit(args.ledger, spec, utc_day)
                     s4 = v33_s4_decision(start, bal.dollars, pending)
         except Exception as e:  # noqa: BLE001
             logger.warning("[V33] balance/S4 read failed: %s", e)
+        # ACCOUNT-WIDE S4 cross-stop: an S4 latch on the SIBLING roster's guard halts this roster too. A
+        # missing/absent sibling guard -> False, so the BTC path is byte-identical until ETH latches S4.
+        cross_s4 = _sibling_s4_latched(utc_day, spec)
         outcome = decide_v33_arming(
             resolved_mode=resolved_mode, falsifier_path=args.falsifier, health=health,
             positions=positions, params_verified=True, lots_per_rung=params.lots_per_rung,
-            day_guard=day_guard, s4=s4, k_rungs=params.rungs, rung_lots=params.rung_lots)
+            day_guard=day_guard, s4=s4, k_rungs=params.rungs, rung_lots=params.rung_lots,
+            position_prefix=spec.position_prefix, cross_s4_latched=cross_s4)
         effective_mode = outcome.effective_mode
         if not outcome.armed:
             degrade = "degrade_to_dry"
@@ -1200,7 +1257,12 @@ def main(argv: list[str] | None = None) -> int:
     dry_sim = not armed   # dry/shakedown -> simulate the ladder fills for the side-by-side row
 
     cts = close_epoch(close_iso)
-    state = V33State.new(close_iso, cts, bucket_map, params, shakedown=shakedown)
+    # ETH feeds the discovered strike-floor map into the core (the BTC parse_strike_ticker prefix would
+    # reject KXETHD); BTC uses the default parser (floor map left empty). The coid prefix is the roster's
+    # (``v33-`` BTC / ``v33e-`` ETH) so the two same-hour rosters never collide on the shared account.
+    sfm = dict(strike_disc.floor_by_ticker) if spec.needs_strike_floor_map else None
+    state = V33State.new(close_iso, cts, bucket_map, params, shakedown=shakedown,
+                         strike_floor_map=sfm, coid_prefix=spec.coid_prefix)
 
     exch_map: dict[str, int | None] = dict(strike_disc.exchange_index_by_ticker)
     for b in range_disc.buckets:
@@ -1225,21 +1287,22 @@ def main(argv: list[str] | None = None) -> int:
     executor = build_executor_v33(effective_mode, bucket_map=bucket_map, exchange_index_by_ticker=exch_map,
                                   journal=journal, close_epoch_val=cts, params=params, writer=writer,
                                   clock=clock, batch_create=args.batch_create, wing_cap=wing_cap,
-                                  async_writer=async_writer)
+                                  async_writer=async_writer, coid_prefix=spec.coid_prefix)
     driver = V33Driver(params, state, journal, executor, dry_sim=dry_sim,
                        batch_create=args.batch_create, clock=clock, async_writer=async_writer)
-    shared = R.V32Recorder(journal, driver, clock=clock, m15_tickers=frozenset(m15_disc.tickers))
+    shared = R.V32Recorder(journal, driver, clock=clock, m15_tickers=frozenset(m15_tickers))
 
     if armed and writer is not None:
         try:
-            cancel_stale_open_orders(writer, journal, clock)
+            cancel_stale_open_orders(writer, journal, clock,
+                                     ticker_prefix=spec.sweep_ticker_prefix, coid_prefix=spec.coid_prefix)
         except Exception as e:  # noqa: BLE001
             logger.warning("[V33] startup open-order cancel failed: %s", e)
 
     strike_ws = KalshiWebSocketClient(proxy_auth=proxy, tickers=list(strike_disc.tickers),
                                       callbacks=shared.callbacks(False), include_private=False,
                                       record=shared.tap, clock=clock, channels=STRIKE_CHANNELS)
-    bucket_sub_tickers = sorted(set(bucket_map) | set(m15_disc.tickers))
+    bucket_sub_tickers = sorted(set(bucket_map) | set(m15_tickers))
     bucket_ws = KalshiWebSocketClient(proxy_auth=proxy, tickers=bucket_sub_tickers,
                                       callbacks=shared.callbacks(include_private),
                                       include_private=include_private, record=shared.tap, clock=clock,
@@ -1300,7 +1363,7 @@ def main(argv: list[str] | None = None) -> int:
             if armed and s1_one_legged:
                 try:
                     utc_day = close_iso[:10]
-                    n = record_legged_occurrence(_resolve_v33_guard_path(utc_day), utc_day, close_iso,
+                    n = record_legged_occurrence(_resolve_v33_guard_path(utc_day, spec), utc_day, close_iso,
                                                  "ladder set left one-legged below lock floor (reconciled "
                                                  "against executor truth)", clock())
                     olc = str(recon.one_legged_contracts) if recon is not None else None
@@ -1315,9 +1378,10 @@ def main(argv: list[str] | None = None) -> int:
                                 journal_path=journal_path, summary_path=summary_path, ledger_path=args.ledger,
                                 strike_lag=lag_sampler.mean("strikes"), bucket_lag=lag_sampler.mean("buckets"),
                                 lag_stats=lag_sampler.summaries(), clock=clock,
-                                m15_tickers=list(m15_disc.tickers), armed=armed, degrade_reason=degrade_reason,
-                                recon=recon, reconcile_alarms=reconcile_alarms)
-            logger.info("[V33] window done: %s", summary)
+                                m15_tickers=list(m15_tickers), armed=armed, degrade_reason=degrade_reason,
+                                recon=recon, reconcile_alarms=reconcile_alarms,
+                                series=spec.ledger_series, roster=spec.roster)
+            logger.info("[%s] window done: %s", spec.log_tag, summary)
     finally:
         hard_stop.cancel()  # normal exit / _finalize error: disarm the belt-and-braces hard stop
         if async_writer is not None:

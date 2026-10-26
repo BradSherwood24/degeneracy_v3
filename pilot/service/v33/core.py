@@ -435,6 +435,12 @@ class V33State:
     roll_count: int = 0                                  # confirmed rolls (falsifier)
     roll_single_order_count: int = 0                     # rolls that moved exactly one order (falsifier)
     coid_seq: int = 0
+    # The client_order_id prefix the core mints (``<prefix><close_time>-<seq>``). DEFAULT ``"v33-"`` keeps
+    # the BTC roster byte-identical; the ETH roster sets ``"v33e-"`` so that, since BTC and ETH windows run
+    # the SAME hour on ONE shared account, their coids can never collide at Kalshi (a duplicate
+    # client_order_id is rejected). Note ``"v33e-".startswith("v33-")`` is False and vice versa, so neither
+    # roster's startup sweep / attribution can ever match the other's orders (asserted in the tests).
+    coid_prefix: str = "v33-"
 
     # fills / wings
     rest_fills: tuple[RungFill, ...] = ()               # every rung fill booked this hour
@@ -515,6 +521,7 @@ class V33State:
         *,
         shakedown: bool = False,
         strike_floor_map: Mapping[str, int] | None = None,
+        coid_prefix: str = "v33-",
     ) -> "V33State":
         shadows = {str(E): ShadowSub(E=E) for E in params.shadow_Es}
         # margin array: indices 0..(E_min_c + K - 1); 0 below E_min, 1 (open order wanted) for the K
@@ -535,6 +542,7 @@ class V33State:
             shadows=shadows,
             margin_state=margin_state,
             strike_floor_map=dict(strike_floor_map or {}),
+            coid_prefix=coid_prefix,
         )
 
     # ------------------------------------------------------------------
@@ -643,7 +651,9 @@ def _mk(kind: ActionKind, shakedown: bool, **fields) -> V33Action:
 
 def _mint_coid(st: V33State) -> tuple[str, V33State]:
     seq = st.coid_seq + 1
-    coid = f"v33-{st.close_time}-{seq}"
+    # ``st.coid_prefix`` is ``"v33-"`` for BTC (byte-identical) and ``"v33e-"`` for ETH, so the two
+    # concurrent same-hour rosters mint distinct coids on the shared account (no venue collision).
+    coid = f"{st.coid_prefix}{st.close_time}-{seq}"
     return coid, replace(st, coid_seq=seq)
 
 

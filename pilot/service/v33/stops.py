@@ -65,12 +65,32 @@ S4_DAY_LOSS = "S4"
 S5_ARMING = "S5"
 
 _DAY_GUARD_PREFIX_V33 = "v33_stops_"
+# The ETH V3.3 roster's own day-guard prefix -> ops/v33_eth_stops_YYYY-MM-DD.json. SEPARATE from the BTC
+# guard so an ETH S1_LEGGED latch never halts the BTC day and vice versa; the ACCOUNT-WIDE S4 is instead
+# shared by a cross-read (``guard_has_s4_latch`` on the sibling guard), per Brad's one-account-S4 ruling.
+_DAY_GUARD_PREFIX_V33_ETH = "v33_eth_stops_"
 _FROZEN_LINE = "STATUS: FROZEN"
 
 
-def v33_day_guard_path(ops_dir: str, utc_day: str) -> str:
-    """The V3.3 day-scoped guard file: ops/v33_stops_YYYY-MM-DD.json (SEPARATE from V3.2's and the box's)."""
-    return os.path.join(ops_dir, f"{_DAY_GUARD_PREFIX_V33}{utc_day}.json")
+def v33_day_guard_path(ops_dir: str, utc_day: str, prefix: str = _DAY_GUARD_PREFIX_V33) -> str:
+    """The V3.3 day-scoped guard file: ops/<prefix>YYYY-MM-DD.json. DEFAULT ``v33_stops_`` is the BTC guard
+    (SEPARATE from V3.2's and the box's). The ETH roster passes ``prefix=_DAY_GUARD_PREFIX_V33_ETH``."""
+    return os.path.join(ops_dir, f"{prefix}{utc_day}.json")
+
+
+def v33_eth_day_guard_path(ops_dir: str, utc_day: str) -> str:
+    """The ETH V3.3 roster's day-scoped guard file: ops/v33_eth_stops_YYYY-MM-DD.json."""
+    return v33_day_guard_path(ops_dir, utc_day, _DAY_GUARD_PREFIX_V33_ETH)
+
+
+def guard_has_s4_latch(guard: DayGuard) -> bool:
+    """True iff ``guard`` carries an S4 day-loss latch. Used for the ACCOUNT-WIDE S4: each roster reads the
+    SIBLING roster's guard for an S4 latch and, if present, refuses to arm (an S4 on EITHER roster stops
+    BOTH — Brad's one-account-S4 ruling). A corrupt/missing sibling guard has NO latch here, so the caller
+    reads a fresh ``DayGuard`` (absent file -> empty, not latched) and the cross-stop is fail-safe: an
+    unreadable sibling guard never spuriously halts this roster (its OWN ``day_guard.corrupt`` check still
+    fails this roster closed on its OWN unreadable guard)."""
+    return any(e.get("kind") == S4_DAY_LOSS for e in guard.latched)
 
 
 # ---------------------------------------------------------------------------
@@ -222,12 +242,20 @@ def decide_v33_arming(
     s4: Any = None,
     k_rungs: int = 1,
     rung_lots: Any = None,
+    position_prefix: str = "KXBTC",
+    cross_s4_latched: bool = False,
 ) -> V33ArmingOutcome:
     """The single arm-or-degrade gate (mirrors ``decide_v32_arming``). Only ``resolved_mode == "armed"``
     is a candidate; anything else passes through unarmed. An armed candidate must clear ALL of: the day
     guard (not corrupt, no day-halting latch), S5 (frozen falsifier + params sha + /health caps &
-    budget), reconcile-first (no inherited un-settled KXBTC* position), and S4 (not ``latch``). Any
-    failure -> degrade to dry with the reasons (the caller journals ``degrade_to_dry`` and runs dry)."""
+    budget), reconcile-first (no inherited un-settled ``<position_prefix>*`` position), and S4 (not
+    ``latch``). Any failure -> degrade to dry with the reasons (the caller journals ``degrade_to_dry``).
+
+    ``position_prefix`` scopes reconcile-first to this roster's series (BTC default ``KXBTC``; ETH
+    ``KXETH``). ``cross_s4_latched`` is the ACCOUNT-WIDE S4 cross-stop: True when the SIBLING roster's day
+    guard carries an S4 latch, which halts THIS roster too (an S4 on either roster stops both). BTC passes
+    False when the ETH guard is absent/has no S4 latch, so the BTC path is byte-identical until ETH ever
+    latches S4."""
     if resolved_mode != "armed":
         return V33ArmingOutcome(effective_mode=resolved_mode, armed=False,
                                 degrade_reason=None, reasons=())
@@ -238,10 +266,12 @@ def decide_v33_arming(
         latched = v33_latched_stop_kind(day_guard)
         if latched is not None:
             reasons.append(f"day-halting stop already latched today: {latched}")
+    if cross_s4_latched:
+        reasons.append("account-wide S4 day-loss latched on the sibling roster")
     dec = v33_arming_check(falsifier_path, health, params_verified, lots_per_rung, k_rungs,
                            rung_lots=rung_lots)
     reasons.extend(dec.reasons)
-    clean, detail = reconcile_positions_clean(positions)
+    clean, detail = reconcile_positions_clean(positions, prefix=position_prefix)
     if not clean:
         reasons.append(f"reconcile-first: {detail}")
     if s4 is not None:

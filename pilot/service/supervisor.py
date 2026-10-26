@@ -184,7 +184,23 @@ class PopenChild:
             pass
 
 
-_ROSTER_MODULE = {"v32": "service.run_v32", "v33": "service.run_v33"}
+_ROSTER_MODULE = {"v32": "service.run_v32", "v33": "service.run_v33",
+                  "v33_eth": "service.run_v33_eth_live"}
+
+# Rosters the MULTI-roster supervisor may co-host in one process (the live BTC ladder + the ETH ladder).
+# Each runs as its OWN child process every :40; they share only this wrapper's signal handler and loop.
+_MULTI_ROSTERS = ("v33", "v33_eth")
+
+
+def _roster_journal_dir(roster: str) -> str:
+    """The journal dir to rotate for ``roster`` (used by the rotation step)."""
+    if roster == "v33":
+        from service.paths import journal_dir_v33
+        return journal_dir_v33()
+    if roster == "v33_eth":
+        from service.paths import journal_dir_v33_eth
+        return journal_dir_v33_eth()
+    return journal_dir_v32()
 
 
 def _default_spawn(child_args: list[str], module: str = "service.run_v32") -> PopenChild:
@@ -298,12 +314,23 @@ def _default_boot_sweep(
     Before any proxy-touching sweep it waits (bounded) for the proxy to answer ``/health``.
     """
     from service.proxy_writer import ProxyWriter
-    if roster == "v33":
-        from service.v33.executor import cancel_stale_open_orders
+    # Per-roster sweep binding: v33 + v33_eth both use the V3.3 executor's sweep, but the ETH roster scopes
+    # it to KXETH tickers + ``v33e-`` coids so it can NEVER cancel a BTC (``v33-``) or V3.2 (``v32-``) rest
+    # on the shared account (and vice versa). v32 keeps its own sweep unchanged.
+    if roster in ("v33", "v33_eth"):
+        from service.v33.executor import cancel_stale_open_orders as _v33_sweep
+        if roster == "v33_eth":
+            from service.v33.executor import _KXETH_PREFIX, _V33E_COID_PREFIX
+
+            def cancel_stale_open_orders(writer, journal, clock):
+                return _v33_sweep(writer, journal, clock, ticker_prefix=_KXETH_PREFIX,
+                                  coid_prefix=_V33E_COID_PREFIX)
+        else:
+            cancel_stale_open_orders = _v33_sweep
     else:
         from service.v32.executor import cancel_stale_open_orders
 
-    # v32 keeps the historic zero-arg call (tests patch it that way); v33 passes its roster explicitly.
+    # v32 keeps the historic zero-arg call (tests patch it that way); v33/v33_eth pass their roster explicitly.
     mode = _read_mode_safe() if roster == "v32" else _read_mode_safe(roster)
     journal = _LogJournal(log)
     if not dry_sweep and mode != "armed":
@@ -337,11 +364,17 @@ _VALID_MODES = ("shakedown", "dry", "armed")
 def _read_mode_safe(roster: str = "v32") -> str:
     """Read the roster's mode file; unknown/absent/error -> ``shakedown`` (fail-closed, never raises).
 
-    ``v32`` reads ``v32_mode.txt`` (missing -> shakedown, as before). ``v33`` reads ``v33_mode.txt``;
-    absent there means the V3.3 dry ladder is not deployed, so the sweep is a no-op -> ``shakedown`` too
-    (a missing v33 mode file NEVER arms the boot sweep)."""
-    from service.paths import mode_path_v33
-    path = mode_path_v33() if roster == "v33" else mode_path_v32()
+    ``v32`` reads ``v32_mode.txt`` (missing -> shakedown, as before). ``v33`` reads ``v33_mode.txt`` and
+    ``v33_eth`` reads ``v33_eth_mode.txt``; absent there means that ladder is not armed, so the sweep is a
+    no-op -> ``shakedown`` too (a missing roster mode file NEVER arms the boot sweep)."""
+    if roster == "v33":
+        from service.paths import mode_path_v33
+        path = mode_path_v33()
+    elif roster == "v33_eth":
+        from service.paths import mode_path_v33_eth
+        path = mode_path_v33_eth()
+    else:
+        path = mode_path_v32()
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read().strip().lower()
@@ -583,8 +616,7 @@ class Supervisor:
                 continue
 
             try:
-                from service.paths import journal_dir_v33
-                jdir = journal_dir_v33() if self._roster == "v33" else journal_dir_v32()
+                jdir = _roster_journal_dir(self._roster)
                 rot = self._rotate(jdir)
             except Exception as e:  # noqa: BLE001 - rotation must never affect the window run
                 logger.warning("[SUPERVISOR] journal rotation failed (ignored): %s", e)
@@ -622,6 +654,273 @@ class Supervisor:
 
 
 # ===========================================================================
+# Multi-roster supervisor (ONE process co-hosts several rosters' children)
+# ===========================================================================
+class MultiRosterSupervisor:
+    """Co-host SEVERAL rosters (e.g. ``v33`` + ``v33_eth``) in ONE process, ONE signal handler, ONE loop.
+
+    Brad (2026-10-26): "ETH live at 1 lot, sharing the Render worker with BTC." Each roster still runs as
+    its OWN child process (``python -m <roster module>``) every UTC :40; they share only this wrapper. The
+    children are spawned IN PARALLEL in the given order (BTC first) for the same close and awaited together,
+    each with its OWN per-window watchdog, so an ETH child crash / early exit / watchdog kill NEVER affects
+    the BTC child. A shutdown signal is forwarded to ALL live children. One structured JSON line is emitted
+    per child per window, and one-run-per-close is tracked PER ROSTER (a child that returns early is not
+    respawned for the same close).
+
+    The single-roster ``Supervisor`` above is UNCHANGED (``--roster`` is byte-identical); this class is the
+    ``--rosters`` path. Every side effect (clock, sleep, spawn, sweep, rotation, emission) is injectable."""
+
+    def __init__(
+        self,
+        *,
+        proxy_base: str,
+        rosters: list[str],
+        child_args: list[str] | None = None,
+        once: bool = False,
+        run_now: bool = False,
+        dry_sweep: bool = False,
+        grace_s: float = SIGTERM_GRACE_S,
+        child_poll_s: float = CHILD_POLL_S,
+        watchdog_grace_s: float = WATCHDOG_GRACE_S,
+        boot_sweep_max_attempts: int = BOOT_SWEEP_MAX_ATTEMPTS,
+        boot_sweep_retry_interval_s: float = BOOT_SWEEP_RETRY_INTERVAL_S,
+        clock: Callable[[], float] = time.time,
+        spawn: Callable[[str, list[str]], Any] | None = None,
+        sweep: Callable[[str, str], dict[str, Any]] | None = None,
+        rotate: Callable[[str], dict[str, Any]] | None = None,
+        sleep: Callable[[float], bool] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        log_path: str | None = None,
+        install_signals: bool = True,
+    ) -> None:
+        # keep only known rosters, de-duped, order preserved (BTC first); default to the BTC+ETH pair.
+        seen: set[str] = set()
+        rs: list[str] = []
+        for r in (rosters or list(_MULTI_ROSTERS)):
+            if r in _ROSTER_MODULE and r not in seen:
+                seen.add(r)
+                rs.append(r)
+        self._rosters = rs or list(_MULTI_ROSTERS)
+        self._proxy_base = proxy_base
+        self._child_args = list(child_args or [])
+        self._once = once
+        self._run_now = run_now
+        self._dry_sweep = dry_sweep
+        self._grace_s = grace_s
+        self._child_poll_s = child_poll_s
+        self._watchdog_grace_s = watchdog_grace_s
+        self._boot_sweep_max_attempts = boot_sweep_max_attempts
+        self._boot_sweep_retry_interval_s = boot_sweep_retry_interval_s
+        self._clock = clock
+        self._spawn = spawn or (lambda roster, ca: _default_spawn(ca, _ROSTER_MODULE[roster]))
+        self._sweep = sweep or (
+            lambda base, roster: _default_boot_sweep(
+                base, dry_sweep=self._dry_sweep, clock=self._clock, log=logger.info,
+                max_attempts=self._boot_sweep_max_attempts,
+                retry_interval_s=self._boot_sweep_retry_interval_s, roster=roster,
+            )
+        )
+        self._rotate = rotate or (lambda jd: _default_rotate(jd, clock=self._clock))
+        self._on_event = on_event
+        # the multi-roster log lives with the V3.3 logs (the primary roster of the pair).
+        if log_path is not None:
+            self._log_path = log_path
+        else:
+            from service.paths import log_dir_v33
+            self._log_path = os.path.join(log_dir_v33(), "supervisor_multi.out")
+        self._install_signals = install_signals
+        self._stop_event = threading.Event()
+        self._stop_requested = False
+        self._sig: int | None = None
+        self._sleep = sleep or self._event_sleep
+        # the close each roster last launched FOR (one-run-per-close, PER roster).
+        self._last_close_run: dict[str, float | None] = {r: None for r in self._rosters}
+
+    # --- signals (one handler for the whole process) ---
+    def _install_signal_handlers(self) -> None:
+        def handler(signum: int, _frame: Any) -> None:
+            self._stop_requested = True
+            self._sig = signum
+            self._stop_event.set()
+
+        for name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+            s = getattr(signal, name, None)
+            if s is None:
+                continue
+            try:
+                signal.signal(s, handler)
+            except (ValueError, OSError):
+                pass
+
+    def request_stop(self, signum: int = signal.SIGTERM) -> None:
+        self._stop_requested = True
+        self._sig = signum
+        self._stop_event.set()
+
+    def _event_sleep(self, seconds: float) -> bool:
+        if seconds <= 0:
+            return self._stop_requested
+        interrupted = self._stop_event.wait(timeout=seconds)
+        return interrupted or self._stop_requested
+
+    def _sleep_until(self, wake: float) -> bool:
+        remaining = wake - self._clock()
+        if remaining <= 0:
+            return self._stop_requested
+        return self._sleep(remaining)
+
+    # --- emission ---
+    def _emit(self, record: dict[str, Any]) -> None:
+        line = json.dumps(record, sort_keys=True)
+        logger.info("[SUPERVISOR] %s", line)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self._log_path)), exist_ok=True)
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            logger.warning("[SUPERVISOR] log write failed (ignored): %s", e)
+        if self._on_event is not None:
+            self._on_event(record)
+
+    # --- child wait (several children at once) ---
+    def _reap_all_after_signal(self, children: list[dict[str, Any]]) -> None:
+        """Forward the current signal to every still-live child, wait the grace, hard-kill stragglers."""
+        sig = self._sig if self._sig is not None else signal.SIGTERM
+        for c in children:
+            c["child"].forward_signal(sig)
+        for c in children:
+            rc = c["child"].wait(self._grace_s)
+            if rc is None:
+                c["child"].kill()
+                rc = c["child"].wait(self._child_poll_s)
+            c["rc"], c["status"] = rc, "signaled"
+
+    def _wait_children(self, children: list[dict[str, Any]]) -> bool:
+        """Wait for ALL children. Each dict carries ``roster``/``child``/``watchdog_deadline``/``wake_iso``/
+        ``start``; on return each carries ``rc``/``status`` (``exited``/``watchdog_killed``/``signaled``).
+        Returns True iff a shutdown signal arrived (the caller then exits the process). A per-child watchdog
+        kills only the overrunning child; the others keep running (an ETH hang never halts BTC)."""
+        pending = list(children)
+        while pending:
+            # poll each pending child once (short, so the stop flag stays responsive across children).
+            for c in list(pending):
+                rc = c["child"].wait(self._child_poll_s)
+                if rc is not None:
+                    c["rc"], c["status"] = rc, "exited"
+                    pending.remove(c)
+            if not pending:
+                break
+            if self._stop_requested:
+                self._reap_all_after_signal(pending)
+                return True
+            now = self._clock()
+            for c in list(pending):
+                if now >= c["watchdog_deadline"]:
+                    logger.warning("[SUPERVISOR] child watchdog (%s): window overran close + %.0fs; "
+                                   "killing child", c["roster"], self._watchdog_grace_s)
+                    sig = self._sig if self._sig is not None else signal.SIGTERM
+                    c["child"].forward_signal(sig)
+                    rc = c["child"].wait(self._grace_s)
+                    if rc is None:
+                        c["child"].kill()
+                        rc = c["child"].wait(self._child_poll_s)
+                    c["rc"], c["status"] = rc, "watchdog_killed"
+                    pending.remove(c)
+        return False
+
+    # --- main loop ---
+    def run(self) -> int:
+        if self._install_signals:
+            self._install_signal_handlers()
+        self._emit({"event": "boot", "at": _iso(self._clock()), "rosters": list(self._rosters),
+                    "proxy_base": self._proxy_base, "once": self._once, "dry_sweep": self._dry_sweep})
+
+        # boot sweep EACH roster (BTC first). A sweep failure for one roster must never sink the others.
+        for roster in self._rosters:
+            try:
+                sweep_result = self._sweep(self._proxy_base, roster)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[SUPERVISOR] boot sweep failed for %s (ignored): %s", roster, e)
+                sweep_result = {"error": repr(e)}
+            self._emit({"event": "boot_sweep", "roster": roster, "result": sweep_result})
+
+        if self._stop_requested:
+            self._emit({"event": "stop_idle", "at": _iso(self._clock())})
+            return 0
+
+        first = True
+        while True:
+            if not (first and self._run_now):
+                now = self._clock()
+                if not in_launch_band(now):
+                    wake = next_forty(now)
+                    self._emit({"event": "sleep", "now": _iso(now), "wake": _iso(wake)})
+                    if self._sleep_until(wake):
+                        self._emit({"event": "stop_idle", "at": _iso(self._clock())})
+                        return 0
+                    now2 = self._clock()
+                    if not in_launch_band(now2):
+                        self._emit({"event": "skipped_late", "woke": _iso(now2)})
+                        first = False
+                        continue
+            first = False
+
+            now = self._clock()
+            close_epoch = _next_top_of_hour_epoch(now)
+            # which rosters still need to run for THIS close (per-roster one-run-per-close)?
+            due = [r for r in self._rosters
+                   if not (in_launch_band(now) and close_epoch == self._last_close_run[r])]
+            if not due:
+                wake = next_forty(now)
+                self._emit({"event": "sleep", "reason": "close_already_run", "close": _iso(close_epoch),
+                            "wake": _iso(wake)})
+                if self._sleep_until(wake):
+                    self._emit({"event": "stop_idle", "at": _iso(self._clock())})
+                    return 0
+                continue
+
+            start = self._clock()
+            close_epoch = _next_top_of_hour_epoch(start)
+            watchdog_deadline = close_epoch + self._watchdog_grace_s
+            wake_iso = _iso(start)
+            children: list[dict[str, Any]] = []
+            for roster in due:
+                # rotate THIS roster's leftover journals, then spawn its child.
+                try:
+                    rot = self._rotate(_roster_journal_dir(roster))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[SUPERVISOR] journal rotation failed for %s (ignored): %s", roster, e)
+                    rot = {"error": repr(e)}
+                self._last_close_run[roster] = close_epoch   # mark run BEFORE the wait (never spawn twice)
+                child = self._spawn(roster, self._child_args)
+                children.append({"roster": roster, "child": child, "wake_iso": wake_iso,
+                                 "watchdog_deadline": watchdog_deadline, "start": start,
+                                 "rotated": rot.get("count") if isinstance(rot, dict) else None,
+                                 "rc": None, "status": None})
+
+            signaled = self._wait_children(children)
+            for c in children:
+                duration = self._clock() - c["start"]
+                self._emit({"event": "window", "roster": c["roster"], "wake": c["wake_iso"],
+                            "pid": getattr(c["child"], "pid", None), "exit_code": c["rc"],
+                            "duration_s": round(duration, 3), "status": c["status"],
+                            "signaled": c["status"] == "signaled", "rotated": c["rotated"]})
+                if c["status"] == "watchdog_killed":
+                    self._emit({"event": "child_watchdog_killed", "roster": c["roster"],
+                                "wake": c["wake_iso"], "exit_code": c["rc"]})
+
+            if signaled:
+                # exit with the first non-zero child code, else 0.
+                for c in children:
+                    if isinstance(c["rc"], int) and c["rc"] != 0:
+                        return c["rc"]
+                return 0
+            if self._once:
+                return 0
+            # all children exited / watchdog-killed -> continue to the next :40
+
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 def build_parser() -> argparse.ArgumentParser:
@@ -638,10 +937,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--proxy-base", default=None,
                    help="Proxy base URL for the boot sweep (default: $DV3_PROXY_BASE else "
                         "http://127.0.0.1:8642).")
-    p.add_argument("--roster", choices=("v32", "v33"), default="v32",
-                   help="Which roster this supervisor drives: v32 (default; run_v32 + v32-* boot sweep + "
-                        "v32_mode.txt) or v33 (run_v33 + v33-* boot sweep + v33_mode.txt, the dry ladder "
-                        "alongside V3.2). Default is byte-identical to before.")
+    p.add_argument("--roster", choices=("v32", "v33", "v33_eth"), default="v32",
+                   help="Which SINGLE roster this supervisor drives: v32 (default; run_v32 + v32-* boot "
+                        "sweep + v32_mode.txt), v33 (run_v33 + v33-* boot sweep + v33_mode.txt) or v33_eth "
+                        "(run_v33_eth_live + v33e-* boot sweep + v33_eth_mode.txt). Default is "
+                        "byte-identical to before. Mutually exclusive with --rosters.")
+    p.add_argument("--rosters", default=None,
+                   help="Comma-separated rosters to CO-HOST in one process (e.g. 'v33,v33_eth' — BTC first, "
+                        "each as its own child per :40, one signal handler, per-child watchdog). When given, "
+                        "--roster is ignored.")
     p.add_argument("--child-args", nargs=argparse.REMAINDER, default=[],
                    help="Everything after this flag is passed verbatim to the child (must be last).")
     return p
@@ -652,6 +956,17 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     args = build_parser().parse_args(argv)
     proxy_base = args.proxy_base or default_proxy_base()
+    if args.rosters:
+        rosters = [r.strip() for r in str(args.rosters).split(",") if r.strip()]
+        sup_multi = MultiRosterSupervisor(
+            proxy_base=proxy_base,
+            rosters=rosters,
+            child_args=list(args.child_args or []),
+            once=args.once,
+            run_now=args.now,
+            dry_sweep=args.dry_sweep,
+        )
+        return sup_multi.run()
     sup = Supervisor(
         proxy_base=proxy_base,
         child_args=list(args.child_args or []),
