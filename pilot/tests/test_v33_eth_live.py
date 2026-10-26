@@ -581,6 +581,32 @@ def test_multi_sigterm_forwards_to_all_live_children():
         assert c.forwarded == [_signal.SIGTERM]               # the signal reached BOTH children
 
 
+def test_multi_sigterm_grace_is_one_shared_deadline_not_per_child():
+    """Two hung children on SIGTERM share ONE grace deadline: the second child gets only what is left of
+    it, so total shutdown stays under Render's 300 s cap (grace per child in series would be 2 x 240 s)."""
+    clk = _Clock(_epoch("2026-10-18T00:45:00Z"))
+    holder = {}
+    waits = []
+
+    class _Hung(_FakeChild):
+        def wait(self, timeout):
+            waits.append(timeout)
+            if not holder["sup"]._stop_requested:
+                holder["sup"].request_stop()
+                return None
+            clk.t += timeout                                  # the hung child burns its whole timeout
+            return None
+
+    sup = MultiRosterSupervisor(**_multi_fakes(
+        once=True, run_now=True, spawn=lambda r, a: _Hung([]), grace_s=240.0, child_poll_s=0.0,
+        clock=clk))
+    holder["sup"] = sup
+    start = clk.t
+    sup.run()
+    assert clk.t - start <= 240.0 + 1e-6                      # whole shutdown within ONE grace
+    assert waits[-1] == 0.0                                   # the second child got only the remainder
+
+
 def test_multi_per_child_watchdog_kills_only_overrunning_child():
     clk = _Clock(_epoch("2026-10-18T00:45:00Z"))
     kids = {}

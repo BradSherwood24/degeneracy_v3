@@ -788,8 +788,11 @@ class MultiRosterSupervisor:
         sig = self._sig if self._sig is not None else signal.SIGTERM
         for c in children:
             c["child"].forward_signal(sig)
+        # ONE shared grace deadline for all children (not grace per child in series): N children waited
+        # back-to-back would overrun Render's 300 s shutdown cap (2 x 240 s = 480 s).
+        deadline = self._clock() + self._grace_s
         for c in children:
-            rc = c["child"].wait(self._grace_s)
+            rc = c["child"].wait(max(0.0, deadline - self._clock()))
             if rc is None:
                 c["child"].kill()
                 rc = c["child"].wait(self._child_poll_s)
