@@ -1118,6 +1118,35 @@ its record stands; Test Fire #2 opens a NEW evaluation window under L7.
     NO T81099.99 x3 @0.64, fees $0.0526. 3 sets x +4.25c = +$0.1274 = the balance change ($140.5103 -> $140.6377)
     to the cent; positions flat, 0 resting, 0 one-legged. Test Fire #4 good orders: 3 of > 90.
 
+- 2026-10-26 22:20Z -- TEST FIRE #4 CLOSES PASS (Brad's ruling). Sizing-only test, 3 lots/rung, armed on Render main
+  81cac04 from the 2026-10-18 19:00Z close. Brad, verbatim: "Test fire 4 is a pass. Lets leave it running on render,
+  but it gets my thumbs up".
+  * RULE (n > 90 good orders, at least three full sweeps) MET BY THE LETTER: 111 good orders (rung-fill contracts
+    whose sets completed with both wings, reconciled to the venue). The line was crossed at the 2026-10-25 01:00Z close
+    (93). Multi-rung sweeps: 6 rungs (10-22 05Z), 5 (10-25 20Z), 4 (10-19 09Z), 3 (x4).
+  * VENUE (laptop read-only proxy, fills + settlements): 14 fill windows, 111 contracts, all both-winged and settled,
+    net +$6.8946 (~+6.2c/set); 10 windows positive, 4 negative (worst 10-19 09Z, 12 cts, -$0.4054). Balance
+    $140.5103 at arm -> $147.4049, the sum of the windows to the cent. Wing legs n = 38: fill->wing p50 198 ms,
+    p90 1,116 ms, max 1,288 ms. The losing windows were the slow-wing / W-repricing ones (444-1,288 ms); the
+    largest wins (10-21 02Z/09Z, 10-22 05Z: +12.3/+13.0/+13.3c) had 175-226 ms wings and W unchanged. Wing orders
+    above the proxy cap split as designed (18 -> 11 + 7; 15 -> 11 + 4).
+  * WORKER (Brad's Render shell, 10-26): last 200 ledger lines = 187 effective_mode armed, 187 degrade_reason null,
+    11 stand-downs; 0 Tracebacks in supervisor.out; v33_stops files 10-16..10-26 all "latched": [] (no S4, no
+    S1_LEGGED, no stop on any day); one exit_code 1 (below).
+  * KALSHI LISTING GAP, 2026-10-22: no KXBTC or KXBTCD hourly event was listed for the 06, 07, 08 and 09Z closes
+    (KXBTC/KXBTCD-26OCT2202..2205 hold 0 markets; 2201 and 2206 hold 188 each). 06/07/09Z stood down ("no KXBTC
+    range buckets co-settling"); the 08Z window (07:40Z wake) exited 1 after 7.5 s: before quoting, no ledger
+    row, no journal, no orders. Recorded for V3.4: an unlisted hour must stand down cleanly with a ledger row.
+  * PER CONTRACT vs TEST FIRE #3 (1 lot): #3 closed at 15 sets, +$1.8244 (~+12.2c/set); counting the 1-lot windows
+    between the two fires, 39 sets at ~+6.7c. #4 at 3 lots: ~+6.2c/set. Sizing behaved like 1 lot per contract:
+    wings sized to each fill, splits handled by the cap, every window reconciled. The thin and negative windows are
+    the known adverse-repricing pattern (V3.4 scope), not a sizing effect.
+  * FILL RATE: ~1.7 fill windows/day under #4 vs ~3.8 under #3. Not the worker (armed every window, no degrades);
+    four hours were unlisted by Kalshi; the remainder reads as market activity. Not a verdict criterion.
+  * STATE AFTER THE CLOSE: V3.3 stays ARMED on Render at 3 lots/rung, params 80b9d84f, S4 $5.00 (campaign KILL),
+    one-legged <= 6, S1_LEGGED 6 -- all unchanged. Windows after this close count toward no test fire until the
+    next one is registered. The next size step (or holding at 3 while V3.4 is built) is Brad's call.
+
 ## Pre-registered shadow observations (observational; change NOTHING above this line)
 
 ### SO-1 -- edge-ladder shadow (E = 0.08 and E = 0.12), inherited from V3.2
