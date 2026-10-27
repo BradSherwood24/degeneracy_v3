@@ -298,24 +298,31 @@ def test_eth_spec_values():
 
 
 # ===========================================================================
-# the ETH falsifier is a DRAFT -> S5 refuses to arm the ETH roster
+# the ETH falsifier is FROZEN (Brad 2026-10-27) -> S5 no longer refuses the ETH roster
 # ===========================================================================
-def test_eth_falsifier_is_draft_not_frozen():
+def test_eth_falsifier_is_frozen_with_registration():
     from service.stops import falsifier_is_frozen
     path = ETH_LIVE_SPEC.falsifier_path_fn()
-    assert os.path.exists(path), "the ETH falsifier draft must be shipped"
-    assert falsifier_is_frozen(path) is False, "the ETH falsifier must NOT be frozen (agent cannot arm ETH)"
-    # no standalone line may be exactly the frozen marker.
-    with open(path, encoding="utf-8") as f:
-        assert not any(ln.strip() == "STATUS: FROZEN" for ln in f)
+    assert os.path.exists(path), "the ETH falsifier must be shipped"
+    assert falsifier_is_frozen(path) is True
+    text = open(path, encoding="utf-8").read()
+    assert "Freeze it and merge." in " ".join(text.split())   # Brad's verbatim go
+    assert "DRAFT -- NOT FROZEN" not in text
+    # the BTC falsifier is a different file and stays frozen.
+    from service.v33.series import BTC_SPEC
+    assert BTC_SPEC.falsifier_path_fn() != path
+    assert falsifier_is_frozen(BTC_SPEC.falsifier_path_fn()) is True
 
 
-def test_eth_arming_refused_on_draft_falsifier():
-    """S5 with the REAL ETH falsifier path (a draft) refuses to arm regardless of healthy caps."""
+def test_eth_s5_passes_on_frozen_falsifier():
+    """S5 with the REAL (frozen) ETH falsifier path and healthy caps arms; the mode file still gates it."""
     out = decide_v33_arming(**_arm_kwargs(falsifier_path=ETH_LIVE_SPEC.falsifier_path_fn(),
-                                          position_prefix="KXETH"))
-    assert out.armed is False
-    assert any("falsifier" in r.lower() for r in out.reasons)
+                                          position_prefix="KXETH", s1_threshold=2))
+    assert out.armed is True, out.reasons
+    # a non-armed mode never arms, frozen or not.
+    dry = decide_v33_arming(**_arm_kwargs(resolved_mode="dry",
+                                          falsifier_path=ETH_LIVE_SPEC.falsifier_path_fn()))
+    assert dry.armed is False
 
 
 # ===========================================================================

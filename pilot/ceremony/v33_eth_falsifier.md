@@ -1,17 +1,16 @@
-# V3.3 ETH FALSIFIER (DRAFT) -- rolling K-rung ladder spot-bucket pump-fader on the ETH hourly markets
+# V3.3 ETH FALSIFIER -- rolling K-rung ladder spot-bucket pump-fader on the ETH hourly markets
 
-STATUS: DRAFT -- NOT FROZEN
+STATUS: FROZEN
 
-This file is a DRAFT. It is NOT frozen. It becomes frozen ONLY when Brad ALONE, on his verbatim go,
-replaces the STATUS line above with the exact frozen marker (the one the BTC falsifier carries) and appends
-his go under Registration. An agent NEVER flips it. Until then the ETH V3.3 roster cannot arm: the S5
-arming gate (`service.v33.stops.decide_v33_arming` -> `service.v33.stops.v33_arming_check` ->
+FROZEN 2026-10-27 on Brad's verbatim go (Registration below). The S5 arming gate
+(`service.v33.stops.decide_v33_arming` -> `service.v33.stops.v33_arming_check` ->
 `service.stops.falsifier_is_frozen`, wired in `service.run_v33` at the `--falsifier` default
-`pilot/ceremony/v33_eth_falsifier.md` via `ETH_LIVE_SPEC.falsifier_path_fn`) requires THIS exact path to
-carry a line that is exactly the frozen marker. While this draft stands, `falsifier_is_frozen` returns
-False and every ETH window degrades to dry -- an agent can never arm ETH by editing code.
+`pilot/ceremony/v33_eth_falsifier.md` via `ETH_LIVE_SPEC.falsifier_path_fn`) reads THIS exact path; with the
+frozen marker present, S5 no longer degrades the ETH roster, and ETH arms only if every other gate passes AND
+the ETH mode file reads `armed`. The `[pin]` values below do not change without a new Registration entry
+carrying Brad's verbatim words.
 
-This draft is the ETH analogue of the frozen BTC falsifier (`pilot/ceremony/v33_falsifier.md`). It is
+This falsifier is the ETH analogue of the frozen BTC falsifier (`pilot/ceremony/v33_falsifier.md`). It is
 written for ETH-TEST FIRE #1 (the first armed ETH shakedown, 1 lot per rung). The BTC falsifier is
 untouched and stays the sole governing document for the BTC roster.
 
@@ -76,10 +75,19 @@ There is no automated ETH report yet: `service.v33.report` applies the BTC pins 
 is scored BY HAND against the venue (`/portfolio/fills` + the balance), window by window, exactly as every
 BTC test-fire fill was reconciled, and each fill window's tally is recorded under Registration.
 
-The thresholds above are DRAFT and may change until Brad freezes this document. On freeze, the pre-registered
-`[pin]` values here are the ones the ETH report / stops enforce, exactly as the BTC falsifier's `[pin]`
-values are mirrored in `service.v33.falsifier_pins` / `service.v33.stops`.
+The `[pin]` values above are frozen. The code-enforced ones (S4, S1_LEGGED, reconcile-first, S5) live in
+`service.v33.stops` / `ETH_LIVE_SPEC`; the rest (good orders, one-legged tolerance, economic KILL, capital
+reserve) are scored by hand per the Scoring section.
 
 ## Registration
 
-(DRAFT -- empty. Brad appends his verbatim freeze go here, and only then the STATUS line changes.)
+- 2026-10-27 -- FREEZE. Brad reviewed the draft and its four revisions (PR #156: GOOD order definition,
+  one-legged <= 2 + ETH S1 latch 2, 25% capital reserve, economic KILL), verbatim: "All four fixes sound
+  good, go ahead when ready", then gave the freeze go, verbatim: "Freeze it and merge. We'll take it live
+  tonight". The STATUS line was set to the frozen marker by Claude on that instruction. Phase 2 (ETH dry on
+  Render beside armed BTC) ran 13 windows 2026-10-27 03:00Z..15:00Z: all dry, clean exits, Render matched the
+  laptop ETH dry (same markets, spot bucket, decisions; the 12Z dry fill and the 13Z ws alarm on both), BTC
+  feed-lag p99 93/156 ms and writer p50 21 ms (no CPU-contention signal). Capital at freeze: $143.31 on
+  exchange_index 2; worst concurrent full sweep ~$88 = 61% (<= 75%). ETH-TF#1 begins with the first armed
+  ETH window after Brad sets `/var/dv3/ops/v33_eth_mode.txt` to `armed` and adds `KXETH,KXETHD` to the
+  proxy's `ORDER_TICKER_PREFIXES`.
