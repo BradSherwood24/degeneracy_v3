@@ -178,6 +178,13 @@ def falsifier_path_v33() -> str:
     return os.path.join(_PILOT_DIR, "ceremony", "v33_falsifier.md")
 
 
+def falsifier_path_v33_eth() -> str:
+    """The ETH V3.3 falsifier -- a read-only input (S5 reads it for the ETH live roster), always in the
+    checkout. Shipped as a DRAFT (STATUS line is NOT ``STATUS: FROZEN``), so S5 refuses to arm the ETH
+    roster until Brad freezes it; an agent can never arm ETH by editing code."""
+    return os.path.join(_PILOT_DIR, "ceremony", "v33_eth_falsifier.md")
+
+
 # --- proxy base ---
 
 

@@ -1340,10 +1340,17 @@ class V33AsyncExecutor(V33LiveExecutor):
 # Startup safety (async twin of cancel_stale_open_orders) — off-loop crash-recovery sweep
 # ===========================================================================
 async def cancel_stale_open_orders_async(async_writer: AsyncOrderWriter, journal: Any,
-                                         clock) -> dict[str, Any]:
-    """Async twin of V33 cancel_stale_open_orders: GET our resting orders and DELETE any KXBTC* order whose
-    coid is ``v33-*`` (a prior crashed V3.3 process); NEVER touches v32-* or foreign orders. Fail-closed."""
+                                         clock, *, ticker_prefix: str | None = None,
+                                         coid_prefix: str | None = None) -> dict[str, Any]:
+    """Async twin of V33 cancel_stale_open_orders: GET our resting orders and DELETE any
+    ``<ticker_prefix>*`` order whose coid is ``<coid_prefix>*`` (a prior crashed process of THIS roster);
+    NEVER touches another roster's (v32-*, the sibling V3.3 roster's) or foreign orders. Fail-closed.
+    Defaults (``KXBTC`` + ``v33-``) keep the BTC path byte-identical; the ETH roster passes KXETH + v33e-."""
     from service.v33.executor import _KXBTC_PREFIX, _V33_COID_PREFIX
+    if ticker_prefix is None:
+        ticker_prefix = _KXBTC_PREFIX
+    if coid_prefix is None:
+        coid_prefix = _V33_COID_PREFIX
     result = {"found": 0, "cancelled": 0, "errors": 0, "skipped_foreign": 0}
     try:
         body = await async_writer.get(OPEN_ORDERS_PATH, {"status": "resting"}, klass=CLASS_POLL)
@@ -1358,10 +1365,10 @@ async def cancel_stale_open_orders_async(async_writer: AsyncOrderWriter, journal
             continue
         ticker = str(o.get("ticker") or o.get("market_ticker") or "")
         oid = o.get("order_id")
-        if not ticker.startswith(_KXBTC_PREFIX) or not oid:
+        if not ticker.startswith(ticker_prefix) or not oid:
             continue
         coid = o.get("client_order_id")
-        if not (coid and str(coid).startswith(_V33_COID_PREFIX)):
+        if not (coid and str(coid).startswith(coid_prefix)):
             result["skipped_foreign"] += 1
             journal.append("startup_skip_foreign_order",
                            {"ticker": ticker, "order_id": oid, "client_order_id": coid}, clock())

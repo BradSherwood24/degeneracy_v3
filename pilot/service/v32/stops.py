@@ -142,10 +142,14 @@ def v32_arming_check(
 # ---------------------------------------------------------------------------
 # Reconcile-first (no inherited un-settled position)
 # ---------------------------------------------------------------------------
-def reconcile_positions_clean(positions: Any) -> tuple[bool, str]:
-    """(clean, detail). Clean iff no KXBTC* market position carries a non-zero size. A malformed /
+def reconcile_positions_clean(positions: Any, *, prefix: str = "KXBTC") -> tuple[bool, str]:
+    """(clean, detail). Clean iff no ``<prefix>*`` market position carries a non-zero size. A malformed /
     unreadable payload is NOT clean (fail closed). ``positions`` is the /portfolio/positions payload
-    ({"market_positions": [...]}) or a bare list."""
+    ({"market_positions": [...]}) or a bare list.
+
+    ``prefix`` defaults to ``KXBTC`` (the live V3.2/V3.3 BTC tree, byte-identical for every existing
+    caller). The ETH V3.3 roster passes ``prefix="KXETH"`` so its reconcile-first scopes to KXETH*
+    positions on the shared account — a BTC position never blocks ETH arming and vice versa."""
     if positions is None:
         return False, "no positions payload (fail closed)"
     rows: Any
@@ -161,7 +165,7 @@ def reconcile_positions_clean(positions: Any) -> tuple[bool, str]:
         if not isinstance(p, dict):
             return False, "malformed position row (fail closed)"
         ticker = str(p.get("ticker") or p.get("market_ticker") or "")
-        if not ticker.startswith("KXBTC"):
+        if not ticker.startswith(prefix):
             continue
         pos = p.get("position")
         if pos is None:
