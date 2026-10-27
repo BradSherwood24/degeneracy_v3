@@ -51,6 +51,8 @@ V33_MAX_CONTRACTS_PER_ORDER = 2                   # the proxy's per-order cap re
 # At TF#4's 3-lot ladder the band is [3, 33]: the Render proxy cap (2 at the last freeze) MUST be raised to
 # >= 3 before the 3-lot params arm, else S5 degrades to dry. This value just records the setting for the runbook.
 V33_S1_LEGGED_LATCH_THRESHOLD = 6                 # [pin] one-legged contracts below floor before a DAY latch
+V33_ETH_S1_LEGGED_LATCH_THRESHOLD = 2             # [pin] the ETH roster's S1 day latch (ETH-TF#1, Brad 2026-10-27:
+#   ETH runs 1 lot, so it takes BTC's 1-lot TF#3 value of 2, not the 3-lot value of 6; BTC unchanged).
                                                   # (TF#4 2026-10-17: 2 -> 6; 6 contracts = two 3-lot rung
                                                   # events. S1 is still counted PER CONTRACT -- no logic change)
 
@@ -208,13 +210,15 @@ def record_legged_occurrence(path: str, utc_day: str, window: str | None, reason
     return count_legged(read_day_guard(path, utc_day))
 
 
-def v33_latched_stop_kind(guard: DayGuard) -> str | None:
+def v33_latched_stop_kind(guard: DayGuard,
+                          s1_threshold: int = V33_S1_LEGGED_LATCH_THRESHOLD) -> str | None:
     """The day-halting stop latched in the V3.3 guard, else None. S4 latches immediately; S1_LEGGED
-    latches only once its occurrence count reaches ``V33_S1_LEGGED_LATCH_THRESHOLD``."""
+    latches only once its occurrence count reaches ``s1_threshold`` (BTC default
+    ``V33_S1_LEGGED_LATCH_THRESHOLD``; the ETH roster passes ``V33_ETH_S1_LEGGED_LATCH_THRESHOLD``)."""
     for e in guard.latched:
         if e.get("kind") == S4_DAY_LOSS:
             return S4_DAY_LOSS
-    if count_legged(guard) >= V33_S1_LEGGED_LATCH_THRESHOLD:
+    if count_legged(guard) >= s1_threshold:
         return S1_LEGGED
     return None
 
@@ -244,6 +248,7 @@ def decide_v33_arming(
     rung_lots: Any = None,
     position_prefix: str = "KXBTC",
     cross_s4_latched: bool = False,
+    s1_threshold: int = V33_S1_LEGGED_LATCH_THRESHOLD,
 ) -> V33ArmingOutcome:
     """The single arm-or-degrade gate (mirrors ``decide_v32_arming``). Only ``resolved_mode == "armed"``
     is a candidate; anything else passes through unarmed. An armed candidate must clear ALL of: the day
@@ -255,7 +260,7 @@ def decide_v33_arming(
     ``KXETH``). ``cross_s4_latched`` is the ACCOUNT-WIDE S4 cross-stop: True when the SIBLING roster's day
     guard carries an S4 latch, which halts THIS roster too (an S4 on either roster stops both). BTC passes
     False when the ETH guard is absent/has no S4 latch, so the BTC path is byte-identical until ETH ever
-    latches S4."""
+    latches S4. ``s1_threshold`` is this roster's S1_LEGGED day-latch count (BTC default 6, ETH 2)."""
     if resolved_mode != "armed":
         return V33ArmingOutcome(effective_mode=resolved_mode, armed=False,
                                 degrade_reason=None, reasons=())
@@ -263,7 +268,7 @@ def decide_v33_arming(
     if day_guard.corrupt:
         reasons.append("day guard corrupt/unreadable (fail closed)")
     else:
-        latched = v33_latched_stop_kind(day_guard)
+        latched = v33_latched_stop_kind(day_guard, s1_threshold)
         if latched is not None:
             reasons.append(f"day-halting stop already latched today: {latched}")
     if cross_s4_latched:

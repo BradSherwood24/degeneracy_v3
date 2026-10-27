@@ -91,7 +91,6 @@ from service.v33.reconcile import (
     reconcile_live,
 )
 from service.v33.stops import (
-    V33_S1_LEGGED_LATCH_THRESHOLD,
     decide_v33_arming,
     guard_has_s4_latch,
     record_legged_occurrence,
@@ -1232,7 +1231,8 @@ def main(argv: list[str] | None = None, *, spec: V33SeriesSpec = BTC_SPEC) -> in
             resolved_mode=resolved_mode, falsifier_path=args.falsifier, health=health,
             positions=positions, params_verified=True, lots_per_rung=params.lots_per_rung,
             day_guard=day_guard, s4=s4, k_rungs=params.rungs, rung_lots=params.rung_lots,
-            position_prefix=spec.position_prefix, cross_s4_latched=cross_s4)
+            position_prefix=spec.position_prefix, cross_s4_latched=cross_s4,
+            s1_threshold=spec.s1_latch_threshold)
         effective_mode = outcome.effective_mode
         if not outcome.armed:
             degrade = "degrade_to_dry"
@@ -1368,7 +1368,7 @@ def main(argv: list[str] | None = None, *, spec: V33SeriesSpec = BTC_SPEC) -> in
                                                  "against executor truth)", clock())
                     olc = str(recon.one_legged_contracts) if recon is not None else None
                     journal.append("s1_legged_occurrence",
-                                   {"count": n, "latch_threshold": V33_S1_LEGGED_LATCH_THRESHOLD,
+                                   {"count": n, "latch_threshold": spec.s1_latch_threshold,
                                     "one_legged_contracts": olc}, clock())
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[V33] S1_LEGGED record failed: %s", e)
