@@ -46,7 +46,7 @@ S1_LEGGED stays PER-roster (ETH has its own `v33_eth_stops_*` guard); only S4 is
 
 ## Brad's levers, IN ORDER
 
-### (a) Deploy the co-hosted worker in DRY (24–48 h Phase-2 gates)
+### (a) Deploy the co-hosted worker in DRY (>= 8 armed-hour windows, Phase-2 gates)
 
 Change the Render worker start command to:
 
@@ -61,7 +61,8 @@ Set the ETH mode file to dry on the persistent disk (do NOT arm yet):
 echo dry > /var/dv3/ops/v33_eth_mode.txt
 ```
 
-Leave BTC's mode file exactly as it is (BTC stays armed at 3 lots). Watch for 24–48 h:
+Leave BTC's mode file exactly as it is (BTC stays armed at 3 lots). Brad 2026-10-26: run ETH dry for NO
+LESS THAN 8 hours (8 ETH dry windows on Render), first window the 11 PM local (EDT) hour. Watch:
 - BTC wing p50 stays near the TF#4 baseline (**~198 ms**) — the shared CPU must not slow BTC's sends.
 - Worker CPU / RAM headroom on the Standard 1 CPU / 2 GB instance (two Python children per hour, each a
   ~22-min window; the ETH child subscribes fewer markets — no 15M leg).
@@ -76,11 +77,12 @@ Add `KXETH,KXETHD` to the proxy's `ORDER_TICKER_PREFIXES` env (the proxy's allow
 ticker via startswith, exactly as S5's `v33_caps_agree` checks). Without this, ETH would be refused at the
 proxy even if armed. BTC's existing prefixes are untouched.
 
-### (c) Kalshi balance top-up
+### (c) Capital check (no deposit needed)
 
-A BTC 3-lot full sweep is ~$66 and an ETH 1-lot full sweep is ~$22 → ~$88 worst-case concurrent vs a
-balance of ~$147 (>50% utilization). Deposit ~$30–40 and move the funds to **exchange_index 2** via
-kalshi.com/account/exchange-indexes (crypto lives on index 2; deposits land on index 0).
+Brad 2026-10-26: reserve rule relaxed from 50% to **25%** (max 75% utilization). A BTC 3-lot full sweep is
+~$66 and an ETH 1-lot full sweep is ~$22 → ~$88 worst-case concurrent vs $144.29 on exchange_index 2
+(read 2026-10-27 01:37Z) = 61% < 75%. Green without a top-up. Re-check before any size step (BTC 6 lots +
+ETH 1 lot would breach 75% at today's balance).
 
 Disk note: ETH adds ~**75 MB/day** of journals on the 20 GB persistent disk. Keep the journal rotation /
 offload cadence (the supervisor rotates leftover journals per roster at each wake).
