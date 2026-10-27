@@ -636,3 +636,28 @@ def test_multi_per_child_watchdog_kills_only_overrunning_child():
 def test_multi_unknown_rosters_filtered_and_deduped():
     sup = MultiRosterSupervisor(**_multi_fakes(rosters=["v33", "bogus", "v33", "v33_eth"]))
     assert sup._rosters == ["v33", "v33_eth"]
+
+
+# ===========================================================================
+# ETH-TF#1 S1_LEGGED day latch: 2 for ETH (1 lot), BTC unchanged at 6
+# ===========================================================================
+def test_s1_latch_threshold_per_series():
+    from service.v33.series import BTC_SPEC, ETH_LIVE_SPEC
+    from service.v33.stops import V33_ETH_S1_LEGGED_LATCH_THRESHOLD, V33_S1_LEGGED_LATCH_THRESHOLD
+    assert V33_S1_LEGGED_LATCH_THRESHOLD == 6                  # BTC pin untouched
+    assert V33_ETH_S1_LEGGED_LATCH_THRESHOLD == 2
+    assert BTC_SPEC.s1_latch_threshold == 6
+    assert ETH_LIVE_SPEC.s1_latch_threshold == 2
+
+
+def test_eth_s1_latches_at_two_occurrences_btc_does_not(monkeypatch):
+    monkeypatch.setattr("service.v33.stops.falsifier_is_frozen", lambda p: True)
+    two = _guard([{"kind": S1_LEGGED}, {"kind": S1_LEGGED}])
+    one = _guard([{"kind": S1_LEGGED}])
+    # ETH (threshold 2): one occurrence still arms; the second latches the ETH day.
+    assert decide_v33_arming(**_arm_kwargs(day_guard=one, s1_threshold=2)).armed is True
+    eth = decide_v33_arming(**_arm_kwargs(day_guard=two, s1_threshold=2))
+    assert eth.armed is False
+    assert any("S1_LEGGED" in r for r in eth.reasons)
+    # BTC default (6): the same two occurrences do NOT latch (byte-identical BTC behaviour).
+    assert decide_v33_arming(**_arm_kwargs(day_guard=two)).armed is True

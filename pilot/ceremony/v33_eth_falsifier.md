@@ -36,23 +36,45 @@ ETH-TF#1 is MECHANICAL: it proves the ETH plumbing is correct on the real venue 
 edge clears a profit bar. It is the ETH analogue of BTC Test Fire #3 (mechanical, pass on order count).
 
 - Sizing: 1 lot per rung, 11 rungs, margins 8..18c (the shipped ETH policy, sha above).
-- `[pin]` PASS at `> 30` GOOD orders over `>= 3` distinct armed sweeps. A GOOD order is a placed rung or a
-  booked wing-pair leg that reconciles against executor truth with no defect (mirrors the BTC "good order"
-  count the Registration uses). Fewer than 3 sweeps or <= 30 good orders is INCONCLUSIVE, not a pass.
+- `[pin]` PASS at `> 30` GOOD orders over `>= 3` distinct armed sweeps (a sweep = an armed window with at
+  least one rung fill). A GOOD order is a FILLED rung contract whose set completes with BOTH wings filled,
+  whose ledger row reconciles to the venue fills, and that leaves nothing one-legged beyond the tolerance --
+  the SAME definition the BTC Registration used for Test Fires #3 and #4. Placed / re-placed / cancelled
+  rungs are NOT orders for this count. Fewer than 3 sweeps or <= 30 good orders is INCONCLUSIVE, not a pass.
 - `[pin]` KILL immediately on ANY of: an unbooked fill (a venue fill the core never booked / hedged); a
   ledger-vs-executor reconcile mismatch; or an S4 CAMPAIGN latch (see below). These are the same
   defence-in-depth receipts the BTC gate E / S1 machinery already produces, read for the ETH roster.
+- `[pin]` ONE-LEGGED tolerance: `<= 2` contracts left one-legged across the test fire; the 3rd KILLS. (BTC at
+  1 lot, Test Fire #3, used 2; the shared BTC value 6 is sized for 3 lots and does NOT apply to ETH.)
+- `[pin]` ECONOMIC KILL: mean realised true lock per GOOD order `< +2.0c` once `>= 15` good orders exist ->
+  KILL (BTC's `V33_KILL_MEAN_LOCK_CENTS` / `V33_KILL_MIN_N`, borrowed as-is). Realised true lock = the set's
+  $2 minus the venue-filled bucket-NO price, the venue-filled wing prices and the exact fees; the venue fills
+  and the balance are the truth, not the ledger's W-at-fill estimate. ETH wings are ~10x thinner than BTC's
+  and live is expected ~2c/contract under dry, so a mechanically clean test fire must not quietly bleed.
 - `[pin]` ACCOUNT-WIDE S4 day-loss cap `$5.00` (the SAME cap as BTC, `service.v33.stops.V33_S4_DAY_LOSS_CAP_DOLLARS`).
   The Kalshi balance is SHARED across the BTC and ETH rosters, so each roster's balance-banded S4 already
   sees BOTH series' losses, and an S4 latch on EITHER roster's day guard stops BOTH (the ETH roster reads
   BTC's guard for an S4 latch and vice versa; `service.run_v33._sibling_s4_latched`). An S4 latch on any
   armed UTC day the ETH report covers is a CAMPAIGN kill, not merely a day halt.
-- `[pin]` S1_LEGGED: a one-legged-below-floor set is counted PER CONTRACT; the ETH DAY latches at
-  `V33_S1_LEGGED_LATCH_THRESHOLD` occurrences (the same threshold constant as BTC). The ETH day guard is
+- `[pin]` S1_LEGGED: each armed ETH window that ends one-legged below the lock floor (reconciled against
+  executor truth) records one occurrence in the ETH day guard; the ETH DAY latches at
+  `V33_ETH_S1_LEGGED_LATCH_THRESHOLD` = **2** occurrences (`ETH_LIVE_SPEC.s1_latch_threshold`; BTC stays at
+  `V33_S1_LEGGED_LATCH_THRESHOLD` = 6). The ETH day guard is
   its own file (`ops/v33_eth_stops_YYYY-MM-DD.json`), SEPARATE from BTC's, so an ETH S1 latch never halts
   the BTC day (only the account-wide S4 is shared, by Brad's ruling).
 - `[pin]` reconcile-first: the ETH roster refuses to arm with any inherited un-settled `KXETH*` position
   (scoped to the ETH series; a BTC position never blocks ETH and vice versa).
+- `[pin]` CAPITAL RESERVE (Brad 2026-10-26: "the 50% threshold seems too conservative ... If we bumped that
+  to 25% reserves"): the worst-case CONCURRENT full sweep of every armed roster must be `<= 75%` of the
+  exchange_index 2 balance (a 25% reserve). At arming: BTC 3-lot ~$66 + ETH 1-lot ~$22 = ~$88 vs $143.31
+  (2026-10-27) = 61%. Checked by hand (Claude + Brad) before arming and before ANY size step on either
+  roster; not enforced in code.
+
+## Scoring (honest gap)
+
+There is no automated ETH report yet: `service.v33.report` applies the BTC pins to the BTC ledger only. ETH-TF#1
+is scored BY HAND against the venue (`/portfolio/fills` + the balance), window by window, exactly as every
+BTC test-fire fill was reconciled, and each fill window's tally is recorded under Registration.
 
 The thresholds above are DRAFT and may change until Brad freezes this document. On freeze, the pre-registered
 `[pin]` values here are the ones the ETH report / stops enforce, exactly as the BTC falsifier's `[pin]`

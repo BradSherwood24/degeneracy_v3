@@ -63,7 +63,12 @@ from service.v33.eth import (
     load_v33_eth_params,
     parse_eth_strike_ticker,
 )
-from service.v33.stops import _DAY_GUARD_PREFIX_V33, _DAY_GUARD_PREFIX_V33_ETH
+from service.v33.stops import (
+    _DAY_GUARD_PREFIX_V33,
+    _DAY_GUARD_PREFIX_V33_ETH,
+    V33_ETH_S1_LEGGED_LATCH_THRESHOLD,
+    V33_S1_LEGGED_LATCH_THRESHOLD,
+)
 
 # The BTC roster's literals (unchanged from run_v33's historic constants).
 BTC_ROSTER = "DegeneracyV3_3"
@@ -111,6 +116,8 @@ class V33SeriesSpec:
     sibling_ledger_path_fn: Callable[[], str] | None
     sibling_guard_ops_dir_fn: Callable[[], str] | None
     sibling_guard_prefix: str | None
+    # this roster's S1_LEGGED day-latch count (BTC 6 at 3 lots; ETH 2 at 1 lot, ETH-TF#1)
+    s1_latch_threshold: int = V33_S1_LEGGED_LATCH_THRESHOLD
 
     @property
     def has_m15(self) -> bool:
@@ -170,4 +177,5 @@ ETH_LIVE_SPEC = V33SeriesSpec(
     sibling_ledger_path_fn=ledger_path_v33,
     sibling_guard_ops_dir_fn=ops_dir_v33,
     sibling_guard_prefix=_DAY_GUARD_PREFIX_V33,
+    s1_latch_threshold=V33_ETH_S1_LEGGED_LATCH_THRESHOLD,
 )
