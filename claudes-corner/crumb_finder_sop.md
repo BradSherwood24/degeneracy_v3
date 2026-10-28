@@ -84,8 +84,26 @@ shape*. A colony needs new identity *kinds*, ranked by reuse of what exists:
 3. **Non-crypto events with both a range ladder and a threshold ladder** — economic releases,
    weather highs, index closes. Slower, fewer windows, different (possibly more naive) crowds. The
    scan ruled out *hourly* pairs only, not daily/event ones.
-4. **Cross-venue identity** — e.g. a Polymarket market mirroring a Kalshi event. Same structure,
-   but capital on two venues + access/ops friction. Parked.
+4. **Cross-venue identity: Kalshi ↔ Polymarket BTC 15M / hourly** (Brad 10-27, months out).
+   Buy the cheap YES on one venue and the cheap NO on the other, then hold to settlement.
+   - **Venue map.** Coinbase and Robinhood are front ends on Kalshi's book (no arb with Kalshi).
+     The separate books are Kalshi, Polymarket (intl + US), Gemini Predictions and Crypto.com.
+     Scope is the two largest by volume, Kalshi and Polymarket.
+   - **Fees.** Rest the Kalshi leg as a maker (fee $0) and pay Polymarket's taker fee on the other
+     leg. That is one taker fee instead of two.
+   - **The hole.** The two venues settle on different prices: Kalshi on the CF BRTI 60 s average
+     vs target, Polymarket on a Chainlink start/end print. In close windows they can disagree, so
+     the pair pays $0 (or $2). The biggest on-screen gaps sit in exactly those fast, near-50/50
+     windows. This is the 09-01 hole-to-plug shape across venues.
+   - **Adverse selection.** The Kalshi rest tends to fill as Kalshi reprices toward Polymarket,
+     which is the W-jump again.
+   - **Capital.** No one-way drain: each $1 pays on the venue holding the winning side, a coin
+     flip, so balances drift like √n. Occasional top-ups; the real cost is idle capital on two
+     venues.
+   - **Test (read-only, no accounts).** Record Polymarket's public CLOB alongside the Kalshi
+     journals. Measure (a) how long executable sub-$1 pairs persist after fees (Kalshi maker +
+     Polymarket taker), and (b) the oracle-split rate as a function of |final − target|. Go only if
+     the persistent edge clearly beats the hole.
 
 ## 5. The Crumb Finder v1 (sketch, not a spec)
 
